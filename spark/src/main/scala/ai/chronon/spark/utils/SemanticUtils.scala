@@ -1,13 +1,12 @@
 package ai.chronon.spark.utils
 
 import ai.chronon.api.Constants
-import ai.chronon.spark.catalog.{CreationUtils, TableUtils}
+import ai.chronon.spark.catalog.{CreationUtils, Format, TableUtils}
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.format.DateTimeFormatter
 import java.time.{Instant, ZoneOffset}
-import scala.util.Try
 
 class SemanticUtils(tableUtils: TableUtils) {
 
@@ -15,17 +14,9 @@ class SemanticUtils(tableUtils: TableUtils) {
 
   def renameTable(srcTable: String, destTable: String): Unit = {
 
-    val normalizedDestTable = Try {
-      val parser = tableUtils.sparkSession.sessionState.sqlParser
-      val destParts = parser.parseMultipartIdentifier(destTable).toList
-
-      destParts match {
-        case _ :: destNamespace :: destName :: Nil =>
-          s"${QuotingUtils.quoteIdentifier(destNamespace)}.${QuotingUtils.quoteIdentifier(destName)}"
-        case _ =>
-          destTable
-      }
-    }.getOrElse(destTable)
+    val resolvedDest = Format.resolveTableName(destTable)(tableUtils.sparkSession)
+    val normalizedDestTable =
+      s"${QuotingUtils.quoteIdentifier(resolvedDest.namespace)}.${QuotingUtils.quoteIdentifier(resolvedDest.table)}"
 
     val alterStatement = s"ALTER TABLE $srcTable RENAME TO $normalizedDestTable"
 
