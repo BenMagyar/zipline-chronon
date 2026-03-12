@@ -4,7 +4,7 @@ import ai.chronon.api.{Constants, LongType, StringType, StructField, StructType}
 import ai.chronon.spark.catalog.{CreationUtils, TableUtils}
 import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.TestUtils.makeDf
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.junit.Assert.{assertEquals, assertFalse, assertTrue}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.flatspec.AnyFlatSpec
@@ -322,5 +322,22 @@ class SemanticUtilsTest extends AnyFlatSpec with BeforeAndAfterEach {
     val archivedTableOpt = semanticUtils.checkSemanticHashAndArchive(tableName, longHash)
     assertEquals(None, archivedTableOpt) // Should not archive
     assertTrue(spark.catalog.tableExists(tableName))
+  }
+
+  it should "normalize destination rename identifier by stripping catalog in renameTable" in {
+    var capturedStatement = ""
+    val capturingTableUtils = new TableUtils(spark) {
+      override def sql(query: String): DataFrame = {
+        capturedStatement = query
+        spark.emptyDataFrame
+      }
+    }
+    val semanticUtilsWithCapture = new SemanticUtils(capturingTableUtils)
+
+    val srcTable = s"spark_catalog.$testDb.src_table"
+    val destTable = s"spark_catalog.$testDb.dest_table"
+
+    semanticUtilsWithCapture.renameTable(srcTable, destTable)
+    assertEquals(s"ALTER TABLE $srcTable RENAME TO `$testDb`.`dest_table`", capturedStatement)
   }
 }
