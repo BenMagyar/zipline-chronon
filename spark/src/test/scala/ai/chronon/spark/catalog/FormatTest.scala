@@ -44,4 +44,24 @@ class FormatTest extends SparkTestBase {
     assertEquals("tbl", resolved.table)
   }
 
+  it should "strip destination catalog in rename SQL when source and destination share a catalog" in {
+    val sql = Format.renameTableSql(
+      "spark_non_default_catalog.custom_test_db.src_table",
+      "spark_non_default_catalog.custom_test_db.dest_table"
+    )
+    assertEquals(
+      "ALTER TABLE spark_non_default_catalog.custom_test_db.src_table RENAME TO `custom_test_db`.`dest_table`",
+      sql)
+  }
+
+  it should "keep destination catalog in rename SQL when source and destination catalogs differ" in {
+    val sql = Format.renameTableSql(
+      "spark_non_default_catalog.custom_test_db.src_table",
+      "spark_catalog.default.dest_table"
+    )
+    assertEquals(
+      "ALTER TABLE spark_non_default_catalog.custom_test_db.src_table RENAME TO `spark_catalog`.`default`.`dest_table`",
+      sql)
+  }
+
 }

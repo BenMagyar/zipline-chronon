@@ -587,6 +587,27 @@ class TableUtilsTest extends AnyFlatSpec {
     }
   }
 
+  it should "rename tables" in {
+    val dbName = "db"
+    val srcTable = s"$dbName.test_rename_src"
+    val destTable = s"$dbName.test_rename_dest"
+
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+    try {
+      spark.sql(s"CREATE TABLE $srcTable (id INT, ds STRING)")
+      spark.sql(s"INSERT INTO $srcTable VALUES (1, '2024-01-01'), (2, '2024-01-02')")
+
+      tableUtils.renameTable(srcTable, destTable)
+
+      assertFalse(s"Original table should not exist after rename", spark.catalog.tableExists(srcTable))
+      assertTrue(s"Destination table should exist after rename", spark.catalog.tableExists(destTable))
+      assertEquals(2L, spark.table(destTable).count())
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $srcTable")
+      spark.sql(s"DROP TABLE IF EXISTS $destTable")
+    }
+  }
+
   it should "test catalog detection" in {
     implicit val localSparkRef: SparkSession = spark
     assertEquals("catalogA", Format.getCatalog("catalogA.foo.bar"))

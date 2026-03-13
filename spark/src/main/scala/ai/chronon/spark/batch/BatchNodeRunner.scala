@@ -713,7 +713,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
                   if (tableUtils.tableReachable(outputTable)) {
                     tableUtils.sql(s"DROP TABLE IF EXISTS $outputTable")
                   }
-                  su.renameTable(archivedTable, outputTable)
+                  tableUtils.renameTable(archivedTable, outputTable)
                   logger.info(s"Rolled back archival: restored $archivedTable to $outputTable")
                 }
               } catch {

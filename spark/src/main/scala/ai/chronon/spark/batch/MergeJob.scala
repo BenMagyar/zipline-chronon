@@ -248,9 +248,8 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
     // If there is an existing _archive_reuse table then rename that to archive_currtime
     // Then rename the current output table to _archive_reuse
     tableUtils.archiveOrDropTableIfExists(archiveReuseTable, Option(Instant.now()))
-    val archiveCommand = s"ALTER TABLE $outputTable RENAME TO $archiveReuseTable"
     logger.info(s"Archiving current output table $outputTable to $archiveReuseTable")
-    tableUtils.sql(archiveCommand)
+    tableUtils.renameTable(outputTable, archiveReuseTable)
   }
 
   private def getExistingColHashes(table: String): Map[String, String] = {

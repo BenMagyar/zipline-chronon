@@ -1,8 +1,7 @@
 package ai.chronon.spark.utils
 
 import ai.chronon.api.Constants
-import ai.chronon.spark.catalog.{CreationUtils, Format, TableUtils}
-import org.apache.spark.sql.catalyst.util.QuotingUtils
+import ai.chronon.spark.catalog.{CreationUtils, TableUtils}
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.format.DateTimeFormatter
@@ -11,20 +10,6 @@ import java.time.{Instant, ZoneOffset}
 class SemanticUtils(tableUtils: TableUtils) {
 
   private val logger: Logger = LoggerFactory.getLogger(this.getClass)
-
-  def renameTable(srcTable: String, destTable: String): Unit = {
-
-    val resolvedDest = Format.resolveTableName(destTable)(tableUtils.sparkSession)
-    val normalizedDestTable =
-      s"${QuotingUtils.quoteIdentifier(resolvedDest.namespace)}.${QuotingUtils.quoteIdentifier(resolvedDest.table)}"
-
-    val alterStatement = s"ALTER TABLE $srcTable RENAME TO $normalizedDestTable"
-
-    logger.info(s"Renaming table: $alterStatement")
-
-    tableUtils.sql(alterStatement)
-
-  }
 
   // tries to archive to a "reuse" table,
   // if a reuse table is already present, it first moves the reuse table to "shelf" table - suffixed with timestamp
@@ -42,11 +27,11 @@ class SemanticUtils(tableUtils: TableUtils) {
     val shelfTable = shelfTableOpt.getOrElse(outputTable + "_archive_" + nowSecondsStr)
 
     if (tableUtils.tableReachable(reuseTable)) {
-      renameTable(reuseTable, shelfTable)
+      tableUtils.renameTable(reuseTable, shelfTable)
     }
 
     if (tableUtils.tableReachable(outputTable)) {
-      renameTable(outputTable, reuseTable)
+      tableUtils.renameTable(outputTable, reuseTable)
     }
 
     logger.info(s"Archived table $outputTable to $reuseTable")

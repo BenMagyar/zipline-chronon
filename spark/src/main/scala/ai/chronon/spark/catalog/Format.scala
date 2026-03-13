@@ -28,8 +28,7 @@ trait Format {
       case Some(hash) =>
         val parts = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(tableName).toList
         val hashedParts = parts.init :+ s"${parts.last}_$hash"
-        (hashedParts.map(QuotingUtils.quoteIdentifier).mkString("."),
-         parts.map(QuotingUtils.quoteIdentifier).mkString("."))
+        (hashedParts.map(QuotingUtils.quoteIdentifier).mkString("."), tableName)
       case None => (tableName, tableName)
     }
     sparkSession.sql(
@@ -37,7 +36,7 @@ trait Format {
         .createTableSql(creationName, schema, partitionColumns, providedProperties, tableTypeString))
     if (semanticHash.isDefined) {
       try {
-        sparkSession.sql(s"ALTER TABLE $creationName RENAME TO $quotedOriginal")
+        sparkSession.sql(Format.renameTableSql(creationName, tableName))
       } catch {
         case _: TableAlreadyExistsException =>
           // Another writer already created the target table — safe to clean up our intermediate table
@@ -200,6 +199,17 @@ object Format {
       case _ :: Nil                 => defaultCatalog
       case _ => throw new IllegalStateException(s"Invalid table naming convention specified: ${inputTableName}")
     }
+  }
+
+  def renameTableSql(srcTable: String, destTable: String)(implicit sparkSession: SparkSession): String = {
+    val srcResolved = resolveTableName(srcTable)
+    val destResolved = resolveTableName(destTable)
+    val normalizedDest = if (srcResolved.catalog == destResolved.catalog) {
+      s"${QuotingUtils.quoteIdentifier(destResolved.namespace)}.${QuotingUtils.quoteIdentifier(destResolved.table)}"
+    } else {
+      s"${QuotingUtils.quoteIdentifier(destResolved.catalog)}.${QuotingUtils.quoteIdentifier(destResolved.namespace)}.${QuotingUtils.quoteIdentifier(destResolved.table)}"
+    }
+    s"ALTER TABLE $srcTable RENAME TO $normalizedDest"
   }
 
 }

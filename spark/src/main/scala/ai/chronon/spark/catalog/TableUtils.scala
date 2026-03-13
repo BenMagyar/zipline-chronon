@@ -477,6 +477,12 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
     sql(command)
   }
 
+  def renameTable(srcTable: String, destTable: String): Unit = {
+    val command = Format.renameTableSql(srcTable, destTable)(sparkSession)
+    logger.info(s"Renaming table with command: $command")
+    sql(command)
+  }
+
   def archiveOrDropTableIfExists(tableName: String, timestamp: Option[Instant]): Option[String] = {
     val archiveTry = Try(archiveTableIfExists(tableName, timestamp))
     archiveTry match {
@@ -496,9 +502,7 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
     if (tableReachable(tableName)) {
       val humanReadableTimestamp = archiveTimestampFormatter.format(timestamp.getOrElse(Instant.now()))
       val finalArchiveTableName = s"${tableName}_$humanReadableTimestamp"
-      val command = s"ALTER TABLE $tableName RENAME TO $finalArchiveTableName"
-      logger.info(s"Archiving table with command: $command")
-      sql(command)
+      renameTable(tableName, finalArchiveTableName)
       Some(finalArchiveTableName)
     } else {
       None
