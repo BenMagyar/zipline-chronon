@@ -1,5 +1,6 @@
 from gen_thrift.api.ttypes import (
     Aggregation,
+    BootstrapPart,
     EventSource,
     GroupBy,
     Join,
@@ -65,6 +66,11 @@ def _make_validator(existing_gbs=None, existing_joins=None, existing_staging_que
 
 def _has_online_in_place_error(errors):
     return any("is online and cannot be changed in-place" in str(e) for e in errors)
+
+
+def _has_time_partitioned_missing_partition_column_error(errors, context=None):
+    message = "timePartitioned sources must have partitionColumn set to the timestamp/date column name"
+    return any(message in str(e) and (context is None or context in str(e)) for e in errors)
 
 
 class TestOnlineConfNotChangedInPlace:
@@ -137,3 +143,61 @@ class TestOnlineConfNotChangedInPlace:
         assert len(online_errors) == 1
         assert "team.important_gb" in str(online_errors[0])
         assert "GroupBy" in str(online_errors[0])
+
+
+class TestTimePartitionedValidation:
+    def test_group_by_source_requires_partition_column_when_time_partitioned(self):
+        group_by = _make_group_by()
+        group_by.sources[0].events.query.timePartitioned = True
+        group_by.sources[0].events.query.partitionColumn = None
+        validator = _make_validator()
+
+        errors = validator.validate_obj(group_by)
+        assert _has_time_partitioned_missing_partition_column_error(
+            errors, "group_by team.my_gb source[0]"
+        )
+
+    def test_join_left_requires_partition_column_when_time_partitioned(self):
+        join = _make_join()
+        join.left.events.query.timePartitioned = True
+        join.left.events.query.partitionColumn = None
+        validator = _make_validator()
+
+        errors = validator.validate_obj(join)
+        assert _has_time_partitioned_missing_partition_column_error(
+            errors, "join team.my_join left"
+        )
+
+    def test_join_bootstrap_part_requires_partition_column_when_time_partitioned(self):
+        join = _make_join()
+        bootstrap_query = Query()
+        bootstrap_query.timePartitioned = True
+        bootstrap_query.partitionColumn = None
+        join.bootstrapParts = [
+            BootstrapPart(
+                table="test.bootstrap_table",
+                query=bootstrap_query,
+            )
+        ]
+        validator = _make_validator()
+
+        errors = validator.validate_obj(join)
+        assert _has_time_partitioned_missing_partition_column_error(
+            errors, "join team.my_join bootstrapParts[0]"
+        )
+
+    def test_time_partitioned_with_partition_column_passes(self):
+        group_by = _make_group_by()
+        group_by.sources[0].events.query.timePartitioned = True
+        group_by.sources[0].events.query.partitionColumn = "created_at"
+        validator = _make_validator()
+
+        errors = validator.validate_obj(group_by)
+        assert not _has_time_partitioned_missing_partition_column_error(errors)
+
+    def test_non_time_partitioned_without_partition_column_passes_this_validation(self):
+        group_by = _make_group_by()
+        validator = _make_validator()
+
+        errors = validator.validate_obj(group_by)
+        assert not _has_time_partitioned_missing_partition_column_error(errors)

@@ -21,7 +21,7 @@ import sys
 import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gen_thrift.common.ttypes as common
 from ai.chronon.cli.compile.column_hashing import (
@@ -44,6 +44,7 @@ from gen_thrift.api.ttypes import (
     GroupBy,
     Join,
     JoinPart,
+    Query,
     Source,
 )
 
@@ -283,6 +284,19 @@ class ConfValidator(object):
         old_obj = self._get_old_obj(type(obj), obj.metaData.name)
         return not old_obj or not self._has_diff(obj, old_obj) or not old_obj.metaData.online
 
+    def _validate_time_partitioned_query(
+        self, query: Optional[Query], source_context: str
+    ) -> BaseException | None:
+        if query is None:
+            return None
+
+        if query.timePartitioned and query.partitionColumn is None:
+            return ValueError(
+                f"{source_context}: timePartitioned sources must have partitionColumn set to the timestamp/date column name"
+            )
+
+        return None
+
     def _validate_derivations(
         self, pre_derived_cols: List[str], derivations: List[Derivation]
     ) -> List[BaseException]:
@@ -421,6 +435,21 @@ class ConfValidator(object):
             if not gb.metaData or gb.metaData.online is False
         ]
         errors = []
+
+        if join.left and (left_query := get_query(join.left)) is not None:
+            left_query_err = self._validate_time_partitioned_query(
+                left_query, f"join {join.metaData.name} left"
+            )
+            if left_query_err:
+                errors.append(left_query_err)
+
+        for index, bootstrap_part in enumerate(join.bootstrapParts or []):
+            bootstrap_query_err = self._validate_time_partitioned_query(
+                bootstrap_part.query, f"join {join.metaData.name} bootstrapParts[{index}]"
+            )
+            if bootstrap_query_err:
+                errors.append(bootstrap_query_err)
+
         old_group_bys = [
             group_by
             for group_by in included_group_bys
@@ -576,8 +605,14 @@ class ConfValidator(object):
                 columns = list(get_pre_derived_group_by_columns(group_by).keys())
             errors.extend(self._validate_derivations(columns, group_by.derivations))
 
-        for source in group_by.sources:
+        for index, source in enumerate(group_by.sources):
             src: Source = source
+            query_error = self._validate_time_partitioned_query(
+                get_query(src), f"group_by {group_by.metaData.name} source[{index}]"
+            )
+            if query_error:
+                errors.append(query_error)
+
             if src.events and src.events.isCumulative and (src.events.query.timeColumn is None):
                 errors.append(
                     ValueError(
