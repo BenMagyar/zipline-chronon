@@ -54,18 +54,13 @@ def _safe_extractall(tar, dest):
     tar.extractall(dest)
 
 
-_CLOUDS_WITH_EVAL = ("gcp", "azure")
-
-
 def _app_images(cloud):
     """Return the list of (image_type, repo) tuples for application images (excludes engine)."""
-    images = [
+    return [
         ("hub", f"ziplineai/hub-{cloud}"),
+        ("eval", f"ziplineai/eval-{cloud}"),
         ("frontend", "ziplineai/web-ui"),
     ]
-    if cloud in _CLOUDS_WITH_EVAL:
-        images.insert(1, ("eval", f"ziplineai/eval-{cloud}"))
-    return images
 
 
 def _parse_registry(registry):
@@ -841,14 +836,12 @@ def _print_summary(results, release, cloud, registry):
         if is_local:
             console.print("\nImages available in local Docker daemon:")
             console.print(f"  ziplineai/hub-{cloud}:{release}")
-            if cloud in _CLOUDS_WITH_EVAL:
-                console.print(f"  ziplineai/eval-{cloud}:{release}")
+            console.print(f"  ziplineai/eval-{cloud}:{release}")
             console.print(f"  ziplineai/web-ui:{release}")
         else:
             console.print("\nFor terraform.tfvars:")
             console.print(f'  hub_image      = "{registry}/ziplineai/hub-{cloud}:{release}"')
-            if cloud in _CLOUDS_WITH_EVAL:
-                console.print(f'  eval_image     = "{registry}/ziplineai/eval-{cloud}:{release}"')
+            console.print(f'  eval_image     = "{registry}/ziplineai/eval-{cloud}:{release}"')
             console.print(f'  frontend_image = "{registry}/ziplineai/web-ui:{release}"')
             console.print(f'  engine_image   = "{registry}/ziplineai/engine-{cloud}:{release}"')
     else:
