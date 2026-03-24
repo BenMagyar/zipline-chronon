@@ -346,7 +346,7 @@
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
                     "outputTableInfo": {
-                      "table": "{{ db }}.aws_dim_listings_v1__0"
+                      "table": "data.aws_dim_listings_v1__0"
                     },
                     "stepDays": 30
                   },
@@ -726,7 +726,7 @@
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
                     "outputTableInfo": {
-                      "table": "{{ db }}.aws_user_activities_v1__1"
+                      "table": "data.aws_user_activities_v1__1"
                     },
                     "stepDays": 30
                   },

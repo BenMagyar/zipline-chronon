@@ -3,9 +3,9 @@ import json
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
-from gen_thrift.api.ttypes import GroupBy, MetaData
+from gen_thrift.api.ttypes import GroupBy, Join, JoinSource, MetaData, Source, Team
 
-from ai.chronon.cli.compile import parse_configs
+from ai.chronon.cli.compile import parse_configs, parse_teams
 from ai.chronon.cli.compile.compile_context import CompileContext
 from ai.chronon.repo.compile import __compile, compile
 
@@ -81,6 +81,29 @@ def test_parse_configs_relative_source_file():
     expected_relative_path = "group_bys/team/test_group_by.py"
     assert results[0].obj.metaData.sourceFile == expected_relative_path
     assert not results[0].obj.metaData.sourceFile.startswith("/")  # Should be relative, not absolute
+
+
+def test_populate_table_names_uses_root_namespace_for_nested_outputs():
+    team_dict = {
+        "default": Team(outputNamespace="default_namespace"),
+        "test_team": Team(outputNamespace="team_namespace"),
+    }
+
+    nested_join = Join(metaData=MetaData(name="test_team.nested_join.v1"))
+    obj = GroupBy(
+        metaData=MetaData(
+            team="test_team",
+            name="test.group_by.name",
+        ),
+        sources=[Source(joinSource=JoinSource(join=nested_join))],
+    )
+
+    parse_teams.update_metadata(obj, team_dict)
+    parse_configs.populate_table_names(obj)
+
+    assert obj.metaData.outputNamespace == "team_namespace"
+    assert nested_join.metaData.outputNamespace is None
+    assert nested_join.metaData.executionInfo.outputTableInfo.table == "team_namespace.test_team_nested_join_v1"
 
 
 def test_compile_with_json_format(canary):

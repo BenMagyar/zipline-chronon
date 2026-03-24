@@ -166,7 +166,6 @@ def test_update_metadata_sets_missing_join_part_namespace():
     # Verify outputNamespace values were set correctly
     assert join.metaData.outputNamespace == "join_namespace"
     assert join.joinParts[0].groupBy.metaData.outputNamespace == "join_namespace"
-
 def test_merge_team_execution_info():
     """Test that merge_team_execution_info correctly merges team execution info."""
     # Setup

@@ -92,7 +92,7 @@
                           "historicalBackfill": 0,
                           "onlineSchedule": "@daily",
                           "outputTableInfo": {
-                            "table": "{{ db }}.azure_dim_listings_v3"
+                            "table": "data.azure_dim_listings_v3"
                           }
                         },
                         "name": "azure.dim_listings.v3",

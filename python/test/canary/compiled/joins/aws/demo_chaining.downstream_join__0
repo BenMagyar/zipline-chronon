@@ -138,7 +138,7 @@
                           "historicalBackfill": 0,
                           "onlineSchedule": "@daily",
                           "outputTableInfo": {
-                            "table": "{{ db }}.aws_dim_listings_v1__0"
+                            "table": "data.aws_dim_listings_v1__0"
                           },
                           "stepDays": 30
                         },

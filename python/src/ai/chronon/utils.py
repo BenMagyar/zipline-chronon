@@ -351,7 +351,7 @@ def get_name(obj) -> str:
     version = obj.metaData.version if hasattr(obj.metaData, "version") else None
     return get_object_name(mod, var, version)
 
-def output_table_name(obj, full_name: bool) -> str:
+def output_table_name(obj, full_name: bool, output_namespace: str = None) -> str:
     """Return the stored output table when present, otherwise derive it from metadata."""
     metadata = obj.metaData
     execution_info = metadata.executionInfo
@@ -363,7 +363,7 @@ def output_table_name(obj, full_name: bool) -> str:
     name = get_name(obj)
     table_name = sanitize(name)
     if full_name:
-        db = metadata.outputNamespace or "{{ db }}"
+        db = metadata.outputNamespace or output_namespace or "{{ db }}"
         return db + "." + table_name
 
     return table_name

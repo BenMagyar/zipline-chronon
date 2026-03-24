@@ -118,7 +118,7 @@
                           "historicalBackfill": 0,
                           "onlineSchedule": "@daily",
                           "outputTableInfo": {
-                            "table": "{{ db }}.gcp_dim_listings_v1__0"
+                            "table": "data.gcp_dim_listings_v1__0"
                           }
                         },
                         "name": "gcp.dim_listings.v1__0",

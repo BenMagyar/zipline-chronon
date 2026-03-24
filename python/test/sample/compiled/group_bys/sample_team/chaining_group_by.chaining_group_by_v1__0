@@ -175,7 +175,7 @@
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
                     "outputTableInfo": {
-                      "table": "{{ db }}.sample_team_entity_sample_group_by_from_module_v1__0"
+                      "table": "sample_namespace.sample_team_entity_sample_group_by_from_module_v1__0"
                     }
                   },
                   "name": "sample_team.entity_sample_group_by_from_module.v1__0",

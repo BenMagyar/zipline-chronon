@@ -28,6 +28,7 @@ def populate_table_names(obj: Any):
         execution_info.outputTableInfo.table = utils.output_table_name(
             output_obj,
             full_name=True,
+            output_namespace=obj.metaData.outputNamespace,
         )
 
 
