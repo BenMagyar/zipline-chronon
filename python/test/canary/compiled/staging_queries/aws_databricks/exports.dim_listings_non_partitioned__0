@@ -54,7 +54,7 @@
       },
       "offlineSchedule": "@daily",
       "outputTableInfo": {
-        "table": "workspace_iceberg.poc.aws_databricks_exports_dim_listings__2"
+        "table": "workspace_iceberg.poc.aws_databricks_exports_dim_listings_non_partitioned__0"
       }
     },
     "name": "aws_databricks.exports.dim_listings_non_partitioned__0",

@@ -52,7 +52,10 @@
           "WAREHOUSE_PREFIX": "s3://zipline-warehouse-dev"
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "workspace_iceberg.poc.aws_databricks_exports_dim_listings__0"
+      }
     },
     "name": "aws_databricks.exports.dim_listings__0",
     "outputNamespace": "workspace_iceberg.poc",

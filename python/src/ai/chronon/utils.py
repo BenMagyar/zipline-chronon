@@ -15,6 +15,7 @@
 import gc
 import importlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -36,6 +37,7 @@ ANY_SOURCE_TYPE = Union[
 ]
 
 chronon_root_path = ""  # passed from compile.py
+logger = logging.getLogger(__name__)
 
 
 def normalize_source(source: ANY_SOURCE_TYPE, output_namespace: str = None) -> api.Source:
@@ -213,7 +215,7 @@ def get_output_table_targets(obj) -> Iterator[OutputTableTypes]:
             get_name(target)
             yield target
         except ValueError:
-            pass
+            logger.info("Skipping unnamed output target during table-name population: %s", type(target).__name__)
 
 
 def get_query(source: api.Source) -> api.Query:
