@@ -5,10 +5,8 @@ import os
 import sys
 from typing import Any, List
 
-import gen_thrift.api.ttypes as api
 import gen_thrift.common.ttypes as common
-from ai.chronon import utils
-from ai.chronon import airflow_helpers
+from ai.chronon import airflow_helpers, utils
 from ai.chronon.cli.compile import parse_teams, serializer
 from ai.chronon.cli.compile.compile_context import CompileContext
 from ai.chronon.cli.compile.display.compiled_obj import CompiledObj
