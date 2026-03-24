@@ -31,13 +31,11 @@ logging.basicConfig(level=logging.INFO)
 
 def _get_output_table_name(join: api.Join, full_name: bool = False):
     """generate output table name for join backfill job"""
-    # join sources could also be created inline alongside groupBy file
-    # so we specify fallback module as group_bys
-    if isinstance(join, api.Join):
-        utils.__set_name(join, api.Join, "joins")
+    name = utils.get_name(join)
+    join.metaData.name = name
     # set output namespace
     if not join.metaData.outputNamespace:
-        team_name = join.metaData.name.split(".")[0]
+        team_name = name.split(".")[0]
         namespace = (
             parse_teams.load_teams(utils.chronon_root_path, print=False)
             .get(team_name)

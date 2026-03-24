@@ -98,6 +98,8 @@ def load_teams(conf_root: str, print: bool = True) -> Dict[str, Team]:
 
 
 def update_metadata(obj: Any, team_dict: Dict[str, Team]):
+    from ai.chronon import utils
+
     assert obj is not None, "Cannot update metadata None object"
 
     metadata = obj.metaData
@@ -150,8 +152,9 @@ def update_metadata(obj: Any, team_dict: Dict[str, Team]):
             for m in obj.models or []:
                 set_join_part_or_models_metadata(m, model_transforms_namespace)
 
-    if metadata.executionInfo is None:
-        metadata.executionInfo = ExecutionInfo()
+    for output_obj in utils.get_output_table_targets(obj):
+        if output_obj.metaData.executionInfo is None:
+            output_obj.metaData.executionInfo = ExecutionInfo()
 
     merge_team_execution_info(metadata, team_dict, team)
 

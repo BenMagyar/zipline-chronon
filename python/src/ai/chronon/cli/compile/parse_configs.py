@@ -5,6 +5,9 @@ import os
 import sys
 from typing import Any, List
 
+import gen_thrift.api.ttypes as api
+import gen_thrift.common.ttypes as common
+from ai.chronon import utils
 from ai.chronon import airflow_helpers
 from ai.chronon.cli.compile import parse_teams, serializer
 from ai.chronon.cli.compile.compile_context import CompileContext
@@ -13,6 +16,21 @@ from ai.chronon.cli.logger import get_logger
 from gen_thrift.api.ttypes import GroupBy, Join
 
 logger = get_logger()
+
+
+def populate_table_names(obj: Any):
+    """
+    Populate the outputTableInfo.table field in the object's metadata with the
+    resolved output table name for the object and any nested output targets.
+    """
+    for output_obj in utils.get_output_table_targets(obj):
+        execution_info = output_obj.metaData.executionInfo
+        if execution_info.outputTableInfo is None:
+            execution_info.outputTableInfo = common.TableInfo()
+        execution_info.outputTableInfo.table = utils.output_table_name(
+            output_obj,
+            full_name=True,
+        )
 
 
 def from_folder(cls: type, input_dir: str, compile_context: CompileContext) -> List[CompiledObj]:
@@ -33,6 +51,7 @@ def from_folder(cls: type, input_dir: str, compile_context: CompileContext) -> L
                 parse_teams.update_metadata(obj, compile_context.teams_dict)
                 # Populate columnHashes field with semantic hashes
                 populate_column_hashes(obj)
+                populate_table_names(obj)
 
                 # Airflow deps must be set AFTER updating metadata
                 airflow_helpers.set_airflow_deps(obj)
@@ -108,11 +127,7 @@ def from_file(file_path: str, cls: type, input_dir: str):
         if isinstance(obj, cls):
             copied_obj = copy.deepcopy(obj)
 
-            name = f"{mod_path}.{var_name}"
-
-            # Add version suffix if version is set
-            if copied_obj.metaData.version is not None:
-                name = name + "__" + str(copied_obj.metaData.version)
+            name = utils.get_object_name(module_name, var_name, copied_obj.metaData.version)
 
             copied_obj.metaData.name = name
             copied_obj.metaData.team = mod_path.split(".")[0]

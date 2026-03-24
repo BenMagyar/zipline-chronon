@@ -12,7 +12,8 @@ from ai.chronon.constants import AIRFLOW_DEPENDENCIES_KEY
 
 def _get_output_table_name(staging_query: ttypes.StagingQuery, full_name: bool = False):
     """generate output table name for staging query job"""
-    utils.__set_name(staging_query, ttypes.StagingQuery, "staging_queries")
+    name = utils.get_name(staging_query)
+    staging_query.metaData.name = name
     return utils.output_table_name(staging_query, full_name=full_name)
 
 

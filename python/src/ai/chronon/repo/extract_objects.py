@@ -18,6 +18,7 @@ import importlib.util
 import logging
 import os
 
+from ai.chronon import utils
 from ai.chronon.logger import get_logger
 from ai.chronon.repo import FOLDER_NAME_TO_CLASS
 
@@ -75,11 +76,8 @@ def import_module_set_name(module, cls):
             # example module.__name__=group_bys.user.avg_session_length, version=1
             # obj.metaData.name=user.avg_session_length.v1__1
             # obj.metaData.team=user
-            base_name = module.__name__.partition(".")[2] + "." + name
-
-            # Add version suffix if version is set
-            if hasattr(obj.metaData, "version") and obj.metaData.version is not None:
-                base_name = base_name + "__" + str(obj.metaData.version)
+            version = obj.metaData.version if hasattr(obj.metaData, "version") else None
+            base_name = utils.get_object_name(module.__name__, name, version)
 
             obj.metaData.name = base_name
             obj.metaData.team = module.__name__.split(".")[1]

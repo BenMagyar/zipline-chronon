@@ -9,6 +9,7 @@ from ai.chronon.utils import (
     dict_to_bash_commands,
     dict_to_exports,
     join_part_name,
+    output_table_name,
     sanitize,
 )
 
@@ -61,7 +62,7 @@ class JoinBackfill:
         """
         flow = Flow(self.join.metaData.name)
         final_node = Node(
-            f"{TASK_PREFIX}__{sanitize(self.join.table)}",
+            f"{TASK_PREFIX}__{sanitize(output_table_name(self.join, full_name=True))}",
             self.run_final_join(),
         )
         left_node = Node(f"{TASK_PREFIX}__left_table", self.run_left_table())

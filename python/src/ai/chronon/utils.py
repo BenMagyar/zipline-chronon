@@ -21,13 +21,14 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable
-from typing import List, Optional, Union, cast
+from typing import Iterator, List, Optional, Union, cast
 
 import ai.chronon.repo.extract_objects as eo
 import gen_thrift.api.ttypes as api
 from ai.chronon.repo import FOLDER_NAME_TO_CLASS
 
 ChrononJobTypes = Union[api.GroupBy, api.Join, api.StagingQuery]
+OutputTableTypes = Union[ChrononJobTypes, api.ModelTransforms]
 
 # Common type definition for any source type used across the codebase
 ANY_SOURCE_TYPE = Union[
@@ -170,6 +171,51 @@ def get_root_source(
         return get_root_source(source.joinSource.join.left)
 
 
+def get_output_children(target: OutputTableTypes) -> Iterator[OutputTableTypes]:
+    """Yield output-producing child configs embedded in the target."""
+    if isinstance(target, api.GroupBy):
+        for source in target.sources or []:
+            if source is None:
+                continue
+            if source.joinSource and source.joinSource.join:
+                yield source.joinSource.join
+            if source.modelTransforms:
+                yield source.modelTransforms
+    elif isinstance(target, api.Join):
+        if target.left:
+            if target.left.joinSource and target.left.joinSource.join:
+                yield target.left.joinSource.join
+            if target.left.modelTransforms:
+                yield target.left.modelTransforms
+        for join_part in target.joinParts or []:
+            if join_part.groupBy:
+                yield join_part.groupBy
+    elif isinstance(target, api.ModelTransforms):
+        for source in target.sources or []:
+            if source is None:
+                continue
+            if source.joinSource and source.joinSource.join:
+                yield source.joinSource.join
+            if source.modelTransforms:
+                yield source.modelTransforms
+
+
+def get_output_table_targets(obj) -> Iterator[OutputTableTypes]:
+    """Yield named output-producing configs in a deterministic depth-first walk."""
+    visited, stack = set(), [obj]
+    while stack:
+        target = stack.pop()
+        if target is None or id(target) in visited:
+            continue
+        visited.add(id(target))
+        stack.extend(reversed(tuple(get_output_children(target))))
+        try:
+            get_name(target)
+            yield target
+        except ValueError:
+            pass
+
+
 def get_query(source: api.Source) -> api.Query:
     return _get_underlying_source(source).query
 
@@ -274,14 +320,53 @@ def dict_to_exports(d):
     return " && ".join(exports)
 
 
-def output_table_name(obj, full_name: bool):
-    table_name = sanitize(obj.metaData.name)
-    db = obj.metaData.outputNamespace
-    db = db or "{{ db }}"
-    if full_name:
-        return db + "." + table_name
+def get_object_name(module_name: str, object_name: str, version: Optional[object] = None) -> str:
+    """Build the canonical Chronon object name from module, variable, and version."""
+    base_name = module_name.partition(".")[2] + "." + object_name
+    if version is not None:
+        base_name = base_name + "__" + str(version)
+    return base_name
+
+
+def get_name(obj) -> str:
+    """Return the object's canonical name, inferring it from module context when needed."""
+    if obj.metaData.name:
+        return obj.metaData.name
+
+    if isinstance(obj, api.GroupBy):
+        mod_prefix = "group_bys"
+    elif isinstance(obj, api.Join):
+        mod_prefix = "joins"
+    elif isinstance(obj, api.StagingQuery):
+        mod_prefix = "staging_queries"
+    elif isinstance(obj, api.ModelTransforms):
+        mod_prefix = "models"
     else:
-        return table_name
+        raise ValueError(f"Name is undefined for unnamed {type(obj).__name__}")
+
+    mod, var = get_mod_and_var_name_from_gc(obj, mod_prefix) or (None, None)
+    if not mod or not var:
+        raise ValueError(f"Name is undefined for unnamed {type(obj).__name__}")
+
+    version = obj.metaData.version if hasattr(obj.metaData, "version") else None
+    return get_object_name(mod, var, version)
+
+def output_table_name(obj, full_name: bool) -> str:
+    """Return the stored output table when present, otherwise derive it from metadata."""
+    metadata = obj.metaData
+    execution_info = metadata.executionInfo
+    output_table_info = execution_info.outputTableInfo if execution_info else None
+    stored_table = output_table_info.table if output_table_info else None
+    if stored_table:
+        return stored_table if full_name else stored_table.rsplit(".", 1)[-1]
+
+    name = get_name(obj)
+    table_name = sanitize(name)
+    if full_name:
+        db = metadata.outputNamespace or "{{ db }}"
+        return db + "." + table_name
+
+    return table_name
 
 
 def join_part_name(jp):
@@ -321,7 +406,7 @@ def join_part_output_table_name(join, jp, full_name: bool = False):
     )
 
 
-def log_table_name(obj, full_name: bool = False):
+def log_table_name(obj, full_name: bool = False) -> str:
     return output_table_name(obj, full_name=full_name) + "_logged"
 
 
