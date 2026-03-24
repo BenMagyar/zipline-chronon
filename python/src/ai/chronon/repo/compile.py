@@ -3,8 +3,6 @@ import os
 import sys
 
 import click
-
-from ai.chronon import utils
 from ai.chronon.cli.compile.compile_context import CompileContext
 from ai.chronon.cli.compile.compiler import Compiler
 from ai.chronon.cli.formatter import Format, jsonify_exceptions_if_json_format
@@ -71,7 +69,6 @@ def __compile(
     if chronon_root:
         chronon_root_path = os.path.expanduser(chronon_root)
         os.chdir(chronon_root_path)
-        utils.chronon_root_path = chronon_root_path
 
     # check that a "teams.py" file exists in the current directory
     if not (os.path.exists("teams.py") or os.path.exists("teams.json")):
