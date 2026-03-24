@@ -372,12 +372,11 @@ def output_table_name(obj, full_name: bool, output_namespace: str = None) -> str
 def join_part_name(jp):
     if jp.groupBy is None:
         raise NotImplementedError("Join Part names for non group bys is not implemented.")
-    if not jp.groupBy.metaData.name and isinstance(jp.groupBy, api.GroupBy):
-        __set_name(jp.groupBy, api.GroupBy, "group_bys")
+    group_by_name = get_name(jp.groupBy)
     return "_".join(
         [
             component
-            for component in [jp.prefix, sanitize(jp.groupBy.metaData.name)]
+            for component in [jp.prefix, sanitize(group_by_name)]
             if component is not None
         ]
     )
@@ -392,8 +391,6 @@ def join_part_output_table_name(join, jp, full_name: bool = False):
     def partOutputTable(jp: JoinPart): String = (Seq(join.metaData.outputTable) ++ Option(jp.prefix) :+
       jp.groupBy.metaData.cleanName).mkString("_")
     """
-    if not join.metaData.name and isinstance(join, api.Join):
-        __set_name(join, api.Join, "joins")
     return "_".join(
         [
             component
