@@ -540,6 +540,9 @@
             },
             "historicalBackfill": 0,
             "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "quickstart.quickstart_user_activities_v1__1"
+            },
             "stepDays": 4
           },
           "name": "quickstart.user_activities.v1__1",
@@ -743,7 +746,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "quickstart.quickstart_dim_listings_v1__0"
+            }
           },
           "name": "quickstart.dim_listings.v1__0",
           "online": 1,
@@ -1023,6 +1029,9 @@
       },
       "offlineSchedule": "@daily",
       "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_demo_v1__1"
+      },
       "stepDays": 5
     },
     "name": "quickstart.demo.v1__1",

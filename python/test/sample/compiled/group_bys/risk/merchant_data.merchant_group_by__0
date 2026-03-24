@@ -55,7 +55,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "risk.risk_merchant_data_merchant_group_by__0"
+      }
     },
     "name": "risk.merchant_data.merchant_group_by__0",
     "outputNamespace": "risk",

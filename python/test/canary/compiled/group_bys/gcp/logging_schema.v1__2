@@ -82,7 +82,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "data.gcp_logging_schema_v1__2"
+      }
     },
     "name": "gcp.logging_schema.v1__2",
     "outputNamespace": "data",

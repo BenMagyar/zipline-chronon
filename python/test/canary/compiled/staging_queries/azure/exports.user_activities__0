@@ -43,6 +43,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_exports_user_activities__0"
+      },
       "stepDays": 30
     },
     "name": "azure.exports.user_activities__0",

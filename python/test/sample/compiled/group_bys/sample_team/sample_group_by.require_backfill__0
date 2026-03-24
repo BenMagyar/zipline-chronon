@@ -77,7 +77,10 @@
         }
       },
       "historicalBackfill": 0,
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_group_by_require_backfill__0"
+      }
     },
     "name": "sample_team.sample_group_by.require_backfill__0",
     "outputNamespace": "sample_namespace",

@@ -47,6 +47,9 @@
             "VERSION": "latest"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "risk.risk_transaction_model_model__1_0"
       }
     },
     "name": "risk.transaction_model.model__1.0",

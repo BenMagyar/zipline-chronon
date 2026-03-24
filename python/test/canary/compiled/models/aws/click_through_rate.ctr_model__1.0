@@ -111,6 +111,9 @@
             "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.aws_click_through_rate_ctr_model__1_0"
       }
     },
     "name": "aws.click_through_rate.ctr_model__1.0",

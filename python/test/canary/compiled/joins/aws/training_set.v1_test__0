@@ -172,7 +172,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.aws_purchases_v1_test__0"
+            }
           },
           "name": "aws.purchases.v1_test__0",
           "online": 1,
@@ -313,7 +316,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_training_set_v1_test__0"
+      }
     },
     "name": "aws.training_set.v1_test__0",
     "online": 0,

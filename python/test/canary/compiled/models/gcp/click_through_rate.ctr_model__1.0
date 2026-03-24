@@ -91,6 +91,9 @@
             "WAREHOUSE_PREFIX": "gs://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.gcp_click_through_rate_ctr_model__1_0"
       }
     },
     "name": "gcp.click_through_rate.ctr_model__1.0",

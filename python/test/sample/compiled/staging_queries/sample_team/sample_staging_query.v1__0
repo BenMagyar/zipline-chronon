@@ -43,7 +43,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_staging_query_v1__0"
+      }
     },
     "name": "sample_team.sample_staging_query.v1__0",
     "outputNamespace": "sample_namespace",

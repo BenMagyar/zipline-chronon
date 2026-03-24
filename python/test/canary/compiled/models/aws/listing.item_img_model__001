@@ -96,6 +96,9 @@
             "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.aws_listing_model_item_img_model__001"
       }
     },
     "name": "aws.listing.item_img_model__001",

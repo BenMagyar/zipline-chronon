@@ -49,7 +49,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_dim_merchants_v2"
+      }
     },
     "name": "azure.dim_merchants.v2",
     "online": 1,

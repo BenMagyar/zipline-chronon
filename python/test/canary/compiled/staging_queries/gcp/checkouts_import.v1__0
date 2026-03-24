@@ -68,7 +68,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_checkouts_import_v1__0"
+      }
     },
     "name": "gcp.checkouts_import.v1__0",
     "outputNamespace": "data",

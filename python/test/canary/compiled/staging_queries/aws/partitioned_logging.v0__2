@@ -87,7 +87,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_partitioned_logging_v0__2"
+      }
     },
     "name": "aws.partitioned_logging.v0__2",
     "outputNamespace": "data",

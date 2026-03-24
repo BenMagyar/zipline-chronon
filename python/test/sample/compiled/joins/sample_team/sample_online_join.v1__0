@@ -81,7 +81,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "sample_namespace.sample_team_event_sample_group_by_v1__0"
+            }
           },
           "name": "sample_team.event_sample_group_by.v1__0",
           "online": 1,
@@ -183,7 +186,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "test.sample_team_entity_sample_group_by_from_module_v1__0"
+            }
           },
           "name": "sample_team.entity_sample_group_by_from_module.v1__0",
           "online": 1,
@@ -295,7 +301,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "test.sample_team_group_by_with_kwargs_v1__0"
+            }
           },
           "name": "sample_team.group_by_with_kwargs.v1__0",
           "online": 1,
@@ -416,7 +425,10 @@
         }
       },
       "offlineSchedule": "@daily",
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "test.sample_team_sample_online_join_v1__0"
+      }
     },
     "name": "sample_team.sample_online_join.v1__0",
     "online": 1,

@@ -152,7 +152,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_dim_merchants_v1__0"
+      }
     },
     "name": "quickstart.dim_merchants.v1__0",
     "online": 1,

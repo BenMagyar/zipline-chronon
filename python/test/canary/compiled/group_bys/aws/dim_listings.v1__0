@@ -110,6 +110,9 @@
       },
       "historicalBackfill": 0,
       "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_dim_listings_v1__0"
+      },
       "stepDays": 30
     },
     "name": "aws.dim_listings.v1__0",

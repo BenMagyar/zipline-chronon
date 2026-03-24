@@ -146,6 +146,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_exports_user_activities__0"
+      },
       "stepDays": 20
     },
     "name": "quickstart.exports.user_activities__0",

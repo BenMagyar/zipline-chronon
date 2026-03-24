@@ -88,6 +88,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_sample_staging_query_user__0"
+      },
       "stepDays": 30
     },
     "name": "aws.sample_staging_query.user__0",

@@ -166,7 +166,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_dim_listings_v1__0"
+      }
     },
     "name": "quickstart.dim_listings.v1__0",
     "online": 1,

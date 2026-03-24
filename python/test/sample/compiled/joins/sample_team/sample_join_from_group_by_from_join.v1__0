@@ -62,7 +62,10 @@
                 }
               }
             },
-            "historicalBackfill": 0
+            "historicalBackfill": 0,
+            "outputTableInfo": {
+              "table": "sample_namespace.sample_team_sample_group_by_from_join_part_v2__0"
+            }
           },
           "name": "sample_team.sample_group_by_from_join_part.v2__0",
           "outputNamespace": "sample_namespace",
@@ -161,7 +164,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_join_from_group_by_from_join_v1__0"
+      }
     },
     "name": "sample_team.sample_join_from_group_by_from_join.v1__0",
     "online": 0,

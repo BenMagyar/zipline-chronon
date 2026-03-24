@@ -102,7 +102,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "data.aws_logging_schema_v1__2"
+      }
     },
     "name": "aws.logging_schema.v1__2",
     "outputNamespace": "data",

@@ -60,7 +60,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_group_by_from_join_part_v2__0"
+      }
     },
     "name": "sample_team.sample_group_by_from_join_part.v2__0",
     "outputNamespace": "sample_namespace",

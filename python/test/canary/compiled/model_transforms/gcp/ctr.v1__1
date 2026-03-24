@@ -95,6 +95,9 @@
             "WAREHOUSE_PREFIX": "gs://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.gcp_ctr_v1__1"
       }
     },
     "name": "gcp.ctr.v1__1",
@@ -300,7 +303,10 @@
                 "metaData": {
                   "executionInfo": {
                     "historicalBackfill": 0,
-                    "onlineSchedule": "@daily"
+                    "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.gcp_dim_listings_v1__0"
+                    }
                   },
                   "name": "gcp.dim_listings.v1__0",
                   "online": 1,
@@ -677,6 +683,9 @@
                     },
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.gcp_user_activities_v1__1"
+                    },
                     "stepDays": 30
                   },
                   "name": "gcp.user_activities.v1__1",
@@ -729,6 +738,9 @@
             "executionInfo": {
               "offlineSchedule": "0 4 * * *",
               "onlineSchedule": "0 3 * * *",
+              "outputTableInfo": {
+                "table": "data.gcp_demo_derivations_v1__2"
+              },
               "stepDays": 30
             },
             "name": "gcp.demo.derivations_v1__2",

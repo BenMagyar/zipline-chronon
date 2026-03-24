@@ -63,7 +63,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_dim_listings_v3"
+      }
     },
     "name": "azure.dim_listings.v3",
     "online": 1,

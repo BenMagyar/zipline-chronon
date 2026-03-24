@@ -86,7 +86,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "risk.risk_transaction_events_txn_group_by_user__0"
+      }
     },
     "name": "risk.transaction_events.txn_group_by_user__0",
     "online": 1,

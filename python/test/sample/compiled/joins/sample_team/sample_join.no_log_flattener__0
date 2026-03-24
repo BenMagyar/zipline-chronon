@@ -68,7 +68,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "sample_namespace.sample_team_sample_group_by_v1__0"
+            }
           },
           "name": "sample_team.sample_group_by.v1__0",
           "online": 1,
@@ -167,7 +170,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_join_no_log_flattener__0"
+      }
     },
     "name": "sample_team.sample_join.no_log_flattener__0",
     "online": 0,

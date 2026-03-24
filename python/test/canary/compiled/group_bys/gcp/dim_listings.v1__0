@@ -89,7 +89,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_dim_listings_v1__0"
+      }
     },
     "name": "gcp.dim_listings.v1__0",
     "online": 1,

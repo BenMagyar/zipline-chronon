@@ -56,7 +56,10 @@
           "WAREHOUSE_PREFIX": "abfss://dev-zipline-warehouse@ziplineai2.dfs.core.windows.net"
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "data.azure_logging_schema_v1__2"
+      }
     },
     "name": "azure.logging_schema.v1__2",
     "outputNamespace": "data",

@@ -96,6 +96,9 @@
       },
       "historicalBackfill": 0,
       "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_dim_merchants_v1__0"
+      },
       "stepDays": 30
     },
     "name": "aws.dim_merchants.v1__0",

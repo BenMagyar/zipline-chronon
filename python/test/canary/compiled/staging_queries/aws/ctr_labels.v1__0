@@ -87,7 +87,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_ctr_labels_v1__0"
+      }
     },
     "name": "aws.ctr_labels.v1__0",
     "outputNamespace": "data",

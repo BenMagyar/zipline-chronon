@@ -69,7 +69,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_sample_non_prod_group_by_v1__0"
+      }
     },
     "name": "sample_team.sample_non_prod_group_by.v1__0",
     "online": 0,

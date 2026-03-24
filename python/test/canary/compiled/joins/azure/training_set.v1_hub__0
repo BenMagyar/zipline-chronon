@@ -126,7 +126,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_purchases_v1_test__0"
+            }
           },
           "name": "azure.purchases.v1_test__0",
           "online": 1,
@@ -221,7 +224,10 @@
           "WAREHOUSE_PREFIX": "abfss://dev-zipline-warehouse@ziplineai2.dfs.core.windows.net"
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_training_set_v1_hub__0"
+      }
     },
     "name": "azure.training_set.v1_hub__0",
     "online": 0,

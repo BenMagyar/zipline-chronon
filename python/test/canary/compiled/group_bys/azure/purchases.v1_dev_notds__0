@@ -124,7 +124,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_purchases_v1_dev_notds__0"
+      }
     },
     "name": "azure.purchases.v1_dev_notds__0",
     "online": 1,

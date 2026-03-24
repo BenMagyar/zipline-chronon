@@ -67,7 +67,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_partitioned_logging_v0__2"
+      }
     },
     "name": "gcp.partitioned_logging.v0__2",
     "outputNamespace": "data",

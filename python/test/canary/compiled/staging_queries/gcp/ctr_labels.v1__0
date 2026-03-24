@@ -67,7 +67,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_ctr_labels_v1__0"
+      }
     },
     "name": "gcp.ctr_labels.v1__0",
     "outputNamespace": "data",

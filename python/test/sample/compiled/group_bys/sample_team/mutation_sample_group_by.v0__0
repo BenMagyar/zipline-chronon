@@ -58,7 +58,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "test.sample_team_mutation_sample_group_by_v0__0"
+      }
     },
     "name": "sample_team.mutation_sample_group_by.v0__0",
     "outputNamespace": "test",

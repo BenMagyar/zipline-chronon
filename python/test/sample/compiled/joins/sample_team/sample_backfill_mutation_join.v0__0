@@ -60,7 +60,10 @@
                 }
               }
             },
-            "historicalBackfill": 0
+            "historicalBackfill": 0,
+            "outputTableInfo": {
+              "table": "test.sample_team_mutation_sample_group_by_v0__0"
+            }
           },
           "name": "sample_team.mutation_sample_group_by.v0__0",
           "outputNamespace": "test",
@@ -154,7 +157,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "test.sample_team_sample_backfill_mutation_join_v0__0"
+      }
     },
     "name": "sample_team.sample_backfill_mutation_join.v0__0",
     "online": 0,

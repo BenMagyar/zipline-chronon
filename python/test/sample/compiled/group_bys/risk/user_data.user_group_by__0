@@ -56,7 +56,10 @@
           }
         }
       },
-      "historicalBackfill": 0
+      "historicalBackfill": 0,
+      "outputTableInfo": {
+        "table": "risk.risk_user_data_user_group_by__0"
+      }
     },
     "name": "risk.user_data.user_group_by__0",
     "outputNamespace": "risk",

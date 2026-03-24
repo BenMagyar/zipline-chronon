@@ -79,7 +79,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "test.sample_team_group_by_with_kwargs_v1__0"
+      }
     },
     "name": "sample_team.group_by_with_kwargs.v1__0",
     "online": 1,

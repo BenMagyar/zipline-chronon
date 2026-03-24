@@ -42,6 +42,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_local_staging_query_simple__0"
+      },
       "stepDays": 30
     },
     "name": "azure.local_staging_query.simple__0",

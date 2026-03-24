@@ -59,7 +59,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "sample_namespace.sample_team_chaining_group_by_chaining_group_by_v1__0"
+      }
     },
     "name": "sample_team.chaining_group_by.chaining_group_by_v1__0",
     "online": 1,
@@ -112,7 +115,10 @@
                 "metaData": {
                   "executionInfo": {
                     "historicalBackfill": 0,
-                    "onlineSchedule": "@daily"
+                    "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "sample_namespace.sample_team_event_sample_group_by_v1__0"
+                    }
                   },
                   "name": "sample_team.event_sample_group_by.v1__0",
                   "online": 1,
@@ -167,7 +173,10 @@
                 "metaData": {
                   "executionInfo": {
                     "historicalBackfill": 0,
-                    "onlineSchedule": "@daily"
+                    "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.sample_team_entity_sample_group_by_from_module_v1__0"
+                    }
                   },
                   "name": "sample_team.entity_sample_group_by_from_module.v1__0",
                   "online": 1,
@@ -218,7 +227,10 @@
             "executionInfo": {
               "historicalBackfill": 0,
               "offlineSchedule": "@daily",
-              "onlineSchedule": "@daily"
+              "onlineSchedule": "@daily",
+              "outputTableInfo": {
+                "table": "sample_namespace.sample_team_sample_chaining_join_parent_parent_join__0"
+              }
             },
             "name": "sample_team.sample_chaining_join_parent.parent_join__0",
             "online": 1,

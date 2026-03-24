@@ -47,6 +47,9 @@
             "VERSION": "latest"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_test_model__1_0"
       }
     },
     "name": "quickstart.test.model__1.0",

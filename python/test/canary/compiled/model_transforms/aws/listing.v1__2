@@ -103,6 +103,9 @@
             "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.aws_listing_transforms_v1__2"
       }
     },
     "name": "aws.listing.v1__2",
@@ -621,6 +624,9 @@
                     },
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.aws_user_activities_v1__1"
+                    },
                     "stepDays": 30
                   },
                   "name": "aws.user_activities.v1__1",
@@ -663,6 +669,9 @@
                   "executionInfo": {
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.aws_dim_listings_v1__0"
+                    },
                     "stepDays": 30
                   },
                   "name": "aws.dim_listings.v1__0",
@@ -709,6 +718,9 @@
                   "executionInfo": {
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.aws_dim_merchants_v1__0"
+                    },
                     "stepDays": 30
                   },
                   "name": "aws.dim_merchants.v1__0",
@@ -753,6 +765,9 @@
               "enableStatsCompute": 1,
               "offlineSchedule": "@daily",
               "onlineSchedule": "@daily",
+              "outputTableInfo": {
+                "table": "data.aws_demo_v1__1"
+              },
               "stepDays": 30
             },
             "name": "aws.demo.v1__1",

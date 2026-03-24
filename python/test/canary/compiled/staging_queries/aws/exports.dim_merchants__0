@@ -89,6 +89,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_exports_dim_merchants__0"
+      },
       "stepDays": 30
     },
     "name": "aws.exports.dim_merchants__0",

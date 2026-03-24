@@ -65,7 +65,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_dim_listings_v3"
+            }
           },
           "name": "azure.dim_listings.v3",
           "online": 1,
@@ -154,7 +157,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_dim_merchants_v2"
+            }
           },
           "name": "azure.dim_merchants.v2",
           "online": 1,
@@ -263,6 +269,9 @@
       },
       "offlineSchedule": "@daily",
       "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_demo_v2"
+      },
       "stepDays": 30
     },
     "name": "azure.demo.v2",

@@ -89,6 +89,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_exports_user_activities__0"
+      },
       "stepDays": 30
     },
     "name": "aws.exports.user_activities__0",

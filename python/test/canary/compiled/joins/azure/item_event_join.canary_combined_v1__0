@@ -100,7 +100,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_item_event_canary_actions_pubsub_v2__0"
+            }
           },
           "name": "azure.item_event_canary.actions_pubsub_v2__0",
           "online": 1,
@@ -258,7 +261,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_purchases_v1_test__0"
+            }
           },
           "name": "azure.purchases.v1_test__0",
           "online": 1,
@@ -360,7 +366,10 @@
         }
       },
       "offlineSchedule": "@daily",
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_item_event_join_canary_combined_v1__0"
+      }
     },
     "name": "azure.item_event_join.canary_combined_v1__0",
     "online": 1,

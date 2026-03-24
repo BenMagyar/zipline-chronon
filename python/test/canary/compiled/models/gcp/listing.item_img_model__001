@@ -77,6 +77,9 @@
             "WAREHOUSE_PREFIX": "gs://zipline-warehouse-canary"
           }
         }
+      },
+      "outputTableInfo": {
+        "table": "data.gcp_listing_model_item_img_model__001"
       }
     },
     "name": "gcp.listing.item_img_model__001",

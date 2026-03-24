@@ -146,7 +146,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.aws_item_event_canary_actions_v1__0"
+            }
           },
           "name": "aws.item_event_canary.actions_v1__0",
           "online": 1,
@@ -350,7 +353,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.aws_purchases_v1_test__0"
+            }
           },
           "name": "aws.purchases.v1_test__0",
           "online": 1,
@@ -498,7 +504,10 @@
         }
       },
       "offlineSchedule": "@daily",
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_item_event_join_canary_combined_v1__0"
+      }
     },
     "name": "aws.item_event_join.canary_combined_v1__0",
     "online": 1,

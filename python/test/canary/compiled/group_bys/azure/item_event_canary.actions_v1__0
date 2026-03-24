@@ -98,7 +98,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_item_event_canary_actions_v1__0"
+      }
     },
     "name": "azure.item_event_canary.actions_v1__0",
     "online": 1,

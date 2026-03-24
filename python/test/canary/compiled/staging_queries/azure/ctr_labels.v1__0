@@ -41,7 +41,10 @@
           "WAREHOUSE_PREFIX": "abfss://dev-zipline-warehouse@ziplineai2.dfs.core.windows.net"
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_ctr_labels_v1__0"
+      }
     },
     "name": "azure.ctr_labels.v1__0",
     "outputNamespace": "data",

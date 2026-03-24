@@ -477,6 +477,9 @@
       },
       "historicalBackfill": 0,
       "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_user_activities_kafka_v1__1"
+      },
       "stepDays": 30
     },
     "name": "aws.user_activities.kafka_v1__1",

@@ -69,6 +69,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_exports_dim_listings__0"
+      },
       "stepDays": 30
     },
     "name": "gcp.exports.dim_listings__0",

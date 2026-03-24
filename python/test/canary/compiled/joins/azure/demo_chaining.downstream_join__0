@@ -66,7 +66,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.azure_user_activities_chained_chained_user_gb__0"
+            }
           },
           "name": "azure.user_activities_chained.chained_user_gb__0",
           "online": 1,
@@ -87,7 +90,10 @@
                       "metaData": {
                         "executionInfo": {
                           "historicalBackfill": 0,
-                          "onlineSchedule": "@daily"
+                          "onlineSchedule": "@daily",
+                          "outputTableInfo": {
+                            "table": "{{ db }}.azure_dim_listings_v3"
+                          }
                         },
                         "name": "azure.dim_listings.v3",
                         "online": 1,
@@ -142,7 +148,10 @@
                 "metaData": {
                   "executionInfo": {
                     "offlineSchedule": "17 0 * * *",
-                    "onlineSchedule": "@daily"
+                    "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "data.azure_demo_parent_parent_join__0"
+                    }
                   },
                   "name": "azure.demo_parent.parent_join__0",
                   "online": 1,
@@ -237,7 +246,10 @@
         }
       },
       "offlineSchedule": "@daily",
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_demo_chaining_downstream_join__0"
+      }
     },
     "name": "azure.demo_chaining.downstream_join__0",
     "online": 1,

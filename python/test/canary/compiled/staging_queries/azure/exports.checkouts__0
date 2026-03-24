@@ -43,6 +43,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.azure_exports_checkouts__0"
+      },
       "stepDays": 30
     },
     "name": "azure.exports.checkouts__0",

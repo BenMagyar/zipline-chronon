@@ -110,7 +110,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.aws_user_activities_chained_chained_user_gb__0"
+      }
     },
     "name": "aws.user_activities_chained.chained_user_gb__0",
     "online": 1,
@@ -133,6 +136,9 @@
                   "executionInfo": {
                     "historicalBackfill": 0,
                     "onlineSchedule": "@daily",
+                    "outputTableInfo": {
+                      "table": "{{ db }}.aws_dim_listings_v1__0"
+                    },
                     "stepDays": 30
                   },
                   "name": "aws.dim_listings.v1__0",
@@ -189,7 +195,10 @@
           "metaData": {
             "executionInfo": {
               "offlineSchedule": "@daily",
-              "onlineSchedule": "@daily"
+              "onlineSchedule": "@daily",
+              "outputTableInfo": {
+                "table": "data.aws_demo_parent_parent_join__0"
+              }
             },
             "name": "aws.demo_parent.parent_join__0",
             "online": 1,

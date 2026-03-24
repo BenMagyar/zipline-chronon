@@ -68,6 +68,9 @@
         }
       },
       "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_sample_staging_query_terminal__0"
+      },
       "stepDays": 30
     },
     "name": "gcp.sample_staging_query.terminal__0",

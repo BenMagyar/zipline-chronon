@@ -52,7 +52,10 @@
         }
       },
       "historicalBackfill": 0,
-      "onlineSchedule": "@daily"
+      "onlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "quickstart.quickstart_users_v1__0"
+      }
     },
     "name": "quickstart.users.v1__0",
     "online": 1,

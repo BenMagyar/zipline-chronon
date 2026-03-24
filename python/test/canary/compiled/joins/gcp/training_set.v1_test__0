@@ -152,7 +152,10 @@
               }
             },
             "historicalBackfill": 0,
-            "onlineSchedule": "@daily"
+            "onlineSchedule": "@daily",
+            "outputTableInfo": {
+              "table": "data.gcp_purchases_v1_test__0"
+            }
           },
           "name": "gcp.purchases.v1_test__0",
           "online": 1,
@@ -273,7 +276,10 @@
           }
         }
       },
-      "offlineSchedule": "@daily"
+      "offlineSchedule": "@daily",
+      "outputTableInfo": {
+        "table": "data.gcp_training_set_v1_test__0"
+      }
     },
     "name": "gcp.training_set.v1_test__0",
     "online": 0,
