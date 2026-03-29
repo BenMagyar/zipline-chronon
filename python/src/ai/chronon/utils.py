@@ -69,12 +69,18 @@ def normalize_sources(
     sources: Union[Sequence[ANY_SOURCE_TYPE], ANY_SOURCE_TYPE], output_namespace: str = None
 ) -> List[api.Source]:
     """Convert a source or source sequence into wrapped api.Source objects."""
-    if isinstance(sources, get_args(ANY_SOURCE_TYPE)):
+    source_types = get_args(ANY_SOURCE_TYPE)
+
+    if isinstance(sources, source_types):
         sources = [sources]
-    elif isinstance(sources, Sequence):
-        sources = list(sources)
-    else:
+    elif not isinstance(sources, Sequence):
         raise TypeError("sources must be a source or a sequence of sources")
+
+    for index, source in enumerate(sources):
+        if not isinstance(source, source_types):
+            raise TypeError(
+                f"sources[{index}] must be a supported source type, got {type(source).__name__}"
+            )
 
     return [normalize_source(source, output_namespace) for source in sources]
 

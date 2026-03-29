@@ -113,6 +113,11 @@ def test_dedupe_in_order():
     assert utils.dedupe_in_order([2, 1, 3, 1, 3, 2]) == [2, 1, 3]
 
 
+def test_normalize_sources_rejects_invalid_element():
+    with pytest.raises(TypeError, match=r"sources\[1\] must be a supported source type, got int"):
+        utils.normalize_sources([api.EventSource(), 123])
+
+
 def test_get_applicable_mode_for_group_bys(
     group_by_requiring_backfill, online_group_by_requiring_streaming
 ):
