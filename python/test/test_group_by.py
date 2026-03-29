@@ -217,6 +217,23 @@ def test_select_sanitization():
     )
 
 
+def test_tuple_sources_are_normalized():
+    gb = group_by.GroupBy(
+        sources=(event_source("event_table1"), event_source("event_table2")),
+        keys=["subject"],
+        aggregations=group_by.Aggregations(
+            event_id=ttypes.Aggregation(operation=ttypes.Operation.LAST),
+            cnt=ttypes.Aggregation(operation=ttypes.Operation.COUNT),
+        ),
+        version=0,
+    )
+
+    assert [source.events.table for source in gb.sources] == [
+        "event_table1",
+        "event_table2",
+    ]
+
+
 def test_snapshot_with_hour_aggregation():
     with pytest.raises(AssertionError):
         group_by.GroupBy(

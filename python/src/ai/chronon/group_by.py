@@ -15,6 +15,7 @@
 import inspect
 import json
 import logging
+from collections.abc import Sequence
 from copy import deepcopy
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -412,7 +413,7 @@ def get_output_col_names(aggregation):
 
 
 def GroupBy(
-    sources: Union[List[utils.ANY_SOURCE_TYPE], utils.ANY_SOURCE_TYPE],
+    sources: Union[Sequence[utils.ANY_SOURCE_TYPE], utils.ANY_SOURCE_TYPE],
     keys: List[str],
     aggregations: Optional[List[ttypes.Aggregation]],
     version: Optional[int] = None,
@@ -460,7 +461,7 @@ def GroupBy(
 
         Multiple sources can be supplied to backfill the historical values with their respective start and end
         partitions. However, only one source is allowed to be a streaming one.
-    :type sources: List[gen_thrift.api.ttypes.Events|gen_thrift.api.ttypes.Entities]
+    :type sources: List of sources or a single source
     :param keys:
         List of primary keys that defines the data that needs to be collected in the result table. Similar to the
         GroupBy in the SQL context.
@@ -607,11 +608,9 @@ def GroupBy(
             )
         return source
 
-    if not isinstance(sources, list):
-        sources = [sources]
-
     sources = [
-        _sanitize_columns(utils.normalize_source(source, output_namespace)) for source in sources
+        _sanitize_columns(source)
+        for source in utils.normalize_sources(sources, output_namespace)
     ]
 
     # get caller's filename to assign team

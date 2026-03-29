@@ -1,4 +1,5 @@
 import inspect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -7,7 +8,7 @@ import gen_thrift.common.ttypes as common
 from ai.chronon import utils
 from ai.chronon import windows as window_utils
 from ai.chronon.data_types import DataType, FieldsType
-from ai.chronon.utils import ANY_SOURCE_TYPE, normalize_source
+from ai.chronon.utils import ANY_SOURCE_TYPE, normalize_source, normalize_sources
 
 
 class ModelBackend:
@@ -301,7 +302,7 @@ def _get_model_transforms_output_table_name(
 
 
 def ModelTransforms(
-    sources: List[ANY_SOURCE_TYPE],
+    sources: Sequence[ANY_SOURCE_TYPE],
     models: List[ttypes.Model],
     version: int,
     passthrough_fields: Optional[List[str]] = None,
@@ -338,7 +339,7 @@ def ModelTransforms(
                 utils.__set_name(model, ttypes.Model, "models")
 
     # Normalize all sources to ensure they are properly wrapped
-    normalized_sources = [normalize_source(source) for source in sources]
+    normalized_sources = normalize_sources(sources)
 
     # Create metadata
     meta_data = ttypes.MetaData(
