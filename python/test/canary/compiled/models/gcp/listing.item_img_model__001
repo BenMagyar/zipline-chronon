@@ -79,7 +79,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.gcp_listing_model_item_img_model__001"
+        "table": "data.gcp_listing_item_img_model__001"
       }
     },
     "name": "gcp.listing.item_img_model__001",

@@ -77,7 +77,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.gcp_listing_model_item_description_model__1"
+        "table": "data.gcp_listing_item_description_model__1"
       }
     },
     "name": "gcp.listing.item_description_model__1",

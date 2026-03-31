@@ -105,7 +105,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.aws_listing_transforms_v1__2"
+        "table": "data.aws_listing_v1__2"
       }
     },
     "name": "aws.listing.v1__2",

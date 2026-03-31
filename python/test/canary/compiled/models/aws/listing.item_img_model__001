@@ -98,7 +98,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.aws_listing_model_item_img_model__001"
+        "table": "data.aws_listing_item_img_model__001"
       }
     },
     "name": "aws.listing.item_img_model__001",

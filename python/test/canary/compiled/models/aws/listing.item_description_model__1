@@ -97,7 +97,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.aws_listing_model_item_description_model__1"
+        "table": "data.aws_listing_item_description_model__1"
       }
     },
     "name": "aws.listing.item_description_model__1",

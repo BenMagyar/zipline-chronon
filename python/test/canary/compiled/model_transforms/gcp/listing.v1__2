@@ -85,7 +85,7 @@
         }
       },
       "outputTableInfo": {
-        "table": "data.gcp_listing_transforms_v1__2"
+        "table": "data.gcp_listing_v1__2"
       }
     },
     "name": "gcp.listing.v1__2",
