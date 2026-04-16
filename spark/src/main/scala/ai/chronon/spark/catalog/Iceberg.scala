@@ -79,13 +79,13 @@ case object Iceberg extends Format {
         .select(col(s"partition.$partitionColumn"), col("partition.hr"))
         .collect()
         .filter(_.get(1) == null)
-        .map(_.getString(0))
+        .flatMap(row => Option(row.getString(0)))
         .toList
     } else {
       partitionsDf
         .select(col(s"partition.$partitionColumn").cast("string"))
         .collect()
-        .map(_.getString(0))
+        .flatMap(row => Option(row.getString(0)))
         .toList
     }
   }

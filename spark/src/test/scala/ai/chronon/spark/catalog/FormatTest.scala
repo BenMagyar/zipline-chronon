@@ -1,5 +1,6 @@
 package ai.chronon.spark.catalog
 
+import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.utils.SparkTestBase
 import org.apache.spark.sql.SparkSession
 import org.junit.Assert.assertEquals
@@ -57,6 +58,31 @@ class FormatTest extends SparkTestBase {
     }
     fmt.primaryPartitions("db.table", "ds", "", subPartitionsFilter = Map("hr" -> "12"))(spark) shouldBe
       List("2023-01-01", "2023-01-02")
+  }
+
+  it should "fall back to a table scan when metadata partitions are null" in {
+    val tableName = "format_null_metadata_fallback_test"
+    spark.sql(s"""
+      CREATE OR REPLACE TEMP VIEW $tableName AS
+      SELECT * FROM VALUES
+        (1, '2024-04-01'),
+        (2, '2024-04-03'),
+        (3, '2024-04-02')
+      AS t(id, ds)
+    """)
+
+    val fmt = new Format {
+      override def supportSubPartitionsFilter = false
+      override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      override def primaryPartitions(tableName: String,
+                                     partitionColumn: String,
+                                     partitionFilters: String,
+                                     subPartitionsFilter: Map[String, String])(implicit
+          ss: SparkSession) = List(null)
+    }
+
+    fmt.firstAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-01")
+    fmt.lastAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
   }
 
   it should "resolve table names consistently with Spark SQL" in {

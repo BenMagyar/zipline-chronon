@@ -126,8 +126,12 @@ trait Format {
       sparkSession: SparkSession): Option[String] = {
     // Try metadata-based partition listing first (free for Hive/Iceberg/Delta)
     val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
-      case Success(parts) if parts.nonEmpty => Some(parts.max)
-      case Success(_) => None // Empty result — column not a catalog partition, fall through to data scan
+      case Success(metadata) =>
+        metadata.flatMap(Option(_)) match {
+          // Partition metadata might not exist, if it does not then there are no partitions.
+          case parts if parts.nonEmpty => Some(parts.max)
+          case _                       => None
+        }
       case Failure(ex) =>
         logger.warn(
           s"[NonFatal] Failed to check primary partitions for ${tableName}, falling back to data scan: ${ex.getMessage}");
@@ -173,8 +177,12 @@ trait Format {
   def firstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] = {
     val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
-      case Success(parts) if parts.nonEmpty => Some(parts.min)
-      case _                                => None
+      case Success(metadata) =>
+        metadata.flatMap(Option(_)) match {
+          case parts if parts.nonEmpty => Some(parts.min)
+          case _                       => None
+        }
+      case _ => None
     }
     if (metadataResult.isDefined) return metadataResult
 
