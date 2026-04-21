@@ -218,26 +218,33 @@ class EmrSubmitter(customerId: String,
 
     // Escape single quotes for safe shell interpolation inside bash -c '...'
     // Values referencing the Databricks OAuth token use double quotes to allow shell variable expansion
-    val confArgs = jobProperties
-      .map { case (k, v) =>
-        if (v.contains(DatabricksOAuthTokenVar)) {
-          val escapedKey = k.replace("\"", "\\\"")
-          val escapedValue = v.replace("\"", "\\\"")
-          s"""--conf "$escapedKey=$escapedValue""""
-        } else {
-          val escapedKey = k.replace("'", "'\\''")
-          val escapedValue = v.replace("'", "'\\''")
-          s"--conf '$escapedKey=$escapedValue'"
+    val tokenExpandingKeys = jobProperties.collect { case (k, v) if v.contains(DatabricksOAuthTokenVar) => k }.toSet
+    def renderConfArgs(properties: Seq[(String, String)]): String =
+      properties
+        .map { case (k, v) =>
+          if (tokenExpandingKeys.contains(k)) {
+            val escapedKey = k.replace("\"", "\\\"")
+            val escapedValue = v.replace("\"", "\\\"")
+            s"""--conf "$escapedKey=$escapedValue""""
+          } else {
+            val escapedKey = k.replace("'", "'\\''")
+            val escapedValue = v.replace("'", "'\\''")
+            s"--conf '$escapedKey=$escapedValue'"
+          }
         }
-      }
-      .mkString(" ")
+        .mkString(" ")
+    val confArgs = renderConfArgs(jobProperties.toSeq)
     val mainClass = submissionProperties(MainClass)
     val jarUri = submissionProperties(JarURI)
     val sparkSubmitCmd =
       s"${tokenFetchScript.getOrElse("")}spark-submit $confArgs --class $mainClass $jarUri ${args.mkString(" ")}"
 
     val finalArgs = List("bash", "-c", (awsS3CpArgs ++ List(sparkSubmitCmd)).mkString("; \n"))
-    logger.debug(s"Step config args: $finalArgs")
+    val redactedSparkSubmitCmd =
+      s"${tokenFetchScript.getOrElse("")}spark-submit ${SparkPropertyRedaction
+          .redactPropertiesWithFormat(jobProperties, jobProperties.toSeq.sortBy(_._1))(properties => renderConfArgs(properties))} --class $mainClass $jarUri ${args.mkString(" ")}"
+    val redactedFinalArgs = List("bash", "-c", (awsS3CpArgs ++ List(redactedSparkSubmitCmd)).mkString("; \n"))
+    logger.debug(s"Step config args: $redactedFinalArgs")
     StepConfig
       .builder()
       .name("Run Zipline Job")

@@ -5,6 +5,9 @@ import ai.chronon.integrations.cloud_k8s.K8sFlinkSubmitter
 import ai.chronon.api.ScalaJavaConversions.ListOps
 import ai.chronon.spark.submission.JobSubmitterConstants._
 import ai.chronon.spark.submission.{FlinkJob, SparkJob, StorageClient}
+import ch.qos.logback.classic.{Level, Logger}
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import io.fabric8.kubernetes.client.Config
 import org.junit.Assert.assertEquals
 import org.mockito.ArgumentMatchers.anyString
@@ -12,11 +15,31 @@ import org.mockito.Mockito.{verify, when}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
+import org.slf4j.LoggerFactory
 import software.amazon.awssdk.services.ec2.Ec2Client
 import software.amazon.awssdk.services.emr.EmrClient
 import software.amazon.awssdk.services.emr.model.{AddJobFlowStepsRequest, AddJobFlowStepsResponse}
 
+import scala.jdk.CollectionConverters._
+
 class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
+  private def captureLogMessages(loggerName: String, level: Level)(body: => Unit): Seq[String] = {
+    val underlying = LoggerFactory.getLogger(loggerName).asInstanceOf[Logger]
+    val appender = new ListAppender[ILoggingEvent]()
+    val previousLevel = underlying.getLevel
+    appender.start()
+    underlying.setLevel(level)
+    underlying.addAppender(appender)
+    try {
+      body
+      appender.list.asScala.map(_.getFormattedMessage).toSeq
+    } finally {
+      underlying.detachAppender(appender)
+      underlying.setLevel(previousLevel)
+      appender.stop()
+    }
+  }
+
   "EmrSubmitterClient" should "return job id when a job is submitted and assert EMR request args" in {
     val stepId = "mock-step-id"
     val clusterId = "j-MOCKCLUSTERID123"
@@ -79,6 +102,44 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     assert(actualArgs.contains(s"--class $expectedMainClass"))
     assert(actualArgs.contains(expectedJarURI))
     assert(actualArgs.contains(expectedApplicationArgs.mkString(" ")))
+  }
+
+  it should "use spark.redaction.regex from SparkConf when logging EMR step args" in {
+    val stepId = "mock-step-id"
+    val clusterId = "j-MOCKCLUSTERID123"
+
+    val mockEmrClient = mock[EmrClient]
+    val mockEc2Client = mock[Ec2Client]
+    val mockEksSubmitter = mock[K8sFlinkSubmitter]
+
+    when(mockEmrClient.addJobFlowSteps(org.mockito.ArgumentMatchers.any(classOf[AddJobFlowStepsRequest])))
+      .thenReturn(AddJobFlowStepsResponse.builder().stepIds(stepId).build())
+
+    val submitter = new EmrSubmitter("canary", mockEmrClient, mockEc2Client, Some(mockEksSubmitter))
+    val rawCredential = "classic-redaction-value"
+
+    val messages = captureLogMessages(classOf[EmrSubmitter].getName, Level.DEBUG) {
+      submitter.submit(
+        jobType = SparkJob,
+        submissionProperties = Map(
+          MainClass -> "some-main-class",
+          JarURI -> "s3://-random-jar-uri",
+          ClusterId -> clusterId
+        ),
+        jobProperties = Map(
+          "spark.redaction.regex" -> "(?i)credential",
+          "spark.custom.credential" -> rawCredential
+        ),
+        files = List.empty,
+        labels = Map.empty,
+        "arg1"
+      )
+    }
+
+    val combined = messages.mkString("\n")
+    combined should include("Step config args:")
+    combined should include("spark.custom.credential")
+    combined should not include rawCredential
   }
 
   it should "test createSubmissionPropsMap for Spark job on EMR on EC2" in {

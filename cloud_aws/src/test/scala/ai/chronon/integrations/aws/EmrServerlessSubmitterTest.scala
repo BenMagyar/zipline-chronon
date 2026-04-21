@@ -5,6 +5,9 @@ import ai.chronon.integrations.cloud_k8s.K8sFlinkSubmitter
 import ai.chronon.spark.submission
 import ai.chronon.spark.submission.JobSubmitterConstants._
 import ai.chronon.spark.submission.{FlinkJob, StorageClient}
+import ch.qos.logback.classic.{Level, Logger}
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import org.junit.Assert.assertEquals
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers._
@@ -12,6 +15,7 @@ import org.mockito.Mockito._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
+import org.slf4j.LoggerFactory
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.emrserverless.EmrServerlessClient
 import software.amazon.awssdk.services.emrserverless.model._
@@ -78,6 +82,23 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     )
   }
 
+  private def captureLogMessages(loggerName: String, level: Level = Level.INFO)(body: => Unit): Seq[String] = {
+    val underlying = LoggerFactory.getLogger(loggerName).asInstanceOf[Logger]
+    val appender = new ListAppender[ILoggingEvent]()
+    val previousLevel = underlying.getLevel
+    appender.start()
+    underlying.setLevel(level)
+    underlying.addAppender(appender)
+    try {
+      body
+      appender.list.asScala.map(_.getFormattedMessage).toSeq
+    } finally {
+      underlying.detachAppender(appender)
+      underlying.setLevel(previousLevel)
+      appender.stop()
+    }
+  }
+
   "EmrServerlessSubmitter" should "submit a Spark job using app ID from submission props" in {
     val mockClient = mock[EmrServerlessClient]
     val applicationId = "app-123456"
@@ -113,6 +134,82 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     val requestCaptor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
     verify(mockClient).startJobRun(requestCaptor.capture())
     assertEquals(applicationId, requestCaptor.getValue.applicationId())
+  }
+
+  it should "redact secret-looking values from EMR Serverless submission logs" in {
+    val mockClient = mock[EmrServerlessClient]
+    val applicationId = "app-redacted-default"
+
+    when(mockClient.startJobRun(any[StartJobRunRequest]))
+      .thenReturn(StartJobRunResponse.builder().applicationId(applicationId).jobRunId("job-redacted-default").build())
+
+    val submitter = createSubmitter(mockClient)
+    val rawSecret = "super-secret-value"
+
+    val messages = captureLogMessages(classOf[EmrServerlessSubmitter].getName) {
+      submitter.submit(
+        submission.SparkJob,
+        Map(
+          MainClass -> "ai.chronon.spark.Driver",
+          JarURI -> "s3://my-bucket/jars/cloud-aws.jar",
+          JobId -> "test-redacted-default",
+          submitter.clusterIdentifierKey -> applicationId
+        ),
+        Map(
+          "spark.executor.memory" -> "4g",
+          "spark.sql.catalog.workspace.client.secret" -> rawSecret
+        ),
+        List.empty,
+        Map.empty
+      )
+    }
+
+    val combined = messages.mkString("\n")
+    combined should include("spark.sql.catalog.workspace.client.secret")
+    combined should not include rawSecret
+
+    val requestCaptor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
+    verify(mockClient).startJobRun(requestCaptor.capture())
+    val props = requestCaptor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
+    props.get("spark.sql.catalog.workspace.client.secret") shouldBe rawSecret
+  }
+
+  it should "use spark.redaction.regex from SparkConf when redacting submission logs" in {
+    val mockClient = mock[EmrServerlessClient]
+    val applicationId = "app-redacted-override"
+
+    when(mockClient.startJobRun(any[StartJobRunRequest]))
+      .thenReturn(StartJobRunResponse.builder().applicationId(applicationId).jobRunId("job-redacted-override").build())
+
+    val submitter = createSubmitter(mockClient)
+    val rawCredential = "override-redaction-value"
+
+    val messages = captureLogMessages(classOf[EmrServerlessSubmitter].getName) {
+      submitter.submit(
+        submission.SparkJob,
+        Map(
+          MainClass -> "ai.chronon.spark.Driver",
+          JarURI -> "s3://my-bucket/jars/cloud-aws.jar",
+          JobId -> "test-redacted-override",
+          submitter.clusterIdentifierKey -> applicationId
+        ),
+        Map(
+          "spark.redaction.regex" -> "(?i)credential",
+          "spark.custom.credential" -> rawCredential
+        ),
+        List.empty,
+        Map.empty
+      )
+    }
+
+    val combined = messages.mkString("\n")
+    combined should include("spark.custom.credential")
+    combined should not include rawCredential
+
+    val requestCaptor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
+    verify(mockClient).startJobRun(requestCaptor.capture())
+    val props = requestCaptor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
+    props.get("spark.custom.credential") shouldBe rawCredential
   }
 
   it should "resolve app by name via ListApplications when no app ID in submission props" in {

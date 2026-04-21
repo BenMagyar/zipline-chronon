@@ -177,15 +177,13 @@ class EmrServerlessSubmitter(
           s"${EmrServerlessSubmitter.MaxPropertiesPerClassification} per classification; " +
           s"routing ${overflowProps.size} through sparkSubmitParameters as --conf flags")
     }
-    val overflowConf = overflowProps.toSeq
-      .sortBy(_._1)
-      .map { case (k, v) =>
-        s"--conf ${EmrServerlessSubmitter.maybeShellQuote(s"$k=$v")}"
-      }
-      .mkString(" ")
-
-    val sparkSubmitParams =
-      Seq(s"--class $mainClass", filesParam, overflowConf).filter(_.nonEmpty).mkString(" ")
+    val overflowArgs = overflowProps.toSeq.flatMap { case (k, v) =>
+      Seq("--conf", EmrServerlessSubmitter.maybeShellQuote(s"$k=$v"))
+    }
+    val sparkSubmitArgs =
+      Seq("--class", mainClass) ++ (if (filesParam.nonEmpty) Seq("--files", files.mkString(","))
+                                    else Seq.empty) ++ overflowArgs
+    val sparkSubmitParams = sparkSubmitArgs.mkString(" ")
 
     val jobName = submissionProperties.getOrElse(JobId, s"chronon-job-${System.currentTimeMillis()}")
     logger.info(
@@ -194,9 +192,18 @@ class EmrServerlessSubmitter(
     if (inlineProps.nonEmpty) {
       logger.info(
         s"spark-defaults classification for $jobName:\n  " +
-          inlineProps.toSeq.sortBy(_._1).map { case (k, v) => s"$k = $v" }.mkString("\n  "))
+          SparkPropertyRedaction.redactPropertiesWithFormat(resolvedProps, inlineProps.toSeq) { properties =>
+            properties.map { case (key, value) => s"$key = $value" }.mkString("\n  ")
+          })
     }
-    logger.info(s"sparkSubmitParameters for $jobName: $sparkSubmitParams")
+    val redactedSparkSubmitParams =
+      SparkPropertyRedaction.redactPropertiesWithFormat(resolvedProps, overflowProps.toSeq) { redactedOverflowProps =>
+        (Seq("--class", mainClass) ++ (if (filesParam.nonEmpty) Seq("--files", files.mkString(","))
+                                       else Seq.empty) ++ redactedOverflowProps
+          .flatMap { case (key, value) => Seq("--conf", EmrServerlessSubmitter.maybeShellQuote(s"$key=$value")) })
+          .mkString(" ")
+      }
+    logger.info(s"sparkSubmitParameters for $jobName: $redactedSparkSubmitParams")
 
     val jobDriverBuilder = JobDriver
       .builder()
