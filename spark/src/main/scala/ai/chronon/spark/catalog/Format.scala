@@ -100,6 +100,8 @@ trait Format {
           partitionMap.get(k).contains(v)
         }
       ) {
+        // partitionMap values come from a Java-interop catalog, so .get can
+        // yield Some(null). Rehydrate via Option(_) to collapse that to None.
         partitionMap.get(effectiveColumn).flatMap(Option(_))
       } else {
         None
@@ -272,11 +274,11 @@ object Format {
     .toList
 
   def pickMinPartition(partitions: Iterable[String]): Option[String] = {
-    sanitizePartitionValues(partitions).reduceOption(stringOrdering.min)
+    sanitizePartitionValues(partitions).reduceOption((x, y) => stringOrdering.min(x, y))
   }
 
   def pickMaxPartition(partitions: Iterable[String]): Option[String] = {
-    sanitizePartitionValues(partitions).reduceOption(stringOrdering.max)
+    sanitizePartitionValues(partitions).reduceOption((x, y) => stringOrdering.max(x, y))
   }
 
   def parseHiveStylePartition(pstring: String): List[(String, String)] = {
