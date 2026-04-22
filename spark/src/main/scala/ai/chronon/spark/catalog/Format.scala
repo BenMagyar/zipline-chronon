@@ -265,15 +265,19 @@ case class ResolvedTableName(catalog: String, namespace: String, table: String) 
 
 object Format {
 
+  private val stringOrdering: Ordering[String] = Ordering.String
+
   def sanitizePartitionValues(partitions: Iterable[String]): List[String] = partitions.iterator
     .flatMap(Option(_))
     .toList
 
-  def pickMinPartition(partitions: Iterable[String]): Option[String] =
-    sanitizePartitionValues(partitions).reduceOption(Ordering.String.min)
+  def pickMinPartition(partitions: Iterable[String]): Option[String] = {
+    sanitizePartitionValues(partitions).reduceOption(stringOrdering.min)
+  }
 
-  def pickMaxPartition(partitions: Iterable[String]): Option[String] =
-    sanitizePartitionValues(partitions).reduceOption(Ordering.String.max)
+  def pickMaxPartition(partitions: Iterable[String]): Option[String] = {
+    sanitizePartitionValues(partitions).reduceOption(stringOrdering.max)
+  }
 
   def parseHiveStylePartition(pstring: String): List[(String, String)] = {
     pstring
