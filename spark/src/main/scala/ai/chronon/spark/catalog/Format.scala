@@ -100,7 +100,7 @@ trait Format {
           partitionMap.get(k).contains(v)
         }
       ) {
-        partitionMap.get(effectiveColumn)
+        partitionMap.get(effectiveColumn).flatMap(Option(_))
       } else {
         None
       }
@@ -127,11 +127,7 @@ trait Format {
     // Try metadata-based partition listing first (free for Hive/Iceberg/Delta)
     val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
       case Success(metadata) =>
-        metadata.flatMap(Option(_)) match {
-          // Partition metadata might not exist, if it does not then there are no partitions.
-          case parts if parts.nonEmpty => Some(parts.max)
-          case _                       => None
-        }
+        Format.pickMaxPartition(metadata)
       case Failure(ex) =>
         logger.warn(
           s"[NonFatal] Failed to check primary partitions for ${tableName}, falling back to data scan: ${ex.getMessage}");
@@ -178,10 +174,7 @@ trait Format {
       sparkSession: SparkSession): Option[String] = {
     val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
       case Success(metadata) =>
-        metadata.flatMap(Option(_)) match {
-          case parts if parts.nonEmpty => Some(parts.min)
-          case _                       => None
-        }
+        Format.pickMinPartition(metadata)
       case _ => None
     }
     if (metadataResult.isDefined) return metadataResult
@@ -271,6 +264,16 @@ case class ResolvedTableName(catalog: String, namespace: String, table: String) 
 }
 
 object Format {
+
+  def sanitizePartitionValues(partitions: Iterable[String]): List[String] = partitions.iterator
+    .flatMap(Option(_))
+    .toList
+
+  def pickMinPartition(partitions: Iterable[String]): Option[String] =
+    sanitizePartitionValues(partitions).reduceOption(Ordering.String.min)
+
+  def pickMaxPartition(partitions: Iterable[String]): Option[String] =
+    sanitizePartitionValues(partitions).reduceOption(Ordering.String.max)
 
   def parseHiveStylePartition(pstring: String): List[(String, String)] = {
     pstring

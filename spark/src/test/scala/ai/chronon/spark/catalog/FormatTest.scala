@@ -85,6 +85,36 @@ class FormatTest extends SparkTestBase {
     fmt.lastAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
   }
 
+  it should "compute metadata boundaries by ignoring null partition entries" in {
+    val tableName = "format_null_metadata_boundary_test"
+    spark.sql(s"""
+      CREATE OR REPLACE TEMP VIEW $tableName AS
+      SELECT * FROM VALUES
+        (1, '2024-04-01'),
+        (2, '2024-04-03'),
+        (3, '2024-04-02')
+      AS t(id, ds)
+    """)
+
+    val fmt = new Format {
+      override def supportSubPartitionsFilter = false
+      override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      override def primaryPartitions(tableName: String,
+                                     partitionColumn: String,
+                                     partitionFilters: String,
+                                     subPartitionsFilter: Map[String, String])(implicit
+          ss: SparkSession) = List("2024-04-02", null, "2024-04-01")
+    }
+
+    Format.sanitizePartitionValues(List("2024-04-02", null, "2024-04-01")) shouldBe List(
+      "2024-04-02",
+      "2024-04-01")
+    Format.pickMinPartition(List("2024-04-02", null, "2024-04-01")) shouldBe Some("2024-04-01")
+    Format.pickMaxPartition(List("2024-04-02", null, "2024-04-01")) shouldBe Some("2024-04-02")
+    fmt.firstAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-01")
+    fmt.lastAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-02")
+  }
+
   it should "resolve table names consistently with Spark SQL" in {
     spark.sql("CREATE DATABASE IF NOT EXISTS spark_non_default_catalog.custom_test_db")
     spark.sql(
