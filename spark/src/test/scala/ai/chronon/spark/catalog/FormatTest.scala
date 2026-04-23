@@ -168,4 +168,32 @@ class FormatTest extends SparkTestBase {
       sql)
   }
 
+  // --- parseIdentifier ---
+
+  it should "parse a 3-part unquoted identifier" in {
+    Format.parseIdentifier("catalog.schema.table") shouldBe Seq("catalog", "schema", "table")
+  }
+
+  it should "parse a 2-part identifier" in {
+    Format.parseIdentifier("schema.table") shouldBe Seq("schema", "table")
+  }
+
+  it should "parse a single-segment identifier" in {
+    Format.parseIdentifier("table") shouldBe Seq("table")
+  }
+
+  it should "strip surrounding backticks from quoted segments" in {
+    Format.parseIdentifier("workspace.`schema-with-dashes`.events") shouldBe
+      Seq("workspace", "schema-with-dashes", "events")
+  }
+
+  it should "preserve a literal dot inside a backticked segment" in {
+    Format.parseIdentifier("catalog.`schema.with.dots`.table") shouldBe
+      Seq("catalog", "schema.with.dots", "table")
+  }
+
+  it should "handle every segment quoted" in {
+    Format.parseIdentifier("`c`.`s`.`t`") shouldBe Seq("c", "s", "t")
+  }
+
 }

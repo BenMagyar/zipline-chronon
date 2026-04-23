@@ -46,15 +46,18 @@ class AzureSubmitter(
       jobProperties: Map[String, String],
       files: List[String],
       labels: Map[String, String],
+      envVars: Map[String, String],
       args: String*
   ): String = {
-    val userArgs = JobSubmitter.getApplicationArgs(jobType, args.toArray)
-
     jobType match {
       case TypeSparkJob =>
-        kyuubiSubmitter.submit(jobType, submissionProperties, jobProperties, files, labels, args: _*)
+        // Pass raw args — KyuubiSubmitter.submit runs its own getApplicationArgs
+        // normalization internally, so pre-filtering here would be a double-filter.
+        kyuubiSubmitter.submit(jobType, submissionProperties, jobProperties, files, labels, envVars, args: _*)
 
       case TypeFlinkJob =>
+        // K8sFlinkSubmitter doesn't normalize args, so do it here for the Flink path.
+        val userArgs = JobSubmitter.getApplicationArgs(jobType, args.toArray)
         val jobId = submissionProperties.getOrElse(JobId, throw new RuntimeException("Job ID not found"))
         val mainClass =
           submissionProperties.getOrElse(MainClass, throw new RuntimeException("Main class not found"))

@@ -51,7 +51,7 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     val mockKyuubi = mock[KyuubiSubmitter]
     val submitter = createSubmitter(mockKyuubi = mockKyuubi)
 
-    when(mockKyuubi.submit(any(), any(), any(), any(), any(), any[String]()))
+    when(mockKyuubi.submit(any(), any(), any(), any(), any(), any(), any[String]()))
       .thenReturn("kyuubi-batch-123")
 
     val result = submitter.submit(
@@ -64,11 +64,12 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       ),
       jobProperties = Map("spark.executor.memory" -> "4g"),
       files = List("conf.json"),
-      labels = Map("team" -> "chronon")
+      labels = Map("team" -> "chronon"),
+      envVars = Map.empty
     )
 
     result shouldBe "kyuubi-batch-123"
-    verify(mockKyuubi).submit(any(), any(), any(), any(), any(), any[String]())
+    verify(mockKyuubi).submit(any(), any(), any(), any(), any(), any(), any[String]())
   }
 
   it should "pass submissionProperties and labels unchanged to KyuubiSubmitter for Spark jobs" in {
@@ -83,24 +84,70 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     )
     val labels = Map("env" -> "prod", "team" -> "zipline")
 
-    when(mockKyuubi.submit(
-      any(),
-      org.mockito.ArgumentMatchers.eq(submissionProps),
-      any(),
-      any(),
-      org.mockito.ArgumentMatchers.eq(labels),
-      any[String]()
-    )).thenReturn("kyuubi-batch-456")
+    when(
+      mockKyuubi.submit(
+        any(),
+        org.mockito.ArgumentMatchers.eq(submissionProps),
+        any(),
+        any(),
+        org.mockito.ArgumentMatchers.eq(labels),
+        any(),
+        any[String]()
+      )).thenReturn("kyuubi-batch-456")
 
     val result = submitter.submit(
       jobType = submission.SparkJob,
       submissionProperties = submissionProps,
       jobProperties = Map.empty,
       files = List.empty,
-      labels = labels
+      labels = labels,
+      envVars = Map.empty
     )
 
     result shouldBe "kyuubi-batch-456"
+  }
+
+  it should "forward envVars verbatim to KyuubiSubmitter for Spark jobs" in {
+    val mockKyuubi = mock[KyuubiSubmitter]
+    val submitter = createSubmitter(mockKyuubi = mockKyuubi)
+
+    val envVars = Map("FOO" -> "bar", "CUSTOMER_ID" -> "canary")
+
+    when(
+      mockKyuubi.submit(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        org.mockito.ArgumentMatchers.eq(envVars),
+        any[String]()
+      )).thenReturn("kyuubi-batch-env")
+
+    val result = submitter.submit(
+      jobType = submission.SparkJob,
+      submissionProperties = Map(
+        MainClass -> "ai.chronon.spark.Driver",
+        JarURI -> "abfss://libs@account.dfs.core.windows.net/jars/cloud_azure.jar",
+        MetadataName -> "my_feature",
+        JobId -> "spark-job-env"
+      ),
+      jobProperties = Map.empty,
+      files = List.empty,
+      labels = Map.empty,
+      envVars = envVars
+    )
+
+    result shouldBe "kyuubi-batch-env"
+    verify(mockKyuubi).submit(
+      any(),
+      any(),
+      any(),
+      any(),
+      any(),
+      org.mockito.ArgumentMatchers.eq(envVars),
+      any[String]()
+    )
   }
 
   // --- submit: Flink jobs ---
@@ -109,26 +156,28 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     val mockAksFlink = mock[K8sFlinkSubmitter]
     val submitter = createSubmitter(mockAksFlink = mockAksFlink)
 
-    when(mockAksFlink.submit(
-      jobId = anyString(),
-      mainClass = anyString(),
-      mainJarUri = anyString(),
-      jarUris = any(),
-      flinkCheckpointUri = anyString(),
-      maybeSavepointUri = any(),
-      maybeFlinkJarsUri = any(),
-      jobProperties = any(),
-      args = any(),
-      serviceAccount = anyString(),
-      namespace = anyString()
-    )).thenReturn("flink-abc123")
+    when(
+      mockAksFlink.submit(
+        jobId = anyString(),
+        mainClass = anyString(),
+        mainJarUri = anyString(),
+        jarUris = any(),
+        flinkCheckpointUri = anyString(),
+        maybeSavepointUri = any(),
+        maybeFlinkJarsUri = any(),
+        jobProperties = any(),
+        args = any(),
+        serviceAccount = anyString(),
+        namespace = anyString()
+      )).thenReturn("flink-abc123")
 
     val result = submitter.submit(
       jobType = FlinkJob,
       submissionProperties = baseFlinkSubmissionProps,
       jobProperties = Map.empty,
       files = List.empty,
-      labels = Map.empty
+      labels = Map.empty,
+      envVars = Map.empty
     )
 
     result shouldBe "flink:zipline-flink:flink-abc123"
@@ -139,26 +188,28 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     val submitter = createSubmitter(mockAksFlink = mockAksFlink)
     val savepointUri = "abfss://checkpoints@account.dfs.core.windows.net/flink/checkpoints/chk-100"
 
-    when(mockAksFlink.submit(
-      jobId = anyString(),
-      mainClass = anyString(),
-      mainJarUri = anyString(),
-      jarUris = any(),
-      flinkCheckpointUri = anyString(),
-      maybeSavepointUri = org.mockito.ArgumentMatchers.eq(Some(savepointUri)),
-      maybeFlinkJarsUri = any(),
-      jobProperties = any(),
-      args = any(),
-      serviceAccount = anyString(),
-      namespace = anyString()
-    )).thenReturn("flink-abc123")
+    when(
+      mockAksFlink.submit(
+        jobId = anyString(),
+        mainClass = anyString(),
+        mainJarUri = anyString(),
+        jarUris = any(),
+        flinkCheckpointUri = anyString(),
+        maybeSavepointUri = org.mockito.ArgumentMatchers.eq(Some(savepointUri)),
+        maybeFlinkJarsUri = any(),
+        jobProperties = any(),
+        args = any(),
+        serviceAccount = anyString(),
+        namespace = anyString()
+      )).thenReturn("flink-abc123")
 
     submitter.submit(
       jobType = FlinkJob,
       submissionProperties = baseFlinkSubmissionProps + (SavepointUri -> savepointUri),
       jobProperties = Map.empty,
       files = List.empty,
-      labels = Map.empty
+      labels = Map.empty,
+      envVars = Map.empty
     )
 
     verify(mockAksFlink).submit(
@@ -180,26 +231,28 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     val mockAksFlink = mock[K8sFlinkSubmitter]
     val submitter = createSubmitter(mockAksFlink = mockAksFlink)
 
-    when(mockAksFlink.submit(
-      jobId = anyString(),
-      mainClass = anyString(),
-      mainJarUri = anyString(),
-      jarUris = any(),
-      flinkCheckpointUri = anyString(),
-      maybeSavepointUri = org.mockito.ArgumentMatchers.eq(None),
-      maybeFlinkJarsUri = any(),
-      jobProperties = any(),
-      args = any(),
-      serviceAccount = anyString(),
-      namespace = anyString()
-    )).thenReturn("flink-no-sp")
+    when(
+      mockAksFlink.submit(
+        jobId = anyString(),
+        mainClass = anyString(),
+        mainJarUri = anyString(),
+        jarUris = any(),
+        flinkCheckpointUri = anyString(),
+        maybeSavepointUri = org.mockito.ArgumentMatchers.eq(None),
+        maybeFlinkJarsUri = any(),
+        jobProperties = any(),
+        args = any(),
+        serviceAccount = anyString(),
+        namespace = anyString()
+      )).thenReturn("flink-no-sp")
 
     val result = submitter.submit(
       jobType = FlinkJob,
       submissionProperties = baseFlinkSubmissionProps, // no SavepointUri key
       jobProperties = Map.empty,
       files = List.empty,
-      labels = Map.empty
+      labels = Map.empty,
+      envVars = Map.empty
     )
 
     result shouldBe "flink:zipline-flink:flink-no-sp"
@@ -214,7 +267,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         submissionProperties = baseFlinkSubmissionProps - JobId,
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -228,7 +282,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         submissionProperties = baseFlinkSubmissionProps - FlinkMainJarURI,
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -242,7 +297,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         submissionProperties = baseFlinkSubmissionProps - EksServiceAccount,
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -440,9 +496,9 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
   private val testArtifactPrefix = "abfss://artifacts@account.dfs.core.windows.net"
   private val testVersion = "1.0.0"
   private val baseFlinkEnv = Map(
-    "FLINK_STATE_URI"           -> "abfss://checkpoints@account.dfs.core.windows.net/flink",
+    "FLINK_STATE_URI" -> "abfss://checkpoints@account.dfs.core.windows.net/flink",
     "FLINK_AKS_SERVICE_ACCOUNT" -> "zipline-flink-sa",
-    "FLINK_AKS_NAMESPACE"       -> "zipline-flink"
+    "FLINK_AKS_NAMESPACE" -> "zipline-flink"
   )
 
   "buildFlinkSubmissionProps" should "include FlinkMainJarURI, FlinkCheckpointUri, service account, and namespace" in {

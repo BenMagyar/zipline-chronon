@@ -104,7 +104,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map("spark.executor.memory" -> "4g"),
       List.empty,
-      Map("team" -> "chronon")
+      Map("team" -> "chronon"),
+      Map.empty
     )
 
     assertEquals(jobRunId, submittedJobId)
@@ -136,6 +137,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map.empty,
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -165,6 +167,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         ),
         Map.empty,
         List.empty,
+        Map.empty,
         Map.empty
       )
     }
@@ -333,6 +336,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       List.empty,
       Map("team" -> "chronon"),
+      Map.empty,
       "--arg1",
       "--arg2=value"
     )
@@ -379,6 +383,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map.empty,
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -955,7 +960,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       jobProperties = Map.empty,
       files = List.empty,
-      labels = Map.empty
+      labels = Map.empty,
+      envVars = Map.empty
     )
 
     jobId shouldBe "flink:zipline-flink:flink-abc123"
@@ -1058,7 +1064,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         ),
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -1081,7 +1088,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         ),
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -1104,7 +1112,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         ),
         jobProperties = Map.empty,
         files = List.empty,
-        labels = Map.empty
+        labels = Map.empty,
+        envVars = Map.empty
       )
     }
   }
@@ -1131,6 +1140,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map("spark.some.config" -> "{HOME}/data"),
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -1162,6 +1172,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map("spark.executor.memory" -> "4g", "spark.driver.cores" -> "2"),
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -1195,6 +1206,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       props,
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -1234,6 +1246,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map("spark.executor.memory" -> "4g", "spark.executor.cores" -> "2"),
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -1274,6 +1287,52 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     tail.contains("k150") shouldBe true
   }
 
+  "envVarsToSparkProperties" should "emit spark.emr-serverless.driverEnv and spark.executorEnv entries only" in {
+    val submitter = createSubmitter(mock[EmrServerlessClient])
+    val result = submitter.envVarsToSparkProperties(Map("CUSTOMER_ID" -> "canary", "AWS_REGION" -> "us-west-2"))
+    result shouldBe Map(
+      "spark.emr-serverless.driverEnv.CUSTOMER_ID" -> "canary",
+      "spark.executorEnv.CUSTOMER_ID" -> "canary",
+      "spark.emr-serverless.driverEnv.AWS_REGION" -> "us-west-2",
+      "spark.executorEnv.AWS_REGION" -> "us-west-2"
+    )
+    // Crucially, none of the legacy YARN / K8s / bogus driverEnv prefixes appear.
+    result.keys.exists(_.startsWith("spark.yarn.appMasterEnv.")) shouldBe false
+    result.keys.exists(_.startsWith("spark.kubernetes.driverEnv.")) shouldBe false
+    result.keys.exists(k => k.startsWith("spark.driverEnv.") && !k.startsWith("spark.emr-serverless.")) shouldBe false
+  }
+
+  it should "thread envVars into spark-defaults with the EMR Serverless expansion" in {
+    val mockClient = mock[EmrServerlessClient]
+    val applicationId = "app-envvars-123"
+
+    when(mockClient.startJobRun(any[StartJobRunRequest]))
+      .thenReturn(StartJobRunResponse.builder().applicationId(applicationId).jobRunId("job-envvars-1").build())
+
+    val submitter = createSubmitter(mockClient)
+
+    submitter.submit(
+      submission.SparkJob,
+      Map(
+        MainClass -> "ai.chronon.spark.Driver",
+        JarURI -> "s3://bucket/jar.jar",
+        JobId -> "test-envvars",
+        submitter.clusterIdentifierKey -> applicationId
+      ),
+      Map.empty,
+      List.empty,
+      Map.empty,
+      Map("CUSTOMER_ID" -> "canary")
+    )
+
+    val requestCaptor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
+    verify(mockClient).startJobRun(requestCaptor.capture())
+    val props = requestCaptor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
+    props.get("spark.emr-serverless.driverEnv.CUSTOMER_ID") shouldBe "canary"
+    props.get("spark.executorEnv.CUSTOMER_ID") shouldBe "canary"
+    props.containsKey("spark.yarn.appMasterEnv.CUSTOMER_ID") shouldBe false
+  }
+
   it should "keep unresolvable {VAR} placeholders as-is when env var is not set" in {
     val mockClient = mock[EmrServerlessClient]
     val applicationId = "app-env-789"
@@ -1293,6 +1352,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ),
       Map("spark.some.token" -> "{CHRONON_NONEXISTENT_VAR_XYZ}"),
       List.empty,
+      Map.empty,
       Map.empty
     )
 
@@ -1455,6 +1515,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         "test" -> "integration",
         "framework" -> "chronon"
       ),
+      Map.empty,
       "--help"
     )
 

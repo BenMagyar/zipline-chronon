@@ -227,6 +227,7 @@ class KyuubiSubmitter private[submission] (
       jobProperties: Map[String, String],
       files: List[String],
       labels: Map[String, String],
+      envVars: Map[String, String],
       rawArgs: String*
   ): String = {
     val args = JobSubmitter.getApplicationArgs(jobType, rawArgs.toArray)
@@ -280,7 +281,8 @@ class KyuubiSubmitter private[submission] (
       case SparkJob => Map.empty[String, String]
     }
 
-    val completeConf = jobProperties ++ labelConf ++ filesConf ++ additionalJarsConf ++ flinkConf
+    val completeConf =
+      jobProperties ++ envVarsToSparkProperties(envVars) ++ labelConf ++ filesConf ++ additionalJarsConf ++ flinkConf
 
     val request = BatchSubmitRequest(
       batchType = batchType,
@@ -369,7 +371,8 @@ class KyuubiSubmitter private[submission] (
       jobProperties = jobProperties,
       files = KyuubiSubmitter.getFilesArgs(args),
       labels = labels,
-      args: _*
+      envVars = Map.empty,
+      rawArgs = args: _*
     )
 
     logger.info(s"Kyuubi job submitted. ID: $jobId")

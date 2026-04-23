@@ -22,7 +22,6 @@ from typing import Dict, List, Optional, Union
 import ai.chronon.utils as utils
 import gen_thrift.api.ttypes as api
 import gen_thrift.common.ttypes as common
-from ai.chronon.cli.compile import parse_teams
 from ai.chronon.data_types import DataType, FieldsType
 
 logging.basicConfig(level=logging.INFO)
@@ -30,20 +29,7 @@ logging.basicConfig(level=logging.INFO)
 
 def _get_output_table_name(join: api.Join, full_name: bool = False):
     """generate output table name for join backfill job"""
-    # join sources could also be created inline alongside groupBy file
-    # so we specify fallback module as group_bys
-    if isinstance(join, api.Join):
-        utils.__set_name(join, api.Join, "joins")
-    # set output namespace
-    if not join.metaData.outputNamespace:
-        team_name = join.metaData.name.split(".")[0]
-        namespace = (
-            parse_teams.load_teams(utils.chronon_root_path, print=False)
-            .get(team_name)
-            .outputNamespace
-        )
-        join.metaData.outputNamespace = namespace
-    return utils.output_table_name(join, full_name=full_name)
+    return utils._ensure_name_and_get_output_table(join, api.Join, "joins", full_name)
 
 
 def JoinPart(

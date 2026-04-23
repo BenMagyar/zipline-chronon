@@ -237,7 +237,12 @@ class EmrSubmitter(customerId: String,
       s"${tokenFetchScript.getOrElse("")}spark-submit $confArgs --class $mainClass $jarUri ${args.mkString(" ")}"
 
     val finalArgs = List("bash", "-c", (awsS3CpArgs ++ List(sparkSubmitCmd)).mkString("; \n"))
-    logger.debug(s"Step config args: $finalArgs")
+    // Don't log $finalArgs directly — it contains the fully-rendered spark-submit
+    // command with --conf <secret>=<value> for every jobProperty. Log keys and
+    // counts instead, matching the redaction policy on EmrServerlessSubmitter.
+    logger.debug(
+      s"Step config: confKeys=${jobProperties.keys.toSeq.sorted.mkString(",")}; " +
+        s"filesToMount=${filesToMount.size}; argsCount=${args.size}")
     StepConfig
       .builder()
       .name("Run Zipline Job")
@@ -487,6 +492,7 @@ class EmrSubmitter(customerId: String,
                       jobProperties: Map[String, String],
                       files: List[String],
                       labels: Map[String, String],
+                      envVars: Map[String, String],
                       args: String*): String = {
     val userArgs = JobSubmitter.getApplicationArgs(jobType, args.toArray)
 
@@ -527,6 +533,9 @@ class EmrSubmitter(customerId: String,
             flinkCheckpointUri = flinkCheckpointPath,
             maybeSavepointUri = maybeSavepointUri,
             maybeFlinkJarsUri = submissionProperties.get(FlinkJarsUri),
+            // Don't merge Spark-prefixed env properties into Flink jobProperties — the
+            // `spark.*Env.*` shape isn't what Flink reads and the K8sFlinkSubmitter
+            // strips them anyway. Flink env var injection lives on the submitter side.
             jobProperties = jobProperties,
             args = userArgs,
             serviceAccount = serviceAccount,
@@ -537,7 +546,8 @@ class EmrSubmitter(customerId: String,
 
       case TypeSparkJob =>
         val existingJobId = submissionProperties.getOrElse(ClusterId, throw new RuntimeException("JobFlowId not found"))
-        val stepConfig = createStepConfig(files, submissionProperties, jobProperties, userArgs: _*)
+        val sparkJobProperties = jobProperties ++ envVarsToSparkProperties(envVars)
+        val stepConfig = createStepConfig(files, submissionProperties, sparkJobProperties, userArgs: _*)
 
         val request = AddJobFlowStepsRequest
           .builder()
@@ -947,7 +957,8 @@ object EmrSubmitter {
       jobProperties = modeConfigProperties.getOrElse(Map.empty),
       files = files.toList,
       labels = Map.empty,
-      finalArgs: _*
+      envVars = Map.empty,
+      args = finalArgs: _*
     )
   }
 }

@@ -26,7 +26,7 @@ trait Format {
                   semanticHash: Option[String] = None)(implicit sparkSession: SparkSession): Unit = {
     val (creationName, quotedOriginal) = semanticHash match {
       case Some(hash) =>
-        val parts = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(tableName).toList
+        val parts = Format.parseIdentifier(tableName).toList
         val hashedParts = parts.init :+ s"${parts.last}_$hash"
         (hashedParts.map(QuotingUtils.quoteIdentifier).mkString("."), tableName)
       case None => (tableName, tableName)
@@ -281,6 +281,17 @@ object Format {
     sanitizePartitionValues(partitions).reduceOption((x, y) => stringOrdering.max(x, y))
   }
 
+  /** Parse a (possibly multipart, possibly backticked) table identifier into its dotted segments,
+    * using the session parser so any session-level parser extensions apply. Does NOT fill in a
+    * default catalog: callers (e.g. [[resolveTableName]]) own that policy since different contexts
+    * have different defaults (read vs. write catalog, ephemeral eval catalog, etc.).
+    *
+    * Prefer this over `split("\\.")` wherever you need to break up a table identifier — the naive
+    * split drops backticks and corrupts segments containing escaped dots.
+    */
+  def parseIdentifier(identifier: String)(implicit sparkSession: SparkSession): Seq[String] =
+    sparkSession.sessionState.sqlParser.parseMultipartIdentifier(identifier)
+
   def parseHiveStylePartition(pstring: String): List[(String, String)] = {
     pstring
       .split("/")
@@ -292,7 +303,7 @@ object Format {
   }
 
   def resolveTableName(tableName: String)(implicit sparkSession: SparkSession): ResolvedTableName = {
-    val parsed = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(tableName)
+    val parsed = parseIdentifier(tableName)
     def defaultCatalog: String = sparkSession.conf.get("spark.sql.defaultCatalog", "spark_catalog")
     parsed.toList match {
       case catalog :: namespace :: table :: Nil => ResolvedTableName(catalog, namespace, table)
@@ -305,7 +316,7 @@ object Format {
 
   // Lightweight version that avoids triggering catalog initialization
   def getCatalog(inputTableName: String)(implicit sparkSession: SparkSession): String = {
-    val parsed = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(inputTableName)
+    val parsed = parseIdentifier(inputTableName)
     def defaultCatalog: String = sparkSession.conf.get("spark.sql.defaultCatalog", "spark_catalog")
     parsed.toList match {
       case catalog :: _ :: _ :: Nil => catalog

@@ -24,7 +24,22 @@ trait JobSubmitter {
              jobProperties: Map[String, String],
              files: List[String],
              labels: Map[String, String],
+             envVars: Map[String, String],
              args: String*): String
+
+  /** Translates logical env vars into platform-specific Spark properties that actually
+    * set the env in the driver/executors. Default mirrors the historical NodeSubmitter
+    * expansion (driver on YARN, driver on K8s, executors); cloud submitters should
+    * override to match their runtime (e.g. EMR Serverless uses spark.emr-serverless.driverEnv.*).
+    */
+  def envVarsToSparkProperties(env: Map[String, String]): Map[String, String] =
+    env.flatMap { case (key, value) =>
+      Seq(
+        s"spark.executorEnv.$key" -> value,
+        s"spark.yarn.appMasterEnv.$key" -> value,
+        s"spark.kubernetes.driverEnv.$key" -> value
+      )
+    }
 
   def status(jobId: String): JobStatusType
 

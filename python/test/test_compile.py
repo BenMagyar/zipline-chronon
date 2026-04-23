@@ -1,7 +1,10 @@
 import os
 import json
+import sys
+from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 from gen_thrift.api.ttypes import (
     EventSource,
@@ -17,9 +20,18 @@ from gen_thrift.api.ttypes import (
 from gen_thrift.common.ttypes import ExecutionInfo
 
 from ai.chronon.cli.compile import parse_configs
-from ai.chronon.cli.compile.compile_context import CompileContext
+from ai.chronon.cli.compile.compile_context import CONFIG_INFOS, CompileContext
 from ai.chronon.cli.compile.parse_teams import update_metadata
 from ai.chronon.repo.compile import __compile, compile
+from ai.chronon.utils import OUTPUT_NAMESPACE_PLACEHOLDER
+
+
+def user_authoring_folders():
+    """Folder names under `chronon_root` that users place authoring `.py` files in.
+    Derived from the canonical `CONFIG_INFOS` registry so adding a new conf type
+    automatically propagates to the test helpers below. Lives in the test file (not
+    in production code) because nothing in the compile pipeline itself needs it."""
+    return [ci.folder_name for ci in CONFIG_INFOS if ci.config_type is not None]
 
 
 def test_compile(repo):
@@ -123,6 +135,8 @@ def test_compile_with_json_format(canary):
 
     assert "results" in output_json, f"Output missing 'results' field: {output_json}"
     assert isinstance(output_json["results"], dict), f"'results' should be a dict, got: {type(output_json['results'])}"
+
+
 
 
 def _make_team_dict(namespace="test_namespace"):
@@ -413,3 +427,143 @@ def test_update_metadata_user_reported_chain():
     assert acct_by_company.metaData.outputNamespace == "warehouse_db"
     assert acct_by_segment.metaData.outputNamespace == "warehouse_db"
     assert acct_by_tier.metaData.outputNamespace == "warehouse_db"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end compile invariants:
+#   (1) no compiled thriftjson contains the internal namespace placeholder
+#       (`OUTPUT_NAMESPACE_PLACEHOLDER`) — every occurrence must be resolved
+#       to a literal namespace by the compile pass.
+#   (2) compile fails fast when a config has no outputNamespace and no team default.
+# ---------------------------------------------------------------------------
+
+
+_TEAMS_PY = dedent(
+    """
+    from ai.chronon.types import ConfigProperties, Team
+
+    _DEFAULT_CONF = ConfigProperties(common={"spark.chronon.partition.column": "ds"})
+
+    default = Team(outputNamespace="default_ns", conf=_DEFAULT_CONF)
+    sample_team = Team(outputNamespace="sample_ns", conf=_DEFAULT_CONF)
+    """
+).strip()
+
+
+def _write(path, contents):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents)
+
+
+def _init_pkg(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "__init__.py").write_text("")
+
+
+def _scaffold_repo(tmp_path, teams_py_body=_TEAMS_PY):
+    """Scaffold the full set of user-authoring conf subdirs so compile discovery
+    works regardless of which conf types a given test actually writes. Derives
+    the folder list from the canonical `CONFIG_INFOS` registry so adding a new
+    conf type to chronon doesn't silently skip it here."""
+    (tmp_path / "teams.py").write_text(teams_py_body)
+    for folder in user_authoring_folders():
+        _init_pkg(tmp_path / folder)
+        _init_pkg(tmp_path / folder / "sample_team")
+    return tmp_path
+
+
+def _run_compile(tmp_path, monkeypatch, ignore_python_errors=True):
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    # The compile loop imports user modules by name; drop stale caches so repeated
+    # tests don't pick up a previous tmp repo's files. Include every user-authoring
+    # conf folder plus `teams` so a new conf type never silently bypasses the reset.
+    prefixes_to_reset = set(user_authoring_folders()) | {"teams"}
+    for name in list(sys.modules):
+        if name.split(".")[0] in prefixes_to_reset:
+            del sys.modules[name]
+    return __compile(chronon_root=str(tmp_path), ignore_python_errors=ignore_python_errors)
+
+
+def _assert_no_namespace_placeholder_in_compiled(compiled_dir):
+    violations = []
+    for root, _, files in os.walk(compiled_dir):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, compiled_dir)
+            if OUTPUT_NAMESPACE_PLACEHOLDER in open(full).read():
+                violations.append(f"{rel}: found {OUTPUT_NAMESPACE_PLACEHOLDER!r} in compiled output")
+    assert not violations, "\n".join(violations)
+
+
+def test_compile_never_leaves_namespace_placeholder_in_thriftjson(tmp_path, monkeypatch):
+    """Regression guard: compiled thriftjson must never contain the internal
+    `OUTPUT_NAMESPACE_PLACEHOLDER` token. The token is emitted by `utils.output_table_name`
+    when `.table` is accessed at authoring time before namespace propagation; the compile
+    pass must substitute every occurrence before the Thrift is serialized."""
+    _scaffold_repo(tmp_path)
+    _write(
+        tmp_path / "group_bys" / "sample_team" / "gb_ok.py",
+        dedent(
+            """
+            from ai.chronon.types import Aggregation, EventSource, GroupBy, Operation, Query, selects
+
+            v1 = GroupBy(
+                sources=[
+                    EventSource(
+                        table="external.events",
+                        query=Query(
+                            selects=selects(event="event_expr", group_by_subject="user_id"),
+                            time_column="ts",
+                        ),
+                    )
+                ],
+                keys=["group_by_subject"],
+                aggregations=[Aggregation(input_column="event", operation=Operation.SUM, windows=["1d"])],
+            )
+            """
+        ).strip(),
+    )
+
+    _run_compile(tmp_path, monkeypatch)
+    _assert_no_namespace_placeholder_in_compiled(tmp_path / "compiled")
+
+
+def test_compile_fails_when_config_has_no_output_namespace(tmp_path, monkeypatch):
+    """If a config has no outputNamespace and the team has no default, compile must fail."""
+    teams_py = dedent(
+        """
+        from ai.chronon.types import ConfigProperties, Team
+        _CONF = ConfigProperties(common={"spark.chronon.partition.column": "ds"})
+        default = Team(conf=_CONF)
+        sample_team = Team(conf=_CONF)
+        """
+    ).strip()
+    _scaffold_repo(tmp_path, teams_py_body=teams_py)
+    _write(
+        tmp_path / "group_bys" / "sample_team" / "gb_no_ns.py",
+        dedent(
+            """
+            from ai.chronon.types import Aggregation, EventSource, GroupBy, Operation, Query, selects
+
+            v1 = GroupBy(
+                sources=[
+                    EventSource(
+                        table="external.events",
+                        query=Query(
+                            selects=selects(event="event_expr", group_by_subject="user_id"),
+                            time_column="ts",
+                        ),
+                    )
+                ],
+                keys=["group_by_subject"],
+                aggregations=[Aggregation(input_column="event", operation=Operation.SUM, windows=["1d"])],
+            )
+            """
+        ).strip(),
+    )
+
+    _, has_errors, _ = _run_compile(tmp_path, monkeypatch, ignore_python_errors=True)
+    assert has_errors, "Expected compile to surface an error for missing outputNamespace"
+    compiled_path = tmp_path / "compiled" / "group_bys" / "sample_team" / "gb_no_ns.v1"
+    assert not compiled_path.exists()

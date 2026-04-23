@@ -90,28 +90,6 @@ def test_group_by_table_names(repo, materialized_group_by, table_name):
     assert _get_output_table_name(gb, True) == table_name
 
 
-@pytest.mark.parametrize(
-    "materialized_join,table_name",
-    [
-        (
-            "sample_chaining_join.v1",
-            "chronon_db.sample_team_sample_chaining_join_v1_sample_team_chaining_group_by_chaining_group_by_v1",
-        ),
-        (
-            "sample_join.v1",
-            "sample_namespace.sample_team_sample_join_v1_sample_team_sample_group_by_v1",
-        ),
-    ],
-)
-def test_join_part_table_names(repo, materialized_join, table_name):
-    join = file2thrift(
-        os.path.join(repo, "production/joins/sample_team", materialized_join), api.Join
-    )
-    assert (
-        utils.join_part_output_table_name(join, join.joinParts[0], True) == table_name
-    )
-
-
 def test_compose():
     computed = utils.compose(
         "user_id_approx_distinct_count_by_query",

@@ -37,6 +37,7 @@ object SnowflakeConnector {
       "sfDatabase" -> require("db", "Database"),
       "sfSchema" -> require("schema", "Schema"),
       "sfWarehouse" -> require("warehouse", "Warehouse"),
+      "treat_decimal_as_long" -> "true",
       "tracing" -> "all"
     )
   }

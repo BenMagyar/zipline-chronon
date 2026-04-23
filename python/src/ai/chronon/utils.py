@@ -267,7 +267,8 @@ def _get_team_from_caller(stack_depth=2):
 
 
 def _ensure_name_and_get_output_table(obj, cls, mod_prefix, full_name=False):
-    """Set name via GC if missing, then return output table name."""
+    """Set name via GC if missing, then return the output table name. Used by `.table`
+    property accessors on GroupBy, Join, StagingQuery, and ModelTransforms."""
     if not obj.metaData.name:
         __set_name(obj, cls, mod_prefix)
     return output_table_name(obj, full_name)
@@ -283,14 +284,26 @@ def sanitize(name):
     return None
 
 
+# Internal compile-time placeholder emitted by `output_table_name` when `outputNamespace`
+# isn't populated yet (i.e., during Python authoring time, before the compile pass runs
+# `_propagate_namespace`). The compile pass walks every string field and substitutes this
+# token using each object's own post-propagation namespace — so consumers that capture a
+# producer's `.table` name at import time still land on the correct fully-qualified name
+# in the compiled Thrift. Purely internal plumbing; users should never type it themselves.
+#
+# The token shape is deliberately alphanumeric+underscore so `utils.sanitize` (used by
+# `airflow_helpers.create_airflow_dependency` when building the `name` field from a table)
+# passes it through unchanged. A `{{ db }}`-style token would be mangled to `____db____`
+# by sanitize and become unfindable at compile-time substitution.
+OUTPUT_NAMESPACE_PLACEHOLDER = "_chronon_namespace_placeholder_"
+
+
 def output_table_name(obj, full_name: bool):
     table_name = sanitize(obj.metaData.name)
-    db = obj.metaData.outputNamespace
-    db = db or "{{ db }}"
-    if full_name:
-        return db + "." + table_name
-    else:
+    if not full_name:
         return table_name
+    db = obj.metaData.outputNamespace or OUTPUT_NAMESPACE_PLACEHOLDER
+    return db + "." + table_name
 
 
 def join_part_name(jp):
@@ -302,29 +315,6 @@ def join_part_name(jp):
         [
             component
             for component in [jp.prefix, sanitize(jp.groupBy.metaData.name)]
-            if component is not None
-        ]
-    )
-
-
-def join_part_output_table_name(join, jp, full_name: bool = False):
-    """
-    From api.Extensions.scala
-
-    Join Part output table name.
-    To be synced with Scala API.
-    def partOutputTable(jp: JoinPart): String = (Seq(join.metaData.outputTable) ++ Option(jp.prefix) :+
-      jp.groupBy.metaData.cleanName).mkString("_")
-    """
-    if not join.metaData.name and isinstance(join, api.Join):
-        __set_name(join, api.Join, "joins")
-    return "_".join(
-        [
-            component
-            for component in [
-                output_table_name(join, full_name),
-                join_part_name(jp),
-            ]
             if component is not None
         ]
     )

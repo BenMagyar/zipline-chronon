@@ -196,6 +196,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                       jobProperties: Map[String, String],
                       files: List[String],
                       labels: Map[String, String],
+                      envVars: Map[String, String],
                       rawArgs: String*): String = {
     val args = JobSubmitter.getApplicationArgs(
       jobType = jobType,
@@ -212,10 +213,12 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
       .map(_.split(",").map(_.trim).filter(_.nonEmpty))
       .getOrElse(Array.empty)
 
+    val effectiveJobProperties = jobProperties ++ envVarsToSparkProperties(envVars)
+
     val jobBuilder = jobType match {
       case TypeSparkJob =>
         val jarUris = Array(jarUri) ++ additionalJars
-        buildSparkJob(mainClass, jarUris, files, jobProperties, args: _*)
+        buildSparkJob(mainClass, jarUris, files, effectiveJobProperties, args: _*)
       case TypeFlinkJob =>
         val mainJarUri =
           submissionProperties.getOrElse(FlinkMainJarURI,
@@ -233,7 +236,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                       flinkCheckpointPath,
                       maybeSavepointUri,
                       maybeFlinkJarsBasePath,
-                      jobProperties,
+                      effectiveJobProperties,
                       (args :+ "--parent-job-id" :+ jobId): _*)
     }
 
@@ -441,7 +444,8 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
       jobProperties = maybeConf.getOrElse(JobSubmitter.getModeConfigProperties(args).getOrElse(Map.empty)),
       files = DataprocSubmitter.getDataprocFilesArgs(args),
       labels = labels,
-      args: _*
+      envVars = Map.empty,
+      rawArgs = args: _*
     )
     logger.info("Dataproc submitter job id: " + jobId)
     logger.info(

@@ -51,7 +51,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       jobProperties = expectedJobProperties,
       files = expectedFiles,
       labels = Map.empty,
-      expectedApplicationArgs: _*
+      envVars = Map.empty,
+      args = expectedApplicationArgs: _*
     )
     assertEquals(submittedStepId, s"$clusterId:$stepId")
 
@@ -336,7 +337,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       ),
       jobProperties = Map.empty,
       files = List.empty,
-      labels = Map.empty
+      labels = Map.empty,
+      envVars = Map.empty
     )
 
     jobId shouldBe "flink:zipline-flink:flink-abc123"
@@ -371,7 +373,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       ),
       files = List.empty,
       labels = Map.empty,
-      "arg1"
+      envVars = Map.empty,
+      args = "arg1"
     )
 
     val actualArgs = requestCaptor.getValue.steps().get(0).hadoopJarStep().args().toScala.mkString(" ")
@@ -402,7 +405,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         jobProperties = Map.empty,
         files = List.empty,
         labels = Map.empty,
-        "arg1"
+        envVars = Map.empty,
+        args = "arg1"
       )
     }
   }
@@ -571,14 +575,17 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       ),
       jobProperties = Map.empty,
       files = List("s3://zipline-warehouse-canary/purchases.v1"),
-      Map.empty,
-      "group-by-backfill",
-      "--conf-path",
-      "/mnt/zipline/purchases.v1",
-      "--end-date",
-      "2025-02-26",
-      "--conf-type",
-      "group_bys",
+      labels = Map.empty,
+      envVars = Map.empty,
+      args = Seq(
+        "group-by-backfill",
+        "--conf-path",
+        "/mnt/zipline/purchases.v1",
+        "--end-date",
+        "2025-02-26",
+        "--conf-type",
+        "group_bys"
+      ): _*
     )
     println("EMR job id: " + jobId)
     0

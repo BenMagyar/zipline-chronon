@@ -57,6 +57,17 @@ class EmrServerlessSubmitter(
                                       })
     }
 
+  // EMR Serverless-specific env var expansion. Unlike YARN/K8s setups, driver env vars
+  // must use spark.emr-serverless.driverEnv.<KEY> — see
+  // https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/jobs-spark.html
+  override def envVarsToSparkProperties(env: Map[String, String]): Map[String, String] =
+    env.flatMap { case (key, value) =>
+      Seq(
+        s"spark.emr-serverless.driverEnv.$key" -> value,
+        s"spark.executorEnv.$key" -> value
+      )
+    }
+
   private lazy val resolvedStudioId: Option[String] =
     emrStudioId.orElse(EmrServerlessSubmitter.resolveEmrStudioId(awsRegion))
 
@@ -97,6 +108,7 @@ class EmrServerlessSubmitter(
       jobProperties: Map[String, String],
       files: List[String],
       labels: Map[String, String],
+      envVars: Map[String, String],
       args: String*
   ): String = {
     val userArgs = JobSubmitter.getApplicationArgs(jobType, args.toArray)
@@ -138,6 +150,9 @@ class EmrServerlessSubmitter(
             flinkCheckpointUri = flinkCheckpointPath,
             maybeSavepointUri = maybeSavepointUri,
             maybeFlinkJarsUri = submissionProperties.get(FlinkJarsUri),
+            // Don't merge Spark-prefixed env properties into Flink jobProperties — the
+            // `spark.*Env.*` shape isn't what Flink reads and the K8sFlinkSubmitter
+            // strips them anyway. Flink env var injection lives on the submitter side.
             jobProperties = jobProperties,
             args = userArgs,
             serviceAccount = serviceAccount,
@@ -146,13 +161,14 @@ class EmrServerlessSubmitter(
         s"flink:$namespace:$deploymentName"
 
       case TypeSparkJob =>
-        submitSparkJob(submissionProperties, jobProperties, files, labels, args: _*)
+        submitSparkJob(submissionProperties, jobProperties, envVars, files, labels, userArgs: _*)
     }
   }
 
   private def submitSparkJob(
       submissionProperties: Map[String, String],
       jobProperties: Map[String, String],
+      envVars: Map[String, String],
       files: List[String],
       labels: Map[String, String],
       args: String*
@@ -169,7 +185,9 @@ class EmrServerlessSubmitter(
     // EMR Serverless caps properties per Configuration at 100. Anything beyond
     // that spills into --conf flags on sparkSubmitParameters (same effect on SparkConf,
     // without the console-side property-count limit).
-    val resolvedProps = resolveEnvVars(jobProperties)
+    // envVars get expanded into EMR-Serverless-specific driver/executor Spark props here
+    // (see envVarsToSparkProperties) and merged with caller-provided jobProperties.
+    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars))
     val (inlineProps, overflowProps) = EmrServerlessSubmitter.splitForConfigCap(resolvedProps)
     if (overflowProps.nonEmpty) {
       logger.warn(
@@ -723,7 +741,8 @@ object EmrServerlessSubmitter {
       jobProperties = modeConfigProperties.getOrElse(Map.empty),
       files = files.toList,
       labels = Map.empty,
-      finalArgs: _*
+      envVars = Map.empty,
+      args = finalArgs: _*
     )
 
     val outputId = jobType match {
