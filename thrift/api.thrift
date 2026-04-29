@@ -377,6 +377,11 @@ struct GroupBy {
     5: optional Accuracy accuracy
     // support for offline only for now
     7: optional list<Derivation> derivations
+    // SQL expressions for canonicalizing key columns before storing or looking up GroupBy rows.
+    // Keys not present in this map are treated as identity transforms.
+    8: optional map<string, string> keyTransforms
+    // SQL setup statements needed by keyTransforms/derivations, colocated with the GroupBy.
+    9: optional list<string> setups
 }
 
 struct JoinPart {
