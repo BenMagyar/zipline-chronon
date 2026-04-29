@@ -148,7 +148,7 @@ object JoinUtils {
                                      keys: Seq[String],
                                      joinPart: api.JoinPart,
                                      joinType: String = "left"): DataFrame = {
-    val transformedKeyJoin = new TransformedKeyJoin(joinPart, leftDf.columns.toSet)
+    val transformedKeyJoin = new TransformedKeyJoin(joinPart, leftDf.columns.toSet ++ rightDf.columns.toSet)
     if (transformedKeyJoin.isEmpty) coalescedJoin(leftDf, rightDf, keys, joinType)
     else {
       coalescedJoin(transformedKeyJoin.prepareLeft(leftDf),

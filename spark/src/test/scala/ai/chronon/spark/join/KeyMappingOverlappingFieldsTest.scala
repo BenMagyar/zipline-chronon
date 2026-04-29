@@ -47,6 +47,29 @@ class KeyMappingOverlappingFieldsTest extends BaseJoinTest {
     assertEquals("matched", row.getAs[String]("value"))
   }
 
+  it should "preserve right columns that conflict with transformed key internals" in {
+    import spark.implicits._
+
+    val groupBy = Builders.GroupBy(
+      keyColumns = Seq("user"),
+      keyTransforms = Map("user" -> "lower(user)"),
+      metaData = Builders.MetaData(name = "unit_test.key_overlap.transformed_user_names", team = "chronon")
+    )
+    val joinPart = Builders.JoinPart(groupBy = groupBy, keyMapping = Map("user_id" -> "user"))
+
+    val leftDf = Seq("Alice").toDF("user_id")
+    val rightDf = Seq(("alice", "right_key_user_id", "right_input_user", "matched"))
+      .toDF("user_id", "key_user_id", "input_user", "value")
+
+    val joinedDf = JoinUtils.coalescedJoinWithKeyTransforms(leftDf, rightDf, Seq("user_id"), joinPart)
+    val row = joinedDf.select("user_id", "key_user_id", "input_user", "value").collect().head
+
+    assertEquals("Alice", row.getAs[String]("user_id"))
+    assertEquals("right_key_user_id", row.getAs[String]("key_user_id"))
+    assertEquals("right_input_user", row.getAs[String]("input_user"))
+    assertEquals("matched", row.getAs[String]("value"))
+  }
+
   it should "testKeyMappingOverlappingFields" in {
     // test the scenario when a key_mapping is a -> b, (right key b is mapped to left key a) and
     // a happens to be another field in the same group by
