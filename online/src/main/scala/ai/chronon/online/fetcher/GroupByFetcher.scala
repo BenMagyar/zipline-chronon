@@ -55,14 +55,15 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       var batchKeyBytes: Array[Byte] = null
       var streamingKeyBytes: Array[Byte] = null
+      val transformedKeys = groupByServingInfo.keyTransformFunc(request.keys)
 
       try {
         // The formats of key bytes for batch requests and key bytes for streaming requests may differ based
         // on the KVStore implementation, so we encode each distinctly.
-        batchKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+        batchKeyBytes = fetchContext.kvStore.createKeyBytes(transformedKeys,
                                                             groupByServingInfo,
                                                             groupByServingInfo.groupByOps.batchDataset)
-        streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+        streamingKeyBytes = fetchContext.kvStore.createKeyBytes(transformedKeys,
                                                                 groupByServingInfo,
                                                                 groupByServingInfo.groupByOps.streamingDataset)
 
@@ -71,7 +72,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
         // TODO: only gets hit in cli path - make this code path just use avro schema to decode keys directly in cli
         // TODO: Remove this code block
         case ex: Exception =>
-          val castedKeys = groupByServingInfo.keyChrononSchema.cast(request.keys)
+          val castedKeys = groupByServingInfo.keyChrononSchema.cast(transformedKeys)
 
           try {
             batchKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
@@ -120,7 +121,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       }
 
-      val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
+      val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(transformedKeys))
       LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)
 
     }

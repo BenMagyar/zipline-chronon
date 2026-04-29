@@ -24,6 +24,7 @@ import ai.chronon.online.Extensions.ChrononStructTypeOps
 import ai.chronon.online._
 import ai.chronon.online.serde._
 import ai.chronon.spark.GenericRowHandler
+import ai.chronon.spark.JoinUtils
 import com.google.gson.Gson
 import org.apache.spark.sql._
 import org.apache.spark.sql.streaming.DataStreamWriter
@@ -142,8 +143,9 @@ class GroupBy(inputStream: DataFrame,
 
     des.createOrReplaceTempView(streamingTable)
 
-    Option(groupByConf.setups).foreach(_.foreach(session.sql))
-    val selectedDf = session.sql(streamingQuery)
+    groupByConf.allSetups.foreach(session.sql)
+    val selectedRawDf = session.sql(streamingQuery)
+    val selectedDf = JoinUtils.applyKeyTransforms(selectedRawDf, groupByConf)
     assert(selectedDf.schema.fieldNames.contains(Constants.TimeColumn),
            s"time column ${Constants.TimeColumn} must be included in the selects")
     if (groupByConf.dataModel == api.DataModel.ENTITIES) {

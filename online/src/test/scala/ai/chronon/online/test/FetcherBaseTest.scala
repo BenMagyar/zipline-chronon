@@ -17,7 +17,21 @@
 package ai.chronon.online.test
 
 import ai.chronon.aggregator.windowing.FinalBatchIr
-import ai.chronon.api.{MetaData, TimeUnit, Window}
+import ai.chronon.api.{
+  Accuracy,
+  Builders,
+  DoubleType,
+  GroupByServingInfo,
+  IntType,
+  LongType,
+  MetaData,
+  Operation,
+  StringType,
+  StructField,
+  StructType,
+  TimeUnit,
+  Window
+}
 import ai.chronon.api.Extensions.{GroupByOps, WindowOps}
 import ai.chronon.online.fetcher.Fetcher.ColumnSpec
 import ai.chronon.online.fetcher.Fetcher.Request
@@ -38,7 +52,9 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 import ai.chronon.online.metrics.TTLCache
+import ai.chronon.online.serde.AvroConversions
 
+import scala.collection.mutable
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -70,6 +86,68 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
     metadataStore = spy[fetcher.MetadataStore](new MetadataStore(fetchContext))
     joinPartFetcher = spy[fetcher.JoinPartFetcher](new fetcher.JoinPartFetcher(fetchContext, metadataStore))
     groupByFetcher = spy[fetcher.GroupByFetcher](new GroupByFetcher(fetchContext, metadataStore))
+  }
+
+  private def makeKeyTransformServingInfo(): GroupByServingInfoParsed = {
+    val groupBy = Builders.GroupBy(
+      sources = Seq(
+        Builders.Source.events(
+          table = "events.my_stream_raw",
+          topic = "events.my_stream",
+          query = Builders.Query(
+            selects = Map(
+              "id" -> "id",
+              "int_val" -> "int_val",
+              "double_val" -> "double_val"
+            ),
+            wheres = Seq.empty,
+            timeColumn = "ts",
+            startPartition = "20231106"
+          )
+        )
+      ),
+      keyColumns = Seq("id"),
+      keyTransforms = Map("id" -> "lower(id)"),
+      aggregations = Seq(
+        Builders.Aggregation(
+          operation = Operation.SUM,
+          inputColumn = "double_val",
+          windows = Seq(new Window(1, TimeUnit.DAYS))
+        )
+      ),
+      metaData = Builders.MetaData(name = "key_transform_test_group_by"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val groupByServingInfo = new GroupByServingInfo()
+    groupByServingInfo.setGroupBy(groupBy)
+
+    val inputSchema = StructType(
+      "Input",
+      Array(
+        StructField("id", StringType),
+        StructField("int_val", IntType),
+        StructField("double_val", DoubleType),
+        StructField("ts", LongType)
+      )
+    )
+    groupByServingInfo.setInputAvroSchema(AvroConversions.fromChrononSchema(inputSchema).toString(true))
+
+    val keySchema = StructType("Key", Array(StructField("id", StringType)))
+    groupByServingInfo.setKeyAvroSchema(AvroConversions.fromChrononSchema(keySchema).toString(true))
+
+    val selectedSchema = StructType(
+      "Selected",
+      Array(
+        StructField("id", StringType),
+        StructField("int_val", IntType),
+        StructField("double_val", DoubleType)
+      )
+    )
+    groupByServingInfo.setSelectedAvroSchema(AvroConversions.fromChrononSchema(selectedSchema).toString(true))
+
+    groupByServingInfo.setBatchEndDate("2023-11-06")
+    groupByServingInfo.setDateFormat("yyyy-MM-dd")
+    new GroupByServingInfoParsed(groupByServingInfo)
   }
 
   it should "fetch columns single query" in {
@@ -158,6 +236,43 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
     actualRequest shouldNot be(None)
     actualRequest.get.name shouldBe query.groupByName + "." + query.columnName
     actualRequest.get.keys shouldBe query.keyMapping.get
+  }
+
+  it should "transform groupBy keys before encoding kv requests" in {
+    val servingInfo = makeKeyTransformServingInfo()
+    val ttlCache = mock[TTLCache[String, Try[GroupByServingInfoParsed]]]
+    val encodedKeys = mutable.ArrayBuffer.empty[Map[String, AnyRef]]
+
+    doReturn(ttlCache).when(metadataStore).getGroupByServingInfo
+    doReturn(Success(servingInfo)).when(ttlCache).apply("key_transform_test_group_by")
+
+    doAnswer(new Answer[Array[Byte]] {
+      def answer(invocation: InvocationOnMock): Array[Byte] = {
+        val keys = invocation.getArgument(0).asInstanceOf[Map[String, AnyRef]]
+        val dataset = invocation.getArgument(2).asInstanceOf[String]
+        encodedKeys.append(keys)
+        s"$dataset:${keys("id")}".getBytes
+      }
+    }).when(kvStore).createKeyBytes(any(), any(), any())
+
+    doAnswer(new Answer[Future[Seq[KVStore.GetResponse]]] {
+      def answer(invocation: InvocationOnMock): Future[Seq[KVStore.GetResponse]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[KVStore.GetRequest]]
+        Future.successful(requests.map(request => KVStore.GetResponse(request, Success(Seq.empty))))
+      }
+    }).when(kvStore).multiGet(any())
+
+    val request = Request(
+      name = "key_transform_test_group_by",
+      keys = Map("id" -> "TEST_USER_123"),
+      atMillis = None,
+      context = None
+    )
+
+    Await.result(groupByFetcher.fetchGroupBys(Seq(request)), 1.second)
+
+    encodedKeys should not be empty
+    encodedKeys.foreach(_ shouldEqual Map("id" -> "test_user_123"))
   }
 
   // updateServingInfo() is called when the batch response is from the KV store.

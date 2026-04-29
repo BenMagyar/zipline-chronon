@@ -68,6 +68,24 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
   @transient lazy val keyChrononSchema: StructType =
     AvroConversions.toChrononSchema(keyCodec.schema).asInstanceOf[StructType]
 
+  @transient lazy val keyTransformFunc: Map[String, Any] => Map[String, AnyRef] = {
+    val transforms = groupBy.keyTransformsScala
+    if (transforms.isEmpty) { keys =>
+      keys.map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+    } else {
+      val expressions = keyChrononSchema.fields.map { field =>
+        field.name -> transforms.getOrElse(field.name, field.name)
+      }
+      val catalystUtil = new PooledCatalystUtil(expressions, keyChrononSchema, groupBy.allSetups)
+      keys =>
+        catalystUtil
+          .performSql(keys)
+          .headOption
+          .getOrElse(Map.empty[String, Any])
+          .map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+    }
+  }
+
   lazy val valueChrononSchema: StructType = {
     val valueFields = groupBy.aggregationInputs
       .flatMap(inp => selectedChrononSchema.fields.find(_.name == inp))
