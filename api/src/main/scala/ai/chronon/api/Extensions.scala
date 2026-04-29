@@ -579,15 +579,21 @@ object Extensions {
       if (validTopics.nonEmpty) Accuracy.TEMPORAL else Accuracy.SNAPSHOT
     }
 
-    def setups: Seq[String] = {
-      groupBy.sources
-        .iterator()
-        .toScala
+    def allSetups: Seq[String] = {
+      val sourceSetups = Option(groupBy.sources)
+        .map(_.toScala)
+        .getOrElse(Seq.empty)
         .map(_.query.setups)
         .flatMap(setupList => Option(setupList).map(_.iterator().toScala).getOrElse(Iterator.empty))
         .toSeq
-        .distinct
+      val groupBySetups = Option(groupBy.setups).map(_.toScala.toSeq).getOrElse(Seq.empty)
+      (groupBySetups ++ sourceSetups).distinct
     }
+
+    def keyTransformsScala: Map[String, String] =
+      Option(groupBy.keyTransforms).map(_.toScala.toMap).getOrElse(Map.empty)
+
+    def hasKeyTransforms: Boolean = keyTransformsScala.nonEmpty
 
     def copyForVersioningComparison: GroupBy = {
       val newGroupBy = groupBy.deepCopy()
@@ -1141,7 +1147,7 @@ object Extensions {
 
     def setups: Seq[String] =
       (join.left.query.setupsSeq ++ join.joinParts.toScala
-        .flatMap(_.groupBy.setups)).distinct
+        .flatMap(_.groupBy.allSetups)).distinct
 
     lazy val joinPartOps: Seq[JoinPartOps] =
       Option(join.joinParts)

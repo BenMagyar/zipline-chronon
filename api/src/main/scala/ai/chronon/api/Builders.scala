@@ -144,7 +144,9 @@ object Builders {
         keyColumns: Seq[String] = null,
         aggregations: Seq[Aggregation] = null,
         accuracy: Accuracy = null,
-        derivations: Seq[Derivation] = null
+        derivations: Seq[Derivation] = null,
+        keyTransforms: Map[String, String] = null,
+        setups: Seq[String] = null
     ): GroupBy = {
       val result = new GroupBy()
       result.setMetaData(metaData)
@@ -158,6 +160,10 @@ object Builders {
         result.setAccuracy(accuracy)
       if (derivations != null)
         result.setDerivations(derivations.toJava)
+      if (keyTransforms != null)
+        result.setKeyTransforms(keyTransforms.toJava)
+      if (setups != null)
+        result.setSetups(setups.toJava)
       result
     }
   }
