@@ -17,7 +17,7 @@ import json
 import logging
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import ai.chronon.utils as utils
 import ai.chronon.windows as window_utils
@@ -479,10 +479,11 @@ def get_output_col_names(aggregation):
 
 def GroupBy(
     sources: Union[Sequence[utils.ANY_SOURCE_TYPE], utils.ANY_SOURCE_TYPE],
-    keys: List[str],
+    keys: Union[List[str], Mapping[str, Optional[str]]],
     aggregations: Optional[List[ttypes.Aggregation]],
     version: Optional[int] = None,
     derivations: List[ttypes.Derivation] = None,
+    setups: List[str] = None,
     accuracy: ttypes.Accuracy = None,
     output_namespace: str = None,
     table_properties: Dict[str, str] = None,
@@ -529,8 +530,9 @@ def GroupBy(
     :type sources: List of sources or a single source
     :param keys:
         List of primary keys that defines the data that needs to be collected in the result table. Similar to the
-        GroupBy in the SQL context.
-    :type keys: List[String]
+        GroupBy in the SQL context. Can also be a dict of output key name to SQL expression for canonicalizing the
+        stored/lookup key. Dict values of None or the same key name are treated as identity transforms.
+    :type keys: Union[List[String], Dict[String, Optional[String]]]
     :param aggregations:
         List of aggregations that needs to be computed for the data following the grouping defined by the keys::
 
@@ -610,6 +612,10 @@ def GroupBy(
         Derivation allows arbitrary SQL select clauses to be computed using columns from the output of group by backfill
         output schema. It is supported for offline computations for now.
     :type derivations: List[gen_thrift.api.ttypes.Drivation]
+    :param setups:
+        SQL setup statements colocated with the GroupBy. These are available to key transforms and other GroupBy SQL
+        expressions.
+    :type setups: List[str]
     :param kwargs:
         Additional properties that would be passed to run.py if specified under additional_args property.
         And provides an option to pass custom values to the processing logic.
@@ -642,6 +648,28 @@ def GroupBy(
     assert version is None or isinstance(version, int), (
         f"Version must be an integer or None, but found {type(version).__name__}"
     )
+
+    # Normalize the user-facing keys API into the engine-facing representation.
+    #
+    # The Python API allows:
+    #   keys=["user_id", "query"]
+    #   keys={"user_id": None, "query": "stem(lower(query))"}
+    #
+    # The engine still needs keyColumns to remain an ordered list for compatibility
+    # across thrift/Scala/Java/serving code. Transform expressions are therefore
+    # stored separately as a sparse map keyed by the same output key names. Missing
+    # entries, None values, and identity expressions all mean "use the key as-is".
+    key_transforms = None
+    if isinstance(keys, Mapping):
+        key_items = list(keys.items())
+        key_transforms = {
+            key: expr
+            for key, expr in key_items
+            if expr is not None and expr != key
+        }
+        keys = [key for key, _ in key_items]
+    else:
+        keys = list(keys)
 
     agg_inputs = []
     if aggregations is not None:
@@ -731,6 +759,8 @@ def GroupBy(
         metaData=metadata,
         accuracy=accuracy,
         derivations=derivations,
+        keyTransforms=key_transforms if key_transforms else None,
+        setups=setups,
     )
     validate_group_by(group_by)
 
