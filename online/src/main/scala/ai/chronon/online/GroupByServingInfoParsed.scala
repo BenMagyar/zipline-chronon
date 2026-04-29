@@ -71,18 +71,22 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
   @transient lazy val keyTransformFunc: Map[String, Any] => Map[String, AnyRef] = {
     val transforms = groupBy.keyTransformsScala
     if (transforms.isEmpty) { keys =>
-      keys.map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+      Option(keys).map(_.map { case (key, value) => key -> value.asInstanceOf[AnyRef] }).orNull
     } else {
       val expressions = keyChrononSchema.fields.map { field =>
         field.name -> transforms.getOrElse(field.name, field.name)
       }
       val catalystUtil = new PooledCatalystUtil(expressions, keyChrononSchema, groupBy.allSetups)
       keys =>
-        catalystUtil
-          .performSql(keys)
-          .headOption
-          .getOrElse(Map.empty[String, Any])
-          .map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+        Option(keys)
+          .map { keyMap =>
+            catalystUtil
+              .performSql(keyMap)
+              .headOption
+              .getOrElse(Map.empty[String, Any])
+              .map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+          }
+          .orNull
     }
   }
 
