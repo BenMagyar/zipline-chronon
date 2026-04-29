@@ -374,7 +374,7 @@ Mismatched columns among sources [1, {i + 2}], Difference: {column_diff}
 """
 
     # all keys should be present in the selected columns
-    unselected_keys = set(keys) - first_source_columns
+    unselected_keys = set(keys) - set(group_by.keyTransforms or {}) - first_source_columns
     assert not unselected_keys, f"""
 Keys {unselected_keys}, are unselected in source
 """
@@ -675,7 +675,8 @@ def GroupBy(
     if aggregations is not None:
         agg_inputs = [agg.inputColumn for agg in aggregations]
 
-    required_columns = keys + agg_inputs
+    transformed_keys = set(key_transforms or {})
+    required_columns = [key for key in keys if key not in transformed_keys] + agg_inputs
 
     def _sanitize_columns(src: ttypes.Source):
         source = deepcopy(src)
