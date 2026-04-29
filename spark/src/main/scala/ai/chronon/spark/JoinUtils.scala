@@ -27,7 +27,7 @@ import ai.chronon.spark.catalog.TableUtils
 import com.google.gson.Gson
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.expressions.UserDefinedFunction
-import org.apache.spark.sql.functions.{coalesce, col, udf}
+import org.apache.spark.sql.functions.{coalesce, col, expr, udf}
 import org.apache.spark.util.sketch.BloomFilter
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -106,6 +106,57 @@ object JoinUtils {
     }
 
     Some(result.translatePartitionSpec(effectiveLeftSpec, tableUtils.partitionSpec))
+  }
+
+  def applyKeyTransforms(df: DataFrame, groupBy: api.GroupBy): DataFrame = {
+    val transforms = groupBy.keyTransformsScala
+    if (transforms.isEmpty) {
+      df
+    } else {
+      val projections = df.columns.map { column =>
+        transforms.get(column) match {
+          case Some(transform) => expr(transform).as(column)
+          case None            => col(column)
+        }
+      }
+      df.select(projections: _*)
+    }
+  }
+
+  def transformedJoinBloomMap(leftDfWithRightKeys: DataFrame,
+                              joinPart: api.JoinPart,
+                              totalCount: Long,
+                              leftTable: String,
+                              partitionRange: PartitionRange): Option[util.Map[String, BloomFilter]] = {
+    if (!joinPart.groupBy.hasKeyTransforms) {
+      None
+    } else {
+      val transformedLeft = applyKeyTransforms(leftDfWithRightKeys, joinPart.groupBy)
+      Some(
+        joinPart.groupBy.keyColumns.toScala
+          .map { key =>
+            key -> transformedLeft.generateBloomFilter(key, totalCount, leftTable, partitionRange)
+          }
+          .toMap
+          .asJava
+      )
+    }
+  }
+
+  def coalescedJoinWithKeyTransforms(leftDf: DataFrame,
+                                     rightDf: DataFrame,
+                                     keys: Seq[String],
+                                     joinPart: api.JoinPart,
+                                     joinType: String = "left"): DataFrame = {
+    val transformedKeyJoin = new TransformedKeyJoin(joinPart, leftDf.columns.toSet)
+    if (transformedKeyJoin.isEmpty) coalescedJoin(leftDf, rightDf, keys, joinType)
+    else {
+      coalescedJoin(transformedKeyJoin.prepareLeft(leftDf),
+                    transformedKeyJoin.prepareRight(rightDf),
+                    transformedKeyJoin.joinKeys(keys),
+                    joinType)
+        .drop(transformedKeyJoin.columnsToDropAfterJoin: _*)
+    }
   }
 
   /** *

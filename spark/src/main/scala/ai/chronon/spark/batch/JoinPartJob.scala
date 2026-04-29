@@ -63,12 +63,13 @@ class JoinPartJob(node: JoinPartNode,
           return None
         }
 
-        val runSmallMode = JoinUtils.runSmallMode(tableUtils, cachedLeftDf)
+        val runSmallMode = JoinUtils.runSmallMode(tableUtils, cachedLeftDf) && !joinPart.groupBy.hasKeyTransforms
 
         val leftWithStats = cachedLeftDf.withStats
 
         val joinLevelBloomMapOpt =
-          JoinUtils.genBloomFilterIfNeeded(joinPart, node.leftDataModel, dateRange, None)
+          if (joinPart.groupBy.hasKeyTransforms) None
+          else JoinUtils.genBloomFilterIfNeeded(joinPart, node.leftDataModel, dateRange, None)
 
         JoinPartJobContext(Option(leftWithStats),
                            joinLevelBloomMapOpt,
@@ -144,26 +145,6 @@ class JoinPartJob(node: JoinPartNode,
     val statsDf = leftDfWithStats.get
 
     logger.info(s"\nBackfill is required for ${joinPart.groupBy.metaData.name}")
-    val rightBloomMap = if (skipBloom) {
-      None
-    } else {
-      JoinUtils.genBloomFilterIfNeeded(joinPart, node.leftDataModel, dateRange, joinLevelBloomMapOpt)
-    }
-
-    val rightSkewFilter = JoinUtils.partSkewFilter(joinPart, skewKeys)
-
-    def genGroupBy(partitionRange: PartitionRange) =
-      GroupBy.from(joinPart.groupBy,
-                   partitionRange,
-                   tableUtils,
-                   computeDependency = true,
-                   rightBloomMap,
-                   rightSkewFilter,
-                   showDf = showDf)
-
-    // all lazy vals - so evaluated only when needed by each case.
-    lazy val partitionRangeGroupBy = genGroupBy(dateRange)
-
     lazy val unfilledPartitionRange = if (tableUtils.checkLeftTimeRange) {
       val timeRange = statsDf.timeRange
       logger.info(s"left unfilled time range checked to be: $timeRange")
@@ -214,6 +195,30 @@ class JoinPartJob(node: JoinPartNode,
       case c => renamedLeftRawDf.col(c)
     }.toList: _*)
 
+    lazy val transformedLeftDf = JoinUtils.applyKeyTransforms(renamedLeftDf, joinPart.groupBy)
+    lazy val rightBloomMap =
+      if (skipBloom) None
+      else if (joinPart.groupBy.hasKeyTransforms)
+        JoinUtils.transformedJoinBloomMap(renamedLeftDf,
+                                          joinPart,
+                                          statsDf.partitionCounts.values.sum,
+                                          leftTable,
+                                          unfilledPartitionRange)
+      else JoinUtils.genBloomFilterIfNeeded(joinPart, node.leftDataModel, dateRange, joinLevelBloomMapOpt)
+
+    val rightSkewFilter = JoinUtils.partSkewFilter(joinPart, skewKeys)
+
+    def genGroupBy(partitionRange: PartitionRange) =
+      GroupBy.from(joinPart.groupBy,
+                   partitionRange,
+                   tableUtils,
+                   computeDependency = true,
+                   rightBloomMap,
+                   rightSkewFilter,
+                   showDf = showDf)
+
+    lazy val partitionRangeGroupBy = genGroupBy(dateRange)
+
     val rightDf = (node.leftDataModel, joinPart.groupBy.dataModel, joinPart.groupBy.inferredAccuracy) match {
       case (ENTITIES, EVENTS, _)   => partitionRangeGroupBy.snapshotEvents(dateRange)
       case (ENTITIES, ENTITIES, _) => partitionRangeGroupBy.snapshotEntities
@@ -229,21 +234,22 @@ class JoinPartJob(node: JoinPartNode,
           val joinPartWithoutMapping = joinPart.deepCopy()
           joinPartWithoutMapping.unsetKeyMapping()
 
-          UnionJoin.computeJoinPart(renamedLeftDf,
+          UnionJoin.computeJoinPart(transformedLeftDf,
                                     joinPartWithoutMapping,
                                     unfilledPartitionRange,
                                     produceFinalJoinOutput = false)
 
         } else {
           // Use traditional temporalEvents approach
-          genGroupBy(unfilledPartitionRange).temporalEvents(renamedLeftDf, Some(toTimeRange(unfilledPartitionRange)))
+          genGroupBy(unfilledPartitionRange).temporalEvents(transformedLeftDf,
+                                                            Some(toTimeRange(unfilledPartitionRange)))
         }
 
       case (EVENTS, ENTITIES, Accuracy.SNAPSHOT) => genGroupBy(shiftedPartitionRange).snapshotEntities
 
       case (EVENTS, ENTITIES, Accuracy.TEMPORAL) =>
         // Snapshots and mutations are partitioned with ds holding data between <ds 00:00> and ds <23:59>.
-        genGroupBy(unfilledPartitionRange.shift(-1)).temporalEntities(renamedLeftDf)
+        genGroupBy(unfilledPartitionRange.shift(-1)).temporalEntities(transformedLeftDf)
     }
 
     val rightDfWithDerivations = if (joinPart.groupBy.hasDerivations) {

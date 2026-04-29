@@ -116,7 +116,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
                |${leftDf.schema.pretty}
                |Right Schema:
                |${joinableRightDf.schema.pretty}""".stripMargin)
-    val joinedDf = coalescedJoin(leftDf, joinableRightDf, keys)
+    val joinedDf = JoinUtils.coalescedJoinWithKeyTransforms(leftDf, joinableRightDf, keys, joinPart)
     logger.info(s"""Final Schema:
                |${joinedDf.schema.pretty}
                |""".stripMargin)

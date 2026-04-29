@@ -40,6 +40,69 @@ class GroupByTest extends SparkTestBase {
   val tableUtils: TableUtils = TableUtils(spark)
   implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
 
+  it should "aggregate over transformed key expressions" in {
+    import spark.implicits._
+
+    val df = Seq(
+      ("Alice", 10L, "2024-01-01", 1),
+      ("alice", 20L, "2024-01-01", 1),
+      ("Bob", 30L, "2024-01-01", 1)
+    ).toDF("user", Constants.TimeColumn, tableUtils.partitionColumn, "event_count")
+
+    val keyColumns = Seq("user")
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "event_count", Seq(WindowUtils.Unbounded)))
+    val groupByConf = Builders.GroupBy(
+      keyColumns = keyColumns,
+      keyTransforms = Map("user" -> "lower(user)"),
+      aggregations = aggregations,
+      metaData = Builders.MetaData(name = "unit_test.transformed_key_group_by", team = "chronon")
+    )
+
+    val transformedGroupBy = new GroupBy(aggregations, keyColumns, JoinUtils.applyKeyTransforms(df, groupByConf))
+    val results = transformedGroupBy.snapshotEntities
+      .select("user", "event_count_sum")
+      .collect()
+      .map(row => row.getAs[String]("user") -> row.getAs[Long]("event_count_sum"))
+      .toMap
+
+    assertEquals(2, results.size)
+    assertEquals(2L, results("alice"))
+    assertEquals(1L, results("bob"))
+  }
+
+  it should "aggregate over transformed key expressions using group by setups" in {
+    import spark.implicits._
+
+    val df = Seq(
+      ("Alice", 10L, "2024-01-01", 1),
+      ("alice", 20L, "2024-01-01", 1),
+      ("Bob", 30L, "2024-01-01", 1)
+    ).toDF("user", Constants.TimeColumn, tableUtils.partitionColumn, "event_count")
+
+    val keyColumns = Seq("user")
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "event_count", Seq(WindowUtils.Unbounded)))
+    val groupByConf = Builders.GroupBy(
+      keyColumns = keyColumns,
+      keyTransforms = Map("user" -> "temp_replace_group_by_key(user, 'A', 'a')"),
+      setups =
+        Seq("create temporary function temp_replace_group_by_key as 'org.apache.hadoop.hive.ql.udf.UDFRegExpReplace'"),
+      aggregations = aggregations,
+      metaData = Builders.MetaData(name = "unit_test.transformed_key_group_by_setup", team = "chronon")
+    )
+
+    groupByConf.allSetups.foreach(tableUtils.sql)
+    val transformedGroupBy = new GroupBy(aggregations, keyColumns, JoinUtils.applyKeyTransforms(df, groupByConf))
+    val results = transformedGroupBy.snapshotEntities
+      .select("user", "event_count_sum")
+      .collect()
+      .map(row => row.getAs[String]("user") -> row.getAs[Long]("event_count_sum"))
+      .toMap
+
+    assertEquals(2, results.size)
+    assertEquals(2L, results("alice"))
+    assertEquals(1L, results("Bob"))
+  }
+
   it should "snapshot entities" in {
     val schema = List(
       Column("user", StringType, 10),

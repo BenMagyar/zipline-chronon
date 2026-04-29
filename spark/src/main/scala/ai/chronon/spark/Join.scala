@@ -312,7 +312,7 @@ class Join(joinConf: api.Join,
           // So partTable needs to be defined BEFORE the runSmallMode logic below
           val partTable = planner.RelevantLeftForJoinPart.partTableName(joinConfCloned, joinPart)
 
-          val bloomFilterOpt = if (runSmallMode) {
+          val bloomFilterOpt = if (runSmallMode && !joinPart.groupBy.hasKeyTransforms) {
             // If left DF is small, hardcode the key filter into the joinPart's GroupBy's where clause.
             injectKeyFilter(leftDf, joinPart)
             None
@@ -321,7 +321,10 @@ class Join(joinConf: api.Join,
           }
 
           val runContext =
-            JoinPartJobContext(unfilledLeftDf, bloomFilterOpt, tableProps, runSmallMode)
+            JoinPartJobContext(unfilledLeftDf,
+                               bloomFilterOpt,
+                               tableProps,
+                               runSmallMode && !joinPart.groupBy.hasKeyTransforms)
 
           val skewKeys: Option[Map[String, Seq[String]]] = Option(joinConfCloned.skewKeys).map { jmap =>
             val scalaMap = jmap.toScala

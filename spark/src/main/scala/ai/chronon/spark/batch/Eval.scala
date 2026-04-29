@@ -172,7 +172,7 @@ class Eval(implicit tableUtils: TableUtils) {
     // If the source expression is invalid, set the failure and return early
     val groupBy =
       try {
-        groupByConf.setups.foreach(tableUtils.sql)
+        groupByConf.allSetups.foreach(tableUtils.sql)
         GroupBy.from(groupByConf, effectiveRange, tableUtils, computeDependency = false, finalize = true)
       } catch {
         case e: Throwable =>

@@ -219,7 +219,7 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
                    |${leftDf.schema.pretty}
                    |Right Schema:
                    |${joinableRightDf.schema.pretty}""".stripMargin)
-    val joinedDf = coalescedJoin(leftDf, joinableRightDf, keys)
+    val joinedDf = JoinUtils.coalescedJoinWithKeyTransforms(leftDf, joinableRightDf, keys, joinPart)
     logger.info(s"""Final Schema:
                    |${joinedDf.schema.pretty}
                    |""".stripMargin)

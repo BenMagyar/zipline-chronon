@@ -393,7 +393,7 @@ object GroupByUpload {
                                 jsonPercent: Int = 1,
                                 maybeContext: Option[Metrics.Context] = None): UploadResult = {
     implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
-    Option(groupByConf.setups).foreach(_.foreach(tableUtils.sql))
+    groupByConf.allSetups.foreach(tableUtils.sql)
     // add 1 day to the batch end time to reflect data [ds 00:00:00.000, ds + 1 00:00:00.000)
     val batchEndDate = partitionSpec.after(endDs)
     // for snapshot accuracy - we don't need to scan mutations

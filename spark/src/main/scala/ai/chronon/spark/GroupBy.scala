@@ -637,9 +637,11 @@ object GroupBy {
         "Please note that for the entities case, \"ts\" needs to be explicitly specified in the selects."
     )
 
+    val transformedInputDf = JoinUtils.applyKeyTransforms(inputDf, groupByConf)
+
     // at-least one of the keys should be present in the row.
     val nullFilterClause = groupByConf.keyColumns.toScala.map(key => s"($key IS NOT NULL)").mkString(" OR ")
-    inputDf.filter(nullFilterClause)
+    transformedInputDf.filter(nullFilterClause)
   }
 
   def from(groupByConfOld: api.GroupBy,
@@ -687,7 +689,8 @@ object GroupBy {
       }
       .getOrElse(inputDf)
 
-    val processedInputDf = bloomMapOpt.map { skewFilteredDf.filterBloom }.getOrElse { skewFilteredDf }
+    val transformedInputDf = JoinUtils.applyKeyTransforms(skewFilteredDf, groupByConf)
+    val processedInputDf = bloomMapOpt.map { transformedInputDf.filterBloom }.getOrElse { transformedInputDf }
 
     // at-least one of the keys should be present in the row.
     val nullFilterClause = groupByConf.keyColumns.toScala.map(key => s"($key IS NOT NULL)").mkString(" OR ")
@@ -719,8 +722,9 @@ object GroupBy {
             val columns1 = df1.schema.fields.map(_.name)
             df1.union(df2.selectExpr(columns1: _*))
           }
-          .selectExpr(mutationsColumnOrder: _*)
-        bloomMapOpt.map { mutationDf.filterBloom }.getOrElse { mutationDf }
+        val transformedMutationDf = JoinUtils.applyKeyTransforms(mutationDf, groupByConf)
+        val mutationDfWithColumns = transformedMutationDf.selectExpr(mutationsColumnOrder: _*)
+        bloomMapOpt.map { mutationDfWithColumns.filterBloom }.getOrElse { mutationDfWithColumns }
       } else null
 
       if (showDf && df != null) {
@@ -873,7 +877,7 @@ object GroupBy {
                       tableUtils: TableUtils,
                       stepDays: Option[Int] = None,
                       skipFirstHole: Boolean = true): Unit = {
-    Option(groupByConf.setups).foreach(_.foreach(tableUtils.sql))
+    groupByConf.allSetups.foreach(tableUtils.sql)
     val outputTable = groupByConf.metaData.outputTable
     val tableProps = Option(groupByConf.metaData.tableProperties)
       .map(_.toScala)
