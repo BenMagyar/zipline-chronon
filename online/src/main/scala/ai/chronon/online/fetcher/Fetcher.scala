@@ -196,7 +196,14 @@ class Fetcher(val kvStore: KVStore,
 
   def fetchJoin(requests: Seq[Request], joinConf: Option[api.Join] = None): Future[Seq[Response]] = {
     val ts = System.currentTimeMillis()
-    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf)
+    val joinCodecsByName: Map[String, Try[JoinCodec]] = joinConf match {
+      case Some(join) =>
+        val codecTry = Try(metadataStore.buildJoinCodec(join, refreshOnFail = true))
+        requests.iterator.map(_.name).toSeq.distinct.map(joinName => joinName -> codecTry).toMap
+      case None =>
+        requests.iterator.map(_.name).toSeq.distinct.map(joinName => joinName -> joinCodecCache(joinName)).toMap
+    }
+    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecsByName)
     val externalResponsesF = fetchExternal(requests)
     val combinedResponsesF =
       internalResponsesF.zip(externalResponsesF).map { case (internalResponses, externalResponses) =>
@@ -639,6 +646,8 @@ class Fetcher(val kvStore: KVStore,
           .onlineExternalParts // cheap since it is cached, valid since step-1
 
       parts.iterator().asScala.map { part =>
+        // Selected left-key derivation is currently scoped to internal GroupBy join parts. External parts retain the
+        // existing keyMapping behavior and require callers to provide any selected aliases used as external keys.
         val externalRequest = Try(part.applyMapping(joinRequest.keys)) match {
           case Success(mappedKeys)                     => Left(Request(part.source.metadata.name, mappedKeys))
           case Failure(exception: KeyMissingException) => Right(exception)

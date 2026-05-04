@@ -37,16 +37,68 @@ import scala.util.{Failure, Success, Try}
   * derive `query_normalized` inside the fetcher, and use the derived value only when building the GroupBy request.
   *
   * The helper keeps that flow local to Join fetching:
+  *   - `buildKeyMapping` is run while building the JoinCodec so SQL parsing, input-schema construction, and Catalyst
+  *     wrapper setup are cached with the Join metadata instead of repeated per request.
   *   - `requestKeyFields` reports the raw request keys needed to derive selected Join keys, plus the derived key aliases
   *     themselves so existing direct-key callers can still be logged against the Join key schema.
   *   - `valueInfoLeftKeys` reports only the raw request keys for selected Join keys, so fetchJoinSchema does not imply
   *     that callers must provide derived keys.
   *   - `missingRequestKeys` validates against those raw inputs, while still accepting a derived key if the caller
   *     provides it directly.
-  *   - `deriveLeftKeys` runs the Join left selects with the request keys, then combines derived and directly supplied
-  *     left keys before JoinPartFetcher maps them to right-side GroupBy keys.
+  *   - `KeyMapping.leftKeys` runs the cached Join left-select transform when needed, then combines derived and directly
+  *     supplied left keys before JoinPartFetcher maps them to right-side GroupBy keys.
   */
-private[fetcher] object JoinRequestKeys {
+private[online] object JoinRequestKeys {
+  case class KeyMapping(leftToRight: Map[String, String],
+                        requestKeyFields: Iterable[StructField],
+                        rawInputsByLeftKey: Map[String, Seq[String]],
+                        selectedLeftKeys: Seq[(String, String)],
+                        catalystUtil: Option[PooledCatalystUtil]) {
+    private val selectedExpressions = selectedLeftKeys.toMap
+
+    private def shouldDeriveLeftKey(request: Request, leftKey: String): Boolean =
+      selectedExpressions.contains(leftKey) &&
+        (!request.keys.contains(leftKey) || rawInputsByLeftKey.getOrElse(leftKey, Seq.empty).contains(leftKey))
+
+    def missingRequestKeys(request: Request): Seq[String] =
+      leftToRight.keys.toSeq.flatMap { leftKey =>
+        if (request.keys.contains(leftKey)) {
+          Seq.empty
+        } else {
+          rawInputsByLeftKey.get(leftKey).filter(_ => selectedExpressions.contains(leftKey)).getOrElse(Seq(leftKey))
+            .filterNot(request.keys.contains)
+        }
+      }.distinct
+
+    def leftKeys(request: Request): Map[String, AnyRef] = {
+      val directLeftKeys = leftToRight.keys.collect {
+        case leftKey if request.keys.contains(leftKey) && !shouldDeriveLeftKey(request, leftKey) =>
+          leftKey -> request.keys(leftKey)
+      }.toMap
+
+      val keysToDerive = selectedLeftKeys.filter { case (leftKey, _) => shouldDeriveLeftKey(request, leftKey) }
+      val derivedLeftKeys =
+        if (keysToDerive.isEmpty) {
+          Map.empty[String, Any]
+        } else {
+          val derivedValues = catalystUtil
+            .map(_.performSql(request.keys).headOption.getOrElse(Map.empty))
+            .getOrElse(Map.empty)
+          keysToDerive.map { case (leftKey, _) =>
+            leftKey -> derivedValues.getOrElse(leftKey, null)
+          }.toMap
+        }
+
+      (directLeftKeys ++ derivedLeftKeys).map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+    }
+  }
+
+  def partKey(joinPart: JoinPartOps): String =
+    Seq(
+      joinPart.groupBy.metaData.getName,
+      Option(joinPart.prefix).getOrElse(""),
+      joinPart.leftToRight.toSeq.sortBy(_._1).map { case (left, right) => s"$left=$right" }.mkString(",")
+    ).mkString("\u0000")
 
   private def leftSelects(join: Join): Map[String, String] =
     Option(join.left)
@@ -81,16 +133,17 @@ private[fetcher] object JoinRequestKeys {
       selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey))
     }.distinct
 
-  def requestKeyFields(join: Join,
-                       joinPart: JoinPartOps,
-                       servingInfo: GroupByServingInfoParsed): Iterable[StructField] = {
+  private def requestKeyFields(join: Join,
+                               joinPart: JoinPartOps,
+                               servingInfo: GroupByServingInfoParsed,
+                               rawInputsByLeftKey: Map[String, Seq[String]]): Iterable[StructField] = {
     val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
     val fieldsByRightKey = keySchema.fields.map(field => field.name -> field).toMap
     val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
 
     joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
       val fieldType = fieldsByRightKey(rightKey).fieldType
-      val requestKeys = selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey))
+      val requestKeys = rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
       requestKeys.foreach { requestKey =>
         if (!fieldsByRequestKey.contains(requestKey)) {
           fieldsByRequestKey.put(requestKey, StructField(requestKey, rawInputType(servingInfo, requestKey, fieldType)))
@@ -102,6 +155,23 @@ private[fetcher] object JoinRequestKeys {
     }
 
     fieldsByRequestKey.values
+  }
+
+  def buildKeyMapping(join: Join, joinPart: JoinPartOps, servingInfo: GroupByServingInfoParsed): KeyMapping = {
+    val selectedLeftKeys = joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
+      selectExpression(join, leftKey).map(leftKey -> _)
+    }
+    val rawInputsByLeftKey = joinPart.leftToRight.keys.map { leftKey =>
+      leftKey -> selectedLeftKeys.find(_._1 == leftKey).map { case (_, expression) =>
+        rawInputs(expression)
+      }.getOrElse(Seq(leftKey))
+    }.toMap
+    val keyFields = requestKeyFields(join, joinPart, servingInfo, rawInputsByLeftKey)
+    val catalystUtil =
+      if (selectedLeftKeys.isEmpty) None
+      else Some(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join)))
+
+    KeyMapping(joinPart.leftToRight, keyFields, rawInputsByLeftKey, selectedLeftKeys, catalystUtil)
   }
 
   def missingRequestKeys(request: Request, join: Join, joinPart: JoinPartOps): Seq[String] =
@@ -125,30 +195,7 @@ private[fetcher] object JoinRequestKeys {
                      join: Join,
                      joinPart: JoinPartOps,
                      servingInfo: GroupByServingInfoParsed): Map[String, AnyRef] = {
-    val directLeftKeys = joinPart.leftToRight.keys.collect {
-      case leftKey if request.keys.contains(leftKey) && !shouldDeriveLeftKey(request, join, leftKey) =>
-        leftKey -> request.keys(leftKey)
-    }.toMap
-
-    val selectedLeftKeys = joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
-      if (shouldDeriveLeftKey(request, join, leftKey)) selectExpression(join, leftKey).map(leftKey -> _) else None
-    }
-
-    val derivedLeftKeys =
-      if (selectedLeftKeys.isEmpty) {
-        Map.empty[String, Any]
-      } else {
-        val inputSchema = StructType("JoinRequest", requestKeyFields(join, joinPart, servingInfo).toArray)
-        val derivedValues = new PooledCatalystUtil(selectedLeftKeys, inputSchema, leftSetups(join))
-          .performSql(request.keys)
-          .headOption
-          .getOrElse(Map.empty)
-        selectedLeftKeys.map { case (leftKey, _) =>
-          leftKey -> derivedValues.getOrElse(leftKey, null)
-        }.toMap
-      }
-
-    (directLeftKeys ++ derivedLeftKeys).map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+    buildKeyMapping(join, joinPart, servingInfo).leftKeys(request)
   }
 }
 
@@ -180,7 +227,9 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
 
   // prioritize passed in joinOverrides over the ones in metadata store
   // used in stream-enrichment and in staging testing
-  def fetchJoins(requests: Seq[Request], joinConf: Option[Join] = None): Future[Seq[Response]] = {
+  def fetchJoins(requests: Seq[Request],
+                 joinConf: Option[Join] = None,
+                 joinCodecsByName: Map[String, Try[JoinCodec]] = Map.empty): Future[Seq[Response]] = {
     val startTimeMs = System.currentTimeMillis()
     // convert join requests to groupBy requests
     val joinDecomposed: Seq[(Request, Try[Seq[Either[PrefixedRequest, KeyMissingException]]])] =
@@ -207,18 +256,25 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           join.joinPartOps.map { part =>
             import ai.chronon.online.metrics
             val joinContextInner = metrics.Metrics.Context(joinContext.get, part)
-            val missingKeys = JoinRequestKeys.missingRequestKeys(request, join.join, part)
+            val keyMapping = joinCodecsByName
+              .get(request.name)
+              .flatMap(_.toOption)
+              .flatMap(_.joinPartKeyMappings.get(JoinRequestKeys.partKey(part)))
+            val missingKeys = keyMapping
+              .map(_.missingRequestKeys(request))
+              .getOrElse(JoinRequestKeys.missingRequestKeys(request, join.join, part))
 
             if (missingKeys.nonEmpty) {
               Right(KeyMissingException(part.fullPrefix, missingKeys.toSeq, request.keys))
             } else {
-              val leftKeys =
+              val leftKeys = keyMapping.map(_.leftKeys(request)).getOrElse {
                 if (JoinRequestKeys.needsDerivation(request, join.join, part)) {
                   val servingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName).get
                   JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo)
                 } else {
                   part.leftToRight.keys.map(leftKey => leftKey -> request.keys(leftKey)).toMap
                 }
+              }
               val rightKeys = part.leftToRight.map { case (leftKey, rightKey) => rightKey -> leftKeys(leftKey) }
               Left(
                 PrefixedRequest(
