@@ -336,8 +336,12 @@ object GroupByUpload {
     val inputSources = groupByConf.streamingSource.toSeq ++ groupByConf.sources.toScala
     if (inputSources.nonEmpty) {
       def inputSchemaFor(source: api.Source): types.StructType = {
-        val rootTable = source.rootTable
-        val query = source.rootQuery
+        val (rootTable, query) =
+          if (source.isSetModelTransforms) {
+            (source.getModelTransforms.metaData.outputTable, new api.Query())
+          } else {
+            (source.rootTable, source.rootQuery)
+          }
         val fullInputSchema = tableUtils.getSchemaFromTable(rootTable)
         val inputSchema: types.StructType =
           if (Option(query.selects).isEmpty) fullInputSchema
