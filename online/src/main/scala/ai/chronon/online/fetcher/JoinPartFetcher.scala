@@ -21,10 +21,136 @@ import ai.chronon.api._
 import ai.chronon.online._
 import ai.chronon.online.fetcher.Fetcher.{ColumnSpec, PrefixedRequest, Request, Response}
 import ai.chronon.online.fetcher.FetcherCache.BatchResponses
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.slf4j.{Logger, LoggerFactory}
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
+
+/** Translates a Join request's keys into the keys needed by each underlying GroupBy fetch.
+  *
+  * GroupBys are fetched by their source keys, but a Join can define left-side selects that derive those keys from the
+  * raw request. For example, a Join may receive `query`, select `query_normalized = lower(query)`, and then map
+  * `query_normalized` to a GroupBy key. In that case the online Join fetch path should accept `query` from callers,
+  * derive `query_normalized` inside the fetcher, and use the derived value only when building the GroupBy request.
+  *
+  * The helper keeps that flow local to Join fetching:
+  *   - `requestKeyFields` reports the raw request keys needed to derive selected Join keys, plus the derived key aliases
+  *     themselves so existing direct-key callers can still be logged against the Join key schema.
+  *   - `valueInfoLeftKeys` reports only the raw request keys for selected Join keys, so fetchJoinSchema does not imply
+  *     that callers must provide derived keys.
+  *   - `missingRequestKeys` validates against those raw inputs, while still accepting a derived key if the caller
+  *     provides it directly.
+  *   - `deriveLeftKeys` runs the Join left selects with the request keys, then combines derived and directly supplied
+  *     left keys before JoinPartFetcher maps them to right-side GroupBy keys.
+  */
+private[fetcher] object JoinRequestKeys {
+
+  private def leftSelects(join: Join): Map[String, String] =
+    Option(join.left)
+      .flatMap(source => Option(source.query))
+      .flatMap(query => Option(query.getQuerySelects))
+      .getOrElse(Map.empty)
+
+  private def leftSetups(join: Join): Seq[String] =
+    Option(join.left)
+      .flatMap(source => Option(source.query))
+      .map(_.setupsSeq)
+      .getOrElse(Seq.empty)
+
+  private def selectExpression(join: Join, leftKey: String): Option[String] =
+    leftSelects(join).get(leftKey).filter(_ != leftKey)
+
+  private[fetcher] def rawInputs(expression: String): Seq[String] =
+    CatalystSqlParser
+      .parseExpression(expression)
+      .collect { case attr: UnresolvedAttribute =>
+        attr.nameParts.head
+      }
+      .distinct
+
+  private def rawInputType(servingInfo: GroupByServingInfoParsed,
+                           requestKey: String,
+                           fallbackType: DataType): DataType =
+    Try(servingInfo.inputChrononSchema.typeOf(requestKey)).toOption.flatten.getOrElse(fallbackType)
+
+  def valueInfoLeftKeys(join: Join, joinPart: JoinPartOps): Iterable[String] =
+    joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
+      selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey))
+    }.distinct
+
+  def requestKeyFields(join: Join,
+                       joinPart: JoinPartOps,
+                       servingInfo: GroupByServingInfoParsed): Iterable[StructField] = {
+    val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
+    val fieldsByRightKey = keySchema.fields.map(field => field.name -> field).toMap
+    val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
+
+    joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
+      val fieldType = fieldsByRightKey(rightKey).fieldType
+      val requestKeys = selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey))
+      requestKeys.foreach { requestKey =>
+        if (!fieldsByRequestKey.contains(requestKey)) {
+          fieldsByRequestKey.put(requestKey, StructField(requestKey, rawInputType(servingInfo, requestKey, fieldType)))
+        }
+      }
+      if (!fieldsByRequestKey.contains(leftKey)) {
+        fieldsByRequestKey.put(leftKey, StructField(leftKey, fieldType))
+      }
+    }
+
+    fieldsByRequestKey.values
+  }
+
+  def missingRequestKeys(request: Request, join: Join, joinPart: JoinPartOps): Seq[String] =
+    joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
+      if (request.keys.contains(leftKey)) {
+        Seq.empty
+      } else {
+        selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey)).filterNot(request.keys.contains)
+      }
+    }.distinct
+
+  private def shouldDeriveLeftKey(request: Request, join: Join, leftKey: String): Boolean =
+    selectExpression(join, leftKey).exists { expression =>
+      !request.keys.contains(leftKey) || rawInputs(expression).contains(leftKey)
+    }
+
+  def needsDerivation(request: Request, join: Join, joinPart: JoinPartOps): Boolean =
+    joinPart.leftToRight.keys.exists(shouldDeriveLeftKey(request, join, _))
+
+  def deriveLeftKeys(request: Request,
+                     join: Join,
+                     joinPart: JoinPartOps,
+                     servingInfo: GroupByServingInfoParsed): Map[String, AnyRef] = {
+    val directLeftKeys = joinPart.leftToRight.keys.collect {
+      case leftKey if request.keys.contains(leftKey) && !shouldDeriveLeftKey(request, join, leftKey) =>
+        leftKey -> request.keys(leftKey)
+    }.toMap
+
+    val selectedLeftKeys = joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
+      if (shouldDeriveLeftKey(request, join, leftKey)) selectExpression(join, leftKey).map(leftKey -> _) else None
+    }
+
+    val derivedLeftKeys =
+      if (selectedLeftKeys.isEmpty) {
+        Map.empty[String, Any]
+      } else {
+        val inputSchema = StructType("JoinRequest", requestKeyFields(join, joinPart, servingInfo).toArray)
+        val derivedValues = new PooledCatalystUtil(selectedLeftKeys, inputSchema, leftSetups(join))
+          .performSql(request.keys)
+          .headOption
+          .getOrElse(Map.empty)
+        selectedLeftKeys.map { case (leftKey, _) =>
+          leftKey -> derivedValues.getOrElse(leftKey, null)
+        }.toMap
+      }
+
+    (directLeftKeys ++ derivedLeftKeys).map { case (key, value) => key -> value.asInstanceOf[AnyRef] }
+  }
+}
 
 class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) {
 
@@ -81,12 +207,19 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           join.joinPartOps.map { part =>
             import ai.chronon.online.metrics
             val joinContextInner = metrics.Metrics.Context(joinContext.get, part)
-            val missingKeys = part.leftToRight.keys.filterNot(request.keys.contains)
+            val missingKeys = JoinRequestKeys.missingRequestKeys(request, join.join, part)
 
             if (missingKeys.nonEmpty) {
               Right(KeyMissingException(part.fullPrefix, missingKeys.toSeq, request.keys))
             } else {
-              val rightKeys = part.leftToRight.map { case (leftKey, rightKey) => rightKey -> request.keys(leftKey) }
+              val leftKeys =
+                if (JoinRequestKeys.needsDerivation(request, join.join, part)) {
+                  val servingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName).get
+                  JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo)
+                } else {
+                  part.leftToRight.keys.map(leftKey => leftKey -> request.keys(leftKey)).toMap
+                }
+              val rightKeys = part.leftToRight.map { case (leftKey, rightKey) => rightKey -> leftKeys(leftKey) }
               Left(
                 PrefixedRequest(
                   part.columnPrefix,

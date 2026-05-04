@@ -219,13 +219,11 @@ class MetadataStore(fetchContext: FetchContext) {
   }
 
   private def buildJoinPartCodec(
+      joinConf: Join,
       joinPart: JoinPartOps,
       servingInfo: GroupByServingInfoParsed): (Iterable[StructField], Iterable[StructField]) = {
     val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
-    val joinKeyFields = joinPart.leftToRight
-      .map { case (leftKey, rightKey) =>
-        StructField(leftKey, keySchema.fields.find(_.name == rightKey).get.fieldType)
-      }
+    val joinKeyFields = JoinRequestKeys.requestKeyFields(joinConf, joinPart, servingInfo)
 
     val baseValueSchema: StructType = if (servingInfo.groupBy.aggregations == null) {
       servingInfo.selectedChrononSchema
@@ -290,12 +288,12 @@ class MetadataStore(fetchContext: FetchContext) {
     joinConf.joinPartOps.foreach { joinPart =>
       getGroupByServingInfo(joinPart.groupBy.metaData.getName)
         .map { servingInfo =>
-          val (keys, values) = buildJoinPartCodec(joinPart, servingInfo)
+          val (keys, values) = buildJoinPartCodec(joinConf, joinPart, servingInfo)
 
           keys.foreach(k => keyFields.add(k))
           values.foreach(v => valueFields.append(v))
 
-          val leftKeys = keys.map(_.name).map(joinPart.rightToLeft)
+          val leftKeys = JoinRequestKeys.valueInfoLeftKeys(joinConf, joinPart)
           values.foreach { v =>
             val schemaString = SparkConversions.fromChrononType(v.fieldType).catalogString
             valueInfos.append(JoinCodec

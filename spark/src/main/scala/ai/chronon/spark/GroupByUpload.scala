@@ -35,7 +35,6 @@ import org.apache.spark.sql.types.{BinaryType, StringType, StructField, StructTy
 import org.apache.spark.sql.{DataFrame, Encoder, Encoders, Row, SparkSession}
 import org.slf4j.{Logger, LoggerFactory}
 
-import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 import scala.util.Try
@@ -334,41 +333,42 @@ object GroupByUpload {
     groupByServingInfo.setSelectedAvroSchema(groupBy.preAggSchema.toAvroSchema("Value").toString(true))
     groupByServingInfo.setDateFormat(tableUtils.partitionFormat)
 
-    if (groupByConf.streamingSource.isDefined) {
-      val streamingSource = groupByConf.streamingSource.get
+    val inputSources = groupByConf.streamingSource.toSeq ++ groupByConf.sources.toScala
+    if (inputSources.nonEmpty) {
+      def inputSchemaFor(source: api.Source): types.StructType = {
+        val rootTable = source.rootTable
+        val query = source.rootQuery
+        val fullInputSchema = tableUtils.getSchemaFromTable(rootTable)
+        val inputSchema: types.StructType =
+          if (Option(query.selects).isEmpty) fullInputSchema
+          else {
+            val timeExpression = ColumnExpression.getTimeExpression(query)
+            val selects = query.selects.toScala ++ Map(Constants.TimeColumn -> timeExpression.expression.orNull)
 
-      // TODO: move this to SourceOps
-      @tailrec
-      def getInfo(source: api.Source): (String, api.Query, Boolean) = {
-        if (source.isSetEvents) {
-          (source.getEvents.getTable, source.getEvents.getQuery, false)
-        } else if (source.isSetEntities) {
-          (source.getEntities.getSnapshotTable, source.getEntities.getQuery, true)
-        } else {
-          val left = source.getJoinSource.getJoin.getLeft
-          getInfo(left)
-        }
+            /** We don't need to actually use the real table here since we're just trying to extract columns
+              * from a static query. We use a dummy table here since users with bigquery tables would have three part
+              * names instead of a two part typical spark table name
+              */
+            val streamingQuery =
+              QueryUtils.build(selects, "default.dummy_table", query.wheres.toScala)
+            val reqColumns = tableUtils.getColumnsFromQuery(streamingQuery)
+            types.StructType(fullInputSchema.filter(col => reqColumns.contains(col.name)))
+          }
+        inputSchema
       }
 
-      val (rootTable, query, _) = getInfo(streamingSource)
-      val fullInputSchema = tableUtils.getSchemaFromTable(rootTable)
-      val inputSchema: types.StructType =
-        if (Option(query.selects).isEmpty) fullInputSchema
-        else {
-          val selects = query.selects.toScala ++ Map(Constants.TimeColumn -> query.timeColumn)
-
-          /** We don't need to actually use the real table here since we're just trying to extract columns
-            * from a static query. We use a dummy table here since users with bigquery tables would have three part
-            * names instead of a two part typical spark table name
-            */
-          val streamingQuery =
-            QueryUtils.build(selects, "default.dummy_table", query.wheres.toScala)
-          val reqColumns = tableUtils.getColumnsFromQuery(streamingQuery)
-          types.StructType(fullInputSchema.filter(col => reqColumns.contains(col.name)))
+      val inputFields = mutable.LinkedHashMap.empty[String, types.StructField]
+      inputSources.foreach { source =>
+        inputSchemaFor(source).fields.foreach { field =>
+          if (!inputFields.contains(field.name)) {
+            inputFields.put(field.name, field)
+          }
         }
+      }
+      val inputSchema = types.StructType(inputFields.values.toSeq)
       groupByServingInfo.setInputAvroSchema(inputSchema.toAvroSchema(name = "Input").toString(true))
     } else {
-      logger.info("Not setting InputAvroSchema to GroupByServingInfo as there is no streaming source defined.")
+      logger.info("Not setting InputAvroSchema to GroupByServingInfo as there are no sources defined.")
     }
 
     val result = new GroupByServingInfoParsed(groupByServingInfo)
