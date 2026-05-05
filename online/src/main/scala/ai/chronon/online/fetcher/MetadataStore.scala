@@ -218,12 +218,8 @@ class MetadataStore(fetchContext: FetchContext) {
     doRetrieveAllListConfs(new mutable.ArrayBuffer[String]())
   }
 
-  private def buildJoinPartCodec(
-      joinConf: Join,
-      joinPart: JoinPartOps,
-      servingInfo: GroupByServingInfoParsed): (Iterable[StructField],
-                                               Iterable[StructField],
-                                               JoinRequestKeys.KeyMapping) = {
+  private def buildJoinPartCodec(joinConf: Join, joinPart: JoinPartOps, servingInfo: GroupByServingInfoParsed)
+      : (Iterable[StructField], Iterable[StructField], JoinRequestKeys.KeyMapping) = {
     val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
     val keyMapping = JoinRequestKeys.buildKeyMapping(joinConf, joinPart, servingInfo)
     val joinKeyFields = keyMapping.requestKeyFields

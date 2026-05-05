@@ -65,7 +65,10 @@ private[online] object JoinRequestKeys {
         if (request.keys.contains(leftKey)) {
           Seq.empty
         } else {
-          rawInputsByLeftKey.get(leftKey).filter(_ => selectedExpressions.contains(leftKey)).getOrElse(Seq(leftKey))
+          rawInputsByLeftKey
+            .get(leftKey)
+            .filter(_ => selectedExpressions.contains(leftKey))
+            .getOrElse(Seq(leftKey))
             .filterNot(request.keys.contains)
         }
       }.distinct
@@ -142,7 +145,14 @@ private[online] object JoinRequestKeys {
     val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
 
     joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
-      val fieldType = fieldsByRightKey(rightKey).fieldType
+      val fieldType = fieldsByRightKey
+        .getOrElse(
+          rightKey,
+          throw new IllegalArgumentException(
+            s"Join part ${joinPart.fullPrefix} maps left key $leftKey to right key $rightKey, " +
+              s"but $rightKey is not present in GroupBy key schema ${keySchema.fields.map(_.name).mkString(", ")}")
+        )
+        .fieldType
       val requestKeys = rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
       requestKeys.foreach { requestKey =>
         if (!fieldsByRequestKey.contains(requestKey)) {
@@ -162,14 +172,18 @@ private[online] object JoinRequestKeys {
       selectExpression(join, leftKey).map(leftKey -> _)
     }
     val rawInputsByLeftKey = joinPart.leftToRight.keys.map { leftKey =>
-      leftKey -> selectedLeftKeys.find(_._1 == leftKey).map { case (_, expression) =>
-        rawInputs(expression)
-      }.getOrElse(Seq(leftKey))
+      leftKey -> selectedLeftKeys
+        .find(_._1 == leftKey)
+        .map { case (_, expression) =>
+          rawInputs(expression)
+        }
+        .getOrElse(Seq(leftKey))
     }.toMap
     val keyFields = requestKeyFields(join, joinPart, servingInfo, rawInputsByLeftKey)
     val catalystUtil =
       if (selectedLeftKeys.isEmpty) None
-      else Some(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join)))
+      else
+        Some(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join)))
 
     KeyMapping(joinPart.leftToRight, keyFields, rawInputsByLeftKey, selectedLeftKeys, catalystUtil)
   }
