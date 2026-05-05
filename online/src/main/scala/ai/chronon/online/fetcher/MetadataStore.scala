@@ -292,7 +292,8 @@ class MetadataStore(fetchContext: FetchContext) {
 
           keys.foreach(k => keyFields.add(k))
           values.foreach(v => valueFields.append(v))
-          joinPartKeyMappings.put(JoinRequestKeys.partKey(joinPart), keyMapping)
+          joinPartKeyMappings.put(JoinRequestKeys.partKey(joinConf, joinPart), keyMapping)
+          joinPartKeyMappings.put(JoinRequestKeys.partKey(joinConf, joinPart, servingInfo), keyMapping)
 
           val leftKeys = JoinRequestKeys.valueInfoLeftKeys(joinConf, joinPart)
           values.foreach { v =>

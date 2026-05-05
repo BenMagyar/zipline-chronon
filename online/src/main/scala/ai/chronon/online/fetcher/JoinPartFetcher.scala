@@ -96,12 +96,23 @@ private[online] object JoinRequestKeys {
     }
   }
 
-  def partKey(joinPart: JoinPartOps): String =
+  private def partKey(parts: Seq[String]): String =
+    parts.map(part => s"${part.length}:$part").mkString("|")
+
+  private def partKeyParts(join: Join, joinPart: JoinPartOps): Seq[String] =
     Seq(
       joinPart.groupBy.metaData.getName,
-      Option(joinPart.prefix).getOrElse(""),
-      joinPart.leftToRight.toSeq.sortBy(_._1).map { case (left, right) => s"$left=$right" }.mkString(",")
-    ).mkString("\u0000")
+      Option(joinPart.prefix).getOrElse("")
+    ) ++
+      joinPart.leftToRight.toSeq.sortBy(_._1).map { case (left, right) => s"key:$left=$right" } ++
+      leftSelects(join).toSeq.sortBy(_._1).map { case (name, expr) => s"select:$name=$expr" } ++
+      leftSetups(join).map(setup => s"setup:$setup")
+
+  def partKey(join: Join, joinPart: JoinPartOps): String =
+    partKey(partKeyParts(join, joinPart))
+
+  def partKey(join: Join, joinPart: JoinPartOps, servingInfo: GroupByServingInfoParsed): String =
+    partKey(partKeyParts(join, joinPart) ++ Seq(servingInfo.keyAvroSchema, servingInfo.inputAvroSchema))
 
   private def leftSelects(join: Join): Map[String, String] =
     Option(join.left)
@@ -270,10 +281,24 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           join.joinPartOps.map { part =>
             import ai.chronon.online.metrics
             val joinContextInner = metrics.Metrics.Context(joinContext.get, part)
-            val keyMapping = joinCodecsByName
+            val joinCodec = joinCodecsByName
               .get(request.name)
               .flatMap(_.toOption)
-              .flatMap(_.joinPartKeyMappings.get(JoinRequestKeys.partKey(part)))
+            val currentServingInfo = joinCodec.flatMap { _ =>
+              metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName).toOption
+            }
+            val keyMapping = joinCodec.flatMap { codec =>
+              currentServingInfo
+                .flatMap(servingInfo =>
+                  codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part, servingInfo)))
+                .orElse {
+                  if (currentServingInfo.isEmpty) {
+                    codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part))
+                  } else {
+                    None
+                  }
+                }
+            }
             val missingKeys = keyMapping
               .map(_.missingRequestKeys(request))
               .getOrElse(JoinRequestKeys.missingRequestKeys(request, join.join, part))
