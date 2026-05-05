@@ -154,7 +154,14 @@ object TestJoinCodec {
     val keyCodec = AvroCodec.of(keyAvroSchema.toString())
     val valueCodec = AvroCodec.of(valueAvroSchema.toString())
 
-    new JoinCodec(conf, keySchema, valueSchema, keyCodec, valueCodec, Array.empty, false)
+    new JoinCodec(conf,
+                  keySchema,
+                  valueSchema,
+                  keyCodec,
+                  valueCodec,
+                  Array.empty,
+                  joinPartKeyMappings = Map.empty,
+                  hasPartialFailure = false)
   }
 }
 
