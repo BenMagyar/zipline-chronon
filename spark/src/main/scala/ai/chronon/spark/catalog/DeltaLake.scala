@@ -50,8 +50,7 @@ case object DeltaLake extends Format {
     val snapshotPartitionsDf = snapshot.allFiles.toDF().select("partitionValues")
 
     val partitions = snapshotPartitionsDf.collect().map(r => r.getAs[Map[String, String]](0))
-    partitions.toList
-      .distinct
+    partitions.toList.distinct
 
   }
 

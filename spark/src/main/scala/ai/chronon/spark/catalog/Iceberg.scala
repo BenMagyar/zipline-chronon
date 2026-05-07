@@ -119,20 +119,7 @@ case object Iceberg extends Format {
       val fieldType = field.`type`()
       val extractor = new IcebergPartitionStatsExtractor(sparkSession)
 
-      val files = currentDataFiles(table)
-
-      val fileRanges = files.map(file => fileDateRange(file, fieldId, fieldType, partitionSpec, extractor))
-
-      if (fileRanges.nonEmpty && fileRanges.forall(_.isDefined)) {
-        val ranges = fileRanges.flatten
-        Some(
-          StatsDateRange(
-            start = partitionSpec.at(ranges.map(_._1).min),
-            end = partitionSpec.at(ranges.map(_._2).max)
-          ))
-      } else {
-        None
-      }
+      currentDataFilesDateRange(table, fieldId, fieldType, partitionSpec, extractor)
     } match {
       case Success(result) =>
         if (result.isDefined) {
@@ -168,7 +155,7 @@ case object Iceberg extends Format {
   private def boundMillis(value: Any, fieldType: Type, partitionSpec: PartitionSpec): Long =
     fieldType.typeId() match {
       case Type.TypeID.TIMESTAMP =>
-        value.asInstanceOf[java.lang.Long].longValue() / 1000L
+        Math.floorDiv(value.asInstanceOf[java.lang.Long].longValue(), 1000L)
       case Type.TypeID.DATE =>
         LocalDate
           .ofEpochDay(value.asInstanceOf[java.lang.Integer].longValue())
@@ -181,11 +168,31 @@ case object Iceberg extends Format {
         throw new IllegalArgumentException(s"Unsupported Iceberg bound type $other for value $value")
     }
 
-  private def currentDataFiles(table: org.apache.iceberg.Table): List[DataFile] =
-    Option(table.currentSnapshot()).toList.flatMap { _ =>
+  private def currentDataFilesDateRange(table: org.apache.iceberg.Table,
+                                        fieldId: java.lang.Integer,
+                                        fieldType: org.apache.iceberg.types.Type,
+                                        partitionSpec: PartitionSpec,
+                                        extractor: IcebergPartitionStatsExtractor): Option[StatsDateRange] =
+    Option(table.currentSnapshot()).flatMap { _ =>
       val tasks = table.newScan().includeColumnStats().planFiles()
       try {
-        tasks.iterator().asScala.map(task => task.file().copy()).toList
+        val range = tasks.iterator().asScala.foldLeft(Some(None): Option[Option[(Long, Long)]]) {
+          case (None, _) => None
+          case (Some(acc), task) =>
+            fileDateRange(task.file(), fieldId, fieldType, partitionSpec, extractor).map {
+              case (lowerMillis, upperMillis) =>
+                Some(acc.fold(lowerMillis -> upperMillis) { case (minMillis, maxMillis) =>
+                  Math.min(minMillis, lowerMillis) -> Math.max(maxMillis, upperMillis)
+                })
+            }
+        }
+
+        range.flatten.map { case (minMillis, maxMillis) =>
+          StatsDateRange(
+            start = partitionSpec.at(minMillis),
+            end = partitionSpec.at(maxMillis)
+          )
+        }
       } finally {
         tasks.close()
       }
