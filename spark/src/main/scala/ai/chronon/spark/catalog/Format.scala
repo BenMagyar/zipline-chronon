@@ -121,23 +121,27 @@ trait Format {
   // Does this format support sub partitions filters
   def supportSubPartitionsFilter: Boolean
 
-  // Unified last available partition: handles both string partition columns and timestamp/date columns.
-  // For string columns that are catalog partitions (Hive/Iceberg/Delta), uses metadata-only lookup — no data scan.
-  // For timestamp/date columns, falls back to a scan: DATE(MAX(col)) - 1 day.
-  def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
-      sparkSession: SparkSession): Option[String] = {
-    // Try metadata-based partition listing first (free for Hive/Iceberg/Delta)
-    val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
+  protected def metadataPartitions(tableName: String, partitionColumn: String)(implicit
+      sparkSession: SparkSession): Option[List[String]] =
+    Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
       case Success(metadata) =>
-        Format.pickMaxPartition(metadata)
+        Some(Format.sanitizePartitionValues(metadata))
       case Failure(ex) =>
         logger.warn(
-          s"[NonFatal] Failed to check primary partitions for ${tableName}, falling back to data scan: ${ex.getMessage}");
+          s"[NonFatal] Failed to check primary partitions for ${tableName}, falling back to another boundary lookup: ${ex.getMessage}")
         None
     }
-    if (metadataResult.isDefined) return metadataResult
 
-    // Fall back to data scan for non-partitioned tables or timestamp/date columns
+  protected def metadataFirstAvailablePartition(tableName: String, partitionColumn: String)(implicit
+      sparkSession: SparkSession): Option[String] =
+    metadataPartitions(tableName, partitionColumn).flatMap(Format.pickMinPartition)
+
+  protected def metadataLastAvailablePartition(tableName: String, partitionColumn: String)(implicit
+      sparkSession: SparkSession): Option[String] =
+    metadataPartitions(tableName, partitionColumn).flatMap(Format.pickMaxPartition)
+
+  protected def scanLastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(
+      implicit sparkSession: SparkSession): Option[String] = {
     import sparkSession.implicits._
     Try {
       val df = sparkSession.read.table(tableName)
@@ -169,18 +173,8 @@ trait Format {
     }
   }
 
-  // Unified first available partition: handles both string partition columns and timestamp/date columns.
-  // For string columns that are catalog partitions, uses metadata-only lookup.
-  // For timestamp/date columns, falls back to a scan.
-  def firstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
-      sparkSession: SparkSession): Option[String] = {
-    val metadataResult = Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
-      case Success(metadata) =>
-        Format.pickMinPartition(metadata)
-      case _ => None
-    }
-    if (metadataResult.isDefined) return metadataResult
-
+  protected def scanFirstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(
+      implicit sparkSession: SparkSession): Option[String] = {
     import sparkSession.implicits._
     Try {
       val df = sparkSession.read.table(tableName)
@@ -210,6 +204,22 @@ trait Format {
         None
     }
   }
+
+  // Unified last available partition: handles both string partition columns and timestamp/date columns.
+  // For string columns that are catalog partitions (Hive/Iceberg/Delta), uses metadata-only lookup.
+  // For timestamp/date columns, falls back to a scan: DATE(MAX(col)) - 1 day.
+  def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[String] =
+    metadataLastAvailablePartition(tableName, partitionColumn)
+      .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
+
+  // Unified first available partition: handles both string partition columns and timestamp/date columns.
+  // For string columns that are catalog partitions, uses metadata-only lookup.
+  // For timestamp/date columns, falls back to a scan.
+  def firstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[String] =
+    metadataFirstAvailablePartition(tableName, partitionColumn)
+      .orElse(scanFirstAvailablePartition(tableName, partitionColumn, partitionSpec))
 
   @deprecated("Use lastAvailablePartition instead", "0.1.0")
   def maxTimestampDate(tableName: String, timestampColumn: String, partitionSpec: PartitionSpec)(implicit

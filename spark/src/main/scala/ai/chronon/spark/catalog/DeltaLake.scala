@@ -1,10 +1,23 @@
 package ai.chronon.spark.catalog
 
 import ai.chronon.api.PartitionSpec
+import org.apache.spark.sql.Column
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.functions.{col, count, date_format, from_json, lit, min, max, when}
-import org.apache.spark.sql.types.{MapType, StringType, StructField, StructType}
+import org.apache.spark.sql.functions.{
+  coalesce,
+  col,
+  count,
+  date_format,
+  from_json,
+  lit,
+  min,
+  max,
+  to_date,
+  to_timestamp,
+  when
+}
+import org.apache.spark.sql.types.{DataType, DateType, MapType, StringType, StructField, StructType}
 
 import scala.util.{Failure, Success, Try}
 
@@ -12,6 +25,8 @@ import scala.util.{Failure, Success, Try}
 // across Delta versions (e.g. 2 params in 3.2, 3 params in 3.3), so compiling against an older
 // version will cause NoSuchMethodError at runtime if the EMR-bundled Delta jar has a newer signature.
 case object DeltaLake extends Format {
+
+  private val DayMillis = 24L * 60L * 60L * 1000L
 
   private[catalog] case class StatsDateRange(start: String, end: String) {
     def virtualPartitions(partitionSpec: PartitionSpec): List[String] =
@@ -51,23 +66,26 @@ case object DeltaLake extends Format {
 
   override def virtualPartitions(tableName: String, timestampColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): List[String] = {
-    statsDateRange(tableName, timestampColumn, partitionSpec) match {
-      case Some(range) => range.virtualPartitions(partitionSpec)
-      case None        => super.virtualPartitions(tableName, timestampColumn, partitionSpec)
-    }
+    metadataPartitions(tableName, timestampColumn)
+      .filter(_.nonEmpty)
+      .orElse(statsDateRange(tableName, timestampColumn, partitionSpec)
+        .map(_.virtualPartitions(partitionSpec)))
+      .getOrElse(super.virtualPartitions(tableName, timestampColumn, partitionSpec))
   }
 
   override def firstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(
       implicit sparkSession: SparkSession): Option[String] =
-    statsDateRange(tableName, partitionColumn, partitionSpec)
-      .map(_.firstAvailablePartition)
-      .orElse(super.firstAvailablePartition(tableName, partitionColumn, partitionSpec))
+    metadataFirstAvailablePartition(tableName, partitionColumn)
+      .orElse(statsDateRange(tableName, partitionColumn, partitionSpec).map(_.firstAvailablePartition))
+      .orElse(scanFirstAvailablePartition(tableName, partitionColumn, partitionSpec))
 
   override def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
-    statsDateRange(tableName, partitionColumn, partitionSpec)
-      .map(_.lastAvailablePartition(partitionSpec, isStringColumn(tableName, partitionColumn)))
-      .orElse(super.lastAvailablePartition(tableName, partitionColumn, partitionSpec))
+    metadataLastAvailablePartition(tableName, partitionColumn)
+      .orElse(
+        statsDateRange(tableName, partitionColumn, partitionSpec)
+          .map(_.lastAvailablePartition(partitionSpec, isStringColumn(tableName, partitionColumn))))
+      .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
 
   private def isStringColumn(tableName: String, columnName: String)(implicit sparkSession: SparkSession): Boolean =
     Try(sparkSession.read.table(tableName).schema(columnName).dataType == StringType).getOrElse(false)
@@ -80,6 +98,7 @@ case object DeltaLake extends Format {
       val describeResult = sparkSession.sql(s"DESCRIBE DETAIL $tableName")
       val tablePath = describeResult.select("location").head().getString(0)
       val activeFiles = DeltaLog.forTable(sparkSession, tablePath).update().allFiles.toDF()
+      val columnType = sparkSession.read.table(tableName).schema(columnName).dataType
 
       val statsSchema = StructType(
         Seq(
@@ -98,8 +117,8 @@ case object DeltaLake extends Format {
         .agg(
           count(lit(1)).as("fileCount"),
           count(when(col("min_value").isNull || col("max_value").isNull, lit(1))).as("missingCount"),
-          date_format(min(col("min_value").cast("timestamp")), partitionSpec.format).as("start"),
-          date_format(max(col("max_value").cast("timestamp")), partitionSpec.format).as("end")
+          date_format(min(statsBoundary("min_value", columnType, partitionSpec)), partitionSpec.format).as("start"),
+          date_format(max(statsBoundary("max_value", columnType, partitionSpec)), partitionSpec.format).as("end")
         )
         .collect()
         .headOption
@@ -130,6 +149,18 @@ case object DeltaLake extends Format {
         None
     }
   }
+
+  private def statsBoundary(boundaryColumn: String, columnType: DataType, partitionSpec: PartitionSpec): Column =
+    columnType match {
+      case DateType =>
+        col(boundaryColumn).cast(DateType)
+      case StringType if partitionSpec.spanMillis >= DayMillis =>
+        coalesce(to_date(col(boundaryColumn), partitionSpec.format), col(boundaryColumn).cast(DateType))
+      case StringType =>
+        coalesce(to_timestamp(col(boundaryColumn), partitionSpec.format), col(boundaryColumn).cast("timestamp"))
+      case _ =>
+        col(boundaryColumn).cast("timestamp")
+    }
 
   override def supportSubPartitionsFilter: Boolean = true
 }

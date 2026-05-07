@@ -85,6 +85,65 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     }
   }
 
+  it should "prefer actual partition metadata over Delta log stats" in {
+    val dbName = s"delta_partition_metadata_${System.nanoTime()}"
+    val tableName = s"$dbName.time_partitioned"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          created_at TIMESTAMP,
+          user_id STRING,
+          ds STRING
+        ) USING DELTA
+        PARTITIONED BY (ds)
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          (TIMESTAMP '2024-06-01 12:00:00', 'user1', '2024-06-01'),
+          (TIMESTAMP '2024-06-03 12:00:00', 'user2', '2024-06-03')
+      """)
+
+      DeltaLake.virtualPartitions(tableName, "ds", PartitionSpec.daily) should contain theSameElementsAs
+        List("2024-06-01", "2024-06-03")
+      DeltaLake.firstAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-06-01")
+      DeltaLake.lastAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-06-03")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
+  it should "derive Delta log stats boundaries for date and date string columns without timestamp casts" in {
+    val dbName = s"delta_date_stats_${System.nanoTime()}"
+    val tableName = s"$dbName.date_with_stats"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          created_date DATE,
+          created_day STRING,
+          user_id STRING
+        ) USING DELTA
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          (DATE '2024-07-01', '2024-07-01', 'user1'),
+          (DATE '2024-07-03', '2024-07-03', 'user2')
+      """)
+
+      DeltaLake.statsDateRange(tableName, "created_date", PartitionSpec.daily) shouldBe
+        Some(DeltaLake.StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
+      DeltaLake.statsDateRange(tableName, "created_day", PartitionSpec.daily) shouldBe
+        Some(DeltaLake.StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
   it should "fall back to scanning when Delta log stats do not cover the timestamp column" in {
     val dbName = s"delta_stats_fallback_${System.nanoTime()}"
     val tableName = s"$dbName.time_missing_stats"
