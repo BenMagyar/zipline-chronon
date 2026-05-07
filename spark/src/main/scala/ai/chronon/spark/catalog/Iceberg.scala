@@ -2,7 +2,7 @@ package ai.chronon.spark.catalog
 
 import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.batch.iceberg.IcebergPartitionStatsExtractor
-import org.apache.iceberg.{DataFile, ManifestFiles}
+import org.apache.iceberg.DataFile
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.iceberg.types.Type
 import org.apache.spark.sql.connector.catalog.TableCatalog
@@ -133,16 +133,7 @@ case object Iceberg extends Format {
       val fieldType = field.`type`()
       val extractor = new IcebergPartitionStatsExtractor(sparkSession)
 
-      val files = Option(table.currentSnapshot()).toSeq.flatMap { snapshot =>
-        snapshot.allManifests(table.io()).asScala.flatMap { manifest =>
-          val reader = ManifestFiles.read(manifest, table.io())
-          try {
-            reader.iterator().asScala.map(_.copy()).toList
-          } finally {
-            reader.close()
-          }
-        }
-      }
+      val files = currentDataFiles(table)
 
       val fileRanges = files.map(file => fileDateRange(file, fieldId, fieldType, partitionSpec, extractor))
 
@@ -202,6 +193,16 @@ case object Iceberg extends Format {
         partitionSpec.epochMillis(value.toString)
       case other =>
         throw new IllegalArgumentException(s"Unsupported Iceberg bound type $other for value $value")
+    }
+
+  private def currentDataFiles(table: org.apache.iceberg.Table): List[DataFile] =
+    Option(table.currentSnapshot()).toList.flatMap { _ =>
+      val tasks = table.newScan().includeColumnStats().planFiles()
+      try {
+        tasks.iterator().asScala.map(task => task.file().copy()).toList
+      } finally {
+        tasks.close()
+      }
     }
 
   private def loadIcebergTable(tableName: String)(implicit

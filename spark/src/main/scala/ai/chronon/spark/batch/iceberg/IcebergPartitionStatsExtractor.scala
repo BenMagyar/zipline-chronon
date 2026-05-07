@@ -352,7 +352,7 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
     columnStatsMap.toMap
   }
 
-  private[iceberg] def convertBoundValue(bound: java.nio.ByteBuffer, fieldType: org.apache.iceberg.types.Type): Any = {
+  private[spark] def convertBoundValue(bound: java.nio.ByteBuffer, fieldType: org.apache.iceberg.types.Type): Any = {
     require(bound != null, "bound cannot be null")
     require(fieldType != null, "fieldType cannot be null")
     org.apache.iceberg.types.Conversions.fromByteBuffer(fieldType, bound)
