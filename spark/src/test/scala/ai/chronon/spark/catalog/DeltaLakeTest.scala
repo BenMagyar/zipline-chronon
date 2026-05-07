@@ -49,7 +49,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-01-01", "2024-01-02", "2024-01-03")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-02")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
@@ -83,6 +83,14 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
     }
+  }
+
+  it should "return the inclusive last partition from Delta log stats for a single-day timestamp range" in {
+    val range = DeltaLake.StatsDateRange(start = "2024-01-01", end = "2024-01-01")
+
+    range.virtualPartitions(PartitionSpec.daily) shouldBe List("2024-01-01")
+    range.firstAvailablePartition shouldBe "2024-01-01"
+    range.lastAvailablePartition shouldBe "2024-01-01"
   }
 
   it should "prefer actual partition metadata over Delta log stats" in {

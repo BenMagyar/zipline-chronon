@@ -34,8 +34,7 @@ case object DeltaLake extends Format {
 
     def firstAvailablePartition: String = start
 
-    def lastAvailablePartition(partitionSpec: PartitionSpec, isStringColumn: Boolean): String =
-      if (isStringColumn) end else partitionSpec.before(end)
+    def lastAvailablePartition: String = end
   }
 
   override def tableTypeString: String = "delta"
@@ -61,6 +60,7 @@ case object DeltaLake extends Format {
 
     val partitions = snapshotPartitionsDf.collect().map(r => r.getAs[Map[String, String]](0))
     partitions.toList
+      .distinct
 
   }
 
@@ -84,11 +84,8 @@ case object DeltaLake extends Format {
     metadataLastAvailablePartition(tableName, partitionColumn)
       .orElse(
         statsDateRange(tableName, partitionColumn, partitionSpec)
-          .map(_.lastAvailablePartition(partitionSpec, isStringColumn(tableName, partitionColumn))))
+          .map(_.lastAvailablePartition))
       .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
-
-  private def isStringColumn(tableName: String, columnName: String)(implicit sparkSession: SparkSession): Boolean =
-    Try(sparkSession.read.table(tableName).schema(columnName).dataType == StringType).getOrElse(false)
 
   private[catalog] def statsDateRange(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[StatsDateRange] = {

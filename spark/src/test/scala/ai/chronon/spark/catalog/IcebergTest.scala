@@ -165,7 +165,15 @@ class IcebergTest extends SparkTestBase with Matchers {
     Iceberg.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
       List("2024-04-01", "2024-04-02", "2024-04-03")
     Iceberg.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-01")
-    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-02")
+    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-03")
+  }
+
+  it should "return the inclusive last partition from Iceberg file stats for a single-day timestamp range" in {
+    val range = Iceberg.StatsDateRange(start = "2024-04-01", end = "2024-04-01")
+
+    range.virtualPartitions(PartitionSpec.daily) shouldBe List("2024-04-01")
+    range.firstAvailablePartition shouldBe "2024-04-01"
+    range.lastAvailablePartition shouldBe "2024-04-01"
   }
 
   it should "prefer actual partition metadata over Iceberg file stats" in {

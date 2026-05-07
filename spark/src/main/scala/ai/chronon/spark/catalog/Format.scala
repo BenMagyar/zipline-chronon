@@ -125,7 +125,7 @@ trait Format {
       sparkSession: SparkSession): Option[List[String]] =
     Try(primaryPartitions(tableName, partitionColumn, "")(sparkSession)) match {
       case Success(metadata) =>
-        Some(Format.sanitizePartitionValues(metadata))
+        Some(Format.sanitizePartitionValues(metadata).distinct)
       case Failure(ex) =>
         logger.warn(
           s"[NonFatal] Failed to check primary partitions for ${tableName}, falling back to another boundary lookup: ${ex.getMessage}")
