@@ -45,7 +45,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       """)
 
       DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
-        Some(DeltaLake.StatsDateRange(start = "2024-01-01", end = "2024-01-03"))
+        Some(StatsDateRange(start = "2024-01-01", end = "2024-01-03"))
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-01-01", "2024-01-02", "2024-01-03")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
@@ -76,7 +76,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       """)
 
       DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
-        Some(DeltaLake.StatsDateRange(start = "2024-03-01", end = "2024-03-03"))
+        Some(StatsDateRange(start = "2024-03-01", end = "2024-03-03"))
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-03-01", "2024-03-02", "2024-03-03")
     } finally {
@@ -86,7 +86,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
   }
 
   it should "return the inclusive last partition from Delta log stats for a single-day timestamp range" in {
-    val range = DeltaLake.StatsDateRange(start = "2024-01-01", end = "2024-01-01")
+    val range = StatsDateRange(start = "2024-01-01", end = "2024-01-01")
 
     range.virtualPartitions(PartitionSpec.daily) shouldBe List("2024-01-01")
     range.firstAvailablePartition shouldBe "2024-01-01"
@@ -123,6 +123,30 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     }
   }
 
+  it should "return distinct logical partitions from Delta file metadata" in {
+    val dbName = s"delta_duplicate_partition_metadata_${System.nanoTime()}"
+    val tableName = s"$dbName.duplicate_partition_files"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          user_id STRING,
+          ds STRING
+        ) USING DELTA
+        PARTITIONED BY (ds)
+      """)
+      spark.sql(s"INSERT INTO $tableName VALUES ('user1', '2024-08-01')")
+      spark.sql(s"INSERT INTO $tableName VALUES ('user2', '2024-08-01')")
+
+      DeltaLake.partitions(tableName, "") shouldBe List(Map("ds" -> "2024-08-01"))
+      DeltaLake.virtualPartitions(tableName, "ds", PartitionSpec.daily) shouldBe List("2024-08-01")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
   it should "derive Delta log stats boundaries for date and date string columns without timestamp casts" in {
     val dbName = s"delta_date_stats_${System.nanoTime()}"
     val tableName = s"$dbName.date_with_stats"
@@ -143,9 +167,9 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       """)
 
       DeltaLake.statsDateRange(tableName, "created_date", PartitionSpec.daily) shouldBe
-        Some(DeltaLake.StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
+        Some(StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
       DeltaLake.statsDateRange(tableName, "created_day", PartitionSpec.daily) shouldBe
-        Some(DeltaLake.StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
+        Some(StatsDateRange(start = "2024-07-01", end = "2024-07-03"))
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
@@ -176,7 +200,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-02-01", "2024-02-02", "2024-02-03")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-02")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-03")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")

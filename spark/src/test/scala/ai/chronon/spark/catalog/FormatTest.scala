@@ -115,6 +115,47 @@ class FormatTest extends SparkTestBase {
     fmt.lastAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-02")
   }
 
+  it should "deduplicate sanitized metadata partitions while preserving discovery order" in {
+    val fmt = new Format {
+      override def supportSubPartitionsFilter = false
+      override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      override def primaryPartitions(tableName: String,
+                                     partitionColumn: String,
+                                     partitionFilters: String,
+                                     subPartitionsFilter: Map[String, String])(implicit
+          ss: SparkSession) = List("2024-04-02", null, "2024-04-02", "2024-04-01")
+
+      def discoveredPartitions(tableName: String, partitionColumn: String)(implicit
+          ss: SparkSession): Option[List[String]] =
+        metadataPartitions(tableName, partitionColumn)(ss)
+    }
+
+    fmt.discoveredPartitions("db.table", "ds")(spark) shouldBe Some(List("2024-04-02", "2024-04-01"))
+  }
+
+  it should "return the inclusive last available partition when scanning a timestamp column" in {
+    val tableName = "format_timestamp_scan_last_available_test"
+    spark.sql(s"""
+      CREATE OR REPLACE TEMP VIEW $tableName AS
+      SELECT * FROM VALUES
+        (1, TIMESTAMP '2024-04-01 12:00:00'),
+        (2, TIMESTAMP '2024-04-03 12:00:00')
+      AS t(id, created_at)
+    """)
+
+    val fmt = new Format {
+      override def supportSubPartitionsFilter = false
+      override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      override def primaryPartitions(tableName: String,
+                                     partitionColumn: String,
+                                     partitionFilters: String,
+                                     subPartitionsFilter: Map[String, String])(implicit
+          ss: SparkSession) = Nil
+    }
+
+    fmt.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
+  }
+
   it should "resolve table names consistently with Spark SQL" in {
     spark.sql("CREATE DATABASE IF NOT EXISTS spark_non_default_catalog.custom_test_db")
     spark.sql(

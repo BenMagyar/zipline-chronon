@@ -28,15 +28,6 @@ case object DeltaLake extends Format {
 
   private val DayMillis = 24L * 60L * 60L * 1000L
 
-  private[catalog] case class StatsDateRange(start: String, end: String) {
-    def virtualPartitions(partitionSpec: PartitionSpec): List[String] =
-      partitionSpec.expandRange(start, end)
-
-    def firstAvailablePartition: String = start
-
-    def lastAvailablePartition: String = end
-  }
-
   override def tableTypeString: String = "delta"
 
   override def primaryPartitions(tableName: String,

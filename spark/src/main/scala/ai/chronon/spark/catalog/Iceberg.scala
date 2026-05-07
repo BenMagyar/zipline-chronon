@@ -17,15 +17,6 @@ import scala.util.{Failure, Success, Try}
 
 case object Iceberg extends Format {
 
-  private[catalog] case class StatsDateRange(start: String, end: String) {
-    def virtualPartitions(partitionSpec: PartitionSpec): List[String] =
-      partitionSpec.expandRange(start, end)
-
-    def firstAvailablePartition: String = start
-
-    def lastAvailablePartition: String = end
-  }
-
   override def tableTypeString: String = "iceberg"
 
   override def tableProperties: Map[String, String] = {

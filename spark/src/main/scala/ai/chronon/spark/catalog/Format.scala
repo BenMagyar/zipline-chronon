@@ -5,7 +5,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.functions.{col, date_format, date_sub, min, max}
+import org.apache.spark.sql.functions.{col, date_format, min, max}
 import org.apache.spark.sql.types.{DateType, StringType, StructType}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -154,8 +154,7 @@ trait Format {
             .headOption
             .flatMap(v => Option(v))
         case _ =>
-          df.select(date_format(date_sub(max(col(partitionColumn)).cast(DateType), 1), partitionSpec.format)
-            .as("last_partition"))
+          df.select(date_format(max(col(partitionColumn)).cast(DateType), partitionSpec.format).as("last_partition"))
             .as[String]
             .collect()
             .headOption
@@ -269,6 +268,15 @@ trait Format {
     }
   }
 
+}
+
+private[catalog] case class StatsDateRange(start: String, end: String) {
+  def virtualPartitions(partitionSpec: PartitionSpec): List[String] =
+    partitionSpec.expandRange(start, end)
+
+  def firstAvailablePartition: String = start
+
+  def lastAvailablePartition: String = end
 }
 
 case class ResolvedTableName(catalog: String, namespace: String, table: String) {
