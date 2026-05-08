@@ -12,10 +12,10 @@ class IcebergDeltaMergeSourceTest extends SparkTestBase with Matchers {
     "spark.serializer" -> "org.apache.spark.serializer.JavaSerializer",
     "spark.sql.extensions" -> (
       "io.delta.sql.DeltaSparkSessionExtension," +
+      "ai.chronon.spark.extensions.ChrononDeltaFixExtension," +
       "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions," +
       "ai.chronon.spark.extensions.ChrononMergeExtension"
-    ),
-    "spark.databricks.delta.stats.skipping" -> "false"
+    )
   )
 
   "insertPartitions on an unpartitioned Iceberg table" should

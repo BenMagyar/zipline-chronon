@@ -20,12 +20,10 @@ import ai.chronon.api.{Constants, PartitionRange, PartitionSpec, Query, QueryUti
 import ai.chronon.api.ColorPrinter.ColorString
 import ai.chronon.api.Extensions._
 import ai.chronon.api.ScalaJavaConversions._
-import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset, Row, SaveMode, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, SaveMode, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
-import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, Project}
 import org.apache.spark.sql.catalyst.util.QuotingUtils
-import org.apache.spark.sql.delta.stats.PrepareDeltaScan
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.slf4j.{Logger, LoggerFactory}
@@ -335,12 +333,11 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
       // semantics are meaningless; IN-lists stay correct for those. It is slightly over-broad
       // for multi-column keys (matches cartesian product of distinct values) but safe here —
       // we only delete rows the upstream job intends to rewrite.
-      val mergeSourceDf = prepareDeltaScansForMerge(finalizedDf)
       val tempView = s"__chronon_insert_${tableName.replace('.', '_')}_${System.nanoTime()}"
-      mergeSourceDf.createOrReplaceTempView(tempView)
+      finalizedDf.createOrReplaceTempView(tempView)
       val deleteCondition = partitionColumns
         .map { pc =>
-          val values = mergeSourceDf.select(col(pc)).distinct().collect().map(row => lit(row.get(0)).expr.sql)
+          val values = finalizedDf.select(col(pc)).distinct().collect().map(row => lit(row.get(0)).expr.sql)
           s"target.`$pc` IN (${values.mkString(", ")})"
         }
         .mkString(" AND ")
@@ -350,38 +347,14 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
            |ON FALSE
            |WHEN NOT MATCHED BY SOURCE AND $deleteCondition THEN DELETE
            |WHEN NOT MATCHED THEN INSERT *""".stripMargin
-      try {
-        sparkSession.sql(mergeSQL)
-      } finally {
-        sparkSession.catalog.dropTempView(tempView)
-      }
+      sparkSession.sql(mergeSQL)
+      sparkSession.catalog.dropTempView(tempView)
     } else {
       finalizedDf.write
         .mode(SaveMode.Overwrite)
         .insertInto(tableName)
     }
     logger.info(s"Finished writing to $tableName")
-  }
-
-  private def prepareDeltaScansForMerge(df: DataFrame): DataFrame = {
-    // Iceberg MERGE sources can carry Delta scans through a temp view. Delta tables with
-    // deletion vectors require those scans to be planned against a pinned snapshot.
-    //
-    // PrepareDeltaScan returns the original plan when Delta stats skipping is disabled, which
-    // leaves a non-pinned TahoeLogFileIndex in the MERGE source. Temporarily enabling it here
-    // makes Delta replace those scans with PreparedDeltaFileIndex instances.
-    val deltaStatsSkippingConf = "spark.databricks.delta.stats.skipping"
-    val previousDeltaStatsSkipping = sparkSession.conf.getOption(deltaStatsSkippingConf)
-    sparkSession.conf.set(deltaStatsSkippingConf, "true")
-    try {
-      val preparedPlan = new PrepareDeltaScan(sparkSession).apply(df.queryExecution.analyzed)
-      new Dataset[Row](sparkSession, preparedPlan, ExpressionEncoder(preparedPlan.schema))
-    } finally {
-      previousDeltaStatsSkipping match {
-        case Some(value) => sparkSession.conf.set(deltaStatsSkippingConf, value)
-        case None        => sparkSession.conf.unset(deltaStatsSkippingConf)
-      }
-    }
   }
 
   // retains only the invocations from chronon code.
