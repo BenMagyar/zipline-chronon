@@ -1,6 +1,6 @@
 package ai.chronon.spark.catalog
 
-import ai.chronon.api.PartitionSpec
+import ai.chronon.api.{PartitionRange, PartitionSpec}
 import ai.chronon.spark.utils.SparkTestBase
 import org.scalatest.matchers.should.Matchers
 
@@ -687,6 +687,154 @@ class IcebergTest extends SparkTestBase with Matchers {
 
     // ts=10:00 day 2: untouched
     result(2).getAs[Int]("id") shouldBe 3
+  }
+
+  it should "append when file stats prove an unpartitioned Iceberg write is a new range" in {
+    val tableName = "default.iceberg_unpartitioned_append_new_range_test"
+    val tableUtils = TableUtils(spark)
+
+    spark.sql(s"""
+      CREATE TABLE IF NOT EXISTS $tableName (
+        id INT,
+        value STRING,
+        ds STRING
+      ) USING iceberg
+      TBLPROPERTIES (
+        'format-version' = '2',
+        'write.delete.mode' = 'merge-on-read',
+        'write.update.mode' = 'merge-on-read',
+        'write.metadata.metrics.default' = 'full',
+        'write.metadata.metrics.column.ds' = 'full'
+      )
+    """)
+
+    import spark.implicits._
+
+    val firstWrite = (1 to 3).map { day =>
+      val ds = f"2026-07-${day}%02d"
+      (day, s"first_$day", ds)
+    }.toDF("id", "value", "ds")
+    tableUtils.insertPartitions(firstWrite, tableName)
+
+    val secondWrite = (6 to 8).map { day =>
+      val ds = f"2026-07-${day}%02d"
+      (day + 100, s"second_$day", ds)
+    }.toDF("id", "value", "ds")
+
+    val existingRange = Iceberg.statsDateRange(tableName, "ds", PartitionSpec.daily).get
+    existingRange shouldBe StatsDateRange("2026-07-01", "2026-07-03")
+    existingRange.overlaps(StatsDateRange("2026-07-06", "2026-07-08")) shouldBe false
+
+    tableUtils.insertPartitions(secondWrite,
+                                tableName,
+                                writePartitionRange =
+                                  Some(PartitionRange("2026-07-06", "2026-07-08")(PartitionSpec.daily)))
+
+    val result = spark.table(tableName).orderBy("ds").collect()
+    result.length shouldBe 6
+    result.map(_.getAs[String]("ds")).toSeq shouldBe Seq(
+      "2026-07-01",
+      "2026-07-02",
+      "2026-07-03",
+      "2026-07-06",
+      "2026-07-07",
+      "2026-07-08"
+    )
+
+    val latestOperation = spark
+      .table(s"${Iceberg.qualifyWithCatalog(tableName)}.snapshots")
+      .orderBy("committed_at")
+      .select("operation")
+      .collect()
+      .last
+      .getAs[String]("operation")
+    latestOperation shouldBe "append"
+  }
+
+  it should "fall back to merge when unpartitioned Iceberg append is disabled" in {
+    val tableName = "default.iceberg_unpartitioned_append_disabled_test"
+    val tableUtils = TableUtils(spark)
+
+    spark.sql(s"""
+      CREATE TABLE IF NOT EXISTS $tableName (
+        id INT,
+        value STRING,
+        ds STRING
+      ) USING iceberg
+      TBLPROPERTIES (
+        'format-version' = '2',
+        'write.delete.mode' = 'merge-on-read',
+        'write.update.mode' = 'merge-on-read',
+        'write.metadata.metrics.default' = 'full',
+        'write.metadata.metrics.column.ds' = 'full'
+      )
+    """)
+
+    import spark.implicits._
+
+    val firstWrite = Seq((1, "first", "2026-09-01")).toDF("id", "value", "ds")
+    tableUtils.insertPartitions(firstWrite, tableName)
+
+    val secondWrite = Seq((2, "second", "2026-09-03")).toDF("id", "value", "ds")
+    spark.conf.set(TableUtils.UnpartitionedIcebergAppendEnabledConf, "false")
+    try {
+      tableUtils.insertPartitions(secondWrite,
+                                  tableName,
+                                  writePartitionRange =
+                                    Some(PartitionRange("2026-09-03", "2026-09-03")(PartitionSpec.daily)))
+    } finally {
+      spark.conf.unset(TableUtils.UnpartitionedIcebergAppendEnabledConf)
+    }
+
+    val result = spark.table(tableName).orderBy("ds").collect()
+    result.length shouldBe 2
+    result.map(_.getAs[String]("ds")).toSeq shouldBe Seq("2026-09-01", "2026-09-03")
+
+    val latestOperation = spark
+      .table(s"${Iceberg.qualifyWithCatalog(tableName)}.snapshots")
+      .orderBy("committed_at")
+      .select("operation")
+      .collect()
+      .last
+      .getAs[String]("operation")
+    latestOperation should not be "append"
+  }
+
+  it should "fall back to merge when unpartitioned Iceberg file stats are missing" in {
+    val tableName = "default.iceberg_unpartitioned_missing_stats_merge_fallback_test"
+    val tableUtils = TableUtils(spark)
+
+    spark.sql(s"""
+      CREATE TABLE IF NOT EXISTS $tableName (
+        id INT,
+        value STRING,
+        ds STRING
+      ) USING iceberg
+      TBLPROPERTIES (
+        'format-version' = '2',
+        'write.delete.mode' = 'merge-on-read',
+        'write.update.mode' = 'merge-on-read',
+        'write.metadata.metrics.default' = 'none'
+      )
+    """)
+
+    import spark.implicits._
+
+    val firstWrite = Seq((1, "old", "2026-08-01")).toDF("id", "value", "ds")
+    tableUtils.insertPartitions(firstWrite, tableName)
+
+    Iceberg.statsDateRange(tableName, "ds", PartitionSpec.daily) shouldBe None
+
+    val overwrite = Seq((10, "new", "2026-08-01")).toDF("id", "value", "ds")
+    tableUtils.insertPartitions(overwrite,
+                                tableName,
+                                writePartitionRange =
+                                  Some(PartitionRange("2026-08-01", "2026-08-01")(PartitionSpec.daily)))
+
+    val result = spark.table(tableName).collect()
+    result.length shouldBe 1
+    result.head.getAs[Int]("id") shouldBe 10
+    result.head.getAs[String]("value") shouldBe "new"
   }
 
   it should "correctly overwrite when partition column is INT type" in {

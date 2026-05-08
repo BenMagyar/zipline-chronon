@@ -271,6 +271,14 @@ trait Format {
 }
 
 private[catalog] case class StatsDateRange(start: String, end: String) {
+  def intersect(other: StatsDateRange): StatsDateRange =
+    StatsDateRange(Ordering[String].max(start, other.start), Ordering[String].min(end, other.end))
+
+  def nonEmpty: Boolean = start != null && end != null && start <= end
+
+  def overlaps(other: StatsDateRange): Boolean =
+    intersect(other).nonEmpty
+
   def virtualPartitions(partitionSpec: PartitionSpec): List[String] =
     partitionSpec.expandRange(start, end)
 

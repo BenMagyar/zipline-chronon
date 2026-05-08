@@ -117,6 +117,22 @@ Because of this, you often want to write your `StagingQuery` using various templ
 - `'{{ latest_date }}'`: the ds for which computation was requested. If running from the CLI, it defaults to the day before yesterday UTC. If the job gets broken up into smaller chunks due the to `step_days` argument, `latest_date` will be the same in all the runs, and will equal the `end_date` of the last chunk.
 - `'{{ max_date }}'`: the latest existing partition in the table, does not depend on input parameters to the job, but only on available partitions in the source table. It requires the source table as an argument, for example: `'{{ max_date(table=data.some_table) }}'`
 
+## Output Partition Range Writes
+
+For Spark `StagingQuery` jobs, Chronon passes the current run chunk as the expected output partition range when writing results. This lets unpartitioned Iceberg tables append when file statistics prove the incoming range does not overlap existing data. The optimization is enabled by default:
+
+```text
+spark.chronon.write.unpartitioned_iceberg_append.enabled=true
+```
+
+Set it to `false` to force the merge path:
+
+```text
+spark.chronon.write.unpartitioned_iceberg_append.enabled=false
+```
+
+Chronon does not materialize the `StagingQuery` result to compute its true min and max output partitions. Disable this if the query can emit output `ds` values outside `{{ start_date }}` to `{{ end_date }}`, such as offset dates, `{{ latest_date }}` outputs, bootstrap unions, or lookback rows.
+
 ## `StagingQuery` in Production
 
 Once merged into production, your `StagingQuery` will get scheduled for daily run within your `{team}_staging_queries` DAG in airflow. The compute task will get an upstream `PartitionSensor` for each of your table dependencies, which will wait for that day's partition to land before kicking off the compute. See above for an example of how to set dependencies.

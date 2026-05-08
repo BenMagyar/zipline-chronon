@@ -108,7 +108,9 @@ object ModelTransformsJob {
     val resultDf = processWithModels(sourceDf, modelTransformsConf, modelPlatformProvider, timeoutMillis, tableUtils)
 
     logger.info(s"Saving results to $outputTable")
-    resultDf.save(outputTable, tableProperties = modelTransformsConf.metaData.tableProps)
+    resultDf.save(outputTable,
+                  tableProperties = modelTransformsConf.metaData.tableProps,
+                  writePartitionRange = Some(dateRange))
 
     logger.info(s"Successfully completed ModelTransforms backfill for ${modelTransformsConf.metaData.name}")
   }

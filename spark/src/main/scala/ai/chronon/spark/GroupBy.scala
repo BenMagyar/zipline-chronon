@@ -910,11 +910,11 @@ object GroupBy {
               case EVENTS   => groupByBackfill.snapshotEvents(range)
             }
             if (!groupByConf.hasDerivations) {
-              outputDf.save(outputTable, tableProps)
+              outputDf.save(outputTable, tableProps, writePartitionRange = Some(range))
             } else {
               val finalOutputColumns = groupByConf.derivationsScala.finalOutputColumn(outputDf.columns)
               val result = outputDf.select(finalOutputColumns.toSeq: _*)
-              result.save(outputTable, tableProps)
+              result.save(outputTable, tableProps, writePartitionRange = Some(range))
             }
             logger.info(s"Wrote to table $outputTable, into partitions: $range")
           }

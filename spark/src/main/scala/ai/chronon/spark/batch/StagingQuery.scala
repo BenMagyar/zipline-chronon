@@ -87,7 +87,11 @@ class StagingQuery(stagingQueryConf: api.StagingQuery, endPartition: String, tab
       StagingQuery.substitute(tableUtils, stagingQueryConf.query, range.start, range.end, endPartition)
     logger.info(s"Rendered Staging Query to run is:\n$renderedQuery")
     val df = tableUtils.sql(renderedQuery)
-    df.save(outputTable, tableProps, partitionCols, autoExpand = enableAutoExpand.get)
+    df.save(outputTable,
+            tableProps,
+            partitionCols,
+            autoExpand = enableAutoExpand.get,
+            writePartitionRange = Some(range))
     logger.info(s"Wrote to table $outputTable, into partitions: $range")
     logger.info(s"Finished writing Staging Query data to $outputTable")
   }
