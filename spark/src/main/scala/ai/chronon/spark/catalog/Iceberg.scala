@@ -9,7 +9,7 @@ import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructType, TimestampType}
 
 import java.time.{LocalDate, ZoneOffset}
 import scala.collection.JavaConverters._
@@ -101,10 +101,17 @@ case object Iceberg extends Format {
   override def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
     metadataLastAvailablePartition(tableName, partitionColumn)
-      .orElse(
-        statsDateRange(tableName, partitionColumn, partitionSpec)
-          .map(_.lastAvailablePartition))
+      .orElse(statsLastAvailablePartition(tableName, partitionColumn, partitionSpec))
       .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
+
+  private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[String] =
+    statsDateRange(tableName, columnName, partitionSpec).map { range =>
+      sparkSession.read.table(tableName).schema(columnName).dataType match {
+        case TimestampType => partitionSpec.before(range.lastAvailablePartition)
+        case _             => range.lastAvailablePartition
+      }
+    }
 
   private[catalog] def statsDateRange(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[StatsDateRange] =

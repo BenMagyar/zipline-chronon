@@ -5,7 +5,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.functions.{col, date_format, min, max}
+import org.apache.spark.sql.functions.{col, date_format, date_sub, min, max}
 import org.apache.spark.sql.types.{DateType, StringType, StructType}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -154,7 +154,8 @@ trait Format {
             .headOption
             .flatMap(v => Option(v))
         case _ =>
-          df.select(date_format(max(col(partitionColumn)).cast(DateType), partitionSpec.format).as("last_partition"))
+          df.select(date_format(date_sub(max(col(partitionColumn)).cast(DateType), 1), partitionSpec.format)
+            .as("last_partition"))
             .as[String]
             .collect()
             .headOption
@@ -206,7 +207,7 @@ trait Format {
 
   // Unified last available partition: handles both string partition columns and timestamp/date columns.
   // For string columns that are catalog partitions (Hive/Iceberg/Delta), uses metadata-only lookup.
-  // For timestamp/date columns, falls back to a scan: DATE(MAX(col)) - 1 day.
+  // For non-string columns, falls back to the historical scan behavior: DATE(MAX(col)) - 1 day.
   def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
     metadataLastAvailablePartition(tableName, partitionColumn)

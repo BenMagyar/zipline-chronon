@@ -49,7 +49,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-01-01", "2024-01-02", "2024-01-03")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-02")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
@@ -200,7 +200,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-02-01", "2024-02-02", "2024-02-03")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-03")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-02")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")

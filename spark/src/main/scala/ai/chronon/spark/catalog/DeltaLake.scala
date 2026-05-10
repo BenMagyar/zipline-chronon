@@ -17,7 +17,7 @@ import org.apache.spark.sql.functions.{
   to_timestamp,
   when
 }
-import org.apache.spark.sql.types.{DataType, DateType, MapType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{DataType, DateType, MapType, StringType, StructField, StructType, TimestampType}
 
 import scala.util.{Failure, Success, Try}
 
@@ -72,10 +72,17 @@ case object DeltaLake extends Format {
   override def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
     metadataLastAvailablePartition(tableName, partitionColumn)
-      .orElse(
-        statsDateRange(tableName, partitionColumn, partitionSpec)
-          .map(_.lastAvailablePartition))
+      .orElse(statsLastAvailablePartition(tableName, partitionColumn, partitionSpec))
       .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
+
+  private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[String] =
+    statsDateRange(tableName, columnName, partitionSpec).map { range =>
+      sparkSession.read.table(tableName).schema(columnName).dataType match {
+        case TimestampType => partitionSpec.before(range.lastAvailablePartition)
+        case _             => range.lastAvailablePartition
+      }
+    }
 
   private[catalog] def statsDateRange(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[StatsDateRange] = {

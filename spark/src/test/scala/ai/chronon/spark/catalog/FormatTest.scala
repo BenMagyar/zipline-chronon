@@ -133,7 +133,7 @@ class FormatTest extends SparkTestBase {
     fmt.discoveredPartitions("db.table", "ds")(spark) shouldBe Some(List("2024-04-02", "2024-04-01"))
   }
 
-  it should "return the inclusive last available partition when scanning a timestamp column" in {
+  it should "return the last complete partition when scanning a timestamp column" in {
     val tableName = "format_timestamp_scan_last_available_test"
     spark.sql(s"""
       CREATE OR REPLACE TEMP VIEW $tableName AS
@@ -153,7 +153,7 @@ class FormatTest extends SparkTestBase {
           ss: SparkSession) = Nil
     }
 
-    fmt.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
+    fmt.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily)(spark) shouldBe Some("2024-04-02")
   }
 
   it should "resolve table names consistently with Spark SQL" in {
