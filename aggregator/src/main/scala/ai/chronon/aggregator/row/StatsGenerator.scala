@@ -147,6 +147,8 @@ object StatsGenerator {
           dataType match {
             case _: api.ListType | _: api.MapType | _: api.StructType =>
               Seq.empty
+            case api.DateType | api.TimestampType =>
+              anyTransforms(name)
             case _ =>
               val cardinality = cardinalityMap.getOrElse(name, 0.0)
               val isLowCardinality = cardinality <= cardinalityThreshold

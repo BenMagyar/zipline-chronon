@@ -16,6 +16,7 @@
 
 package ai.chronon.spark.other
 
+import ai.chronon.aggregator.row.StatsGenerator
 import ai.chronon.api.{Constants, Operation}
 import ai.chronon.online.InMemoryKvStore
 import ai.chronon.spark.AvroKvEncoder
@@ -96,6 +97,41 @@ class EnhancedStatsComputeTest extends SparkTestBase {
 
     // Rating should be low cardinality (0.5-5.0 scale, ~10 distinct values out of ~100K rows → ratio << 0.01)
     assert(cardinalityMap("rating") <= 0.01, s"Rating should be low cardinality, got ${cardinalityMap("rating")}")
+  }
+
+  it should "only compute null stats for date and timestamp columns" in {
+    val data = Seq(
+      ("2026-04-27 21:45:05.343", "2026-04-27", 10L),
+      ("2026-04-27 21:45:06.343", "2026-04-27", 20L),
+      (null, null, 30L)
+    )
+    val df = spark
+      .createDataFrame(data)
+      .toDF("created_at", "impressed_at", "score")
+      .withColumn("created_at", to_timestamp(col("created_at")))
+      .withColumn("impressed_at", to_date(col("impressed_at")))
+      .withColumn(tableUtils.partitionColumn, lit("2026-04-27"))
+
+    val enhancedStats = new EnhancedStatsCompute(
+      inputDf = df,
+      keys = Seq.empty,
+      name = "datetime_stats_test",
+      cardinalityThreshold = 0.01
+    )
+
+    val metricsByColumn = enhancedStats.enhancedMetrics.groupBy(_.name)
+    assert(metricsByColumn("created_at").map(_.suffix) == Seq(StatsGenerator.nullSuffix))
+    assert(metricsByColumn("impressed_at").map(_.suffix) == Seq(StatsGenerator.nullSuffix))
+
+    val scoreOperations = enhancedStats.enhancedMetrics.filter(_.name == "score").map(_.operation).toSet
+    assert(scoreOperations.contains(Operation.MAX), "Numeric columns should still receive numeric stats")
+    assert(scoreOperations.contains(Operation.MIN), "Numeric columns should still receive numeric stats")
+
+    val (resultDf, _) = enhancedStats.enhancedDailySummary(
+      sample = 1.0,
+      timeBucketMinutes = 0
+    )
+    assert(resultDf.count() == 1, "Should compute one daily stats tile")
   }
 
   it should "generate enhanced metrics based on cardinality" in {
