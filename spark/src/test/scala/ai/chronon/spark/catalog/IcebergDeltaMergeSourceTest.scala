@@ -2,6 +2,7 @@ package ai.chronon.spark.catalog
 
 import ai.chronon.spark.utils.SparkTestBase
 import io.delta.tables.DeltaTable
+import org.apache.commons.io.FileUtils
 import org.scalatest.matchers.should.Matchers
 
 import java.nio.file.Files
@@ -21,7 +22,8 @@ class IcebergDeltaMergeSourceTest extends SparkTestBase with Matchers {
   "insertPartitions on an unpartitioned Iceberg table" should
     "prepare Delta source scans before MERGE" in {
       val tableName = "default.iceberg_delta_merge_source_test"
-      val deltaPath = Files.createTempDirectory("chronon-delta-dv-source").toString
+      val deltaDir = Files.createTempDirectory("chronon-delta-dv-source")
+      val deltaPath = deltaDir.toString
       val tableUtils = TableUtils(spark)
       import spark.implicits._
 
@@ -68,13 +70,15 @@ class IcebergDeltaMergeSourceTest extends SparkTestBase with Matchers {
           "keep")
       } finally {
         spark.sql(s"DROP TABLE IF EXISTS $tableName")
+        FileUtils.deleteDirectory(deltaDir.toFile)
       }
     }
 
   "insertPartitions on a V1 table" should
     "prepare Delta source scans before insertInto" in {
       val tableName = "default.v1_delta_dv_insert_source_test"
-      val deltaPath = Files.createTempDirectory("chronon-delta-dv-v1-source").toString
+      val deltaDir = Files.createTempDirectory("chronon-delta-dv-v1-source")
+      val deltaPath = deltaDir.toString
       val tableUtils = TableUtils(spark)
       import spark.implicits._
 
@@ -116,6 +120,7 @@ class IcebergDeltaMergeSourceTest extends SparkTestBase with Matchers {
           "keep")
       } finally {
         spark.sql(s"DROP TABLE IF EXISTS $tableName")
+        FileUtils.deleteDirectory(deltaDir.toFile)
       }
     }
 }
