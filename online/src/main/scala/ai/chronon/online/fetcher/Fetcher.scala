@@ -183,6 +183,26 @@ class Fetcher(val kvStore: KVStore,
   lazy val joinCodecCache: TTLCache[String, Try[JoinCodec]] = metadataStore.buildJoinCodecCache(
     Some(logControlEvent)
   )
+
+  private class JoinConfCacheKey(val joinName: String, val confHash: String, val join: api.Join) {
+    override def equals(obj: Any): Boolean = obj match {
+      case other: JoinConfCacheKey => joinName == other.joinName && confHash == other.confHash
+      case _                       => false
+    }
+
+    override def hashCode(): Int = (joinName, confHash).hashCode()
+  }
+
+  private lazy val joinConfCodecCache: TTLCache[JoinConfCacheKey, Try[JoinCodec]] =
+    new TTLCache[JoinConfCacheKey, Try[JoinCodec]](
+      cacheKey => Try(metadataStore.buildJoinCodec(cacheKey.join, refreshOnFail = true)),
+      cacheKey => Metrics.Context(environment = "join.codec.fetch", join = cacheKey.joinName),
+      ttlMillis = fetchContext.joinCodecTtlMillis
+    )
+
+  private def joinConfCacheKey(join: api.Join): JoinConfCacheKey =
+    new JoinConfCacheKey(join.metaData.getName, ThriftJsonCodec.md5Digest(join), join)
+
   // Generic withTs method that works with any TimestampableResponse
   private[online] def withTs[T <: BaseResponse](responses: Future[Seq[T]]): Future[FetcherResponseWithTs[T]] = {
     responses.map { response =>
@@ -196,14 +216,15 @@ class Fetcher(val kvStore: KVStore,
 
   def fetchJoin(requests: Seq[Request], joinConf: Option[api.Join] = None): Future[Seq[Response]] = {
     val ts = System.currentTimeMillis()
-    val joinCodecsByName: Map[String, Try[JoinCodec]] = joinConf match {
+    val cachedJoinCodecsByName = mutable.Map.empty[String, Try[JoinCodec]]
+    val joinCodecForName: String => Option[Try[JoinCodec]] = joinConf match {
       case Some(join) =>
-        val codecTry = Try(metadataStore.buildJoinCodec(join, refreshOnFail = true))
-        requests.iterator.map(_.name).toSeq.distinct.map(joinName => joinName -> codecTry).toMap
+        lazy val codecTry = joinConfCodecCache(joinConfCacheKey(join))
+        _ => Some(codecTry)
       case None =>
-        requests.iterator.map(_.name).toSeq.distinct.map(joinName => joinName -> joinCodecCache(joinName)).toMap
+        joinName => Some(cachedJoinCodecsByName.getOrElseUpdate(joinName, joinCodecCache(joinName)))
     }
-    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecsByName)
+    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecForName)
     val externalResponsesF = fetchExternal(requests)
     val combinedResponsesF =
       internalResponsesF.zip(externalResponsesF).map { case (internalResponses, externalResponses) =>

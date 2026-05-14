@@ -56,7 +56,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
   // used in stream-enrichment and in staging testing
   def fetchJoins(requests: Seq[Request],
                  joinConf: Option[Join] = None,
-                 joinCodecsByName: Map[String, Try[JoinCodec]] = Map.empty): Future[Seq[Response]] = {
+                 joinCodecForName: String => Option[Try[JoinCodec]] = _ => None): Future[Seq[Response]] = {
     val startTimeMs = System.currentTimeMillis()
     // convert join requests to groupBy requests
     val joinDecomposed: Seq[(Request, Try[Seq[Either[PrefixedRequest, KeyMissingException]]])] =
@@ -83,39 +83,40 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           join.joinPartOps.map { part =>
             import ai.chronon.online.metrics
             val joinContextInner = metrics.Metrics.Context(joinContext.get, part)
-            val joinCodec = joinCodecsByName
-              .get(request.name)
-              .flatMap(_.toOption)
-            val currentServingInfo = joinCodec.flatMap { _ =>
-              metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName).toOption
-            }
-            val keyMapping = joinCodec.flatMap { codec =>
-              currentServingInfo
+            val needsDerivation = JoinRequestKeys.needsDerivation(request, join.join, part)
+            lazy val currentServingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName)
+            lazy val keyMapping = joinCodecForName(request.name).flatMap(_.toOption).flatMap { codec =>
+              currentServingInfo.toOption
                 .flatMap(servingInfo =>
                   codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part, servingInfo)))
                 .orElse {
-                  if (currentServingInfo.isEmpty) {
+                  if (currentServingInfo.isFailure) {
                     codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part))
                   } else {
                     None
                   }
                 }
             }
-            val missingKeys = keyMapping
-              .map(_.missingRequestKeys(request))
-              .getOrElse(JoinRequestKeys.missingRequestKeys(request, join.join, part))
+            val staticMissingKeys = JoinRequestKeys.missingRequestKeys(request, join.join, part)
+            val missingKeys =
+              if (staticMissingKeys.nonEmpty || !needsDerivation) {
+                staticMissingKeys
+              } else {
+                keyMapping.map(_.missingRequestKeys(request)).getOrElse(staticMissingKeys)
+              }
 
             if (missingKeys.nonEmpty) {
               Right(KeyMissingException(part.fullPrefix, missingKeys.toSeq, request.keys))
             } else {
-              val leftKeys = keyMapping.map(_.leftKeys(request)).getOrElse {
-                if (JoinRequestKeys.needsDerivation(request, join.join, part)) {
-                  val servingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName).get
-                  JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo)
+              val leftKeys =
+                if (needsDerivation) {
+                  keyMapping.map(_.leftKeys(request)).getOrElse {
+                    val servingInfo = currentServingInfo.get
+                    JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo)
+                  }
                 } else {
                   part.leftToRight.keys.map(leftKey => leftKey -> request.keys(leftKey)).toMap
                 }
-              }
               val rightKeys = part.leftToRight.map { case (leftKey, rightKey) => rightKey -> leftKeys(leftKey) }
               Left(
                 PrefixedRequest(
@@ -135,7 +136,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
       }
     }
 
-    val groupByResponsesFuture = groupByFetcher.fetchGroupBys(groupByRequests)
+    val groupByResponsesFuture = fetchGroupBys(groupByRequests)
 
     // re-attach groupBy responses to join
     groupByResponsesFuture
