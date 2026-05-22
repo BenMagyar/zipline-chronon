@@ -211,8 +211,12 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
     loadIcebergTable(fullTableName).flatMap { table =>
       val tableSpec = Option(table.spec())
 
-      if (tableSpec.isEmpty || !tableSpec.get.isPartitioned) {
+      if (tableSpec.isEmpty) {
         return None
+      }
+
+      if (!tableSpec.get.isPartitioned) {
+        return IcebergClusteredStatsExtractor.extract(fullTableName, table, confName)
       }
 
       val currentSnapshot = Option(table.currentSnapshot())
