@@ -39,6 +39,14 @@ import scala.jdk.CollectionConverters._
 object JoinUtils {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
+  val FinalDfExplainEnabled: String = "spark.chronon.join.final_df.explain.enabled"
+
+  def explainFinalDfIfEnabled(df: DataFrame)(implicit tableUtils: TableUtils): Unit = {
+    if (tableUtils.sparkSession.conf.get(FinalDfExplainEnabled, "false").toBoolean) {
+      df.explain()
+    }
+  }
+
   def materializeJoin(joinConf: api.Join,
                       endPartition: String,
                       tableUtils: TableUtils,

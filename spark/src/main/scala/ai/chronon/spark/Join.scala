@@ -394,7 +394,7 @@ class Join(joinConf: api.Join,
     val finalDf = cleanUpContextualFields(applyDerivation(finalBaseDf, bootstrapInfo, leftDf.columns),
                                           bootstrapInfo,
                                           leftDf.columns)
-    finalDf.explain()
+    explainFinalDfIfEnabled(finalDf)(tableUtils)
     finalDf
   }
 

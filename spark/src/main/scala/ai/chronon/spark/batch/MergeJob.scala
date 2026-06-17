@@ -134,7 +134,9 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
 
       val tableProps = createTableProperties
 
-      joinedDfTry.get.save(outputTable, tableProps, autoExpand = true)
+      val joinedDf = joinedDfTry.get
+      JoinUtils.explainFinalDfIfEnabled(joinedDf)
+      joinedDf.save(outputTable, tableProps, autoExpand = true)
     }
   }
 
