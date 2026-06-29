@@ -723,14 +723,18 @@ class ZiplineHub:
             print_error(f"Error calling clear-downstream preview API: {self._get_error_details(e)}", format=self.format)
             raise e
 
-    def apply_clear_downstream(self, node_results, user, affected_confs=None):
+    def apply_clear_downstream(self, conf_name, branch, user, start, end):
+        # Apply takes the same inputs as preview; the hub recomputes the downstream set and persists it.
         url = f"{self.base_url}/workflow/v2/clear-downstream/apply"
+        start_dt = _format_hub_partition(start, None)
+        end_dt = _format_hub_partition(end, None)
         apply_request = {
-            "nodeResults": node_results,
+            "confName": conf_name,
+            "branch": branch,
             "user": user,
+            "start": start_dt,
+            "end": end_dt,
         }
-        if affected_confs:
-            apply_request["affectedConfs"] = affected_confs
         try:
             response = requests.post(
                 url, json=apply_request, headers=self.additional_headers(self.base_url)

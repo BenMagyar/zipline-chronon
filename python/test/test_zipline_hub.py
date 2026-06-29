@@ -181,14 +181,13 @@ class TestZiplineHub:
 
     @patch("requests.post")
     def test_apply_clear_downstream_success(self, mock_post):
-        """Test apply clear-downstream API call posts correct URL and body."""
-        node_results = [
-            {"nodeName": "source_node", "nodeHash": "h1", "semanticHash": "s1",
-             "startPartition": "2024-01-01", "endPartition": "2024-01-05"},
-        ]
+        """Apply posts the same inputs as preview; the hub recomputes server-side."""
         mock_response = Mock()
         mock_response.json.return_value = {
-            "results": node_results,
+            "results": [
+                {"nodeName": "source_node", "nodeHash": "h1", "semanticHash": "s1",
+                 "startPartition": "2024-01-01", "endPartition": "2024-01-05"},
+            ],
             "totalNodesCleared": 1,
             "message": "Cleared 1 nodes",
         }
@@ -197,16 +196,24 @@ class TestZiplineHub:
 
         hub = ZiplineHub("http://example.com")
         result = hub.apply_clear_downstream(
-            node_results=node_results,
+            conf_name="aws.demo.v1",
+            branch="main",
             user="test@example.com",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 5),
         )
 
         assert result["totalNodesCleared"] == 1
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args
         assert call_kwargs[0][0] == "http://example.com/workflow/v2/clear-downstream/apply"
-        assert call_kwargs[1]["json"]["nodeResults"] == node_results
-        assert call_kwargs[1]["json"]["user"] == "test@example.com"
+        body = call_kwargs[1]["json"]
+        assert body["confName"] == "aws.demo.v1"
+        assert body["branch"] == "main"
+        assert body["user"] == "test@example.com"
+        assert body["start"] == "2024-01-01"
+        assert body["end"] == "2024-01-05"
+        assert "nodeResults" not in body
 
     @patch("requests.post")
     def test_apply_clear_downstream_raises_on_bad_json(self, mock_post):
@@ -220,6 +227,9 @@ class TestZiplineHub:
         hub = ZiplineHub("http://example.com")
         with pytest.raises(requests.exceptions.JSONDecodeError):
             hub.apply_clear_downstream(
-                node_results=[{"nodeName": "n"}],
+                conf_name="aws.demo.v1",
+                branch="main",
                 user="test@example.com",
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 5),
             )

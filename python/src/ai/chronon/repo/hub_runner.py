@@ -984,7 +984,6 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
             end=end_ds,
         )
 
-    results = preview_json.get("results", [])
     affected_confs = preview_json.get("affectedConfs", [])
 
     print_key_value("Conf", conf_name, format=format)
@@ -1009,11 +1008,16 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
             sys.exit(0)
 
     with status_spinner("Clearing downstream nodes...", format=format):
-        zipline_hub.apply_clear_downstream(
-            node_results=results,
+        apply_json = zipline_hub.apply_clear_downstream(
+            conf_name=conf_name,
+            branch=branch,
             user=user,
-            affected_confs=affected_confs,
+            start=start_ds,
+            end=end_ds,
         )
+
+    # Apply recomputes the downstream set; use its result for the recompute hints.
+    affected_confs = apply_json.get("affectedConfs", affected_confs)
 
     print_success(f"Cleared {len(affected_confs)} confs", format=format)
     click.echo()

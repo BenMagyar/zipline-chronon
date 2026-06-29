@@ -1080,6 +1080,9 @@ class TestHubRunner:
             "results": [
                 {"nodeName": "aws.my_node.v1", "startPartition": "2024-01-01", "endPartition": "2024-01-05"},
             ],
+            "affectedConfs": [
+                {"confName": "aws.my_conf.v1", "startPartition": "2024-01-01", "endPartition": "2024-01-05", "mode": "backfill"},
+            ],
             "totalNodesCleared": 1,
             "message": "Cleared 1 nodes",
         }
@@ -1117,10 +1120,13 @@ class TestHubRunner:
         apply_call = mock_post.call_args_list[1]
         assert "/workflow/v2/clear-downstream/apply" in apply_call[0][0]
         apply_payload = apply_call[1]['json']
-        assert len(apply_payload['nodeResults']) == 1
+        # Apply sends the same inputs as preview (the hub recomputes) — no nodeResults round-trip.
+        assert apply_payload['confName'] == ".".join(online_join_conf.split("/")[-2:])
+        assert apply_payload['branch'] == "test-branch"
         assert apply_payload['user'] == "test@example.com"
-        assert len(apply_payload['affectedConfs']) == 1
-        assert apply_payload['affectedConfs'][0]['confName'] == "aws.my_conf.v1"
+        assert apply_payload['start'] == "2024-01-01"
+        assert apply_payload['end'] == "2024-01-05"
+        assert 'nodeResults' not in apply_payload
 
     @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
