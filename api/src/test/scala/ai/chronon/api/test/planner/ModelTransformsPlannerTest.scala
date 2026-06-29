@@ -517,6 +517,39 @@ class ModelTransformsPlannerTest extends AnyFlatSpec with Matchers {
     tableNames should contain("test_namespace.test_join_output")
   }
 
+  it should "build plan successfully for join source with no query set (null query)" in {
+    val join = B.Join(
+      left = B.Source.events(
+        query = B.Query(),
+        table = "test_namespace.events_table"
+      ),
+      joinParts = Seq.empty,
+      metaData = B.MetaData(
+        name = "test_join",
+        namespace = "test_namespace"
+      )
+    )
+
+    // Construct JoinSource without a query
+    val joinSourceNoQuery = new JoinSource().setJoin(join)
+    val source = new Source()
+    source.setJoinSource(joinSourceNoQuery)
+
+    val modelTransforms = buildModelTransforms("test_model_transforms_null_query", source)
+    val planner = new ModelTransformsPlanner(modelTransforms)
+
+    noException should be thrownBy planner.buildPlan
+
+    val plan = planner.buildPlan
+    plan.nodes.asScala should have size 2
+
+    val backfillNode = plan.nodes.asScala.find(_.content.isSetModelTransformsBackfill)
+    backfillNode should be(defined)
+    val backfillDeps = backfillNode.get.metaData.executionInfo.tableDependencies.asScala
+    backfillDeps should have size 1
+    backfillDeps.head.tableInfo.table shouldBe "test_namespace.test_join"
+  }
+
   it should "create backfill node with model dependencies when models have training configs" in {
     val source = B.Source.events(
       query = B.Query(),

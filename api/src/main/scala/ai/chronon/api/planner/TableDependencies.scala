@@ -70,7 +70,8 @@ object TableDependencies {
     val startCutOff = Option(source.query).map(_.getStartPartition).orNull
     val endCutOff = Option(source.query).map(_.getEndPartition).orNull
 
-    val lagOpt = Option(WindowUtils.plus(source.query.getPartitionLag, shift.orNull))
+    val lag = Option(source.query).map(_.getPartitionLag).orNull
+    val lagOpt = Option(WindowUtils.plus(lag, shift.orNull))
     val endOffset = lagOpt.getOrElse(WindowUtils.zero())
 
     // we don't care if the source is cumulative YET.
@@ -101,11 +102,13 @@ object TableDependencies {
       .joinSourceOutputTableInfo(source)
       .map(_.deepCopy())
       .getOrElse {
-        new TableInfo()
-          .setPartitionColumn(source.query.getPartitionColumn)
-          .setPartitionFormat(source.query.getPartitionFormat)
-          .setPartitionInterval(source.query.getPartitionInterval)
-          .setPartitionOffset(source.query.getPartitionOffset)
+        Option(source.query).fold(new TableInfo()) { q =>
+          new TableInfo()
+            .setPartitionColumn(q.getPartitionColumn)
+            .setPartitionFormat(q.getPartitionFormat)
+            .setPartitionInterval(q.getPartitionInterval)
+            .setPartitionOffset(q.getPartitionOffset)
+        }
       }
       .setTable(inputTable)
       .setIsCumulative(source.isCumulative)
