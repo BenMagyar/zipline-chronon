@@ -1,3 +1,8 @@
+---
+title: "Sub-Daily Partitions"
+order: 8
+---
+
 # Sub-Daily Partitions
 
 Chronon outputs can be partitioned finer than a day: hourly, 3-hourly, 15-minutely — any
