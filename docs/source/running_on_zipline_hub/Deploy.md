@@ -27,6 +27,9 @@ Schedules a single `GroupBy` or `Join` for recurring execution. This ensures the
 zipline hub schedule compiled/group_bys/aws/user_activities.v1__1
 ```
 
+For schedule syntax, output partition cadence, and sub-daily semantics, see
+[Schedules](/docs/authoring_features/Schedules).
+
 ### [schedule-all](/docs/reference/cli#zipline-hub-schedule-all)
 
 Schedules all configs based on their versions in the `main`/`master` branch. This is intended to be triggered as part of your CI pipeline so that merging changes automatically keeps scheduled jobs in sync.

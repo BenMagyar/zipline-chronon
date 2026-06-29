@@ -124,6 +124,7 @@ sent to Hub as `YYYY-MM-DD`; sub-daily inputs are normalized to
 
 Partition values must validate as real dates and times. Second precision is only
 accepted when seconds are `00`, because Chronon partitions are minute-aligned.
+For authoring semantics, see [Schedules](/docs/authoring_features/Schedules).
 
 You can also see your previously run jobs in the `home` page of the Zipline Hub UI.
 
