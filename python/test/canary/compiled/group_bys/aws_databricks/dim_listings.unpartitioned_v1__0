@@ -55,6 +55,7 @@
           "AWS_REGION": "us-west-2",
           "CLOUD_PROVIDER": "aws",
           "CUSTOMER_ID": "dev",
+          "ENABLE_KINESIS": "true",
           "EVAL_URL": "http://localhost:3904",
           "FETCHER_URL": "http://localhost:9000",
           "FRONTEND_URL": "https://canary-aws.zipline.ai",

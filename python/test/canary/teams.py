@@ -312,6 +312,7 @@ aws_databricks = Team(
             "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary",
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
             "HUB_URL": "https://canary-orch-aws.zipline.ai",
+            "ENABLE_KINESIS": "true",
         },
     ),
     conf=ConfigProperties(

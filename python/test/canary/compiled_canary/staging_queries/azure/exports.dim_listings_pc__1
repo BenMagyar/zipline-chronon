@@ -70,10 +70,6 @@
       },
       "tableInfo": {
         "partitionColumn": "datest",
-        "partitionInterval": {
-          "length": 1,
-          "timeUnit": 1
-        },
         "table": "dim_listings_custom_part",
         "timePartitioned": 1
       }

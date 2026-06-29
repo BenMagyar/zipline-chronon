@@ -189,9 +189,16 @@ aws_databricks_env.common['DATABRICKS_EXTRA'] = "DATABRICKS_EXTRA_1"
 # /services/hub path) — the crucible cluster runs PR-77 consolidated domain wiring.
 aws_databricks_env.common['ARTIFACT_PREFIX'] = "s3://zipline-artifacts-crucible"
 aws_databricks_env.common['WAREHOUSE_PREFIX'] = "s3://zipline-warehouse-crucible"
+
 aws_databricks_env.common['FRONTEND_URL'] = "https://crucible-aws.zipline.ai"
 aws_databricks_env.common['HUB_URL'] = "https://crucible-aws.zipline.ai/services/hub"
+
+aws_databricks_env.common['FLINK_JARS_URI'] = "s3://zipline-spark-libs/spark-3.5.3/libs/"
+aws_databricks_env.common['FLINK_STATE_URI'] = "s3://zipline-warehouse-crucible/flink-state"
+
 aws_databricks.conf.common['spark.sql.warehouse.dir'] = "s3://zipline-warehouse-crucible/data/uc-poc/warehouse/"
+aws_databricks.conf.common['spark.chronon.table_write.upload.format'] = "ion"
+aws_databricks.conf.common['spark.chronon.table_write.upload.location'] = "s3://zipline-warehouse-crucible/data/ion_uploads/"
 # UC's vended-creds default works on the K8sSubmitter path; only EMR needs the opt-out.
 del aws_databricks.conf.common['spark.sql.catalog.workspace.renewCredential.enabled']
 
