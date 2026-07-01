@@ -885,7 +885,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     result shouldBe JobStatusType.PENDING
   }
 
-  it should "pass the flink URL derived from ingressBaseUrl to the health check fn" in {
+  it should "pass the jobId to the health check fn" in {
     val mockClient = mock[EmrServerlessClient]
     val mockFlinkSubmitter = mock[K8sFlinkSubmitter]
     when(mockFlinkSubmitter.statusWithCreationTime("my-deployment", "zipline-flink"))
@@ -897,12 +897,11 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       executionRoleArn = "arn:aws:iam::123456789012:role/TestRole",
       s3LogUri = "s3://test-bucket/logs/",
       eksFlinkSubmitter = Some(mockFlinkSubmitter),
-      ingressBaseUrl = Some("https://hub.example.com"),
       flinkHealthCheckFn = url => { capturedUrl = url; true }
     )
     submitter.status("flink:zipline-flink:my-deployment")
 
-    capturedUrl shouldBe Some("https://hub.example.com/flink/my-deployment/")
+    capturedUrl shouldBe Some("flink:zipline-flink:my-deployment")
   }
 
   it should "propagate non-RUNNING EKS status without invoking health check" in {

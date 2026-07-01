@@ -269,18 +269,17 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     result shouldBe JobStatusType.PENDING
   }
 
-  it should "pass the flink URL derived from ingressBaseUrl to the health check fn" in {
+  it should "pass the jobId to the health check fn" in {
     val mockEks = mock[K8sFlinkSubmitter]
     when(mockEks.statusWithCreationTime("my-deployment", "zipline-flink"))
       .thenReturn((JobStatusType.RUNNING, Some(java.time.Instant.now())))
 
     var capturedUrl: Option[String] = None
     val submitter = new EmrSubmitter("test-customer", mock[EmrClient], mock[Ec2Client], Some(mockEks),
-      ingressBaseUrl = Some("https://hub.example.com"),
       flinkHealthCheckFn = url => { capturedUrl = url; true })
     submitter.status("flink:zipline-flink:my-deployment")
 
-    capturedUrl shouldBe Some("https://hub.example.com/flink/my-deployment/")
+    capturedUrl shouldBe Some("flink:zipline-flink:my-deployment")
   }
 
   it should "propagate non-RUNNING EKS status without invoking health check" in {
@@ -691,7 +690,7 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       None,
       flinkInternalJobIdFetchFn = _ => Some(flinkJobId)
     )
-    val result = submitter.getFlinkInternalJobId("emr:cluster:flink:my-deployment")
+    val result = submitter.getFlinkInternalJobId("flink:my-ns:my-deployment")
     assertEquals(Some(flinkJobId), result)
   }
 

@@ -315,8 +315,8 @@ class EmrServerlessSubmitter(
         .getOrElse(throw new RuntimeException("K8sFlinkSubmitter is required for Flink jobs"))
         .statusWithCreationTime(deploymentName = parts(2), namespace = parts(1))
       eksStatus match {
-        case JobStatusType.RUNNING if flinkHealthCheckFn(getFlinkUrl(jobId)) => JobStatusType.RUNNING
-        case JobStatusType.RUNNING                                           =>
+        case JobStatusType.RUNNING if flinkHealthCheckFn(Some(jobId)) => JobStatusType.RUNNING
+        case JobStatusType.RUNNING                                    =>
           // Health check failed: job is STABLE on K8s but checkpoints haven't accumulated yet.
           // Within the grace period this is expected (K8s startup consumes part of the window),
           // so stay PENDING rather than triggering a retrigger.
@@ -439,7 +439,7 @@ class EmrServerlessSubmitter(
   }
 
   override def getFlinkInternalJobId(jobId: String): Option[String] =
-    flinkInternalJobIdFetchFn(getFlinkUrl(jobId))
+    flinkInternalJobIdFetchFn(Some(jobId))
 
   override def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = {
     val s3 = s3Client.getOrElse {

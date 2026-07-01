@@ -425,12 +425,11 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     healthCheckCalled shouldBe false
   }
 
-  it should "pass flink URL from ingressBaseUrl to the health check fn" in {
+  it should "pass the jobId to the health check fn" in {
     val mockAksFlink = mock[K8sFlinkSubmitter]
     var capturedUrl: Option[String] = None
     val submitter = createSubmitter(
       mockAksFlink = mockAksFlink,
-      ingressBaseUrl = Some("https://hub.example.com"),
       flinkHealthCheckFn = url => { capturedUrl = url; true }
     )
 
@@ -438,7 +437,7 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       .thenReturn((JobStatusType.RUNNING, Some(java.time.Instant.now())))
 
     submitter.status("flink:ns:my-dep")
-    capturedUrl shouldBe Some("https://hub.example.com/flink/my-dep/")
+    capturedUrl shouldBe Some("flink:ns:my-dep")
   }
 
   // --- kill ---

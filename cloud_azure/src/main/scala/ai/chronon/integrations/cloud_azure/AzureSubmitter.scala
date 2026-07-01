@@ -107,8 +107,8 @@ class AzureSubmitter(
       val (flinkStatus, creationTime) =
         aksFlinkSubmitter.statusWithCreationTime(deploymentName = parts(2), namespace = parts(1))
       flinkStatus match {
-        case JobStatusType.RUNNING if flinkHealthCheckFn(getFlinkUrl(jobId)) => JobStatusType.RUNNING
-        case JobStatusType.RUNNING                                           =>
+        case JobStatusType.RUNNING if flinkHealthCheckFn(Some(jobId)) => JobStatusType.RUNNING
+        case JobStatusType.RUNNING                                    =>
           // Health check failed — stay PENDING within the grace window before declaring failure
           JobSubmitter.flinkStatusWithGrace(
             jobId,
@@ -147,7 +147,7 @@ class AzureSubmitter(
     else kyuubiSubmitter.getSparkUrl(jobId)
 
   override def getFlinkInternalJobId(jobId: String): Option[String] =
-    flinkInternalJobIdFetchFn(getFlinkUrl(jobId))
+    flinkInternalJobIdFetchFn(Some(jobId))
 
   override def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = {
     val sc = storageClient.getOrElse {

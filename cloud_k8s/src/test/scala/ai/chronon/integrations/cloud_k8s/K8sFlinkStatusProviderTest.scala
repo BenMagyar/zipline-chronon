@@ -3,6 +3,10 @@ package ai.chronon.integrations.cloud_k8s
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Future, Promise}
+
 class K8sFlinkStatusProviderTest extends AnyFlatSpec with Matchers {
 
   private val provider = new K8sFlinkStatusProvider()
@@ -111,5 +115,101 @@ class K8sFlinkStatusProviderTest extends AnyFlatSpec with Matchers {
     val count = provider.parseCheckpointCounts(json)
     count shouldBe Some(2)
     provider.isHealthyBasedOnCheckpoints(count.get) shouldBe false
+  }
+
+  // ---- Internal K8s service API ----
+
+  // Stubs resolveServiceUrl to return a fixed URL, letting us test the (namespace, deploymentName)
+  // overloads without a real K8s cluster.
+  private def providerWithResolvedUrl(
+      url: Option[String],
+      jobsBody: Option[String] = None,
+      checkpointsBody: Option[String] = None
+  ): K8sFlinkStatusProvider =
+    new K8sFlinkStatusProvider(k8sClient = None) {
+      override private[cloud_k8s] def resolveServiceUrl(namespace: String, deploymentName: String): Option[String] = url
+      override protected def fetchJobsResponse(flinkUri: String): Future[Option[String]] =
+        Future.successful(jobsBody)
+      override protected def fetchCheckpointsResponse(flinkUri: String, jobId: String): Future[Option[String]] =
+        Future.successful(checkpointsBody)
+    }
+
+  "isFlinkJobHealthy(namespace, deploymentName)" should "return false when service is unreachable (resolveServiceUrl returns None)" in {
+    val testProvider = new K8sFlinkStatusProvider(k8sClient = None)
+    // Longer timeout: resolveServiceUrl runs the reachability probe (up to ReachabilityTimeoutMs) on the Future thread.
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 15.seconds)
+    result shouldBe false
+  }
+
+  it should "return false when port-forward fails (k8sClient present but service not found)" in {
+    val testProvider = providerWithResolvedUrl(url = None)
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe false
+  }
+
+  it should "return false when /jobs returns no body" in {
+    val testProvider = providerWithResolvedUrl(url = Some("http://fake-url"), jobsBody = None)
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe false
+  }
+
+  it should "return false when /jobs returns empty jobs list" in {
+    val testProvider = providerWithResolvedUrl(
+      url = Some("http://fake-url"),
+      jobsBody = Some("""{"jobs": []}""")
+    )
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe false
+  }
+
+  it should "return false when /checkpoints returns no body" in {
+    val testProvider = providerWithResolvedUrl(
+      url = Some("http://fake-url"),
+      jobsBody = Some("""{"jobs": [{"id": "abc123", "status": "RUNNING"}]}"""),
+      checkpointsBody = None
+    )
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe false
+  }
+
+  it should "return false when completed checkpoints < 3" in {
+    val testProvider = providerWithResolvedUrl(
+      url = Some("http://fake-url"),
+      jobsBody = Some("""{"jobs": [{"id": "abc123", "status": "RUNNING"}]}"""),
+      checkpointsBody = Some("""{"counts": {"completed": 2, "total": 2, "in_progress": 0, "failed": 0, "restored": 0}}""")
+    )
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe false
+  }
+
+  it should "return true when service is reachable and job has sufficient checkpoints" in {
+    val testProvider = providerWithResolvedUrl(
+      url = Some("http://fake-url"),
+      jobsBody = Some("""{"jobs": [{"id": "abc123", "status": "RUNNING"}]}"""),
+      checkpointsBody = Some("""{"counts": {"completed": 5, "total": 5, "in_progress": 0, "failed": 0, "restored": 0}}""")
+    )
+    val result = Await.result(testProvider.isFlinkJobHealthy("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe true
+  }
+
+  "getFlinkInternalJobId(namespace, deploymentName)" should "return None when service is unreachable" in {
+    val testProvider = new K8sFlinkStatusProvider(k8sClient = None)
+    val result = Await.result(testProvider.getFlinkInternalJobId("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe None
+  }
+
+  it should "return None when /jobs returns no body" in {
+    val testProvider = providerWithResolvedUrl(url = Some("http://fake-url"), jobsBody = None)
+    val result = Await.result(testProvider.getFlinkInternalJobId("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe None
+  }
+
+  it should "return the job ID when service is reachable and /jobs response is valid" in {
+    val testProvider = providerWithResolvedUrl(
+      url = Some("http://fake-url"),
+      jobsBody = Some("""{"jobs": [{"id": "abc123", "status": "RUNNING"}]}""")
+    )
+    val result = Await.result(testProvider.getFlinkInternalJobId("test-ns", "my-deploy"), 5.seconds)
+    result shouldBe Some("abc123")
   }
 }
