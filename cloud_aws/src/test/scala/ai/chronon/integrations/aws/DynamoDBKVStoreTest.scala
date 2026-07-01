@@ -5,6 +5,7 @@ import ai.chronon.api.Constants.{
   KvEnableTtlArg,
   KvReplicaRegionsArg,
   KvTablePrefixArg,
+  KvUploadBatchTableGCAgeDaysKey,
   KvUploadTimeoutMsKey,
   ListLimit
 }
@@ -653,6 +654,26 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     // threshold - 10 days old — should NOT be deleted
     val recentDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays - 10)
+    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000"
+    kvStore.create(recentTableName)
+
+    kvStore.gcOldBatchTables(logicalName)
+
+    val tables = client.listTables().join().tableNames()
+    tables.contains(oldTableName) shouldBe false
+    tables.contains(recentTableName) shouldBe true
+  }
+
+  it should "gcOldBatchTables uses configured GC threshold" in {
+    val logicalName = "GC_CONFIGURED_THRESHOLD_TEST"
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvUploadBatchTableGCAgeDaysKey -> "7"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(10)
+    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000"
+    kvStore.create(oldTableName)
+
+    val recentDate = LocalDate.now().minusDays(5)
     val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000"
     kvStore.create(recentTableName)
 

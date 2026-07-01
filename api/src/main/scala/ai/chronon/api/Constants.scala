@@ -104,4 +104,5 @@ object Constants {
   val KvReplicaRegionsArg = "kv.replicaRegions"
   val ChrononSparkConfPrefix = "spark.chronon."
   val KvUploadTimeoutMsKey = "spark.chronon.kv_upload.timeout_ms"
+  val KvUploadBatchTableGCAgeDaysKey = "spark.chronon.kv_upload.batch_table_gc_age_days"
 }

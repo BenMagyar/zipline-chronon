@@ -5,6 +5,7 @@ import ai.chronon.api.Constants.{
   KvEnableTtlArg,
   KvReplicaRegionsArg,
   KvTablePrefixArg,
+  KvUploadBatchTableGCAgeDaysKey,
   KvUploadTimeoutMsKey,
   ListLimit
 }
@@ -424,14 +425,15 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     }
   }
 
-  /** Deletes batch tables for the given logical name that are older than BatchTableGCAgeDays, up to BatchTableGCMaxDelete at a time.
-    * Failures are swallowed so GC never blocks bulkPut.
+  /** Deletes batch tables for the given logical name that are older than the configured GC age, up to
+    * BatchTableGCMaxDelete at a time. Failures are swallowed so GC never blocks bulkPut.
     */
   private[aws] def gcOldBatchTables(logicalTableName: String): Unit = {
     if (!enableTtl) return
     try {
       val prefix = logicalTableName.sanitize.toUpperCase + "_"
-      val cutoff = LocalDate.now().minusDays(BatchTableGCAgeDays)
+      val cleanupDays = conf.get(KvUploadBatchTableGCAgeDaysKey).map(_.toLong).getOrElse(BatchTableGCAgeDays.toLong)
+      val cutoff = LocalDate.now().minusDays(cleanupDays)
 
       // DynamoDB listTables returns names in ASCII order. By starting pagination at the prefix
       // (exclusive), we land right at the first matching table and stop as soon as names diverge —
@@ -477,7 +479,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
       val toDelete = oldTables.toSeq.sortBy(identity).take(BatchTableGCMaxDelete)
       logger.info(
-        s"Batch table GC for $logicalTableName: found ${oldTables.size} old tables, deleting ${toDelete.size}")
+        s"Batch table GC for $logicalTableName: found ${oldTables.size} tables older than $cleanupDays days, deleting ${toDelete.size}")
 
       toDelete.foreach { tableName =>
         try {
