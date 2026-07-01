@@ -28,6 +28,7 @@ Set the following environment variables on the frontend service:
 | `AUTH_EXTERNAL_URL` | No | Public URL when the frontend is behind a reverse proxy (CloudFront, API Gateway, ingress) and `AUTH_URL` is an internal origin. Used for user-facing URLs — the SAML post-login redirect and the CLI device-login verification URL — so they resolve to the host users actually reach. `AUTH_URL` (and the JWT issuer / JWKS) stay internal. Leave unset when `AUTH_URL` is already the public URL |
 | `AUTH_SECRET` | Yes | Random secret (32+ characters) used for signing keys. Generate with `openssl rand -base64 32` |
 | `AUTH_ALLOWED_HOSTS` | No | Comma-separated list of additional allowed hosts for incoming requests (e.g., internal service names like `orchestration-ui-service`). `AUTH_URL` and `host.docker.internal:*` are always allowed |
+| `AUTH_ALLOWED_PRINCIPALS` | No | Comma-separated allowlist of who may sign in. Each entry is either a domain (`yourcompany.com`) or an exact email (`alice@partner.com`). When unset/empty, **anyone** who can authenticate with a configured provider is allowed. See [Restricting Who Can Sign In](#restricting-who-can-sign-in) |
 
 You must also configure at least one authentication provider (see below).
 
@@ -63,6 +64,8 @@ To create credentials: Google Cloud Console -> APIs & Services -> Credentials ->
 | `GITHUB_OAUTH_CLIENT_SECRET` | OAuth App client secret |
 
 To create credentials: GitHub Settings -> Developer settings -> OAuth Apps -> New OAuth App. Set the authorization callback URL to `{AUTH_URL}/api/auth/callback/github`.
+
+> **Note:** A GitHub OAuth App can be authorized by **any** GitHub user — restricting the OAuth App to your org does not block outside logins. To limit access, set [`AUTH_ALLOWED_PRINCIPALS`](#restricting-who-can-sign-in). Keep in mind a GitHub account's primary email is often a personal address, so prefer listing the exact emails you trust (or, for org-wide control, use [SSO](#sso-oidc)).
 
 ### Microsoft Entra ID
 
@@ -134,6 +137,31 @@ SSO_SAML_CALLBACK_URL="{AUTH_URL}/api/auth/sso/saml2/sp/acs/{SSO_PROVIDER_ID}"
 ```
 
 The user's display name is built from the SAML `firstName` + `lastName` attributes (Okta's default profile attribute names). A custom SAML app sends no attributes by default, so add **Attribute Statements** for them (Name `firstName` → Value `user.firstName`, and likewise `lastName`). For an IdP that uses different attribute names, override with `IDP_FIRSTNAME_CLAIM` / `IDP_LASTNAME_CLAIM` (e.g. `givenName` / `surname`). If absent, the name falls back to the email. The name (and role) re-sync from the IdP on each login.
+
+## Restricting Who Can Sign In
+
+By default, anyone who can authenticate with a configured provider is allowed in — for open providers like **GitHub** or **Google** that means anyone with a GitHub/Google account. Set `AUTH_ALLOWED_PRINCIPALS` to restrict provisioning to a known set of people:
+
+```env
+# Everyone @yourcompany.com, plus two named external collaborators
+AUTH_ALLOWED_PRINCIPALS="yourcompany.com,alice@partner.com,bob@gmail.com"
+```
+
+| Entry form | Matches |
+|---|---|
+| `yourcompany.com` | any email at that domain (`*@yourcompany.com`) |
+| `@yourcompany.com` | same as above (a leading `@` is tolerated) |
+| `alice@partner.com` | only that exact address |
+
+How it behaves:
+
+- **Unset or empty → allow all** (unchanged default behavior).
+- Matching is case-insensitive and runs against the **provider-asserted email**. It applies to **all** providers (Google, GitHub, Microsoft, SSO/OIDC/SAML, and SCIM) — make sure any domain you provision via SCIM/SSO is also listed.
+- Subdomains are **not** implied — list `corp.yourcompany.com` separately if needed.
+- It is checked both when an account is **first created** and on **every login**, so an existing user who is no longer on the list is blocked the next time they sign in. Sessions that were already active when you tighten the list keep working until they expire — to cut someone off immediately, remove/ban them from **Admin -> Users**.
+- A blocked attempt is rejected (the user lands back on the sign-in page with an "account isn't permitted" message) and recorded as a `user_create_denied` (new account) or `authn_login_denied` (existing account) audit event.
+
+> **GitHub specifics:** a GitHub account's primary email is frequently a personal address, so a company-domain rule may not match your teammates. List the exact emails you trust, or — if everyone you'd allow is in your GitHub org — prefer mapping access to **org membership** (today that means using [SSO](#sso-oidc) for lifecycle control rather than the GitHub OAuth provider).
 
 ## Roles & Permissions
 
