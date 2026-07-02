@@ -12,7 +12,8 @@ import java.util.concurrent.{
 }
 
 object InstrumentedThreadPoolExecutor {
-  val DefaultMetricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.Fetcher).withSuffix("threadpool")
+  lazy val DefaultMetricsContext: Metrics.Context =
+    Metrics.Context(Metrics.Environment.Fetcher).withSuffix("threadpool")
 }
 
 class InstrumentedThreadPoolExecutor(corePoolSize: Int,

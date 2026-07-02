@@ -1,7 +1,7 @@
 package ai.chronon.flink.deser
 
 import ai.chronon.api.{DataModel, DataType, Query}
-import ai.chronon.flink.SparkExpressionEval
+import ai.chronon.flink.{ERROR, FlinkLogging, INFO, SparkExpressionEval}
 import ai.chronon.online.serde.{Mutation, SerDe, SparkConversions}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.api.common.serialization.DeserializationSchema
@@ -11,14 +11,12 @@ import org.apache.flink.util.Collector
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 import org.apache.spark.sql.{Encoder, Encoders, Row}
-import org.slf4j.{Logger, LoggerFactory}
 
 abstract class BaseDeserializationSchema[T](deserSchemaProvider: SerDe,
                                             groupByName: String,
                                             enableDebug: Boolean = false)
-    extends ChrononDeserializationSchema[T] {
-
-  @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+    extends ChrononDeserializationSchema[T]
+    with FlinkLogging {
 
   // these are created on instantiation in the various task manager processes in the open() call
   @transient protected var deserializationErrorCounter: Counter = _
@@ -54,13 +52,13 @@ abstract class BaseDeserializationSchema[T](deserSchemaProvider: SerDe,
         maybeMutation.foreach { mutation =>
           val beforeStr = if (mutation.before != null) mutation.before.mkString(",") else "null"
           val afterStr = if (mutation.after != null) mutation.after.mkString(",") else "null"
-          logger.info(s"Deserialized mutation: before=$beforeStr, after=$afterStr")
+          log(INFO, s"Deserialized mutation: before=$beforeStr, after=$afterStr")
         }
       }
       maybeMutation
     } catch {
       case e: Exception =>
-        logger.error("Error deserializing message", e)
+        logThrottled(ERROR, "deser_error", "Error deserializing message", e)
         deserializationErrorCounter.inc()
         None
     }
@@ -148,7 +146,7 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
       val evaluatedRows = doSparkExprEval(row)
       evaluatedRows.foreach { e =>
         if (enableDebug) {
-          logger.info(s"Evaluated row: ${e.mkString(",")}")
+          log(INFO, s"Evaluated row: ${e.mkString(",")}")
         }
         out.collect(ProjectedEvent(e, startProcessingTimeMillis))
       }
@@ -167,7 +165,7 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
       case e: Exception =>
         // To improve availability, we don't rethrow the exception. We just drop the event
         // and track the errors in a metric. Alerts should be set up on this metric.
-        logger.error("Error evaluating Spark expression", e)
+        logThrottled(ERROR, "spark_expr_error", "Error evaluating Spark expression", e)
         performSqlErrorCounter.inc()
         Seq.empty
     }

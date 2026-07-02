@@ -1,6 +1,6 @@
 package ai.chronon.flink.chaining
 
-import ai.chronon.flink.DirectExecutionContext
+import ai.chronon.flink.{DirectExecutionContext, ERROR, FlinkLogging, INFO, WARN}
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.online.fetcher.Fetcher
 import ai.chronon.online.Api
@@ -8,7 +8,6 @@ import org.apache.flink.configuration.Configuration
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
 import org.apache.flink.metrics.{Counter, Histogram}
 import org.apache.flink.streaming.api.functions.async.{ResultFuture, RichAsyncFunction}
-import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success}
@@ -24,9 +23,8 @@ import scala.util.{Failure, Success}
   * @param enableDebug Whether to enable debug logging
   */
 class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, api: Api, enableDebug: Boolean)
-    extends RichAsyncFunction[ProjectedEvent, ProjectedEvent] {
-
-  @transient private lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+    extends RichAsyncFunction[ProjectedEvent, ProjectedEvent]
+    with FlinkLogging {
   @transient private var fetcher: Fetcher = _
   @transient private var successCounter: Counter = _
   @transient private var errorCounter: Counter = _
@@ -39,7 +37,7 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
 
-    logger.info("Initializing Fetcher for JoinEnrichmentAsyncFunction")
+    log(INFO, "Initializing Fetcher for JoinEnrichmentAsyncFunction")
     fetcher = api.buildFetcher(debug = enableDebug)
 
     val group = getRuntimeContext.getMetricGroup
@@ -56,7 +54,7 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
         new com.codahale.metrics.Histogram(new com.codahale.metrics.ExponentiallyDecayingReservoir())
       )
     )
-    logger.info(s"JoinEnrichmentAsyncFunction initialized for join: $joinRequestName")
+    log(INFO, s"JoinEnrichmentAsyncFunction initialized for join: $joinRequestName")
   }
 
   override def asyncInvoke(event: ProjectedEvent, resultFuture: ResultFuture[ProjectedEvent]): Unit = {
@@ -66,7 +64,7 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
     val request = Fetcher.Request(joinRequestName, scalaKeyMap)
 
     if (enableDebug) {
-      logger.info(s"Join request: ${request.keys}, ts: ${request.atMillis}")
+      log(INFO, s"Join request: ${request.keys}, ts: ${request.atMillis}")
     }
 
     // Start latency measurement
@@ -87,9 +85,9 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
           val enrichedFields = event.fields ++ responseMap
 
           if (enableDebug) {
-            logger.info(
-              s"Join response: request=${response.request.keys}, " +
-                s"ts=${response.request.atMillis}, values=${response.values}")
+            log(INFO,
+                s"Join response: request=${response.request.keys}, " +
+                  s"ts=${response.request.atMillis}, values=${response.values}")
           }
 
           val enrichedEvent = ProjectedEvent(
@@ -108,7 +106,7 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
         joinFetchLatencyHistogram.update(System.currentTimeMillis() - startTime)
         errorCounter.inc()
 
-        logger.error("Error fetching join data", ex)
+        logThrottled(ERROR, "join_fetch_error", "Error fetching join data", ex)
         // we swallow the event on error as there might be downstream join source queries dependent on the
         // enrichment fields
         resultFuture.complete(java.util.Collections.emptyList())
@@ -119,7 +117,7 @@ class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, 
     // Increment error counter for timeout
     errorCounter.inc()
 
-    logger.warn(s"Join enrichment timeout for event: ${event.fields}")
+    logThrottled(WARN, "join_fetch_timeout", s"Join enrichment timeout for event: ${event.fields}")
     // we swallow the event on error as there might be downstream join source queries dependent on the
     // enrichment fields
     resultFuture.complete(java.util.Collections.emptyList())

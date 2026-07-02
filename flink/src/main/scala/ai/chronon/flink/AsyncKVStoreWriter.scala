@@ -13,8 +13,6 @@ import org.apache.flink.streaming.api.datastream.AsyncDataStream
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.functions.async.ResultFuture
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 
 import java.util
 import java.util.concurrent.TimeUnit
@@ -55,8 +53,8 @@ object AsyncKVStoreWriter {
   * @param featureGroupName Name of the FG we're writing to
   */
 class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug: Boolean = false)
-    extends RichAsyncFunction[AvroCodecOutput, WriteResponse] {
-  @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+    extends RichAsyncFunction[AvroCodecOutput, WriteResponse]
+    with FlinkLogging {
 
   @transient private var kvStore: KVStore = _
 
@@ -90,7 +88,7 @@ class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug:
   }
 
   override def timeout(input: AvroCodecOutput, resultFuture: ResultFuture[WriteResponse]): Unit = {
-    logger.error(s"Timed out writing to KV Store for object: $input")
+    logThrottled(ERROR, "kvstore_timeout", s"Timed out writing to KV Store for object: $input")
     errorCounter.inc()
     resultFuture.complete(
       util.Arrays.asList[WriteResponse](
@@ -106,7 +104,8 @@ class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug:
     val putRequest = PutRequest(input.keyBytes, input.valueBytes, input.dataset, Some(input.tsMillis))
 
     if (enableDebug) {
-      logger.info(
+      log(
+        INFO,
         s"""
            |Writing to KVStore with request:
            |dataset=${putRequest.dataset}
@@ -127,7 +126,7 @@ class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug:
           successCounter.inc()
         } else {
           errorCounter.inc()
-          logger.error(s"Failed to write to KVStore for object: $input")
+          logThrottled(ERROR, "kvstore_write_fail", s"Failed to write to KVStore for object: $input")
         }
         resultFuture.complete(
           util.Arrays.asList[WriteResponse](
@@ -143,7 +142,7 @@ class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug:
         // not fail the app
         putTimeHistogram.update(System.currentTimeMillis() - startTime)
         errorCounter.inc()
-        logger.error(s"Caught exception writing to KVStore for object: $input", exception)
+        logThrottled(ERROR, "kvstore_exception", s"Caught exception writing to KVStore for object: $input", exception)
         resultFuture.complete(
           util.Arrays.asList[WriteResponse](
             new WriteResponse(input.keyBytes,

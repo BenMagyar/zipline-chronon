@@ -6,6 +6,7 @@ import ai.chronon.api.DataType
 import ai.chronon.api.GroupBy
 import ai.chronon.api.Row
 import ai.chronon.api.ScalaJavaConversions.IteratorOps
+import ai.chronon.flink.{ERROR, FlinkLogging, INFO}
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.TimestampedIR
 import ai.chronon.flink.types.TimestampedTile
@@ -172,10 +173,10 @@ class FlinkRowAggProcessFunction(
     groupBy: GroupBy,
     inputSchema: Seq[(String, DataType)],
     enableDebug: Boolean = false
-) extends ProcessWindowFunction[TimestampedIR, TimestampedTile, java.util.List[Any], TimeWindow] {
+) extends ProcessWindowFunction[TimestampedIR, TimestampedTile, java.util.List[Any], TimeWindow]
+    with FlinkLogging {
 
   @transient private[flink] var tileCodec: TileCodec = _
-  @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   @transient private var rowProcessingErrorCounter: Counter = _
   // Shared metric for errors across the entire Flink app.
@@ -224,7 +225,9 @@ class FlinkRowAggProcessFunction(
       val irBytes = tileCodec.makeTileIr(irEntry.ir, isComplete)
       if (enableDebug) {
         val irStr = irEntry.ir.mkString(", ")
-        logger.info(s"""
+        log(
+          INFO,
+          s"""
              |Flink RowAggProcessFunction created tile IR
              |keys=${keys.iterator().toScala.mkString(", ")},
              |groupBy=${groupBy.getMetaData.getName},
@@ -234,7 +237,8 @@ class FlinkRowAggProcessFunction(
              |ir=$irStr,
              |windowEnd=$windowEnd,
              |tileAvroSchema=${tileCodec.tileAvroSchema},
-             |""".stripMargin)
+             |""".stripMargin
+        )
       }
       irBytes
     }
@@ -250,7 +254,7 @@ class FlinkRowAggProcessFunction(
       case Failure(e) =>
         // To improve availability, we don't rethrow the exception. We just drop the event
         // and track the errors in a metric. Alerts should be set up on this metric.
-        logger.error("Flink process error making tile IR", e)
+        logThrottled(ERROR, "tile_ir_error", "Flink process error making tile IR", e)
         eventProcessingErrorCounter.inc()
         rowProcessingErrorCounter.inc()
     }

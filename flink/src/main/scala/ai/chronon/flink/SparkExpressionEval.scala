@@ -14,8 +14,6 @@ import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.types.StructType
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 
 import scala.jdk.CollectionConverters._
 
@@ -34,11 +32,10 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
                                      query: Query,
                                      groupByName: String,
                                      dataModel: DataModel = DataModel.EVENTS)
-    extends Serializable {
+    extends Serializable
+    with FlinkLogging {
 
   import SparkExpressionEval._
-
-  @transient private lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   private val (transforms, filters) = buildQueryTransformsAndFilters(query, dataModel)
 
@@ -105,7 +102,7 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
       performSql(row)
     } catch {
       case e: Exception =>
-        logger.error("Error evaluating Spark expression", e)
+        logThrottled(ERROR, "spark_expr_error", "Error evaluating Spark expression", e)
         exprEvalErrorCounter.inc()
         Seq.empty
     }

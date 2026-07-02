@@ -1,6 +1,7 @@
 package ai.chronon.flink.chaining
 
 import ai.chronon.api.{Constants, DataType, JoinSource, StructField, StructType}
+import ai.chronon.flink.{ERROR, FlinkLogging, INFO}
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.online.{Api, CatalystUtil, JoinCodec}
 import ai.chronon.online.serde.SparkConversions
@@ -29,9 +30,8 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
                               groupByName: String,
                               api: Api,
                               enableDebug: Boolean)
-    extends RichFlatMapFunction[ProjectedEvent, ProjectedEvent] {
-
-  @transient private lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+    extends RichFlatMapFunction[ProjectedEvent, ProjectedEvent]
+    with FlinkLogging {
   @transient private var catalystUtil: CatalystUtil = _
   @transient private var successCounter: Counter = _
   @transient private var errorCounter: Counter = _
@@ -40,7 +40,7 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
 
-    logger.info("Initializing CatalystUtil for join source query evaluation")
+    log(INFO, "Initializing CatalystUtil for join source query evaluation")
 
     val result = JoinSourceQueryFunction.buildCatalystUtil(joinSource, inputSchema, api, enableDebug)
     catalystUtil = result.catalystUtil
@@ -59,7 +59,7 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
       )
     )
 
-    logger.info(s"Initialized CatalystUtil with join schema")
+    log(INFO, s"Initialized CatalystUtil with join schema")
   }
 
   override def flatMap(enrichedEvent: ProjectedEvent, out: Collector[ProjectedEvent]): Unit = {
@@ -71,8 +71,8 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
       successCounter.inc()
 
       if (enableDebug) {
-        logger.info(s"Join source query input: ${enrichedEvent.fields}")
-        logger.info(s"Join source query results: $queryResults")
+        log(INFO, s"Join source query input: ${enrichedEvent.fields}")
+        log(INFO, s"Join source query results: $queryResults")
       }
 
       // Output each result as a ProjectedEvent
@@ -85,7 +85,10 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
         // we swallow the event on error
         errorCounter.inc()
         queryLatencyHistogram.update(System.currentTimeMillis() - startTime)
-        logger.error(s"Error applying join source query to event: ${enrichedEvent.fields}", ex)
+        logThrottled(ERROR,
+                     "join_query_error",
+                     s"Error applying join source query to event: ${enrichedEvent.fields}",
+                     ex)
     }
   }
 }

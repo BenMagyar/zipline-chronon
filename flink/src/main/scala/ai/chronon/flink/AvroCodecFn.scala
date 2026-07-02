@@ -17,8 +17,6 @@ import org.apache.flink.configuration.Configuration
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
 import org.apache.flink.metrics.{Counter, Histogram}
 import org.apache.flink.util.Collector
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 
 /** Base class for the Avro conversion Flink operator.
   *
@@ -27,10 +25,9 @@ import org.slf4j.LoggerFactory
   * @tparam IN The input data type which contains the data to be avro-converted to bytes.
   * @tparam OUT The output data type (generally a PutRequest).
   */
-sealed abstract class BaseAvroCodecFn[IN, OUT] extends RichFlatMapFunction[IN, OUT] {
+sealed abstract class BaseAvroCodecFn[IN, OUT] extends RichFlatMapFunction[IN, OUT] with FlinkLogging {
   def groupByServingInfoParsed: GroupByServingInfoParsed
 
-  @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
   @transient protected var avroConversionErrorCounter: Counter = _
   // Shared metric for errors across the entire Flink app.
   @transient protected var eventProcessingErrorCounter: Counter = _
@@ -87,7 +84,7 @@ case class AvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParsed)
       case e: Exception =>
         // To improve availability, we don't rethrow the exception. We just drop the event
         // and track the errors in a metric. Alerts should be set up on this metric.
-        logger.error("Error converting to Avro bytes", e)
+        logThrottled(ERROR, "avro_codec_error", "Error converting to Avro bytes", e)
         eventProcessingErrorCounter.inc()
         avroConversionErrorCounter.inc()
     }
@@ -135,7 +132,7 @@ case class TiledAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParsed,
       case e: Exception =>
         // To improve availability, we don't rethrow the exception. We just drop the event
         // and track the errors in a metric. Alerts should be set up on this metric.
-        logger.error("Error converting to Avro bytes - ", e)
+        logThrottled(ERROR, "avro_codec_error", "Error converting to Avro bytes", e)
         eventProcessingErrorCounter.inc()
         avroConversionErrorCounter.inc()
     }
@@ -156,7 +153,8 @@ case class TiledAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParsed,
     val valueBytes = in.tileBytes
 
     if (enableDebug) {
-      logger.info(
+      log(
+        INFO,
         s"""
           |Avro converting tile to PutRequest - tile=${in}
           |groupBy=${groupByServingInfoParsed.groupBy.getMetaData.getName} tsMills=$tsMills keys=$keys
