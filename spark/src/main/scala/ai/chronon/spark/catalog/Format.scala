@@ -204,14 +204,11 @@ trait Format {
             .filterNot(_.isNullAt(0))
             .map(row => partitionSpec.at(row.getLong(0)))
         case dt =>
-          // last COMPLETE partition: the one before the partition containing the max timestamp -
-          // identical to DATE(MAX) - 1 day for daily, but grid-correct (partitionInterval +
-          // partitionOffset) for sub-daily and offset specs
           df.select(epochMillisCol(max(col(partitionColumn)), dt).as("max_millis"))
             .collect()
             .headOption
             .filterNot(_.isNullAt(0))
-            .map(row => partitionSpec.before(partitionSpec.at(row.getLong(0))))
+            .map(row => Format.readinessPartition(partitionSpec.at(row.getLong(0)), partitionSpec))
       }
     } match {
       case Success(result) => result
@@ -366,6 +363,18 @@ object Format {
         )
     }
   }
+
+  /** Newest partition to report for readiness, given the partition containing the newest data
+    * point of a timestamp column. Daily-or-coarser grids are batch-loaded in practice: the
+    * newest data-bearing partition IS the newest available partition — reporting one behind
+    * means a sensor gated on the table's newest required partition can never fire (readiness
+    * stalls until the NEXT batch lands, or forever once the gate advances daily). Sub-daily
+    * grids model streaming ingestion where the tail interval is genuinely in flight, so a
+    * partition only counts once data crosses its interval end.
+    */
+  def readinessPartition(dataBearingPartition: String, spec: PartitionSpec): String =
+    if (spec.spanMillis >= PartitionSpec.daily.spanMillis) dataBearingPartition
+    else spec.before(dataBearingPartition)
 
   def sanitizePartitionValues(partitions: Iterable[String]): List[String] = partitions.iterator
     .flatMap(Option(_))

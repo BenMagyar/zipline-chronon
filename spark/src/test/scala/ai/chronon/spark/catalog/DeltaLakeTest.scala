@@ -49,7 +49,8 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-01-01", "2024-01-02")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-02")
+      // readiness reports the partition containing maxTs; virtualPartitions stays conservative
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
@@ -83,6 +84,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
         Some(StatsDateRange(start = "2024-01-01-09-00", end = "2024-01-01-12-00"))
       DeltaLake.virtualPartitions(tableName, "created_at", threeHourSpec) shouldBe
         List("2024-01-01-09-00")
+      // sub-daily grids keep interval-end readiness: the 12:00 interval holding maxTs is in flight
       DeltaLake.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-01-01-09-00")
 
       // grid phased by 1h: 01:00, 04:00, 07:00, 10:00, 13:00, ...
@@ -90,6 +92,39 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
         Some(StatsDateRange(start = "2024-01-01-07-00", end = "2024-01-01-13-00"))
       DeltaLake.virtualPartitions(tableName, "created_at", offsetSpec) shouldBe
         List("2024-01-01-07-00", "2024-01-01-10-00")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
+  it should "apply readiness semantics to epoch-millis numeric columns in Delta log stats" in {
+    val dbName = s"delta_numeric_stats_${System.nanoTime()}"
+    val tableName = s"$dbName.numeric_epoch_with_stats"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          event_ms BIGINT,
+          user_id STRING
+        ) USING DELTA
+      """)
+      // epoch millis for 2024-01-01 09:17:00 and 14:05:00 UTC
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          (1704100620000, 'user1'),
+          (1704117900000, 'user2')
+      """)
+
+      DeltaLake.statsDateRange(tableName, "event_ms", threeHourSpec) shouldBe
+        Some(StatsDateRange(start = "2024-01-01-09-00", end = "2024-01-01-12-00"))
+      // sub-daily: the 12:00 interval holding the max value is in flight, same as timestamps
+      DeltaLake.lastAvailablePartition(tableName, "event_ms", threeHourSpec) shouldBe Some("2024-01-01-09-00")
+      // daily-or-coarser: report the data-bearing partition
+      DeltaLake.lastAvailablePartition(tableName, "event_ms", PartitionSpec.daily) shouldBe Some("2024-01-01")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
@@ -240,7 +275,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-02-01", "2024-02-02")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-01")
-      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-02")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-02-03")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")

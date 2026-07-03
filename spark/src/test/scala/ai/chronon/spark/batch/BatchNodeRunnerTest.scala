@@ -866,6 +866,46 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     }
   }
 
+  it should "succeed when batch-loaded data ends inside the newest required partition" in {
+    // Sensor coalescing gates every downstream step on the single newest required partition,
+    // so the sensor must be able to sense that partition the day its batch lands. A table whose
+    // newest rows sit inside `yesterday` (today's batch not landed yet) must satisfy a sensor
+    // gated on `yesterday` — sensing one partition behind stalls all downstream workflows.
+    spark.sql(
+      """CREATE TABLE IF NOT EXISTS test_db.time_part_sensor (
+        |  user_id INT,
+        |  value STRING,
+        |  created_at TIMESTAMP
+        |)""".stripMargin)
+    spark.sql(
+      s"""INSERT INTO test_db.time_part_sensor VALUES
+         |(1, 'a', TIMESTAMP '${twoDaysAgo} 12:00:00'),
+         |(2, 'b', TIMESTAMP '${yesterday} 21:37:45')
+         |""".stripMargin)
+
+    val tableInfo = new TableInfo()
+      .setTable("test_db.time_part_sensor")
+      .setPartitionColumn("created_at")
+    val tableDependency = new TableDependency().setTableInfo(tableInfo)
+
+    val sensorNode = new ExternalSourceSensorNode()
+      .setSourceTableDependency(tableDependency)
+      .setRetryCount(0L)
+      .setRetryIntervalMin(1L)
+
+    val range = PartitionRange(yesterday, yesterday)(tableUtils.partitionSpec)
+    val configPath = createTestConfigFile(yesterday, yesterday)
+    val node = ThriftJsonCodec.fromJsonFile[Node](configPath, check = true)
+    val runner = new BatchNodeRunner(node, tableUtils, mockApi)
+
+    val result = runner.checkPartitions(sensorNode, range)
+
+    result match {
+      case Success(_) => // Test passed
+      case Failure(e) => fail(s"checkPartitions should have succeeded: ${e.getMessage}")
+    }
+  }
+
   it should "fail when MAX does not cover the range" in {
     val tableInfo = new TableInfo()
       .setTable("test_db.time_part_sensor")

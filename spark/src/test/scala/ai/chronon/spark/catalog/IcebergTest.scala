@@ -154,7 +154,8 @@ class IcebergTest extends SparkTestBase with Matchers {
     Iceberg.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
       List("2024-04-01", "2024-04-02")
     Iceberg.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-01")
-    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-02")
+    // readiness reports the partition containing maxTs; virtualPartitions stays conservative
+    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-03")
   }
 
   it should "return the inclusive last partition from Iceberg file stats for a single-day timestamp range" in {
@@ -222,7 +223,7 @@ class IcebergTest extends SparkTestBase with Matchers {
     Iceberg.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
       List("2024-05-01", "2024-05-02")
     Iceberg.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-05-01")
-    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-05-02")
+    Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-05-03")
   }
 
   "insertPartitions on unpartitioned Iceberg table" should "overwrite only the subrange without duplicates" in {

@@ -92,8 +92,11 @@ case object DeltaLake extends Format {
       sparkSession: SparkSession): Option[String] =
     statsDateRange(tableName, columnName, partitionSpec).map { range =>
       sparkSession.read.table(tableName).schema(columnName).dataType match {
-        case TimestampType => partitionSpec.before(range.lastAvailablePartition)
-        case _             => range.lastAvailablePartition
+        // numeric columns are epoch millis per statsBoundary, so they carry the same
+        // in-flight-tail semantics as timestamps
+        case TimestampType | _: NumericType =>
+          Format.readinessPartition(range.lastAvailablePartition, partitionSpec)
+        case _ => range.lastAvailablePartition
       }
     }
 
