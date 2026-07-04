@@ -50,8 +50,9 @@ Two rules govern grids:
   that divides a UTC day evenly and can be represented by a simple repeating
   cron field. Common examples are `15m`, `30m`, `1h`, `2h`, `3h`, `4h`, `6h`,
   `8h`, and `12h`. Intervals such as `45m` and `90m` are not supported.
-- `partition_offset` is only supported below a day, and must satisfy
-  `0 <= offset < interval`. Daily partitions always start at midnight UTC.
+- `partition_offset` must satisfy `0 <= offset < interval`. A nonzero offset,
+  including on a `1d` interval, uses timestamp-shaped partition labels such as
+  `yyyy-MM-dd-HH-mm` and follows the grid-aware path.
 
 Week- or month-sized partitions are not supported. Weekly and monthly jobs are
 schedules over daily partitions.
@@ -130,6 +131,8 @@ This grid has boundaries at 01:00, 04:00, 07:00, and so on. The 04:15 fire
 writes the `...-01-00` partition, which holds `[01:00, 04:00)`. The `15` minute
 cron phase is processing delay; it does not move the grid. If your data
 boundaries are offset from midnight, declare that with `partition_offset`.
+When `partition_offset` is provided without `partition_interval`, Chronon assumes
+a `1d` interval on that offset grid.
 
 When both `partition_interval` and an enabled sub-daily schedule are present,
 the interval must match the cron data interval. A daily-or-coarser schedule over

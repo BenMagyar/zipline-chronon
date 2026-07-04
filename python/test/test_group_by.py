@@ -417,6 +417,22 @@ def test_subdaily_group_by_rejects_undeclared_sources():
         )
 
 
+def test_offset_daily_group_by_rejects_undeclared_sources():
+    with pytest.raises(ValueError, match="partition_interval"):
+        group_by.GroupBy(
+            sources=[event_source("table")],
+            keys=["subject"],
+            aggregations=group_by.Aggregations(
+                random=ttypes.Aggregation(
+                    inputColumn="event_id", operation=ttypes.Operation.SUM
+                ),
+            ),
+            partition_interval="1d",
+            partition_offset="1h",
+            version=0,
+        )
+
+
 def test_subdaily_group_by_allows_time_partitioned_source_without_interval():
     src = ttypes.EventSource(
         table="table",
@@ -436,6 +452,33 @@ def test_subdaily_group_by_allows_time_partitioned_source_without_interval():
         offline_schedule="0 */3 * * *",
         version=0,
     )
+    assert gb.sources[0].events.query.timePartitioned is True
+    assert gb.sources[0].events.query.partitionInterval is None
+
+
+def test_offset_daily_group_by_allows_time_partitioned_source_without_interval():
+    src = ttypes.EventSource(
+        table="table",
+        query=query.Query(
+            selects={"subject": "subject_sql", "event_id": "event_sql"},
+            time_column="ts",
+            time_partitioned=True,
+        ),
+    )
+    gb = group_by.GroupBy(
+        sources=[src],
+        keys=["subject"],
+        aggregations=group_by.Aggregations(
+            random=ttypes.Aggregation(inputColumn="event_id", operation=ttypes.Operation.SUM),
+        ),
+        partition_interval="1d",
+        partition_offset="1h",
+        version=0,
+    )
+    table_info = gb.metaData.executionInfo.outputTableInfo
+    assert table_info.partitionFormat == "yyyy-MM-dd-HH-mm"
+    assert table_info.partitionInterval == common.Window(length=1, timeUnit=common.TimeUnit.DAYS)
+    assert table_info.partitionOffset == common.Window(length=1, timeUnit=common.TimeUnit.HOURS)
     assert gb.sources[0].events.query.timePartitioned is True
     assert gb.sources[0].events.query.partitionInterval is None
 

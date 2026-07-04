@@ -27,6 +27,8 @@ HOURLY_SCHEDULE = "0 * * * *"
 SUBDAILY_SCHEDULE = "0 1-22/3 * * *"
 DAILY_INTERVAL = "1d"
 DAILY_FORMAT = "yyyy-MM-dd"
+# daily cron phased after the 01:00 grid boundary: the fire delay is processing lag only
+OFFSET_DAILY_SCHEDULE = "0 2 * * *"
 ZERO_HOURS = Window(length=0, time_unit=TimeUnit.HOURS)
 
 
@@ -259,6 +261,33 @@ parity_offset_ratings_sum = GroupBy(
     partition_interval=SUBDAILY_INTERVAL,
     partition_offset=SUBDAILY_OFFSET,
     offline_schedule=SUBDAILY_SCHEDULE,
+)
+
+
+# Daily cadence directly on the sub-daily offset grid: 1d interval + 1h offset consuming the
+# SAME 3h+1h source as parity_offset_amount — the compute-reuse case daily-with-offset enables.
+parity_offset_daily_amount = GroupBy(
+    sources=[
+        EventSource(
+            table=f"{INPUT_NAMESPACE}.offset_grid_events",
+            query=_subdaily_query(
+                selects("user_id", "amount_3h"),
+                start_partition="2023-08-13-19-00",
+                time_column="ts",
+            ),
+        )
+    ],
+    keys=["user_id"],
+    aggregations=[
+        Aggregation(input_column="amount_3h", operation=Operation.SUM),
+    ],
+    accuracy=Accuracy.SNAPSHOT,
+    output_namespace=OUTPUT_NAMESPACE,
+    conf=_claims_demo_conf(),
+    env_vars=_claims_demo_env(),
+    partition_interval=DAILY_INTERVAL,
+    partition_offset=SUBDAILY_OFFSET,
+    offline_schedule=OFFSET_DAILY_SCHEDULE,
 )
 
 

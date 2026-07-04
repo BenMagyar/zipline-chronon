@@ -613,7 +613,7 @@ def Join(
     output_info = exec_info.outputTableInfo
     if (
         output_info is not None
-        and window_utils.window_millis(output_info.partitionInterval) < window_utils.DAY_MILLIS
+        and window_utils.PartitionSpec.from_table_info(output_info).requires_grid_aware_path()
     ):
         # the left feeds the join's own partitions; right parts pick the latest snapshot at
         # or before each row's ts on their own grid

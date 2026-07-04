@@ -27,6 +27,25 @@ left = EventSource(
 )
 
 
+# Companion to `matrix` for the daily-with-offset grid (1d interval + 1h offset). Kept as a
+# separate conf: `matrix` is online and in-place edits are blocked; fold into the matrix on
+# its next version bump.
+matrix_offset_daily = Join(
+    left=deepcopy(left),
+    right_parts=[
+        JoinPart(group_by=group_bys.parity_offset_daily_amount, prefix="snapd1"),
+    ],
+    output_namespace=group_bys.OUTPUT_NAMESPACE,
+    online=True,
+    use_long_names=False,
+    conf=_claims_demo_conf(),
+    env_vars=_claims_demo_env(),
+    partition_interval=group_bys.DAILY_INTERVAL,
+    modular_execution=True,
+    version=0,
+)
+
+
 matrix = Join(
     left=left,
     right_parts=[

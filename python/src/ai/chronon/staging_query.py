@@ -206,7 +206,7 @@ def _propagate_output_grid_to_time_partitioned_dependency(
         return
 
     output_spec = window_utils.PartitionSpec.from_table_info(output_info)
-    if not output_spec.is_subdaily_grid():
+    if not output_spec.requires_grid_aware_path():
         return
 
     resolved_spec = window_utils.PartitionSpec(
@@ -372,16 +372,16 @@ def StagingQuery(
 
     airflow_dependencies = []
     output_info = exec_info.outputTableInfo
-    subdaily_output = (
+    grid_aware_output = (
         output_info is not None
-        and window_utils.window_millis(output_info.partitionInterval) < window_utils.DAY_MILLIS
+        and window_utils.PartitionSpec.from_table_info(output_info).requires_grid_aware_path()
     )
 
     if dependencies:
         for d in dependencies:
             if isinstance(d, TableDependency):
                 _propagate_output_grid_to_time_partitioned_dependency(d, output_info)
-            if subdaily_output and isinstance(d, TableDependency):
+            if grid_aware_output and isinstance(d, TableDependency):
                 window_utils.validate_table_dependency_grid(
                     "This StagingQuery", d, f"dependency {d.table}"
                 )

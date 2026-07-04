@@ -201,7 +201,10 @@ class GroupBy(val aggregations: Seq[api.Aggregation],
   // Calculate snapshot accurate windows for ALL keys at pre-defined "endTimes".
   def snapshotEvents(partitionRange: PartitionRange): DataFrame = {
     val resolution =
-      if (tableUtils.partitionSpec.spanMillis < WindowUtils.Day.millis) FiveMinuteResolution
+      // daily hops are midnight-aligned, so any offset grid (including 1d with a sub-daily
+      // offset) needs the finer resolution: a 1d+1h partition ending at 01:00 would otherwise
+      // silently drop events in [00:00, 01:00) from its snapshot value
+      if (tableUtils.partitionSpec.requiresGridAwarePath) FiveMinuteResolution
       else DailyResolution
     toDf(snapshotEventsBase(partitionRange, resolution), Seq((tableUtils.partitionColumn, StringType)))
   }

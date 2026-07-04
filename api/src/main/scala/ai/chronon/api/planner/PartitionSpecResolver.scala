@@ -201,9 +201,9 @@ object PartitionSpecResolver {
       case Some(upstreamSpec) =>
         validateUpstreamGrid(nodeName, downstreamSpec, upstreamSpec, sourceDescription, dataModel)
       case None
-          if downstreamSpec.spanMillis < WindowUtils.Day.millis &&
+          if downstreamSpec.requiresGridAwarePath &&
             !(query.isSetTimePartitioned && query.timePartitioned) =>
-        // an undeclared upstream must not silently inherit a sub-daily downstream grid
+        // an undeclared upstream must not silently inherit a non-legacy downstream grid
         throw undeclaredPartitionInterval(nodeName, downstreamSpec, sourceDescription)
       case None =>
     }
@@ -225,7 +225,8 @@ object PartitionSpecResolver {
                            DataModel.EVENTS,
                            requireBoundaryAlignment = false)
     } else if (
-      downstreamSpec.spanMillis < WindowUtils.Day.millis && !(query.isSetTimePartitioned && query.timePartitioned)
+      downstreamSpec.requiresGridAwarePath &&
+      !(query.isSetTimePartitioned && query.timePartitioned)
     ) {
       throw undeclaredPartitionInterval(nodeName, downstreamSpec, sourceDescription)
     }
@@ -247,7 +248,7 @@ object PartitionSpecResolver {
                            sourceDescription,
                            dataModel)
     } else if (
-      downstreamSpec.spanMillis < WindowUtils.Day.millis &&
+      downstreamSpec.requiresGridAwarePath &&
       hasPartialPartitionFields &&
       !Option(tableInfo).exists(ti => ti.isSetTimePartitioned && ti.timePartitioned)
     ) {
@@ -338,14 +339,14 @@ object PartitionSpecResolver {
     s"$kind:$name:${System.identityHashCode(ref)}"
   }
 
-  /** Builds the shared error for a sub-daily node over an implicitly daily dependency. */
+  /** Builds the shared error for a grid-aware node over an implicitly daily dependency. */
   private def undeclaredPartitionInterval(nodeName: String,
                                           downstreamSpec: PartitionSpec,
                                           sourceDescription: String): IllegalArgumentException =
     new IllegalArgumentException(
-      s"$nodeName has a sub-daily output grid (${downstreamSpec.grid.show}) over $sourceDescription " +
-        "with no declared partition_interval - implicitly daily. Every intraday run would wait for the " +
-        "full day's partition and land a day late. Declare the source's partition_interval, or mark it " +
+      s"$nodeName has a grid-aware output grid (${downstreamSpec.grid.show}) over $sourceDescription " +
+        "with no declared partition_interval - implicitly daily. Runs would wait for the wrong " +
+        "partition boundary. Declare the source's partition_interval, or mark it " +
         "time_partitioned if data lands continuously and readiness can be sensed from timestamps."
     )
 

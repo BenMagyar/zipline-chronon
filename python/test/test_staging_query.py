@@ -136,6 +136,19 @@ def test_staging_query_partition_interval_sets_output_table_info():
     assert table_info.partitionInterval == _hours(3)
 
 
+def test_staging_query_partition_offset_without_interval_assumes_daily_grid():
+    sq = StagingQuery(
+        query="SELECT 1",
+        partition_offset="1h",
+    )
+
+    table_info = sq.metaData.executionInfo.outputTableInfo
+    assert table_info.partitionColumn == "ds"
+    assert table_info.partitionFormat == "yyyy-MM-dd-HH-mm"
+    assert table_info.partitionInterval == _days(1)
+    assert table_info.partitionOffset == _hours(1)
+
+
 def test_staging_query_infers_interval_but_never_offset_from_schedule():
     # The cron fire phase (1h) is a derived processing delay over the midnight-boundary
     # grid — it is never inferred as a partition offset.
@@ -219,6 +232,16 @@ def test_staging_query_subdaily_rejects_dependency_without_interval():
         )
 
 
+def test_staging_query_offset_daily_rejects_dependency_without_interval():
+    with pytest.raises(ValueError, match="partition_interval"):
+        StagingQuery(
+            query="SELECT * FROM ns.upstream WHERE ds BETWEEN '{{ start_date }}' AND '{{ end_date }}'",
+            dependencies=[TableDependency(table="ns.upstream")],
+            partition_interval="1d",
+            partition_offset="1h",
+        )
+
+
 def test_staging_query_subdaily_propagates_output_grid_to_time_partitioned_dependency_without_interval():
     sq = StagingQuery(
         query="SELECT * FROM ns.upstream WHERE ds BETWEEN '{{ start_date }}' AND '{{ end_date }}'",
@@ -233,6 +256,22 @@ def test_staging_query_subdaily_propagates_output_grid_to_time_partitioned_depen
     assert dep.partitionColumn == "ds"
     assert dep.partitionFormat == "yyyy-MM-dd-HH-mm"
     assert dep.partitionInterval == _hours(3)
+    assert dep.partitionOffset == _hours(1)
+
+
+def test_staging_query_offset_daily_propagates_output_grid_to_time_partitioned_dependency_without_interval():
+    sq = StagingQuery(
+        query="SELECT * FROM ns.upstream WHERE ds BETWEEN '{{ start_date }}' AND '{{ end_date }}'",
+        dependencies=[TableDependency(table="ns.upstream", time_partitioned=True)],
+        partition_interval="1d",
+        partition_offset="1h",
+    )
+
+    dep = sq.tableDependencies[0].tableInfo
+    assert dep.timePartitioned is True
+    assert dep.partitionColumn == "ds"
+    assert dep.partitionFormat == "yyyy-MM-dd-HH-mm"
+    assert dep.partitionInterval == _days(1)
     assert dep.partitionOffset == _hours(1)
 
 

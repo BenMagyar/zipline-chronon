@@ -36,7 +36,7 @@ import scala.util.Try
 case class PartitionGrid(spanMillis: Long, offsetMillis: Long = 0L) {
   require(spanMillis > 0, s"Partition interval must be positive, found $spanMillis")
   // day-denominated reasoning (partitionsPerDay, stepsByDays, snapshot/orchestration math) relies
-  // on partitions tiling the UTC day; week/month-sized partitions are deliberately unrepresentable
+  // on partitions tiling 24h exactly; week/month-sized partitions are deliberately unrepresentable
   // (7d boundaries would start on Thursday - epoch day zero; 30d boundaries drift off calendar months)
   require(
     spanMillis == WindowUtils.Day.millis || (spanMillis < WindowUtils.Day.millis && WindowUtils.Day.millis % spanMillis == 0),
@@ -48,13 +48,11 @@ case class PartitionGrid(spanMillis: Long, offsetMillis: Long = 0L) {
     s"Partition offset must be in [0, interval), found ${offsetMillis}ms for interval ${spanMillis}ms. " +
       s"Declare the canonical offset instead of relying on modular normalization."
   )
-  require(
-    spanMillis < WindowUtils.Day.millis || offsetMillis == 0,
-    s"Daily partitions keep their boundaries at midnight UTC: offsets are only supported on sub-daily grids, " +
-      s"found offset ${offsetMillis}ms on a ${spanMillis}ms interval."
-  )
-
   def isDaily: Boolean = spanMillis == WindowUtils.Day.millis && offsetMillis == 0
+
+  def isLegacyDaily: Boolean = isDaily
+
+  def requiresGridAwarePath: Boolean = spanMillis < WindowUtils.Day.millis || offsetMillis != 0
 
   /** 1 for daily intervals; used to convert day-denominated configs like stepDays. */
   def partitionsPerDay: Int = math.max(1, (WindowUtils.Day.millis / spanMillis).toInt)
@@ -152,6 +150,10 @@ case class PartitionSpec(column: String, format: String, spanMillis: Long, offse
   }
 
   def isDaily: Boolean = grid.isDaily
+
+  def isLegacyDaily: Boolean = grid.isLegacyDaily
+
+  def requiresGridAwarePath: Boolean = grid.requiresGridAwarePath
 
   /** Same partitionInterval and partitionOffset; ds values translate 1:1 even if column or
     * format differs.

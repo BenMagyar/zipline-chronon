@@ -9,6 +9,7 @@ from ai.chronon.windows import (
     DAILY_PARTITION_FORMAT,
     SUB_DAILY_PARTITION_FORMAT,
     output_table_info,
+    requires_grid_aware_path,
 )
 
 
@@ -63,12 +64,13 @@ class TestIntervalConstraints:
 
 
 class TestOffsetConstraints:
-    """Offsets only exist on sub-daily grids and must be canonical: 0 <= offset < interval."""
+    """Offsets must be canonical: 0 <= offset < interval."""
 
-    def test_rejects_offset_on_daily_grid(self):
-        # daily grids keep their boundaries at midnight
-        with pytest.raises(ValueError, match="daily|sub-daily"):
-            output_table_info(partition_interval="1d", partition_offset="1h")
+    def test_accepts_offset_on_daily_grid_with_timestamp_format(self):
+        info = output_table_info(partition_interval="1d", partition_offset="1h")
+        assert info.partitionFormat == SUB_DAILY_PARTITION_FORMAT
+        assert info.partitionInterval == common.Window(length=1, timeUnit=common.TimeUnit.DAYS)
+        assert info.partitionOffset == common.Window(length=1, timeUnit=common.TimeUnit.HOURS)
 
     def test_rejects_negative_offset_object_form(self):
         # string "-1h" already fails _from_str positivity; the Window object path must
@@ -97,9 +99,12 @@ class TestOffsetConstraints:
         assert info.partitionInterval == common.Window(length=3, timeUnit=common.TimeUnit.HOURS)
         assert info.partitionOffset == common.Window(length=1, timeUnit=common.TimeUnit.HOURS)
 
-    def test_offset_without_interval_or_schedule_rejected(self):
-        with pytest.raises(ValueError, match="partition_offset requires"):
-            output_table_info(partition_offset="1h")
+    def test_offset_without_interval_assumes_daily_grid(self):
+        info = output_table_info(partition_offset="1h")
+        assert info.partitionFormat == SUB_DAILY_PARTITION_FORMAT
+        assert info.partitionInterval == common.Window(length=1, timeUnit=common.TimeUnit.DAYS)
+        assert info.partitionOffset == common.Window(length=1, timeUnit=common.TimeUnit.HOURS)
+        assert requires_grid_aware_path(partition_offset="1h") is True
 
 
 class TestFormatOverrideWarning:
@@ -118,3 +123,8 @@ class TestFormatOverrideWarning:
             output_table_info(partition_interval="3h")
             output_table_info(partition_interval="3h", partition_format=SUB_DAILY_PARTITION_FORMAT)
             output_table_info(partition_interval="1d", partition_format=DAILY_PARTITION_FORMAT)
+            output_table_info(
+                partition_interval="1d",
+                partition_offset="1h",
+                partition_format=SUB_DAILY_PARTITION_FORMAT,
+            )

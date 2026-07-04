@@ -13,22 +13,25 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
   private val compactSpec = PartitionSpec("ds", "yyyyMMdd", 24 * 60 * 60 * 1000)
   private val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
   private val offsetThreeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000, 60 * 60 * 1000)
+  private val offsetDailySpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
   private val fifteenMinuteSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 15 * 60 * 1000)
 
   "PartitionGrid" should "own grid invariants independent of ds format" in {
     an[IllegalArgumentException] should be thrownBy PartitionGrid(0)
     an[IllegalArgumentException] should be thrownBy PartitionGrid(5 * 60 * 60 * 1000L)
-    an[IllegalArgumentException] should be thrownBy PartitionGrid(24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
     an[IllegalArgumentException] should be thrownBy PartitionGrid(3 * 60 * 60 * 1000L, -1L)
     an[IllegalArgumentException] should be thrownBy PartitionGrid(3 * 60 * 60 * 1000L, 3 * 60 * 60 * 1000L)
 
     noException should be thrownBy PartitionGrid(24 * 60 * 60 * 1000L)
+    noException should be thrownBy PartitionGrid(24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
     noException should be thrownBy PartitionGrid(90 * 60 * 1000L)
     noException should be thrownBy PartitionGrid(3 * 60 * 60 * 1000L, 60 * 60 * 1000L)
   }
 
   it should "emit a semantic token only for non-daily grids" in {
     PartitionGrid(24 * 60 * 60 * 1000L).semanticToken should be(None)
+    PartitionGrid(24 * 60 * 60 * 1000L, 60 * 60 * 1000L).semanticToken should be(
+      Some("grid:interval_ms=86400000,offset_ms=3600000"))
     PartitionGrid(3 * 60 * 60 * 1000L).semanticToken should be(Some("grid:interval_ms=10800000,offset_ms=0"))
     PartitionGrid(3 * 60 * 60 * 1000L, 60 * 60 * 1000L).semanticToken should be(
       Some("grid:interval_ms=10800000,offset_ms=3600000"))
@@ -71,6 +74,11 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
   it should "expand offset sub-daily ranges by the partition interval" in {
     val result = offsetThreeHourSpec.expandRange("2024-01-01-22-00", "2024-01-02-04-00")
     result should be(List("2024-01-01-22-00", "2024-01-02-01-00", "2024-01-02-04-00"))
+  }
+
+  it should "expand offset daily ranges by one-day steps on the offset boundary" in {
+    val result = offsetDailySpec.expandRange("2024-01-01-01-00", "2024-01-03-01-00")
+    result should be(List("2024-01-01-01-00", "2024-01-02-01-00", "2024-01-03-01-00"))
   }
 
   it should "expand range across month boundaries" in {
@@ -246,6 +254,24 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
     )
   }
 
+  it should "expand an offset daily range into every overlapping aligned sub-daily partition" in {
+    val range = PartitionRange("2024-01-02-01-00", "2024-01-02-01-00")(offsetDailySpec)
+    val intersecting = range.intersectingRange(offsetThreeHourSpec)
+
+    intersecting.start should be("2024-01-02-01-00")
+    intersecting.end should be("2024-01-02-22-00")
+    intersecting.partitions should contain theSameElementsInOrderAs Seq(
+      "2024-01-02-01-00",
+      "2024-01-02-04-00",
+      "2024-01-02-07-00",
+      "2024-01-02-10-00",
+      "2024-01-02-13-00",
+      "2024-01-02-16-00",
+      "2024-01-02-19-00",
+      "2024-01-02-22-00"
+    )
+  }
+
   it should "expand a midnight-straddling partition into all impacted daily partitions" in {
     val range = PartitionRange("2024-01-02-22-00", "2024-01-02-22-00")(offsetThreeHourSpec)
     val intersecting = range.intersectingRange(dailySpec)
@@ -294,6 +320,9 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
     an[IllegalArgumentException] should be thrownBy PartitionSpec("ds", "yyyy-MM-dd''HH", 60 * 60 * 1000L)
     // a 30m offset is not expressible in an hour-resolution format
     an[IllegalArgumentException] should be thrownBy PartitionSpec("ds", "yyyy-MM-dd-HH", 60 * 60 * 1000L, 30 * 60 * 1000L)
+    // offset daily is allowed, but date-only labels cannot represent its non-midnight boundary
+    an[IllegalArgumentException] should be thrownBy
+      PartitionSpec("ds", "yyyy-MM-dd", 24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
 
     // common formats pass (space/colon formats stay expressible but warn; the default is dash-separated)
     noException should be thrownBy PartitionSpec("ds", "yyyy-MM-dd", 24 * 60 * 60 * 1000L)
@@ -301,6 +330,8 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
     noException should be thrownBy PartitionSpec("ds", "yyyy-MM-dd-HH", 60 * 60 * 1000L)
     noException should be thrownBy PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000L)
     noException should be thrownBy PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000L, 60 * 60 * 1000L)
+    noException should be thrownBy
+      PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
   }
 
   it should "delegate grid invariant validation to PartitionGrid" in {
@@ -372,6 +403,14 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
       "2024-01-05-12-00", "2024-01-05-15-00", "2024-01-05-18-00", "2024-01-05-21-00")
     PartitionRange.fullyContainedPartitions(allSlices, threeHourSpec, dailySpec) should be(Seq("2024-01-05"))
     PartitionRange.fullyContainedPartitions(allSlices.drop(1), threeHourSpec, dailySpec) should be(Seq.empty)
+
+    val alignedOffsetSlices = Seq("2024-01-05-01-00", "2024-01-05-04-00", "2024-01-05-07-00",
+      "2024-01-05-10-00", "2024-01-05-13-00", "2024-01-05-16-00", "2024-01-05-19-00",
+      "2024-01-05-22-00")
+    PartitionRange.fullyContainedPartitions(alignedOffsetSlices, offsetThreeHourSpec, offsetDailySpec) should be(
+      Seq("2024-01-05-01-00"))
+    PartitionRange.fullyContainedPartitions(alignedOffsetSlices.dropRight(1), offsetThreeHourSpec, offsetDailySpec) should be(
+      Seq.empty)
   }
 
   "PartitionRange.steps" should "tumble by partition count and by days" in {

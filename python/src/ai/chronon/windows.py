@@ -155,7 +155,7 @@ class PartitionSpec:
             return self.format
         if self.interval is None:
             return None
-        return default_partition_format(self.interval)
+        return default_partition_format(self.interval, self.offset)
 
     def interval_millis(self) -> Optional[int]:
         return window_millis(self.interval) if self.interval is not None else None
@@ -169,6 +169,12 @@ class PartitionSpec:
     def is_subdaily_grid(self) -> bool:
         interval_ms = self.interval_millis()
         return interval_ms is not None and interval_ms < DAY_MILLIS
+
+    def requires_grid_aware_path(self) -> bool:
+        interval_ms = self.interval_millis()
+        return interval_ms is not None and (
+            interval_ms < DAY_MILLIS or self.offset_millis() != 0
+        )
 
     def query_kwargs(self):
         return {
@@ -211,10 +217,14 @@ def window_millis(w: Union[common.Window, str]) -> int:
     raise ValueError(f"Unsupported TimeUnit for partition interval: {window.timeUnit}")
 
 
-def default_partition_format(partition_interval: Union[common.Window, str]) -> str:
+def default_partition_format(
+    partition_interval: Union[common.Window, str],
+    partition_offset: Union[common.Window, str] = None,
+) -> str:
     return (
         SUB_DAILY_PARTITION_FORMAT
         if window_millis(partition_interval) < DAY_MILLIS
+        or (partition_offset is not None and window_millis(partition_offset) != 0)
         else DAILY_PARTITION_FORMAT
     )
 
@@ -316,7 +326,7 @@ def validate_source_grid(conf_desc: str, query, source_desc: str) -> None:
     """GroupBy/model sources and the join LEFT must hold the output partition's whole time
     range: every output boundary must also be a source boundary. Example: a 3h@1h output over
     a daily source can't fill [13:00, 16:00) until the day closes. Call only when the conf's
-    output grid is sub-daily: physical sources must declare a partition_interval unless the
+    output grid is non-legacy: physical sources must declare a partition_interval unless the
     table is Chronon-produced and the TableReference propagated it. time_partitioned sources
     use timestamp/date slicing and may inherit the consumer grid at planning time. Join RIGHT
     parts pick the latest snapshot at or before each left row's ts on their own grid - mixed
@@ -326,14 +336,13 @@ def validate_source_grid(conf_desc: str, query, source_desc: str) -> None:
     if query.timePartitioned:
         return
     raise ValueError(
-        f"{conf_desc} has a sub-daily output grid over {source_desc} with no declared "
-        "partition_interval - implicitly daily. Every intraday run would wait for the full "
-        "day's partition and land a day late. Declare the source's partition_interval."
+        f"{conf_desc} has a non-legacy output grid over {source_desc} with no declared "
+        "partition_interval - implicitly legacy daily. Declare the source's partition_interval."
     )
 
 
 def validate_table_dependency_grid(conf_desc: str, dependency, source_desc: str) -> None:
-    """Validate a Python StagingQuery TableDependency for a sub-daily output grid.
+    """Validate a Python StagingQuery TableDependency for a non-legacy output grid.
 
     Physical dependencies must declare the upstream cadence explicitly. Chronon-produced
     tables propagate their non-daily grid through TableReference, and time_partitioned
@@ -344,8 +353,8 @@ def validate_table_dependency_grid(conf_desc: str, dependency, source_desc: str)
     if dependency.time_partitioned:
         return
     raise ValueError(
-        f"{conf_desc} has a sub-daily output grid over {source_desc} with no declared "
-        "partition_interval - implicitly daily. Declare the dependency's partition_interval."
+        f"{conf_desc} has a non-legacy output grid over {source_desc} with no declared "
+        "partition_interval - implicitly legacy daily. Declare the dependency's partition_interval."
     )
 
 
@@ -369,6 +378,25 @@ def is_subdaily(
     return False
 
 
+def requires_grid_aware_path(
+    partition_interval: Union[common.Window, str] = None,
+    partition_offset: Union[common.Window, str] = None,
+    schedule: str = None,
+) -> bool:
+    """True when the output grid cannot safely inherit legacy midnight-daily semantics."""
+    if partition_interval is None and partition_offset is not None:
+        return window_millis(partition_offset) != 0
+    if partition_interval is not None:
+        return (
+            window_millis(partition_interval) < DAY_MILLIS
+            or (
+                partition_offset is not None
+                and window_millis(partition_offset) != 0
+            )
+        )
+    return is_subdaily(schedule=schedule)
+
+
 def output_table_info(
     partition_interval: Union[common.Window, str] = None,
     partition_offset: Union[common.Window, str] = None,
@@ -384,11 +412,9 @@ def output_table_info(
     normalized_schedule = schedule.strip().lower() if isinstance(schedule, str) else schedule
     has_enabled_schedule = normalized_schedule not in (None, "", "none", "null", "@never")
     if partition_interval is None and cron_interval_ms is None:
-        if partition_offset is not None:
-            raise ValueError(
-                "partition_offset requires a partition_interval or a regular sub-daily schedule."
-            )
-        return None
+        if partition_offset is None:
+            return None
+        partition_interval = _days(1)
     interval = (
         normalize_window(partition_interval)
         if partition_interval is not None
@@ -420,11 +446,6 @@ def output_table_info(
         )
     # validate on computed millis so the Window object path hits the same checks as strings
     if offset_ms != 0:
-        if interval_ms >= DAY_MILLIS:
-            raise ValueError(
-                "Daily partitions keep their boundaries at midnight: partition_offset is only "
-                "supported on sub-daily grids."
-            )
         if offset_ms < 0 or offset_ms >= interval_ms:
             raise ValueError(
                 f"partition_offset ({offset_ms}ms) must be non-negative and strictly less than "
@@ -433,7 +454,7 @@ def output_table_info(
     # zero offset serializes identically to no offset: the planner convention is
     # offset-only-when-nonzero, and divergent bytes would churn semantic hashes
     offset = normalize_window(partition_offset) if offset_ms != 0 else None
-    default_format = default_partition_format(interval)
+    default_format = default_partition_format(interval, partition_offset)
     if partition_format is not None and partition_format != default_format:
         import warnings
 

@@ -20,6 +20,8 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
   // multiple of the 3h source grid, so it still exercises the exact-multiple rejection
   private val fourHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 4 * 60 * 60 * 1000)
   private val sixHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 6 * 60 * 60 * 1000)
+  private val offsetDailySpec =
+    PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 24 * 60 * 60 * 1000L, 60 * 60 * 1000L)
 
   private def outputTableInfo(table: String, spec: PartitionSpec): TableInfo = {
     val tableInfo = new TableInfo()
@@ -230,6 +232,28 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     dep.tableInfo.partitionFormat should equal(threeHourSpec.format)
   }
 
+  it should "stamp an offset daily grid onto time_partitioned dependencies" in {
+    val gb = withOutputSpec(buildGroupBy(), offsetDailySpec)
+    gb.sources.asScala.foreach(_.getEvents.query.setTimePartitioned(true))
+
+    val plan = GroupByPlanner(gb).buildPlan
+    val backfill = plan.nodes.asScala.find(_.content.isSetGroupByBackfill).get
+    val dep = backfill.metaData.executionInfo.tableDependencies.asScala.head
+
+    dep.tableInfo.timePartitioned shouldBe true
+    dep.tableInfo.partitionInterval should equal(WindowUtils.fromMillis(offsetDailySpec.spanMillis))
+    dep.tableInfo.partitionOffset should equal(WindowUtils.fromMillis(offsetDailySpec.offsetMillis))
+    dep.tableInfo.partitionFormat should equal(offsetDailySpec.format)
+  }
+
+  it should "reject offset daily groupBys over undeclared physical sources" in {
+    val gb = withOutputSpec(buildGroupBy(), offsetDailySpec)
+
+    val error = the[IllegalArgumentException] thrownBy GroupByPlanner(gb).buildPlan
+    error.getMessage should include("grid-aware output grid")
+    error.getMessage should include("no declared partition_interval")
+  }
+
   it should "reject groupBy output boundaries that don't line up on the source grid" in {
     val offsetSourceSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000, offsetMillis = 60 * 60 * 1000)
     val gb = withOutputSpec(withEventSourceSpec(buildGroupBy(), offsetSourceSpec), sixHourSpec)
@@ -253,6 +277,13 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
       val gb = withOutputSpec(withEventSourceSpec(buildGroupBy(), offsetSourceSpec), groupBySpec)
       noException should be thrownBy GroupByPlanner(gb).buildPlan
     }
+  }
+
+  it should "allow offset daily output boundaries that line up on an offset sub-daily source grid" in {
+    val offsetSourceSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000, offsetMillis = 60 * 60 * 1000)
+    val gb = withOutputSpec(withEventSourceSpec(buildGroupBy(), offsetSourceSpec), offsetDailySpec)
+
+    noException should be thrownBy GroupByPlanner(gb).buildPlan
   }
 
   it should "GB planner should skip metadata in sem hash" in {
