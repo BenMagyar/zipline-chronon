@@ -85,14 +85,24 @@ class TestOffsetConstraints:
         with pytest.raises(ValueError, match="less than"):
             output_table_info(partition_interval="3h", partition_offset="3h")
 
-    def test_zero_offset_object_form_is_dropped(self):
-        # explicit zero offset and absent offset must serialize identically -- the planner
-        # convention is offset-only-when-nonzero, and divergent bytes churn semantic hashes
-        info = output_table_info(
-            partition_interval="3h",
-            partition_offset=common.Window(length=0, timeUnit=common.TimeUnit.HOURS),
-        )
-        assert info.partitionOffset is None
+    def test_explicit_zero_offset_is_preserved(self):
+        # an explicit zero offset survives into the conf so defaulting layers (team-level
+        # grids) can tell "author pinned midnight" apart from "author said nothing".
+        # Semantic hashes are safe either way: the scala-side outputGridToken canonicalizes
+        # offset millis with absent == 0. Both the object and "0h" string forms work.
+        zero = common.Window(length=0, timeUnit=common.TimeUnit.HOURS)
+        for spelled in (zero, "0h"):
+            info = output_table_info(partition_interval="3h", partition_offset=spelled)
+            assert info.partitionOffset == zero
+            assert info.partitionFormat == SUB_DAILY_PARTITION_FORMAT
+
+    def test_explicit_zero_offset_without_interval_pins_legacy_daily(self):
+        # the pure opt-out spelling under a team offset default: partition_offset="0h"
+        # alone compiles to the legacy midnight-daily grid, declared explicitly
+        info = output_table_info(partition_offset="0h")
+        assert info.partitionInterval == common.Window(length=1, timeUnit=common.TimeUnit.DAYS)
+        assert info.partitionOffset == common.Window(length=0, timeUnit=common.TimeUnit.HOURS)
+        assert info.partitionFormat == DAILY_PARTITION_FORMAT
 
     def test_accepts_canonical_sub_daily_offset(self):
         info = output_table_info(partition_interval="3h", partition_offset="1h")

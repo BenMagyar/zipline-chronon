@@ -8,6 +8,7 @@ from copy import deepcopy
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from ai.chronon import windows as window_utils
 from ai.chronon.cli.logger import get_logger
 from ai.chronon.cli.theme import console
 from ai.chronon.utils import OUTPUT_NAMESPACE_PLACEHOLDER
@@ -380,9 +381,9 @@ def merge_team_execution_info(
     team_dict: Dict[str, Team],
     team_name: str,
 ):
-    """Merge Team-level env/conf/clusterConf onto `metadata.executionInfo`. Per-env
+    """Merge Team-level defaults onto `metadata.executionInfo`. Per-env
     isolation now lives one layer up — each teams.<env>.py is loaded into its own
-    team_dict, so this function just reads the regular trio off the team."""
+    team_dict, so this function just reads the regular fields off the team."""
     default_team = team_dict.get(_DEFAULT_CONF_TEAM)
     if not metadata.executionInfo:
         metadata.executionInfo = ExecutionInfo()
@@ -409,6 +410,75 @@ def merge_team_execution_info(
         metadata.executionInfo.clusterConf,
         env_or_config_attribute=EnvOrConfigAttribute.CLUSTER_CONFIG,
     )
+
+    original_offline_schedule = metadata.executionInfo.offlineSchedule
+
+    for team_info in (
+        getattr(default_team, "executionInfo", None) if default_team else None,
+        getattr(team, "executionInfo", None),
+    ):
+        if team_info is None:
+            continue
+        if (
+            team_info.offlineSchedule is not None
+            and original_offline_schedule in (None, "@daily")
+        ):
+            metadata.executionInfo.offlineSchedule = team_info.offlineSchedule
+
+    _merge_team_output_grid(metadata, default_team, team)
+
+
+def _team_output_grid(default_team: Optional[Team], team: Team):
+    """The team-level output grid to inherit: the team's own executionInfo.outputTableInfo
+    when it declares an interval or offset, else the default team's. A grid is inherited as
+    a unit — fields from the default team and the team are never mixed into one grid."""
+    for candidate in (team, default_team):
+        execution_info = getattr(candidate, "executionInfo", None) if candidate else None
+        table_info = getattr(execution_info, "outputTableInfo", None) if execution_info else None
+        if table_info is not None and (
+            table_info.partitionInterval is not None or table_info.partitionOffset is not None
+        ):
+            return table_info
+    return None
+
+
+def _merge_team_output_grid(metadata: MetaData, default_team: Optional[Team], team: Team):
+    """Inherit the team-level output partition grid when the conf declares none.
+
+    All-or-nothing: a conf that declares its own partitionInterval or partitionOffset keeps
+    its whole grid. Mixing a conf interval with a team offset would fabricate a grid nobody
+    declared, and the conf's authoring-time validations already ran against its own grid.
+    An explicit zero offset (partition_offset="0h") therefore pins legacy midnight-daily
+    boundaries under a team offset default.
+
+    The inherited grid runs through output_table_info — the same normalization and
+    validation conf-declared grids get: an offset without an interval means a 1d interval
+    on that offset, and the ds label format is derived from the grid (a bare offset with
+    the default yyyy-MM-dd format cannot represent its non-midnight boundaries and fails
+    PartitionSpec validation at upload). This also keeps the semantic-hash grid token
+    live: outputGridToken needs an interval, so stamping a bare offset would change the
+    output grid without changing the conf's semantic hash.
+    """
+    team_grid = _team_output_grid(default_team, team)
+    if team_grid is None:
+        return
+    existing = metadata.executionInfo.outputTableInfo
+    if existing is not None and (
+        existing.partitionInterval is not None or existing.partitionOffset is not None
+    ):
+        return
+
+    inherited = window_utils.output_table_info(
+        partition_interval=team_grid.partitionInterval,
+        partition_offset=team_grid.partitionOffset,
+        partition_column=team_grid.partitionColumn or "ds",
+        partition_format=team_grid.partitionFormat,
+    )
+    if existing is None:
+        metadata.executionInfo.outputTableInfo = deepcopy(inherited)
+    else:
+        for field in ("partitionColumn", "partitionFormat", "partitionInterval", "partitionOffset"):
+            setattr(existing, field, deepcopy(getattr(inherited, field)))
 
 
 def _merge_maps(*maps: Optional[Dict[str, str]]):

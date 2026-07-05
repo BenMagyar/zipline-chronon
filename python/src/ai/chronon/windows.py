@@ -16,6 +16,37 @@ def _minutes(length: int) -> common.Window:
     return common.Window(length=length, timeUnit=common.TimeUnit.MINUTES)
 
 
+def _zero_offset_window(w: Union[common.Window, str]) -> Optional[common.Window]:
+    """Parses an explicitly-zero offset ("0h" / Window(0, HOURS)), else returns None.
+
+    Zero is a legal partition offset (boundaries pinned at midnight), unlike windows and
+    intervals where the positive-duration rule applies, so offset parsing accepts it.
+    """
+    if isinstance(w, common.Window) and w.length == 0:
+        return w
+    if isinstance(w, str):
+        stripped = w.strip().lower()
+        units = {
+            "d": common.TimeUnit.DAYS,
+            "h": common.TimeUnit.HOURS,
+            "m": common.TimeUnit.MINUTES,
+        }
+        if (
+            len(stripped) >= 2
+            and stripped[-1] in units
+            and stripped[:-1].isdigit()
+            and int(stripped[:-1]) == 0
+        ):
+            return common.Window(length=0, timeUnit=units[stripped[-1]])
+    return None
+
+
+def normalize_offset_window(w: Union[common.Window, str]) -> common.Window:
+    """normalize_window for partition offsets: additionally accepts explicit zero."""
+    zero = _zero_offset_window(w)
+    return zero if zero is not None else normalize_window(w)
+
+
 def _from_str(s: str) -> common.Window:
     """
     converts strings like "30d", "2h", "15m" etc into common.Window
@@ -384,6 +415,8 @@ def requires_grid_aware_path(
     schedule: str = None,
 ) -> bool:
     """True when the output grid cannot safely inherit legacy midnight-daily semantics."""
+    if partition_offset is not None:
+        partition_offset = normalize_offset_window(partition_offset)
     if partition_interval is None and partition_offset is not None:
         return window_millis(partition_offset) != 0
     if partition_interval is not None:
@@ -407,6 +440,9 @@ def output_table_info(
     # The offset is never inferred from the cron fire phase; it defaults to zero (midnight
     # boundaries) and only an explicit partition_offset moves the grid. The cron fire phase
     # is treated as a derived processing delay relative to the declared grid.
+    partition_offset = (
+        normalize_offset_window(partition_offset) if partition_offset is not None else None
+    )
     offset_ms = window_millis(partition_offset) if partition_offset is not None else 0
     cron_interval_ms = regular_subdaily_schedule(schedule, offset_ms) if schedule else None
     normalized_schedule = schedule.strip().lower() if isinstance(schedule, str) else schedule
@@ -451,9 +487,11 @@ def output_table_info(
                 f"partition_offset ({offset_ms}ms) must be non-negative and strictly less than "
                 f"the partition interval ({interval_ms}ms)."
             )
-    # zero offset serializes identically to no offset: the planner convention is
-    # offset-only-when-nonzero, and divergent bytes would churn semantic hashes
-    offset = normalize_window(partition_offset) if offset_ms != 0 else None
+    # an explicitly passed zero offset is preserved rather than collapsed to absent, so
+    # defaulting layers (team-level grids) can tell "author pinned midnight" apart from
+    # "author said nothing". Semantic hashes are unaffected either way: the scala-side grid
+    # token (MetadataOps.outputGridToken) canonicalizes offset millis with absent == 0.
+    offset = partition_offset
     default_format = default_partition_format(interval, partition_offset)
     if partition_format is not None and partition_format != default_format:
         import warnings

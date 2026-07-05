@@ -130,7 +130,7 @@ v1 = Join(
 
 ##### Compile
 
-`zipline compile` turns authored configs (under `group_bys/`, `joins/`, `staging_queries/`, `models/`, `model_transforms/`) into thriftjson under `compiled/`. The compiler reads team-level defaults (output namespace, env vars, conf, cluster config) from `teams.py` and merges them onto each config's `metaData.executionInfo`.
+`zipline compile` turns authored configs (under `group_bys/`, `joins/`, `staging_queries/`, `models/`, `model_transforms/`) into thriftjson under `compiled/`. The compiler reads team-level defaults (output namespace, env vars, conf, cluster config, and execution info) from `teams.py` and merges them onto each config's `metaData.executionInfo`.
 
 ```bash
 zipline compile --chronon-root <repo-root>

@@ -70,5 +70,6 @@ EnvironmentVariables = common.EnvironmentVariables
 ConfigProperties = common.ConfigProperties
 ClusterConfigProperties = common.ClusterConfigProperties
 ExecutionInfo = common.ExecutionInfo
+TableInfo = common.TableInfo
 
 Team = ttypes.Team

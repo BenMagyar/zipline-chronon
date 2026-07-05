@@ -15,6 +15,11 @@ Tests for the parse_teams module.
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 import pytest
+
+from ai.chronon.cli.compile import parse_teams
+from ai.chronon.repo.constants import RunMode
+from ai.chronon.types import EnvironmentVariables, ExecutionInfo
+from ai.chronon.utils import OUTPUT_NAMESPACE_PLACEHOLDER
 from gen_thrift.api.ttypes import (
     EventSource,
     GroupBy,
@@ -25,12 +30,7 @@ from gen_thrift.api.ttypes import (
     Source,
     Team,
 )
-from gen_thrift.common.ttypes import ConfigProperties
-
-from ai.chronon.cli.compile import parse_teams
-from ai.chronon.repo.constants import RunMode
-from ai.chronon.types import EnvironmentVariables, ExecutionInfo
-from ai.chronon.utils import OUTPUT_NAMESPACE_PLACEHOLDER
+from gen_thrift.common.ttypes import ConfigProperties, TableInfo, TimeUnit, Window
 
 
 def test_check_deprecated_catalog_in_common_conf():
@@ -68,6 +68,155 @@ def test_check_deprecated_catalog_allows_valid_config():
     )
     # Should not raise
     parse_teams._check_deprecated_catalog("test_team", conf)
+
+
+def _team_with_execution_info(schedule=None, interval=None, offset=None):
+    return Team(
+        outputNamespace="team_namespace",
+        executionInfo=ExecutionInfo(
+            offlineSchedule=schedule,
+            outputTableInfo=TableInfo(
+                partitionInterval=interval,
+                partitionOffset=offset,
+            ),
+        ),
+    )
+
+
+def test_merge_team_execution_info_applies_team_schedule_and_partition_grid_defaults():
+    team_dict = {
+        "default": _team_with_execution_info("0 */6 * * *", Window(6, TimeUnit.HOURS)),
+        "test_team": _team_with_execution_info(
+            "0 1-22/3 * * *",
+            Window(3, TimeUnit.HOURS),
+            Window(1, TimeUnit.HOURS),
+        ),
+    }
+    metadata = MetaData(
+        team="test_team",
+        name="test_metadata_for_groupby",
+        executionInfo=ExecutionInfo(),
+    )
+
+    parse_teams.merge_team_execution_info(metadata, team_dict, "test_team")
+
+    assert metadata.executionInfo.offlineSchedule == "0 1-22/3 * * *"
+    table_info = metadata.executionInfo.outputTableInfo
+    assert table_info.partitionInterval == Window(3, TimeUnit.HOURS)
+    assert table_info.partitionOffset == Window(1, TimeUnit.HOURS)
+    # inherited grids get the same normalization conf-declared grids get: without a
+    # boundary-capable label format the conf would fail PartitionSpec validation at upload
+    assert table_info.partitionFormat == "yyyy-MM-dd-HH-mm"
+    assert table_info.partitionColumn == "ds"
+
+
+def test_merge_team_execution_info_preserves_config_schedule_and_partition_interval():
+    team_dict = {
+        "default": Team(outputNamespace="default_namespace"),
+        "test_team": _team_with_execution_info(
+            "0 1-22/3 * * *",
+            Window(3, TimeUnit.HOURS),
+            Window(1, TimeUnit.HOURS),
+        ),
+    }
+    metadata = MetaData(
+        team="test_team",
+        name="test_metadata_for_groupby",
+        executionInfo=ExecutionInfo(
+            offlineSchedule="0 */2 * * *",
+            outputTableInfo=TableInfo(
+                partitionColumn="event_ds",
+                partitionFormat="yyyy-MM-dd-HH-mm",
+                partitionInterval=Window(2, TimeUnit.HOURS),
+            ),
+        ),
+    )
+
+    parse_teams.merge_team_execution_info(metadata, team_dict, "test_team")
+
+    assert metadata.executionInfo.offlineSchedule == "0 */2 * * *"
+    # a conf that declares its own grid keeps it wholesale: mixing the conf's 2h interval
+    # with the team's 1h offset would fabricate a 2h+1h grid nobody declared, invalidating
+    # the source-alignment checks that ran against 2h at authoring time
+    assert metadata.executionInfo.outputTableInfo.partitionColumn == "event_ds"
+    assert metadata.executionInfo.outputTableInfo.partitionInterval == Window(2, TimeUnit.HOURS)
+    assert metadata.executionInfo.outputTableInfo.partitionOffset is None
+
+
+def test_merge_team_execution_info_applies_offset_without_interval():
+    team_dict = {
+        "default": Team(outputNamespace="default_namespace"),
+        "test_team": _team_with_execution_info(
+            offset=Window(1, TimeUnit.HOURS),
+        ),
+    }
+    metadata = MetaData(
+        team="test_team",
+        name="test_metadata_for_groupby",
+        executionInfo=ExecutionInfo(),
+    )
+
+    parse_teams.merge_team_execution_info(metadata, team_dict, "test_team")
+
+    table_info = metadata.executionInfo.outputTableInfo
+    assert table_info is not None
+    # same rule as conf-level authoring: an offset without an interval means a 1d interval
+    # on that offset grid, and the label format must represent the 01:00 boundaries
+    assert table_info.partitionInterval == Window(1, TimeUnit.DAYS)
+    assert table_info.partitionOffset == Window(1, TimeUnit.HOURS)
+    assert table_info.partitionFormat == "yyyy-MM-dd-HH-mm"
+
+
+def test_merge_team_execution_info_explicit_zero_offset_opts_out():
+    # partition_offset="0h" compiles to an explicit zero offset (no longer collapsed to
+    # absent), which pins legacy midnight-daily boundaries under a team offset default
+    team_dict = {
+        "default": Team(outputNamespace="default_namespace"),
+        "test_team": _team_with_execution_info(offset=Window(1, TimeUnit.HOURS)),
+    }
+    metadata = MetaData(
+        team="test_team",
+        name="test_metadata_for_groupby",
+        executionInfo=ExecutionInfo(
+            outputTableInfo=TableInfo(
+                partitionColumn="ds",
+                partitionFormat="yyyy-MM-dd",
+                partitionInterval=Window(1, TimeUnit.DAYS),
+                partitionOffset=Window(0, TimeUnit.HOURS),
+            ),
+        ),
+    )
+
+    parse_teams.merge_team_execution_info(metadata, team_dict, "test_team")
+
+    table_info = metadata.executionInfo.outputTableInfo
+    assert table_info.partitionInterval == Window(1, TimeUnit.DAYS)
+    assert table_info.partitionOffset == Window(0, TimeUnit.HOURS)
+    assert table_info.partitionFormat == "yyyy-MM-dd"
+
+
+def test_merge_team_execution_info_does_not_mix_grids_across_teams():
+    # the team's grid wins over the default team's as a unit; the default team's 1h offset
+    # must not leak onto the team's interval-only 3h grid
+    team_dict = {
+        "default": _team_with_execution_info(
+            interval=Window(1, TimeUnit.DAYS),
+            offset=Window(1, TimeUnit.HOURS),
+        ),
+        "test_team": _team_with_execution_info(interval=Window(3, TimeUnit.HOURS)),
+    }
+    metadata = MetaData(
+        team="test_team",
+        name="test_metadata_for_groupby",
+        executionInfo=ExecutionInfo(),
+    )
+
+    parse_teams.merge_team_execution_info(metadata, team_dict, "test_team")
+
+    table_info = metadata.executionInfo.outputTableInfo
+    assert table_info.partitionInterval == Window(3, TimeUnit.HOURS)
+    assert table_info.partitionOffset is None
+    assert table_info.partitionFormat == "yyyy-MM-dd-HH-mm"
 
 
 def test_update_metadata_with_existing_output_namespace():

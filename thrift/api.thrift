@@ -557,6 +557,7 @@ struct Team {
     20: optional common.EnvironmentVariables env
     21: optional common.ConfigProperties conf
     22: optional common.ClusterConfigProperties clusterConf
+    23: optional common.ExecutionInfo executionInfo
 
 }
 

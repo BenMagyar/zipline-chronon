@@ -51,8 +51,11 @@ A `Team` has the following fields:
 | `outputNamespace` | `str` | Namespace for output tables (e.g. `"data"`) |
 | `conf` | `ConfigProperties` | Spark/Flink job configuration |
 | `env` | `EnvironmentVariables` | Environment variables for job execution |
+| `executionInfo` | `ExecutionInfo` | Default schedule, output partition grid, and other execution metadata for configs in this team |
 
 Each of `conf` and `env` support a `common` dict (applies to all modes) and a mode-specific dict for per-mode overrides. Configurations are layered in priority order: `default` team -> team-specific -> entity-specific.
+
+Team-level `executionInfo` defaults are inherited by configs that don't set their own: the schedule applies when a config's `offline_schedule` is unset (or the default `"@daily"`), and the output partition grid (`partitionInterval`/`partitionOffset`) applies only when a config declares neither. A config that declares any grid field keeps its whole grid, and an explicit `partition_offset="0h"` pins legacy midnight-daily boundaries under a team offset default.
 
 ## Catalog Configuration
 
@@ -269,12 +272,29 @@ Here is a complete example of a `teams.py` with a default team and a GCP team:
 ```python
 from ai.chronon.repo.constants import RunMode
 from ai.chronon.repo.spark_catalog_confs import *
-from ai.chronon.types import ConfigProperties, EnvironmentVariables, Team
+from ai.chronon.types import (
+    ConfigProperties,
+    EnvironmentVariables,
+    ExecutionInfo,
+    TableInfo,
+    Team,
+    TimeUnit,
+    Window,
+)
 
 default = Team(
     description="Default team",
     email="ml-infra@company.com",
     outputNamespace="default",
+    executionInfo=ExecutionInfo(
+        offlineSchedule="20 0 * * *",
+        # optional: a default output partition grid for the team's configs, e.g. daily
+        # partitions starting at 01:00 UTC instead of midnight
+        outputTableInfo=TableInfo(
+            partitionInterval=Window(1, TimeUnit.DAYS),
+            partitionOffset=Window(1, TimeUnit.HOURS),
+        ),
+    ),
     conf=ConfigProperties(
         common={
             "spark.chronon.partition.column": "ds",
