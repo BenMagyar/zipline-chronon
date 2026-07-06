@@ -50,8 +50,8 @@ object Constants {
   )
 
   def loggingDeps = loggingApiDeps ++ Seq(
-    mvn"ch.qos.logback:logback-classic:1.5.25",
-    mvn"ch.qos.logback:logback-core:1.5.25",
+    mvn"ch.qos.logback:logback-classic:1.5.33",
+    mvn"ch.qos.logback:logback-core:1.5.33",
     // Used for structured JSON logging (8.x uses Jackson 2.x; 9.x switched to Jackson 3.x)
     mvn"net.logstash.logback:logstash-logback-encoder:8.1"
   )
