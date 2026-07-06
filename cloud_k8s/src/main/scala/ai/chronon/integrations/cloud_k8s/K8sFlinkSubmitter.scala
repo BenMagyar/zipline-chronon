@@ -4,8 +4,8 @@ import ai.chronon.api.JobStatusType
 import ai.chronon.spark.submission.JobSubmitterConstants.{MaxRetainedCheckpoints, additionalFlinkJars}
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource
 import io.fabric8.kubernetes.api.model.networking.v1.IngressBuilder
-import io.fabric8.kubernetes.client.{Config, KubernetesClientBuilder}
-import io.fabric8.kubernetes.client.dsl.base.CustomResourceDefinitionContext
+import io.fabric8.kubernetes.client.{Config, KubernetesClientBuilder, KubernetesClientException}
+import io.fabric8.kubernetes.client.dsl.base.{CustomResourceDefinitionContext, PatchContext, PatchType}
 import org.slf4j.LoggerFactory
 
 import java.time.Instant
@@ -256,18 +256,43 @@ class K8sFlinkSubmitter(
     }
   }
 
+  // Suspend rather than hard-delete: sends a JSON merge patch setting spec.job.state=suspended
+  // so the Flink operator triggers a graceful cancel (honouring upgradeMode) and sets
+  // lifecycleState=SUSPENDED. The FlinkDeployment resource stays alive so status() returns
+  // FAILED (terminal) on the next poll instead of UNKNOWN after the resource is GC'd.
+  // JSON merge patch is a single atomic API call with no resourceVersion — avoids the
+  // GET→mutate→update 409 conflict race against the operator's concurrent reconciliation.
   def delete(deploymentName: String, namespace: String): Unit = {
     val client = k8sClient
     try {
+      val patch = suspendPatch(deploymentName, namespace)
       client
         .genericKubernetesResources(flinkDeploymentCrdContext)
         .inNamespace(namespace)
         .withName(deploymentName)
-        .delete()
-      logger.info(s"Deleted FlinkDeployment: $deploymentName in namespace: $namespace")
+        .patch(PatchContext.of(PatchType.JSON_MERGE), patch)
+      logger.info(s"Suspended FlinkDeployment $deploymentName in namespace $namespace")
+    } catch {
+      case e: KubernetesClientException if e.getCode == 404 =>
+        logger.warn(s"FlinkDeployment $deploymentName not found in namespace $namespace, nothing to suspend")
     } finally {
       client.close()
     }
+  }
+
+  // Builds a minimal GenericKubernetesResource suitable for a JSON merge patch that sets
+  // spec.job.state=suspended. Only the fields present in the patch are touched on the server;
+  // all other spec fields are left unchanged.
+  private[cloud_k8s] def suspendPatch(deploymentName: String, namespace: String): GenericKubernetesResource = {
+    val job = new java.util.LinkedHashMap[String, Object]()
+    job.put("state", "suspended")
+    val spec = new java.util.LinkedHashMap[String, Object]()
+    spec.put("job", job)
+    val patch = new GenericKubernetesResource()
+    patch.setApiVersion("flink.apache.org/v1beta1")
+    patch.setKind("FlinkDeployment")
+    patch.setAdditionalProperty("spec", spec)
+    patch
   }
 
   def submit(jobId: String,
