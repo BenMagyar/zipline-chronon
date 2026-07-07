@@ -29,6 +29,18 @@ ARG FLINK_VERSION=1.20.3
 
 USER root
 
+# flink:1.20.3 ships Temurin 11 JRE which lacks jdk.compiler — avro-fastserde
+# generates Java at runtime and needs ToolProvider.getSystemJavaCompiler().
+# openjdk-17-jdk-headless includes jdk.compiler, matching what the EMR Corretto
+# 17 image provides. We override JAVA_HOME so Flink picks up the JDK instead of
+# the bundled Temurin JRE at /opt/java/openjdk.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openjdk-17-jdk-headless && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sfn "$(readlink -f /usr/bin/javac | sed 's|/bin/javac||')" /usr/lib/jvm/java-17
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17
+
 # S3 (flink-s3-fs-hadoop — uses Hadoop S3A, supports IRSA/WebIdentity)
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
     curl -fsSL "https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/${FLINK_VERSION}/flink-s3-fs-hadoop-${FLINK_VERSION}.jar" \

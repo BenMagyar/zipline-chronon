@@ -7,6 +7,7 @@ import org.apache.flink.api.common.serialization.DeserializationSchema
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.flink.streaming.connectors.kinesis.FlinkKinesisConsumer
+import org.apache.flink.api.common.functions.FlatMapFunction
 import org.apache.flink.util.Collector
 
 /** Chronon Flink source that reads events from AWS Kinesis. Can be configured on the topic as:
@@ -67,7 +68,10 @@ class KinesisFlinkSource[T](props: Map[String, String],
       .addSource(kinesisConsumer, s"Kinesis source: $groupByName - ${topicInfo.name}")
       .setParallelism(parallelism)
       .uid(s"kinesis-source-$groupByName")
-      .flatMap[T]((arr: Array[T], out: Collector[T]) => arr.foreach(out.collect), deserializationSchema.getProducedType)
+      .flatMap[T](new FlatMapFunction[Array[T], T] {
+                    override def flatMap(arr: Array[T], out: Collector[T]): Unit = arr.foreach(out.collect)
+                  },
+                  deserializationSchema.getProducedType)
       .uid(s"kinesis-source-flatmap-$groupByName")
       .assignTimestampsAndWatermarks(noWatermarks)
   }

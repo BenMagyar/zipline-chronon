@@ -24,12 +24,11 @@ class GcpApiImpl(conf: Map[String, String]) extends Api(conf) {
 
   // For now we have a flag store that relies on some hardcoded values. Over time we can replace this with something
   // more sophisticated (e.g. service / teams.json based flags)
-  val tilingEnabledFlagStore: FlagStore = (flagName: String, _: util.Map[String, String]) => {
-    if (flagName == FlagStoreConstants.TILING_ENABLED) {
-      true
-    } else {
-      false
-    }
+  // SAM lambda for FlagStore fails deserialization under Java 17 (LambdaMetafactory rejects
+  // captured-arg counts that Java 11 accepted) — use an anonymous class instead.
+  val tilingEnabledFlagStore: FlagStore = new FlagStore {
+    override def isSet(flagName: String, attributes: util.Map[String, String]): java.lang.Boolean =
+      flagName == FlagStoreConstants.TILING_ENABLED
   }
 
   // We set the flag store to always return true for tiling enabled

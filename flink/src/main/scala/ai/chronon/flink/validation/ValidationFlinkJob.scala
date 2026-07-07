@@ -5,6 +5,7 @@ import ai.chronon.flink.validation.SparkExprEvalComparisonFn.compareResultRows
 import ai.chronon.flink.{SparkExpressionEval, SparkExpressionEvalFn}
 import ai.chronon.online.fetcher.MetadataStore
 import ai.chronon.online.{GroupByServingInfoParsed, TopicInfo}
+import org.apache.flink.api.common.functions.MapFunction
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.streaming.api.datastream.DataStream
@@ -124,7 +125,9 @@ class ValidationFlinkJob(eventSrc: FlinkSource[Row],
     // add a unique record ID to every record - this is needed to correlate results from the two operators as we can have
     // 0 to n records per input event.
     val sourceStreamWithId: DataStream[EventRecord] = sourceStream
-      .map(e => EventRecord(java.util.UUID.randomUUID().toString, e))
+      .map(new MapFunction[Row, EventRecord] {
+        override def map(e: Row): EventRecord = EventRecord(java.util.UUID.randomUUID().toString, e)
+      })
       .uid(s"source-with-id-$groupByName")
       .name(s"Source with ID for $groupByName")
       .setParallelism(sourceStream.getParallelism) // Use same parallelism as previous operator
