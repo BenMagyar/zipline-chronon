@@ -67,6 +67,7 @@ Doing this with a new version vs with an entirely new entity has a number of ben
 
 1. Compute reuse: When running a backfill with your new `GroupBy` or `Join`, only the new features are computed. The unchanged ones are reused from existing backfills wherever possible.
 2. Downstream consumers that reference that entity will automatically migrated to the new version when your merge to main. Schema incompatibilities caused by changing/removing features are caught at compile time.
+3. Schedule handoff: after the merge, `schedule-all` schedules the new version and retires the old version's schedules automatically — the superseded version stops running on its own.
 
 
 ## Changing the variable name vs changing the version argument
@@ -86,7 +87,7 @@ v0 = GroupBy(...)
 v1 = GroupBy(...)
 ```
 
-This would allow for both `GroupBy`s to be considered production at the same time.
+This would allow for both `GroupBy`s to be considered production at the same time. Because these are distinct entities rather than versions of one entity, both are scheduled independently — neither retires the other's schedules.
 
 ## Best Practices
 

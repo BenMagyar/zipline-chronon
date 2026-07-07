@@ -28,6 +28,28 @@ For sub-daily online configs, leave `online_schedule` unset unless you need to
 disable it with `@never`. When `online=True`, Chronon inherits the sub-daily
 `offline_schedule`; if both are set, they must match.
 
+## Schedule lifecycle
+
+Your config is the source of truth for which schedules exist. Every
+`zipline hub schedule-all` run (typically CI, post-merge) brings the hub in
+line with the repo for the branch it runs on:
+
+- A conf with a schedule gets one, or keeps the one it has.
+- A conf whose schedules are `@never` or unset has its schedules removed.
+- A conf that no longer exists in the repo — deleted, or superseded by a
+  version bump — has its schedules removed. Bumping `version=3` to
+  `version=4` retires the `__3` schedules automatically; there is nothing to
+  clean up by hand.
+
+Runs from one branch never touch schedules that another branch deployed.
+Scheduling an experimental version from a feature branch alongside the
+production version is safe; when the branch merges, the production
+`schedule-all` takes over and retires the superseded version.
+
+There is deliberately no out-of-band pause: stopping a schedule means changing
+the config (`@never` or remove it) and merging, so every schedule change goes
+through review and nothing stays silently held.
+
 ## Partition grids
 
 Every output table is written on a partition grid.
@@ -311,3 +333,6 @@ partitions are minute-aligned.
    grid do not need to line up with right `GroupBy` output or source grids.
 8. Changing `partition_interval` or `partition_offset` changes the output shape
    and should be versioned.
+9. Config declares which schedules exist: `schedule-all` removes schedules for
+   confs that were unscheduled, deleted, or version-bumped. There is no
+   out-of-band pause — schedule changes go through config review.

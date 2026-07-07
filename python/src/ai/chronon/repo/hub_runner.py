@@ -508,8 +508,9 @@ def submit_schedule_all(
             format=format,
         )
 
-    # Collect confs with schedules (from ALL confs, not just changed ones)
+    # Collect schedule requests (from ALL confs, not just changed ones)
     confs_with_schedules = []
+    unscheduled_confs = []
     skipped_confs = []
     env_filtered_confs = []
 
@@ -532,13 +533,15 @@ def submit_schedule_all(
 
             schedule_modes = get_schedule_modes(conf.localPath)
 
-            # Skip confs without any schedules
+            # Confs with no schedules are still sent (with "None" modes): the hub retires any
+            # existing schedule rows (removes them; pauses on older hubs) and supersedes old
+            # versions, so unscheduling a conf — or bumping its version and unscheduling in one
+            # change — takes effect. Skipping them here would leave the schedule firing forever.
             if (
                 SCHEDULE_NONE_STR == schedule_modes.offline_schedule
-                and SCHEDULE_NONE_STR ==  schedule_modes.online_schedule
+                and SCHEDULE_NONE_STR == schedule_modes.online_schedule
             ):
-                skipped_confs.append(name)
-                continue
+                unscheduled_confs.append(name)
 
             modes = {
                 RunMode.BACKFILL.value.upper(): schedule_modes.offline_schedule,
@@ -559,7 +562,7 @@ def submit_schedule_all(
 
     if not confs_with_schedules:
         message_parts = [
-            f"No confs with schedules found among loaded confs for environment '{env}'."
+            f"No confs to schedule among loaded confs for environment '{env}'."
         ]
         if env_filtered_confs:
             message_parts.append(
@@ -567,7 +570,7 @@ def submit_schedule_all(
             )
         if skipped_confs:
             message_parts.append(
-                f"{len(skipped_confs)} loaded conf(s) have no schedules defined."
+                f"{len(skipped_confs)} loaded conf(s) failed schedule extraction."
             )
         print_info(" ".join(message_parts), format=format)
         return
@@ -577,6 +580,28 @@ def submit_schedule_all(
         f"Deploying schedules for {len(confs_with_schedules)} conf(s)...", format=format
     ):
         response_json = zipline_hub.call_schedule_all_api(confs_with_schedules)
+
+    # Full sync: schedule-all is authoritative for this branch. Deploys only ever add or
+    # modify rows, so hub schedules whose conf no longer exists in the local repo (deleted
+    # confs, superseded versions) would keep firing forever — retire them here. Best-effort:
+    # skipped when any deploy failed, and non-fatal against hubs without the list/delete APIs.
+    pruned_confs = []
+    if response_json.get("failureCount", 0) == 0:
+        try:
+            listing = zipline_hub.call_schedule_list_api(branch=branch)
+            hub_rows = listing.get("schedules") or []
+            stale_confs = sorted({
+                row["confName"]
+                for row in hub_rows
+                if row.get("branch") == branch and row.get("confName") not in conf_name_to_obj_dict
+            })
+            for stale in stale_confs:
+                zipline_hub.call_schedule_delete_api(conf_name=stale, branch=branch)
+                pruned_confs.append(stale)
+            if pruned_confs:
+                response_json = {**response_json, "prunedSchedules": pruned_confs}
+        except Exception as e:
+            logger.warning(f"Failed to prune stale schedules for branch {branch}: {e}")
 
     # Format output
     if format == Format.JSON:
@@ -634,9 +659,22 @@ def submit_schedule_all(
             f"{', '.join(env_filtered_confs[:5])}"
             f"{'...' if len(env_filtered_confs) > 5 else ''}"
         )
+    if unscheduled_confs:
+        info_parts.append(
+            f"{len(unscheduled_confs)} conf(s) have no schedules defined; sent anyway so the "
+            f"hub retires any existing schedules for them: "
+            f"{', '.join(unscheduled_confs[:5])}"
+            f"{'...' if len(unscheduled_confs) > 5 else ''}"
+        )
+    if pruned_confs:
+        info_parts.append(
+            f"{len(pruned_confs)} stale schedule(s) removed (conf no longer in repo): "
+            f"{', '.join(pruned_confs[:5])}"
+            f"{'...' if len(pruned_confs) > 5 else ''}"
+        )
     if skipped_confs:
         info_parts.append(
-            f"{len(skipped_confs)} conf(s) skipped (no schedules defined): "
+            f"{len(skipped_confs)} conf(s) skipped (failed to read schedules): "
             f"{', '.join(skipped_confs[:5])}"
             f"{'...' if len(skipped_confs) > 5 else ''}"
         )

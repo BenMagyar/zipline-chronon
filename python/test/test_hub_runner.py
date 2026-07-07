@@ -719,21 +719,26 @@ class TestHubRunner:
         mock_submit_schedule_all.assert_not_called()
 
 
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
     @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
     @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
     @patch('ai.chronon.repo.hub_runner.get_current_branch')
     @patch('ai.chronon.repo.hub_runner.ZiplineHub')
-    def test_schedule_all_skips_confs_with_none_str_schedules(
+    def test_schedule_all_includes_unscheduled_confs_for_retirement(
         self,
         mock_zipline_hub,
         mock_get_current_branch,
         mock_build_hashmap,
         mock_compute_diffs,
         mock_get_schedule_modes,
+        mock_get_metadata_map,
         canary,
     ):
-        """Test that submit_schedule_all skips confs where both schedules are SCHEDULE_NONE_STR."""
+        """Confs whose schedules are all "None" must still be sent to the hub:
+        the "None" modes pause any existing schedule rows and let the hub retire
+        superseded versions, so unscheduling a conf — or bumping its version and
+        unscheduling in one change — actually stops the old nightly runs."""
         from ai.chronon.repo.hub_runner import (
             SCHEDULE_NONE_STR,
             ScheduleModes,
@@ -743,29 +748,40 @@ class TestHubRunner:
 
         mock_get_current_branch.return_value = "test-branch"
 
-        # Mock build_local_repo_hashmap to return a conf without schedules
         conf_without_schedules = Conf(
-            name="test_team.join_without_schedules",
+            name="test_team.join_without_schedules__2",
             localPath="/path/to/conf",
             hash="hash1",
         )
         mock_build_hashmap.return_value = {
-            "test_team.join_without_schedules": conf_without_schedules,
+            "test_team.join_without_schedules__2": conf_without_schedules,
         }
 
         # Mock compute_and_upload_diffs (still called to upload any changes)
         mock_compute_diffs.return_value = {}
 
-        # Mock get_schedule_modes to return SCHEDULE_NONE_STR for both schedules
+        # No environments field -> defaults to prod
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
         mock_get_schedule_modes.return_value = ScheduleModes(
             offline_schedule=SCHEDULE_NONE_STR,
             online_schedule=SCHEDULE_NONE_STR
         )
 
-        # Mock ZiplineHub instance
         mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {
+                    "confName": "test_team.join_without_schedules__2",
+                    "success": True,
+                    "schedules": {},
+                }
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {"schedules": [], "totalCount": 0}
 
-        # Call submit_schedule_all
         submit_schedule_all(
             repo=canary,
             cloud='gcp',
@@ -774,8 +790,225 @@ class TestHubRunner:
             use_auth=False
         )
 
-        # Verify call_schedule_all_api was NOT called since all confs have no schedules
-        mock_hub_instance.call_schedule_all_api.assert_not_called()
+        mock_hub_instance.call_schedule_all_api.assert_called_once()
+        submitted = mock_hub_instance.call_schedule_all_api.call_args[0][0]
+        assert submitted == [
+            {
+                "conf_name": "test_team.join_without_schedules__2",
+                "conf_hash": "hash1",
+                "branch": "test-branch",
+                "modes": {
+                    "BACKFILL": SCHEDULE_NONE_STR,
+                    "DEPLOY": SCHEDULE_NONE_STR,
+                },
+            }
+        ]
+        # locally-present confs are never pruned, scheduled or not
+        mock_hub_instance.call_schedule_delete_api.assert_not_called()
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_sends_partial_schedules_with_none_mode(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """A conf with only one mode scheduled (offline cron, online "None") is
+        submitted with both modes verbatim — the hub deploys the cron mode and
+        pauses the "None" mode. Such confs are not treated as unscheduled."""
+        from ai.chronon.repo.hub_runner import (
+            SCHEDULE_NONE_STR,
+            ScheduleModes,
+            submit_schedule_all,
+        )
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.offline_only_join": Conf(
+                name="test_team.offline_only_join",
+                localPath="/path/to/conf",
+                hash="hash1",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule=SCHEDULE_NONE_STR,
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {
+                    "confName": "test_team.offline_only_join",
+                    "success": True,
+                    "schedules": {},
+                }
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {"schedules": [], "totalCount": 0}
+
+        submit_schedule_all(
+            repo=canary,
+            cloud='gcp',
+            customer_id=None,
+            hub_url=None,
+            use_auth=False
+        )
+
+        submitted = mock_hub_instance.call_schedule_all_api.call_args[0][0]
+        assert submitted == [
+            {
+                "conf_name": "test_team.offline_only_join",
+                "conf_hash": "hash1",
+                "branch": "test-branch",
+                "modes": {
+                    "BACKFILL": "0 1 * * *",
+                    "DEPLOY": SCHEDULE_NONE_STR,
+                },
+            }
+        ]
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_full_sync_prunes_stale_schedules(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """schedule-all is a full sync for its branch: hub schedules whose conf
+        is no longer in the local repo (deleted confs, superseded versions) are
+        deleted. Rows deployed from other branches are left alone."""
+        from ai.chronon.repo.hub_runner import ScheduleModes, submit_schedule_all
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.image_swiped__4": Conf(
+                name="test_team.image_swiped__4",
+                localPath="/path/to/conf",
+                hash="hash4",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule="None",
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {"confName": "test_team.image_swiped__4", "success": True, "schedules": {}}
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {
+            "schedules": [
+                {"confName": "test_team.image_swiped__4", "branch": "test-branch"},
+                {"confName": "test_team.image_swiped__3", "branch": "test-branch"},
+                {"confName": "test_team.other_join__1", "branch": "other-branch"},
+            ],
+            "totalCount": 3,
+        }
+
+        submit_schedule_all(
+            repo=canary,
+            cloud='gcp',
+            customer_id=None,
+            hub_url=None,
+            use_auth=False
+        )
+
+        mock_hub_instance.call_schedule_list_api.assert_called_once_with(branch="test-branch")
+        # only the same-branch conf that vanished from the repo is deleted
+        mock_hub_instance.call_schedule_delete_api.assert_called_once_with(
+            conf_name="test_team.image_swiped__3", branch="test-branch"
+        )
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_skips_prune_when_deploys_fail(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """A failing deploy batch must not prune: absence-based deletion is only
+        trustworthy when the whole snapshot deployed cleanly."""
+        from ai.chronon.repo.hub_runner import ScheduleModes, submit_schedule_all
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.image_swiped__4": Conf(
+                name="test_team.image_swiped__4",
+                localPath="/path/to/conf",
+                hash="hash4",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule="None",
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 0,
+            "failureCount": 1,
+            "results": [
+                {"confName": "test_team.image_swiped__4", "success": False, "error": "boom"}
+            ],
+        }
+
+        with pytest.raises(SystemExit):
+            submit_schedule_all(
+                repo=canary,
+                cloud='gcp',
+                customer_id=None,
+                hub_url=None,
+                use_auth=False
+            )
+
+        mock_hub_instance.call_schedule_list_api.assert_not_called()
+        mock_hub_instance.call_schedule_delete_api.assert_not_called()
 
     @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')

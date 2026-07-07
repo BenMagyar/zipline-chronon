@@ -477,6 +477,66 @@ class ZiplineHub:
             print_error(f"Error deploying schedules: {self._get_error_details(e)}", format=self.format)
             raise e
 
+    def call_schedule_list_api(self, branch: str, limit: int = 10000) -> dict:
+        """
+        List schedules known to the hub for a branch.
+
+        Returns:
+            dict with:
+                - schedules: list[dict] with per-schedule state (confName, branch, mode, state, ...)
+                - totalCount: int
+        """
+        url = f"{self.base_url}/schedule/v2/schedules"
+
+        try:
+            response = requests.get(
+                url,
+                params={"branch": branch, "limit": limit},
+                headers=self.additional_headers(self.base_url),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error listing schedules: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
+        except requests.RequestException as e:
+            self.handle_unauth(e, "schedule list")
+            print_error(f"Error listing schedules: {self._get_error_details(e)}", format=self.format)
+            raise e
+
+    def call_schedule_delete_api(self, conf_name: str, branch: str) -> dict:
+        """Delete the hub schedules registered for a conf name."""
+        url = f"{self.base_url}/schedule/v2/schedules"
+
+        try:
+            response = requests.delete(
+                url,
+                json={"confName": conf_name, "branch": branch},
+                headers=self.additional_headers(self.base_url),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error deleting schedule for {conf_name}: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
+        except requests.RequestException as e:
+            self.handle_unauth(e, "schedule delete")
+            print_error(
+                f"Error deleting schedule for {conf_name}: {self._get_error_details(e)}",
+                format=self.format,
+            )
+            raise e
+
     def call_cancel_api(self, workflow_id):
         url = f"{self.base_url}/workflow/v2/{workflow_id}/cancel"
 
