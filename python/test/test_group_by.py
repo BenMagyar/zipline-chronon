@@ -776,6 +776,48 @@ def test_online_schedule_validation():
     assert gb.metaData.executionInfo.onlineSchedule is None
 
 
+def test_key_filter():
+    def make_gb(key_filter):
+        return group_by.GroupBy(
+            sources=event_source("table"),
+            keys=["subject"],
+            aggregations=group_by.Aggregations(
+                event_id=ttypes.Aggregation(operation=ttypes.Operation.LAST),
+            ),
+            key_filter=key_filter,
+            version=0,
+        )
+
+    kf = ttypes.EntitySource(
+        snapshotTable="active_subjects",
+        query=ttypes.Query(selects={"subject": "subject"}),
+    )
+    gb = make_gb(kf)
+    assert gb.keyFilter == kf
+
+    # a Source wrapping an EntitySource gets unwrapped
+    assert make_gb(ttypes.Source(entities=kf)).keyFilter == kf
+
+    # filter selects must share at least one column with the GroupBy keys
+    mismatched = ttypes.EntitySource(
+        snapshotTable="active_subjects",
+        query=ttypes.Query(selects={"not_a_key": "not_a_key"}),
+    )
+    with pytest.raises(AssertionError):
+        make_gb(mismatched)
+
+    # only entity sources can be used as a key filter
+    events = ttypes.Source(
+        events=ttypes.EventSource(
+            table="active_subjects",
+            query=ttypes.Query(selects={"subject": "subject"}),
+        )
+    )
+    with pytest.raises(AssertionError):
+        make_gb(events)
+
+    # unset filter stays unset
+    assert make_gb(None).keyFilter is None
 def _online_group_by(sources=None, **kwargs):
     return group_by.GroupBy(
         sources=sources if sources is not None else event_source("table"),

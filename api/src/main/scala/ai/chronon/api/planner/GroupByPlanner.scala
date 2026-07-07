@@ -1,6 +1,6 @@
 package ai.chronon.api.planner
 
-import ai.chronon.api.{DataModel, GroupBy, PartitionSpec, TableDependency, TableInfo}
+import ai.chronon.api.{DataModel, GroupBy, PartitionSpec, Source, TableDependency, TableInfo}
 import ai.chronon.api.Extensions._
 import ai.chronon.planner.{
   ConfPlan,
@@ -51,6 +51,16 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
 
   private val groupByTableDeps: Seq[TableDependency] = TableDependencies.fromGroupBy(groupBy)
 
+  // upload nodes must also wait for the keyFilter's snapshot partition - without this dep the
+  // upload launches before the filter lands and hard-fails at runtime. Deps live in executionInfo,
+  // which is excluded from semantic hashing, so this cannot change any node's semantic hash.
+  private val keyFilterDeps: Seq[TableDependency] =
+    Option(groupBy.keyFilter).toSeq.flatMap { entityFilter =>
+      val filterSource = new Source()
+      filterSource.setEntities(entityFilter)
+      TableDependencies.fromSource(filterSource)
+    }
+
   def backfillNode: Node = {
     val defaultStepDays = if (groupBy.dataModel == DataModel.EVENTS) 15 else 1
     val effectiveStepDays =
@@ -79,6 +89,9 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
         else if (source.isSetEntities) source.getEntities.unsetMutationTopic()
       }
     }
+    // keyFilter only shrinks batch uploads (which run daily anyway) - setting or changing it
+    // should never invalidate backfills or re-trigger the deploy chain
+    semanticGroupBy.unsetKeyFiltersRecursively()
     semanticGroupBy
   }
 
@@ -88,7 +101,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
       MetaDataUtils.layer(groupBy.metaData,
                           "upload",
                           groupBy.metaData.name + "__upload",
-                          groupByTableDeps,
+                          groupByTableDeps ++ keyFilterDeps,
                           Some(stepDays))(confOutputPartitionSpec)
 
     val node = new GroupByUploadNode().setGroupBy(eraseExecutionInfo)

@@ -522,6 +522,45 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "semantic hash should be the same regardless of keyFilter" in {
+    def buildGb(): GroupBy = Builders.GroupBy(
+      sources = Seq(Builders.Source.events(Builders.Query(), table = "my_user_events")),
+      keyColumns = Seq("user"),
+      aggregations = Seq(Builders.Aggregation(Operation.COUNT, "charges", Seq(WindowUtils.Unbounded))),
+      metaData = Builders.MetaData(namespace = "test_namespace", name = "user_charges")
+    )
+
+    val plain = buildGb()
+    val filtered = buildGb()
+    filtered.setKeyFilter(
+      Builders.Source
+        .entities(Builders.Query(selects = Builders.Selects("user")), snapshotTable = "active_users")
+        .getEntities)
+
+    val planPlain = GroupByPlanner(plain).buildPlan
+    val planFiltered = GroupByPlanner(filtered).buildPlan
+
+    // keyFilter only shrinks uploads; setting it should not invalidate any node - offline or deploy
+    planPlain.nodes.asScala.zip(planFiltered.nodes.asScala).foreach { case (nodeA, nodeB) =>
+      nodeA.semanticHash should equal(nodeB.semanticHash)
+    }
+
+    // the upload node must wait for the filter's snapshot partition; backfill ignores the filter
+    def depsOf(plan: ConfPlan, pick: ai.chronon.planner.NodeContent => Boolean): Seq[String] =
+      plan.nodes.asScala
+        .find(n => pick(n.content))
+        .get
+        .metaData
+        .executionInfo
+        .tableDependencies
+        .asScala
+        .map(_.tableInfo.table)
+        .toSeq
+    depsOf(planFiltered, _.isSetGroupByUpload) should contain("active_users")
+    depsOf(planFiltered, _.isSetGroupByBackfill) should not contain "active_users"
+    depsOf(planPlain, _.isSetGroupByUpload) should not contain "active_users"
+  }
+
   it should "GroupBy without streaming source should not be affected by JoinSource" in {
     import ai.chronon.api.Builders._
 

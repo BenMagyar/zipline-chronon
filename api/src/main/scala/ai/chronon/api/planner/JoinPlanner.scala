@@ -64,6 +64,8 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
   private def joinWithoutMetadata(join: Join): Unit = {
     join.unsetMetaData()
     Option(join.joinParts).foreach(_.iterator().toScala.foreach(_.groupBy.unsetMetaData()))
+    // keyFilter is an upload-only concern - embedded groupBys' filters must not affect join hashes
+    join.unsetKeyFiltersRecursively()
   }
 
   private def joinWithoutExecutionInfo: Join = {
@@ -80,7 +82,14 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       .setSource(left)
       .setExcludeKeys(join.skewKeys)
 
-    val leftSourceHash = ThriftJsonCodec.hexDigest(result)
+    // hash an erased copy so keyFilters inside a JoinSource left can't shift the hash or table name
+    val hashable = result.deepCopy()
+    Option(hashable.source).foreach { source =>
+      if (source.isSetJoinSource && source.getJoinSource.isSetJoin)
+        source.getJoinSource.getJoin.unsetKeyFiltersRecursively()
+    }
+
+    val leftSourceHash = ThriftJsonCodec.hexDigest(hashable)
     val leftSourceTable = left.table.replace(".", "__").sanitize // source_namespace.table -> source_namespace__table
     val outputTableName =
       leftSourceTable + "__" + leftSourceHash + "__source" // source__<source_namespace>__<table>__<hash>
@@ -93,7 +102,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       TableDependencies.fromSource(join.left, maxWindowOpt = Some(WindowUtils.zero())).toSeq
     )(joinPartitionSpec)
 
-    toNode(metaData, _.setSourceWithFilter(result), result)
+    toNode(metaData, _.setSourceWithFilter(result), hashable)
   }
 
   private val bootstrapNodeOpt: Option[Node] = Option(join.bootstrapParts).map { bootstrapParts =>
@@ -174,6 +183,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
 
     val copy = result.deepCopy()
     copy.joinPart.groupBy.unsetMetaData()
+    copy.joinPart.groupBy.unsetKeyFiltersRecursively()
 
     toNode(metaData, _.setJoinPart(result), copy)
   }

@@ -852,6 +852,174 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     AvroCodec.of(schema.keySchema).fieldNames.toSet shouldBe Set("user_id")
     AvroCodec.of(schema.valueSchema).fieldNames.toSet shouldBe Set("net_price", "discount_rate")
   }
+
+  private def buildKeyFilterTestConf(namespace: String,
+                                     eventsTable: String,
+                                     name: String,
+                                     keyFilter: Option[EntitySource],
+                                     accuracy: Accuracy = Accuracy.SNAPSHOT): GroupBy = {
+    val conf = Builders.GroupBy(
+      sources = Seq(Builders.Source.events(Builders.Query(), table = eventsTable)),
+      keyColumns = Seq("user"),
+      aggregations = Seq(Builders.Aggregation(Operation.COUNT, "charge", Seq(WindowUtils.Unbounded))),
+      metaData = Builders.MetaData(namespace = namespace, name = name),
+      accuracy = accuracy
+    )
+    keyFilter.foreach(conf.setKeyFilter)
+    conf
+  }
+
+  it should "restrict upload to keys present in the keyFilter source" in {
+    val namespace = testNamespace("key_filter")
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+    val yesterday = tableUtils.partitionSpec.before(today)
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+    import spark.implicits._
+
+    val eventsTable = s"$namespace.key_filter_events"
+    val filterTable = s"$namespace.key_filter_active_users"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("charge", LongType, 100)
+    )
+    DataFrameGen.events(spark, eventSchema, count = 1000, partitions = 18).save(eventsTable)
+
+    // only keys with data visible to the upload (ds <= yesterday) can appear in the output
+    val allUsers = spark
+      .table(eventsTable)
+      .where(s"user IS NOT NULL AND ds <= '$yesterday'")
+      .select("user")
+      .distinct()
+      .collect()
+      .map(_.getString(0))
+      .sorted
+    val keptUsers = allUsers.take(allUsers.length / 2)
+    keptUsers.toSeq
+      .toDF("user")
+      .withColumn("ds", org.apache.spark.sql.functions.lit(yesterday))
+      .save(filterTable)
+
+    val keyFilter = Builders.Source
+      .entities(Builders.Query(selects = Builders.Selects("user")), snapshotTable = filterTable)
+      .getEntities
+    val unfilteredConf = buildKeyFilterTestConf(namespace, eventsTable, "user_charges_unfiltered", None)
+    val filteredConf = buildKeyFilterTestConf(namespace, eventsTable, "user_charges_filtered", Some(keyFilter))
+
+    val unfilteredKv = GroupByUpload.generateDf(unfilteredConf, endDs = yesterday, tableUtils = tableUtils).kvDf.cache()
+    val filteredKv = GroupByUpload.generateDf(filteredConf, endDs = yesterday, tableUtils = tableUtils).kvDf.cache()
+
+    unfilteredKv.count() shouldBe allUsers.length
+    filteredKv.count() shouldBe keptUsers.length
+
+    // whole-key filtering commutes with per-key aggregation - surviving keys must carry
+    // identical aggregates to the unfiltered run
+    val joined = filteredKv.as("f").join(unfilteredKv.as("u"), $"f.key_bytes" === $"u.key_bytes")
+    joined.count() shouldBe keptUsers.length
+    joined.where($"f.value_bytes" === $"u.value_bytes").count() shouldBe keptUsers.length
+  }
+
+  it should "restrict temporal upload to keys present in the keyFilter source" in {
+    val namespace = testNamespace("key_filter_temporal")
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+    val yesterday = tableUtils.partitionSpec.before(today)
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+    import spark.implicits._
+
+    val eventsTable = s"$namespace.key_filter_temporal_events"
+    val filterTable = s"$namespace.key_filter_temporal_active_users"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("charge", LongType, 100)
+    )
+    DataFrameGen.events(spark, eventSchema, count = 1000, partitions = 18).save(eventsTable)
+
+    val allUsers = spark
+      .table(eventsTable)
+      .where("user IS NOT NULL")
+      .select("user")
+      .distinct()
+      .collect()
+      .map(_.getString(0))
+      .sorted
+    val keptUsers = allUsers.take(allUsers.length / 2)
+    keptUsers.toSeq
+      .toDF("user")
+      .withColumn("ds", org.apache.spark.sql.functions.lit(yesterday))
+      .save(filterTable)
+
+    val keyFilter = Builders.Source
+      .entities(Builders.Query(selects = Builders.Selects("user")), snapshotTable = filterTable)
+      .getEntities
+    val unfilteredConf =
+      buildKeyFilterTestConf(namespace, eventsTable, "user_charges_temporal_unfiltered", None, Accuracy.TEMPORAL)
+    val filteredConf =
+      buildKeyFilterTestConf(namespace, eventsTable, "user_charges_temporal_filtered", Some(keyFilter), Accuracy.TEMPORAL)
+
+    // jsonPercent = 100 so every row carries key_json and keys can be compared across runs
+    val unfilteredKv =
+      GroupByUpload.generateDf(unfilteredConf, endDs = yesterday, tableUtils = tableUtils, jsonPercent = 100).kvDf.cache()
+    val filteredKv =
+      GroupByUpload.generateDf(filteredConf, endDs = yesterday, tableUtils = tableUtils, jsonPercent = 100).kvDf.cache()
+
+    // avro json wraps nullable union values: {"user": {"string": "user3"}}
+    def keysOf(kvDf: org.apache.spark.sql.DataFrame): Set[String] =
+      kvDf
+        .select(org.apache.spark.sql.functions.get_json_object($"key_json", "$.user.string"))
+        .collect()
+        .map(_.getString(0))
+        .toSet
+
+    // filtered run must contain exactly the kept subset of the unfiltered run's keys
+    keysOf(filteredKv) shouldBe keysOf(unfilteredKv).intersect(keptUsers.toSet)
+
+    // and surviving keys must carry identical IRs
+    val joined = filteredKv.as("f").join(unfilteredKv.as("u"), $"f.key_bytes" === $"u.key_bytes")
+    joined.count() shouldBe filteredKv.count()
+    joined.where($"f.value_bytes" === $"u.value_bytes").count() shouldBe filteredKv.count()
+  }
+
+  it should "fail the upload when the keyFilter yields no keys or no key columns" in {
+    val namespace = testNamespace("key_filter_failures")
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+    val yesterday = tableUtils.partitionSpec.before(today)
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+    import spark.implicits._
+
+    val eventsTable = s"$namespace.key_filter_events"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("charge", LongType, 100)
+    )
+    DataFrameGen.events(spark, eventSchema, count = 100, partitions = 3).save(eventsTable)
+
+    // filter table only has today's partition - scanning yesterday's must find no keys and fail
+    val emptyFilterTable = s"$namespace.key_filter_empty"
+    Seq("some_user").toDF("user").withColumn("ds", org.apache.spark.sql.functions.lit(today)).save(emptyFilterTable)
+    val emptyFilter = Builders.Source
+      .entities(Builders.Query(selects = Builders.Selects("user")), snapshotTable = emptyFilterTable)
+      .getEntities
+    val emptyConf = buildKeyFilterTestConf(namespace, eventsTable, "user_charges_empty_filter", Some(emptyFilter))
+    val emptyEx = intercept[IllegalArgumentException] {
+      GroupByUpload.generateDf(emptyConf, endDs = yesterday, tableUtils = tableUtils)
+    }
+    emptyEx.getMessage should include("produced no keys")
+
+    // filter table shares no columns with the groupBy keys
+    val mismatchTable = s"$namespace.key_filter_mismatch"
+    Seq("v1").toDF("not_a_key").withColumn("ds", org.apache.spark.sql.functions.lit(yesterday)).save(mismatchTable)
+    val mismatchFilter = Builders.Source
+      .entities(Builders.Query(selects = Builders.Selects("not_a_key")), snapshotTable = mismatchTable)
+      .getEntities
+    val mismatchConf =
+      buildKeyFilterTestConf(namespace, eventsTable, "user_charges_mismatch_filter", Some(mismatchFilter))
+    val mismatchEx = intercept[IllegalArgumentException] {
+      GroupByUpload.keyFilterKeysDf(mismatchConf, yesterday, tableUtils)
+    }
+    mismatchEx.getMessage should include("none of which match")
+  }
 }
 
 object GroupByUploadTest {
@@ -947,5 +1115,5 @@ object GroupByUploadTest {
     // inspect the third index - five minute
     tailHops.get(2).size() shouldBe 0
   }
-
 }
+

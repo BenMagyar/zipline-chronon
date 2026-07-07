@@ -391,6 +391,18 @@ struct GroupBy {
     5: optional Accuracy accuracy
     // support for offline only for now
     7: optional list<Derivation> derivations
+    // Restricts batch uploads to keys present in this entity source's snapshot partition of the
+    // upload date. The filter's query.selects must produce columns named after (a subset of)
+    // keyColumns; the aggregated output (one row per key) is semi-joined against the distinct
+    // key tuples. Whole-key filtering commutes with per-key aggregation, so filtering after
+    // aggregation is equivalent and avoids joining the raw input against a large filter.
+    // Only applied by GroupByUpload to shrink upload size. GroupBy backfills and the
+    // join -> joinPart -> groupBy path ignore it (there the join's left side already restricts
+    // which keys get scanned). It is excluded from semantic hashing (like topics), so
+    // setting/changing it never re-triggers jobs.
+    // NOTE: for TEMPORAL groupBys with a streaming topic, the streaming job still writes all keys,
+    // so filtered-out keys may serve partial streaming-only aggregates instead of nulls.
+    8: optional EntitySource keyFilter
 }
 
 struct JoinPart {

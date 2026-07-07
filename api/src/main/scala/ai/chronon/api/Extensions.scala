@@ -598,9 +598,21 @@ object Extensions {
       }
     }
 
+    // keyFilter only shrinks batch uploads - it never changes what a groupBy computes, so it
+    // must not participate in any semantic hash (offline join parts included). Recurses into
+    // JoinSource-embedded joins. Mutates in place - use on deepCopy-ied objects only.
+    def unsetKeyFiltersRecursively(): Unit = {
+      groupBy.unsetKeyFilter()
+      Option(groupBy.sources).foreach(_.toScala.foreach { source =>
+        if (source.isSetJoinSource && source.getJoinSource.isSetJoin)
+          source.getJoinSource.getJoin.unsetKeyFiltersRecursively()
+      })
+    }
+
     def semanticHash: String = {
       val newGroupBy = groupBy.deepCopy()
       newGroupBy.unsetMetaData()
+      newGroupBy.unsetKeyFiltersRecursively()
       val base = ThriftJsonCodec.md5Digest(newGroupBy)
       Option(groupBy.metaData).map(_.mixGridToken(base)).getOrElse(base)
     }
@@ -1023,6 +1035,17 @@ object Extensions {
     private val leftSourceKey: String = "left_source"
     private val derivedKey: String = "derived"
 
+    // see GroupByOps.unsetKeyFiltersRecursively - keyFilter must not affect any join hash either.
+    // Mutates in place - use on deepCopy-ied objects only.
+    def unsetKeyFiltersRecursively(): Unit = {
+      Option(join.left).foreach { left =>
+        if (left.isSetJoinSource && left.getJoinSource.isSetJoin)
+          left.getJoinSource.getJoin.unsetKeyFiltersRecursively()
+      }
+      Option(join.joinParts).foreach(_.toScala.foreach(joinPart =>
+        Option(joinPart.groupBy).foreach(_.unsetKeyFiltersRecursively())))
+    }
+
     /*
      * semanticHash contains hashes of left side and each join part, and is used to detect join definition
      * changes and determine whether any intermediate/final tables of the join need to be recomputed.
@@ -1031,7 +1054,10 @@ object Extensions {
       // the join's own output grid rides on the left hash: changing partitionInterval or
       // partitionOffset renames every ds in the intermediate/final tables computed off the
       // left, so it must read as a left change
-      val baseLeftHash = ThriftJsonCodec.md5Digest(join.left)
+      val leftForHash = join.left.deepCopy()
+      if (leftForHash.isSetJoinSource && leftForHash.getJoinSource.isSetJoin)
+        leftForHash.getJoinSource.getJoin.unsetKeyFiltersRecursively()
+      val baseLeftHash = ThriftJsonCodec.md5Digest(leftForHash)
       val leftHash = Option(join.metaData).map(_.mixGridToken(baseLeftHash)).getOrElse(baseLeftHash)
       logger.info(s"Join Left Hash: $leftHash")
       logger.info(s"Join Left Object: ${ThriftJsonCodec.toJsonStr(join.left)}")

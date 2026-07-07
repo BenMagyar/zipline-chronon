@@ -18,7 +18,7 @@ package ai.chronon.spark
 
 import ai.chronon.aggregator.windowing._
 import ai.chronon.api
-import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, SourceOps, TableInfoOps, WindowUtils}
+import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, QueryOps, SourceOps, StringOps, TableInfoOps, WindowUtils}
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api._
 import ai.chronon.online.Extensions.ChrononStructTypeOps
@@ -110,11 +110,33 @@ class TemporalNullCountAggregator(
 
 class GroupByUpload(endPartition: String,
                     groupBy: ai.chronon.spark.GroupBy,
-                    uploadPartitionSpec: PartitionSpec = PartitionSpec.daily)
+                    uploadPartitionSpec: PartitionSpec = PartitionSpec.daily,
+                    keyFilterDfOpt: Option[DataFrame] = None)
     extends Serializable {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
   implicit val sparkSession: SparkSession = groupBy.sparkSession
   implicit private val partitionSpec: PartitionSpec = uploadPartitionSpec
+
+  // keyFilter is applied AFTER aggregation: whole-key filtering commutes with per-key aggregation,
+  // and post-aggregation there is one row per key - vastly cheaper than semi-joining the raw
+  // (potentially windowed) input against a filter too large to broadcast.
+  private def resolveFilterJoinColumns(keyFilterDf: DataFrame): Seq[String] = {
+    val joinColumns = groupBy.keyColumns.filter(keyFilterDf.columns.contains)
+    require(
+      joinColumns.nonEmpty,
+      s"keyFilter df columns [${keyFilterDf.columns.mkString(", ")}] share no " +
+        s"groupBy key columns [${groupBy.keyColumns.mkString(", ")}]"
+    )
+    joinColumns
+  }
+
+  private def filterOnKeys(df: DataFrame): DataFrame =
+    keyFilterDfOpt
+      .map { keyFilterDf =>
+        val joinColumns = resolveFilterJoinColumns(keyFilterDf)
+        df.join(keyFilterDf.selectExpr(joinColumns: _*), joinColumns, "left_semi")
+      }
+      .getOrElse(df)
 
   private val avroSchema = StructType(
     Seq(
@@ -176,8 +198,10 @@ class GroupByUpload(endPartition: String,
 
   def snapshotEntities(jsonPercent: Int = 1): (DataFrame, Map[String, Long]) = {
     if (groupBy.aggregations == null || groupBy.aggregations.isEmpty) {
+      // no aggregation stage exists here - the (single snapshot partition) input is the upload
+      val uploadDf = filterOnKeys(groupBy.inputDf)
       val valueColumns = groupBy.preAggSchema.fieldNames.toSeq
-      val nullCounts = computeNullCounts(groupBy.inputDf, valueColumns)
+      val nullCounts = computeNullCounts(uploadDf, valueColumns)
 
       logger.info(s"""
            |pre-agg upload:
@@ -187,7 +211,7 @@ class GroupByUpload(endPartition: String,
            |""".stripMargin)
 
       val kvDf = toAvroDf(
-        groupBy.inputDf,
+        uploadDf,
         groupBy.keySchema.fieldNames.toSeq,
         valueColumns,
         groupBy.keySchema,
@@ -201,7 +225,7 @@ class GroupByUpload(endPartition: String,
   }
 
   private def snapshotEntitiesWithAggregations(jsonPercent: Int): (DataFrame, Map[String, Long]) = {
-    val aggregatedDf = groupBy.snapshotEntities
+    val aggregatedDf = filterOnKeys(groupBy.snapshotEntities)
     val valueColumns = groupBy.postAggSchema.fieldNames.toSeq
     val nullCounts = computeNullCounts(aggregatedDf, valueColumns)
     val kvDf = toAvroDf(
@@ -216,7 +240,7 @@ class GroupByUpload(endPartition: String,
   }
 
   def snapshotEvents(jsonPercent: Int = 1): (DataFrame, Map[String, Long]) = {
-    val aggregatedDf = groupBy.snapshotEvents(PartitionRange(endPartition, endPartition)(partitionSpec))
+    val aggregatedDf = filterOnKeys(groupBy.snapshotEvents(PartitionRange(endPartition, endPartition)(partitionSpec)))
     val valueColumns = groupBy.postAggSchema.fieldNames.toSeq
     val nullCounts = computeNullCounts(aggregatedDf, valueColumns)
     val kvDf = toAvroDf(
@@ -254,13 +278,37 @@ class GroupByUpload(endPartition: String,
     val outputEncoder: Encoder[(Array[Any], Array[Any])] = Encoders.kryo[(Array[Any], Array[Any])]
 
     // Aggregate using Dataset API with Kryo-backed Aggregator
-    val rawAggDs = groupBy.inputDf
+    val unfilteredAggDs = groupBy.inputDf
       .map { row =>
         (keyBuilder(row), SparkConversions.toChrononRow(row, tsIndex): api.Row)
       }(tupleEncoder)
       .groupByKey(_._1)(keyEncoder)
       .mapValues(_._2)(chrononRowEncoder)
       .agg(temporalAggregator)
+
+    // The aggregated dataset is kryo-encoded (KeyWithHash, FinalBatchIr) - no key columns to
+    // semi-join on - so the keyFilter is applied as an RDD join on the subset-key tuple.
+    // KeyWithHash.data holds raw spark Row values, but RDD joins don't coerce types like
+    // DataFrame joins do, so the filter columns are cast to the key schema's types first.
+    val rawAggDs = keyFilterDfOpt
+      .map { keyFilterDf =>
+        val joinColumns = resolveFilterJoinColumns(keyFilterDf)
+        val keyIndices = joinColumns.map(groupBy.keyColumns.indexOf).toArray
+        val castColumns = joinColumns.map(c => col(c).cast(groupBy.keySchema(c).dataType).as(c))
+        val filterKeysDf = keyFilterDf.select(castColumns: _*).na.drop(joinColumns).distinct()
+        require(
+          !filterKeysDf.isEmpty,
+          s"keyFilter keys are empty after casting columns [${joinColumns.mkString(", ")}] to " +
+            s"the groupBy key types - check that the filter column types match the source's"
+        )
+        val filterRdd = filterKeysDf.rdd.map(row => row.toSeq.toList -> (()))
+        val keyedAggRdd = unfilteredAggDs.rdd.map { case t @ (keyWithHash, _) =>
+          keyIndices.map(keyWithHash.data(_)).toList -> t
+        }
+        val joinedRdd = keyedAggRdd.join(filterRdd).values.map(_._1)
+        sparkSession.createDataset(joinedRdd)(Encoders.kryo[(KeyWithHash, FinalBatchIr)])
+      }
+      .getOrElse(unfilteredAggDs)
 
     rawAggDs.cache()
 
@@ -401,6 +449,47 @@ object GroupByUpload {
     result
   }
 
+  // Scans the keyFilter source at the upload date's partition (never the shifted range - that
+  // partition doesn't exist yet when the upload for endDs runs) and returns the distinct key
+  // tuples to semi-join the aggregated output against. Fails hard when no keys are found - an
+  // empty filter would produce an empty upload and wipe the batch data in the KV store.
+  private[spark] def keyFilterKeysDf(groupByConf: api.GroupBy,
+                                     endDs: String,
+                                     tableUtils: TableUtils): Option[DataFrame] = {
+    implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
+    Option(groupByConf.keyFilter).map { filterSource =>
+      require(
+        filterSource.isSetSnapshotTable,
+        s"keyFilter of ${groupByConf.metaData.name} must set snapshotTable"
+      )
+      val filterTable = filterSource.getSnapshotTable.cleanSpec
+      val filterSpec = filterSource.getQuery.partitionSpec(tableUtils.partitionSpec)
+      val filterRange = PartitionRange(endDs, endDs).translate(filterSpec)
+      val scanned = tableUtils.scanDf(filterSource.getQuery,
+                                      filterTable,
+                                      fallbackSelects = Some(Map(filterSpec.column -> null)),
+                                      range = Some(filterRange))
+      val keyColumns = groupByConf.keyColumns.toScala
+      val filterKeyColumns = keyColumns.filter(scanned.columns.contains)
+      require(
+        filterKeyColumns.nonEmpty,
+        s"keyFilter of ${groupByConf.metaData.name} produces columns [${scanned.columns.mkString(", ")}] - " +
+          s"none of which match keyColumns [${keyColumns.mkString(", ")}]. " +
+          "The filter's query.selects must be named after the groupBy's key columns."
+      )
+      val keysDf = scanned.select(filterKeyColumns.map(col): _*).distinct().cache()
+      require(
+        !keysDf.isEmpty,
+        s"keyFilter of ${groupByConf.metaData.name} produced no keys from $filterTable " +
+          s"for partition $filterRange. Failing instead of writing an empty upload."
+      )
+      logger.info(
+        s"keyFilter for ${groupByConf.metaData.name}: restricting upload input to keys of " +
+          s"$filterTable @ $filterRange on columns [${filterKeyColumns.mkString(", ")}]")
+      keysDf
+    }
+  }
+
   private[spark] def generateDf(groupByConf: api.GroupBy,
                                 endDs: String,
                                 showDf: Boolean = false,
@@ -411,6 +500,7 @@ object GroupByUpload {
     Option(groupByConf.setups).foreach(_.foreach(tableUtils.sql))
     // add 1 day to the batch end time to reflect data [ds 00:00:00.000, ds + 1 00:00:00.000)
     val batchEndDate = partitionSpec.after(endDs)
+    lazy val keyFilterDfOpt = keyFilterKeysDf(groupByConf, endDs, tableUtils)
     // for snapshot accuracy - we don't need to scan mutations
     lazy val groupBy =
       ai.chronon.spark.GroupBy.from(groupByConf,
@@ -418,7 +508,7 @@ object GroupByUpload {
                                     tableUtils,
                                     computeDependency = true,
                                     showDf = showDf)
-    lazy val groupByUpload = new GroupByUpload(endDs, groupBy, partitionSpec)
+    lazy val groupByUpload = new GroupByUpload(endDs, groupBy, partitionSpec, keyFilterDfOpt)
     // for temporal accuracy - we don't need to scan mutations for upload
     // when endDs = xxxx-01-02 the timestamp from airflow is more than (xxxx-01-03 00:00:00)
     // we wait for event partitions of (xxxx-01-02) which contain data until (xxxx-01-02 23:59:59.999)
@@ -428,9 +518,9 @@ object GroupByUpload {
                                     tableUtils,
                                     computeDependency = true,
                                     showDf = showDf)
-    lazy val shiftedGroupByUpload = new GroupByUpload(batchEndDate, shiftedGroupBy, partitionSpec)
+    lazy val shiftedGroupByUpload = new GroupByUpload(batchEndDate, shiftedGroupBy, partitionSpec, keyFilterDfOpt)
     // for mutations I need the snapshot from the previous day, but a batch end date of ds +1
-    lazy val otherGroupByUpload = new GroupByUpload(batchEndDate, groupBy, partitionSpec)
+    lazy val otherGroupByUpload = new GroupByUpload(batchEndDate, groupBy, partitionSpec, keyFilterDfOpt)
 
     logger.info(s"""
                    |GroupBy upload for: ${groupByConf.metaData.team}.${groupByConf.metaData.name}

@@ -676,4 +676,38 @@ class JoinPlannerTest extends AnyFlatSpec with Matchers {
     metadataDeps should contain(downstreamListingFeatures.metaData.outputTable + "__uploadToKV")
     metadataDeps should not contain (upstreamJoin.metaData.outputTable + "__metadata_upload")
   }
+
+  it should "keyFilter on a joinPart groupBy should not affect any join node semantic hash" in {
+    def buildTestJoin(): ai.chronon.api.Join = {
+      val gb = Builders.GroupBy(
+        sources = Seq(Builders.Source.events(Builders.Query(), table = "test.user_events")),
+        keyColumns = Seq("user_id"),
+        aggregations = Seq(Builders.Aggregation(Operation.COUNT, "event_count", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = "test_namespace", name = "user_events_gb"),
+        accuracy = Accuracy.SNAPSHOT
+      )
+      Builders.Join(
+        metaData = Builders.MetaData(namespace = "test_namespace", name = "key_filter_join"),
+        left = Builders.Source.events(Builders.Query(), table = "test.left_events"),
+        joinParts = Seq(Builders.JoinPart(groupBy = gb))
+      )
+    }
+
+    val plain = buildTestJoin()
+    val filtered = buildTestJoin()
+    filtered.joinParts.get(0).groupBy.setKeyFilter(
+      Builders.Source
+        .entities(Builders.Query(selects = Builders.Selects("user_id")), snapshotTable = "test.active_users")
+        .getEntities)
+
+    // keyFilter is upload-only: joinPart/merge/monolith and every other join node - names and
+    // hashes both - must be identical whether or not an embedded groupBy carries a filter
+    def nodeFingerprints(join: ai.chronon.api.Join): Seq[(String, String)] = {
+      val modular = new JoinPlanner(join).buildPlan.nodes.asScala
+      val monolith = MonolithJoinPlanner(join).buildPlan.nodes.asScala
+      (modular ++ monolith).map(n => n.metaData.name -> n.semanticHash).toSeq
+    }
+
+    nodeFingerprints(filtered) should equal(nodeFingerprints(plain))
+  }
 }

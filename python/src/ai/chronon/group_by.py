@@ -503,6 +503,7 @@ def GroupBy(
     tags: Dict[str, str] = None,
     online: bool = DEFAULT_ONLINE,
     production: bool = DEFAULT_PRODUCTION,
+    key_filter: Optional[Union[ttypes.Source, ttypes.EntitySource]] = None,
     # execution params
     offline_schedule: str = None,
     online_schedule: Optional[str] = None,
@@ -659,6 +660,15 @@ def GroupBy(
         Cluster configuration properties for the join.
     :param step_days
         The maximum number of days to output at once
+    :param key_filter:
+        An entities source whose snapshot partition for the upload date restricts which keys make it
+        into the batch upload: the aggregated upload rows (one per key) are semi-joined against the
+        distinct key tuples found in this source. The filter's query.selects must produce columns named after
+        (a subset of) the GroupBy keys. Only applied by uploads to shrink upload size - backfills ignore
+        it, and it does not affect semantic hashes, so setting or changing it never re-triggers jobs.
+        Note: for TEMPORAL GroupBys with a streaming topic, the streaming job still writes all keys, so
+        filtered-out keys may serve partial streaming-only aggregates instead of nulls.
+    :type key_filter: gen_thrift.api.ttypes.EntitySource (or a Source wrapping one)
     :param environments:
         List of environments where this GroupBy should be deployed/available.
         Defaults to ['prod']. Valid values: 'prod', 'canary' (case-insensitive).
@@ -716,6 +726,20 @@ def GroupBy(
     sources = [
         _sanitize_columns(source) for source in utils.normalize_sources(sources, output_namespace)
     ]
+
+    if key_filter is not None:
+        if isinstance(key_filter, ttypes.Source):
+            assert key_filter.entities is not None, "key_filter must be an entities source"
+            key_filter = key_filter.entities
+        assert isinstance(key_filter, ttypes.EntitySource) and key_filter.snapshotTable, (
+            "key_filter must be an entities source with a snapshotTable"
+        )
+        key_filter_selects = key_filter.query.selects if key_filter.query is not None else None
+        if key_filter_selects is not None:
+            assert any(k in key_filter_selects for k in keys), (
+                f"key_filter selects {sorted(key_filter_selects.keys())} share no columns with "
+                f"the GroupBy keys {keys}. Name the filter's selects after the key columns."
+            )
 
     # get caller's filename to assign team
     team = inspect.stack()[1].filename.split("/")[-2]
@@ -807,6 +831,7 @@ def GroupBy(
         metaData=metadata,
         accuracy=accuracy,
         derivations=derivations,
+        keyFilter=key_filter,
     )
     validate_group_by(group_by)
 

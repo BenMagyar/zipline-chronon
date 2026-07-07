@@ -66,6 +66,8 @@ case class MonolithJoinPlanner(join: Join)(implicit outputPartitionSpec: Partiti
       bootstrapParts.foreach(bootstrapPart => bootstrapPart.unsetMetaData())
     }
     semanticJoin.unsetOnlineExternalParts()
+    // keyFilter is an upload-only concern - embedded groupBys' filters must not affect join hashes
+    semanticJoin.unsetKeyFiltersRecursively()
     semanticJoin
 
   }
