@@ -90,15 +90,7 @@ case object DeltaLake extends Format {
 
   private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
-    statsDateRange(tableName, columnName, partitionSpec).map { range =>
-      sparkSession.read.table(tableName).schema(columnName).dataType match {
-        // numeric columns are epoch millis per statsBoundary, so they carry the same
-        // in-flight-tail semantics as timestamps
-        case TimestampType | _: NumericType =>
-          Format.readinessPartition(range.lastAvailablePartition, partitionSpec)
-        case _ => range.lastAvailablePartition
-      }
-    }
+    statsDateRange(tableName, columnName, partitionSpec).map(_.lastAvailablePartition)
 
   private def statsVirtualPartitions(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[List[String]] =
@@ -151,9 +143,13 @@ case object DeltaLake extends Format {
         val missingCount = row.getAs[Long]("missingCount")
 
         if (fileCount > 0 && missingCount == 0 && !row.isNullAt(2) && !row.isNullAt(3)) {
-          Some(
-            StatsDateRange(start = partitionSpec.at(row.getAs[Long]("startMillis")),
-                           end = partitionSpec.at(row.getAs[Long]("endMillis"))))
+          val startMillis = row.getAs[Long]("startMillis")
+          val endMillis = row.getAs[Long]("endMillis")
+          val lastPartitionMillis = columnType match {
+            case TimestampType | _: NumericType => endMillis - 1L
+            case _                              => endMillis
+          }
+          Some(StatsDateRange(start = partitionSpec.at(startMillis), end = partitionSpec.at(lastPartitionMillis)))
         } else {
           None
         }

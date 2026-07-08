@@ -154,8 +154,41 @@ class IcebergTest extends SparkTestBase with Matchers {
     Iceberg.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
       List("2024-04-01", "2024-04-02")
     Iceberg.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-01")
-    // readiness reports the partition containing maxTs; virtualPartitions stays conservative
     Iceberg.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-04-03")
+  }
+
+  it should "report the sub-daily Iceberg file-stats bucket containing max timestamp" in {
+    val tableName = "default.iceberg_subdaily_time_stats_test"
+    val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          created_at TIMESTAMP
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full',
+          'write.metadata.metrics.column.created_at' = 'full'
+        )
+      """)
+      spark.sql(s"ALTER TABLE $tableName WRITE ORDERED BY created_at")
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2024-04-03 09:17:00'),
+        (2, TIMESTAMP '2024-04-03 14:05:00')
+      """)
+
+      Iceberg.statsDateRange(tableName, "created_at", threeHourSpec) shouldBe
+        Some(StatsDateRange(start = "2024-04-03-09-00", end = "2024-04-03-12-00"))
+      Iceberg.virtualPartitions(tableName, "created_at", threeHourSpec) shouldBe
+        List("2024-04-03-09-00")
+      Iceberg.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-04-03-12-00")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
   }
 
   it should "return the inclusive last partition from Iceberg file stats for a single-day timestamp range" in {

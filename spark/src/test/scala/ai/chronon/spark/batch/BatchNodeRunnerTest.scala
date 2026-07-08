@@ -1609,18 +1609,18 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     }
   }
 
-  "Sub-daily timestamp watermark sensors" should "require the dependency input interval end timestamp" in {
+  "Sub-daily timestamp watermark sensors" should "succeed when the dependency interval has data" in {
     spark.sql("DROP TABLE IF EXISTS test_db.subdaily_watermark")
     spark.sql(
       """CREATE TABLE test_db.subdaily_watermark (
         |  id INT,
         |  created_at TIMESTAMP
         |)""".stripMargin)
-    // watermark just below the 06:00 partition's interval end (09:00)
+    // An exact interval-start timestamp does not claim the interval; data must be inside the
+    // bucket. This keeps the watermark boundary exclusive on the left.
     spark.sql(
       """INSERT INTO test_db.subdaily_watermark VALUES
-        |(1, TIMESTAMP '2024-01-01 05:10:00'),
-        |(2, TIMESTAMP '2024-01-01 08:59:00')
+        |(1, TIMESTAMP '2024-01-01 06:00:00')
         |""".stripMargin)
 
     val dep = TableDependencies.fromTable("test_db.subdaily_watermark", subDailyQuery("created_at"))
@@ -1628,16 +1628,17 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     val sixOClockFire = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
 
     runner.checkPartitions(sensorFor(dep), sixOClockFire) match {
-      case Success(_) => fail("watermark below the interval end timestamp must not be ready")
+      case Success(_) => fail("timestamp exactly at the interval start must not mark the interval ready")
       case Failure(e) => assertTrue(e.getMessage.contains("Sensor"))
     }
 
-    // watermark reaching the interval end timestamp makes the partition complete
-    spark.sql("INSERT INTO test_db.subdaily_watermark VALUES (3, TIMESTAMP '2024-01-01 09:00:00')")
+    // Any data inside the interval makes the virtual partition present; dataWatermark reports
+    // the bucket's exclusive end.
+    spark.sql("INSERT INTO test_db.subdaily_watermark VALUES (2, TIMESTAMP '2024-01-01 08:59:00')")
 
     runner.checkPartitions(sensorFor(dep), sixOClockFire) match {
       case Success(_) => // ready
-      case Failure(e) => fail(s"watermark at the interval end timestamp should be ready: ${e.getMessage}")
+      case Failure(e) => fail(s"watermark inside the interval should be ready: ${e.getMessage}")
     }
   }
 

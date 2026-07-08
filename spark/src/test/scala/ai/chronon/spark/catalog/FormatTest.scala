@@ -160,10 +160,29 @@ class FormatTest extends SparkTestBase {
     fmt.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
   }
 
-  it should "keep sub-daily readiness one interval behind the data-bearing partition" in {
+  it should "scan the sub-daily partition containing max timestamp" in {
     val threeHourly = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
-    Format.readinessPartition("2024-04-03", PartitionSpec.daily) shouldBe "2024-04-03"
-    Format.readinessPartition("2024-04-03-06-00", threeHourly) shouldBe "2024-04-03-03-00"
+    val tableName = "format_subdaily_timestamp_scan_last_available_test"
+    spark.sql(s"""
+      CREATE OR REPLACE TEMP VIEW $tableName AS
+      SELECT * FROM VALUES
+        (1, TIMESTAMP '2024-04-03 06:00:00')
+      AS t(id, created_at)
+    """)
+
+    val fmt = new Format {
+      override def supportSubPartitionsFilter = false
+      override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      override def primaryPartitions(tableName: String,
+                                     partitionColumn: String,
+                                     partitionFilters: String,
+                                     subPartitionsFilter: Map[String, String])(implicit
+          ss: SparkSession) = Nil
+    }
+
+    fmt.lastAvailablePartition(tableName, "created_at", threeHourly)(spark) shouldBe Some("2024-04-03-03-00")
+    spark.sql(s"CREATE OR REPLACE TEMP VIEW $tableName AS SELECT TIMESTAMP '2024-04-03 06:00:01' AS created_at")
+    fmt.lastAvailablePartition(tableName, "created_at", threeHourly)(spark) shouldBe Some("2024-04-03-06-00")
   }
 
   it should "return the max date when scanning a date column" in {

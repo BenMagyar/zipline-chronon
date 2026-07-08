@@ -49,7 +49,6 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
         List("2024-01-01", "2024-01-02")
       DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
-      // readiness reports the partition containing maxTs; virtualPartitions stays conservative
       DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
@@ -84,8 +83,8 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
         Some(StatsDateRange(start = "2024-01-01-09-00", end = "2024-01-01-12-00"))
       DeltaLake.virtualPartitions(tableName, "created_at", threeHourSpec) shouldBe
         List("2024-01-01-09-00")
-      // sub-daily grids keep interval-end readiness: the 12:00 interval holding maxTs is in flight
-      DeltaLake.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-01-01-09-00")
+      // sub-daily grids report the virtual partition containing maxTs; dataWatermark uses its exclusive end
+      DeltaLake.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-01-01-12-00")
 
       // grid phased by 1h: 01:00, 04:00, 07:00, 10:00, 13:00, ...
       DeltaLake.statsDateRange(tableName, "created_at", offsetSpec) shouldBe
@@ -121,8 +120,8 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
 
       DeltaLake.statsDateRange(tableName, "event_ms", threeHourSpec) shouldBe
         Some(StatsDateRange(start = "2024-01-01-09-00", end = "2024-01-01-12-00"))
-      // sub-daily: the 12:00 interval holding the max value is in flight, same as timestamps
-      DeltaLake.lastAvailablePartition(tableName, "event_ms", threeHourSpec) shouldBe Some("2024-01-01-09-00")
+      // sub-daily: report the virtual partition containing the max value, same as timestamps
+      DeltaLake.lastAvailablePartition(tableName, "event_ms", threeHourSpec) shouldBe Some("2024-01-01-12-00")
       // daily-or-coarser: report the data-bearing partition
       DeltaLake.lastAvailablePartition(tableName, "event_ms", PartitionSpec.daily) shouldBe Some("2024-01-01")
     } finally {

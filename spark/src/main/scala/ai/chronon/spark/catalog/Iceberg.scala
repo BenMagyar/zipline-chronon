@@ -107,12 +107,7 @@ case object Iceberg extends Format {
 
   private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
-    statsDateRange(tableName, columnName, partitionSpec).map { range =>
-      sparkSession.read.table(tableName).schema(columnName).dataType match {
-        case TimestampType => Format.readinessPartition(range.lastAvailablePartition, partitionSpec)
-        case _             => range.lastAvailablePartition
-      }
-    }
+    statsDateRange(tableName, columnName, partitionSpec).map(_.lastAvailablePartition)
 
   private def statsVirtualPartitions(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[List[String]] =
@@ -206,9 +201,11 @@ case object Iceberg extends Format {
         }
 
         range.flatten.map { case (minMillis, maxMillis) =>
+          val lastPartitionMillis =
+            if (fieldType.typeId() == Type.TypeID.TIMESTAMP) maxMillis - 1L else maxMillis
           StatsDateRange(
             start = partitionSpec.at(minMillis),
-            end = partitionSpec.at(maxMillis)
+            end = partitionSpec.at(lastPartitionMillis)
           )
         }
       } finally {
