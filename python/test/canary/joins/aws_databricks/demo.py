@@ -1,7 +1,7 @@
-from group_bys.aws_databricks import dim_listings
+from group_bys.aws_databricks import dim_listings, user_activities
 from staging_queries.aws_databricks import exports
 
-from ai.chronon.types import EntitySource, Join, JoinPart, Query, selects
+from ai.chronon.types import EntitySource, EventSource, Join, JoinPart, Query, selects
 
 v1 = Join(
     left=dim_listings.source,
@@ -67,4 +67,29 @@ unpartitioned_sparse_v1 = Join(
     online=False,
     output_namespace="workspace_iceberg.poc",
     step_days=30,
+)
+
+# Event-source join for run-adhoc streaming integration tests.
+# Left: user activity events from Kinesis; right: user behavioral aggregations + listing attributes.
+adhoc_v1 = Join(
+    left=EventSource(
+        table="workspace.demo.user_activities",
+        query=Query(
+            selects=selects(
+                user_id="user_id",
+                listing_id="listing_id",
+                row_id="event_id",
+            ),
+            time_column="event_time_ms",
+        ),
+    ),
+    row_ids=["event_id"],
+    right_parts=[
+        JoinPart(group_by=user_activities.v1),
+        JoinPart(group_by=dim_listings.adhoc_v1),
+    ],
+    version=1,
+    online=False,
+    output_namespace="workspace_iceberg.poc",
+    step_days=10,
 )
