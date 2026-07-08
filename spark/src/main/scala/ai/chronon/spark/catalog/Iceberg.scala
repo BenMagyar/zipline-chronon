@@ -201,11 +201,12 @@ case object Iceberg extends Format {
         }
 
         range.flatten.map { case (minMillis, maxMillis) =>
-          val lastPartitionMillis =
-            if (fieldType.typeId() == Type.TypeID.TIMESTAMP) maxMillis - 1L else maxMillis
+          val endPartition =
+            if (fieldType.typeId() == Type.TypeID.TIMESTAMP) Format.readinessPartition(maxMillis, partitionSpec)
+            else partitionSpec.at(maxMillis)
           StatsDateRange(
             start = partitionSpec.at(minMillis),
-            end = partitionSpec.at(lastPartitionMillis)
+            end = endPartition
           )
         }
       } finally {

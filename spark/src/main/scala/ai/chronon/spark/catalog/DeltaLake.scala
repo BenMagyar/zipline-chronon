@@ -145,11 +145,11 @@ case object DeltaLake extends Format {
         if (fileCount > 0 && missingCount == 0 && !row.isNullAt(2) && !row.isNullAt(3)) {
           val startMillis = row.getAs[Long]("startMillis")
           val endMillis = row.getAs[Long]("endMillis")
-          val lastPartitionMillis = columnType match {
-            case TimestampType | _: NumericType => endMillis - 1L
-            case _                              => endMillis
+          val endPartition = columnType match {
+            case TimestampType | _: NumericType => Format.readinessPartition(endMillis, partitionSpec)
+            case _                              => partitionSpec.at(endMillis)
           }
-          Some(StatsDateRange(start = partitionSpec.at(startMillis), end = partitionSpec.at(lastPartitionMillis)))
+          Some(StatsDateRange(start = partitionSpec.at(startMillis), end = endPartition))
         } else {
           None
         }

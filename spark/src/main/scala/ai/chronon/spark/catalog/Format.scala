@@ -197,18 +197,12 @@ trait Format {
             .collect()
             .headOption
             .flatMap(v => Option(v))
-        case DateType =>
-          df.select(epochMillisCol(max(col(partitionColumn)), DateType).as("max_millis"))
-            .collect()
-            .headOption
-            .filterNot(_.isNullAt(0))
-            .map(row => partitionSpec.at(row.getLong(0)))
         case dt =>
           df.select(epochMillisCol(max(col(partitionColumn)), dt).as("max_millis"))
             .collect()
             .headOption
             .filterNot(_.isNullAt(0))
-            .map(row => partitionSpec.at(row.getLong(0) - 1L))
+            .map(row => Format.readinessPartition(row.getLong(0), partitionSpec))
       }
     } match {
       case Success(result) => result
@@ -255,7 +249,7 @@ trait Format {
   }
 
   // Unified last available partition: metadata-only lookup for catalog-partitioned string columns,
-  // value scan (last complete partition interval) for timestamp/date/clustered columns.
+  // value scan of the partition containing the latest value for timestamp/date/clustered columns.
   // Formats with richer metadata (Iceberg manifests, Delta log stats) override to insert a
   // stats tier between the two.
   def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
@@ -362,6 +356,17 @@ object Format {
             "or stale partition format on the dependency's table info."
         )
     }
+  }
+
+  /** Newest partition to report for readiness, given the newest observed time value.
+    * Daily-or-coarser grids are batch-loaded in practice: the newest data-bearing partition
+    * is the newest available partition. Sub-daily grids keep the tail interval exclusive on
+    * the left boundary, so a value exactly at 09:00 marks 06:00 ready, not 09:00.
+    */
+  def readinessPartition(maxMillis: Long, spec: PartitionSpec): String = {
+    val readinessMillis =
+      if (spec.spanMillis >= PartitionSpec.daily.spanMillis) maxMillis else maxMillis - 1L
+    spec.at(readinessMillis)
   }
 
   def sanitizePartitionValues(partitions: Iterable[String]): List[String] = partitions.iterator

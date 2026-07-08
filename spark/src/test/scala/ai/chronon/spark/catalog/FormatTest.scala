@@ -133,17 +133,13 @@ class FormatTest extends SparkTestBase {
     fmt.discoveredPartitions("db.table", "ds")(spark) shouldBe Some(List("2024-04-02", "2024-04-01"))
   }
 
-  it should "return the partition containing the max timestamp when scanning a timestamp column" in {
-    // Readiness semantics: report the newest partition that HAS data, matching the string /
-    // date / metadata tiers. Reporting one behind (before(at(maxTs))) means a batch-loaded
-    // table can never satisfy a sensor gated on its newest required partition — downstream
-    // workflows stall until the NEXT batch lands, or forever when the gate advances daily.
+  it should "return the daily partition containing the max timestamp when scanning a timestamp column" in {
     val tableName = "format_timestamp_scan_last_available_test"
     spark.sql(s"""
       CREATE OR REPLACE TEMP VIEW $tableName AS
       SELECT * FROM VALUES
         (1, TIMESTAMP '2024-04-01 12:00:00'),
-        (2, TIMESTAMP '2024-04-03 21:59:58')
+        (2, TIMESTAMP '2024-04-03 00:00:00')
       AS t(id, created_at)
     """)
 
@@ -160,13 +156,16 @@ class FormatTest extends SparkTestBase {
     fmt.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
   }
 
-  it should "scan the sub-daily partition containing max timestamp" in {
-    val threeHourly = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+  it should "keep sub-daily timestamp readiness one interval behind exact boundaries" in {
     val tableName = "format_subdaily_timestamp_scan_last_available_test"
+    val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+    val offsetSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000, offsetMillis = 60 * 60 * 1000)
+
     spark.sql(s"""
       CREATE OR REPLACE TEMP VIEW $tableName AS
       SELECT * FROM VALUES
-        (1, TIMESTAMP '2024-04-03 06:00:00')
+        (1, TIMESTAMP '2024-04-03 06:00:00'),
+        (2, TIMESTAMP '2024-04-03 08:59:59')
       AS t(id, created_at)
     """)
 
@@ -180,9 +179,19 @@ class FormatTest extends SparkTestBase {
           ss: SparkSession) = Nil
     }
 
-    fmt.lastAvailablePartition(tableName, "created_at", threeHourly)(spark) shouldBe Some("2024-04-03-03-00")
-    spark.sql(s"CREATE OR REPLACE TEMP VIEW $tableName AS SELECT TIMESTAMP '2024-04-03 06:00:01' AS created_at")
-    fmt.lastAvailablePartition(tableName, "created_at", threeHourly)(spark) shouldBe Some("2024-04-03-06-00")
+    fmt.lastAvailablePartition(tableName, "created_at", threeHourSpec)(spark) shouldBe Some("2024-04-03-06-00")
+    fmt.lastAvailablePartition(tableName, "created_at", offsetSpec)(spark) shouldBe Some("2024-04-03-07-00")
+
+    spark.sql(s"""
+      CREATE OR REPLACE TEMP VIEW $tableName AS
+      SELECT * FROM VALUES
+        (1, TIMESTAMP '2024-04-03 09:00:00')
+      AS t(id, created_at)
+    """)
+
+    fmt.lastAvailablePartition(tableName, "created_at", threeHourSpec)(spark) shouldBe Some("2024-04-03-06-00")
+    spark.sql(s"CREATE OR REPLACE TEMP VIEW $tableName AS SELECT TIMESTAMP '2024-04-03 09:00:01' AS created_at")
+    fmt.lastAvailablePartition(tableName, "created_at", threeHourSpec)(spark) shouldBe Some("2024-04-03-09-00")
   }
 
   it should "return the max date when scanning a date column" in {
