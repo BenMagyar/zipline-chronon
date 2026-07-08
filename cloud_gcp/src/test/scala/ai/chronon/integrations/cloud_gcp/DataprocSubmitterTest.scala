@@ -1235,6 +1235,88 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     assert(result.isEmpty)
   }
 
+  it should "return None when cluster is in DELETING state" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    val mockCluster = Cluster
+      .newBuilder()
+      .setStatus(ClusterStatus.newBuilder().setState(ClusterStatus.State.DELETING))
+      .build()
+
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String]))
+      .thenReturn(mockCluster)
+
+    val submitterWithClusterClient = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+
+    val result = submitterWithClusterClient.ensureClusterReady(
+      "test-cluster",
+      None
+    )(scala.concurrent.ExecutionContext.global)
+
+    assert(result.isEmpty)
+  }
+
+  it should "return None when cluster is in UNRECOGNIZED state" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    // UNRECOGNIZED is a synthetic proto3 value for enum numbers unknown to the compiled schema.
+    // It can't be set via setState(UNRECOGNIZED); we assign an unknown numeric value so the
+    // enum readback resolves to UNRECOGNIZED.
+    val mockCluster = Cluster
+      .newBuilder()
+      .setStatus(ClusterStatus.newBuilder().setStateValue(9999))
+      .build()
+    assert(mockCluster.getStatus.getState == ClusterStatus.State.UNRECOGNIZED)
+
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String]))
+      .thenReturn(mockCluster)
+
+    val submitterWithClusterClient = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+
+    val result = submitterWithClusterClient.ensureClusterReady(
+      "test-cluster",
+      None
+    )(scala.concurrent.ExecutionContext.global)
+
+    assert(result.isEmpty)
+  }
+
+  it should "return None when cluster is in ERROR_DUE_TO_UPDATE state" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    val mockCluster = Cluster
+      .newBuilder()
+      .setStatus(ClusterStatus.newBuilder().setState(ClusterStatus.State.ERROR_DUE_TO_UPDATE))
+      .build()
+
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String]))
+      .thenReturn(mockCluster)
+
+    val submitterWithClusterClient = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+
+    val result = submitterWithClusterClient.ensureClusterReady(
+      "test-cluster",
+      None
+    )(scala.concurrent.ExecutionContext.global)
+
+    assert(result.isEmpty)
+  }
+
   it should "throw IllegalStateException when cluster is in ERROR state and no idle delete TTL is set" in {
     val mockClusterControllerClient = mock[ClusterControllerClient]
     val mockCluster = Cluster

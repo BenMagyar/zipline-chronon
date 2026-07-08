@@ -729,7 +729,8 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
               case ClusterStatus.State.RUNNING | ClusterStatus.State.UPDATING =>
                 Some(clusterName)
               case ClusterStatus.State.UNKNOWN | ClusterStatus.State.CREATING | ClusterStatus.State.STARTING |
-                  ClusterStatus.State.REPAIRING =>
+                  ClusterStatus.State.REPAIRING | ClusterStatus.State.DELETING | ClusterStatus.State.UNRECOGNIZED |
+                  ClusterStatus.State.ERROR_DUE_TO_UPDATE =>
                 logger.info(s"Cluster $clusterName not ready (state: ${cluster.getStatus.getState}).")
                 None
               case ClusterStatus.State.ERROR =>
