@@ -1,7 +1,7 @@
 package ai.chronon.api.planner
 
 import ai.chronon.api.Extensions._
-import ai.chronon.api.{MetaData, PartitionSpec}
+import ai.chronon.api.{MetaData, PartitionGrid, PartitionSpec}
 import ai.chronon.planner.ExternalSourceSensorNode
 
 import scala.collection.JavaConverters._
@@ -26,6 +26,18 @@ object ExternalSourceSensorUtil {
     semanticSensor
   }
 
+  // Sensor node names must be unique per (table, dependency grid): two confs watching the same
+  // table on different grids (e.g. a 3h@1h staging query and a 1d@1h groupBy) would otherwise
+  // emit sensors with the same name, and the hub keys nodes by name per branch — one grid
+  // clobbers the other and the losing conf fails its partition-grid check every run. Plain daily
+  // keeps the legacy suffix so existing sensors aren't renamed on upgrade.
+  private[planner] def sensorName(table: String, grid: PartitionGrid): String = {
+    def compact(millis: Long): String = WindowUtils.fromMillis(millis).str
+    if (grid.isDaily) s"${table}__sensor"
+    else if (grid.offsetMillis == 0) s"${table}__${compact(grid.spanMillis)}__sensor"
+    else s"${table}__${compact(grid.spanMillis)}-${compact(grid.offsetMillis)}__sensor"
+  }
+
   def sensorNodes(metaData: MetaData)(implicit spec: PartitionSpec): Seq[ExternalSourceSensorNode] = {
 
     metaData.executionInfo.tableDependencies.asScala
@@ -34,7 +46,7 @@ object ExternalSourceSensorUtil {
         val sensorMd = MetaDataUtils.layer(
           metaData,
           "sensor",
-          f"${td.tableInfo.table}__sensor",
+          sensorName(td.tableInfo.table, tdSpec.grid),
           Seq(), // No table dependencies for sensors
           outputTableOverride =
             Option(td.tableInfo.table) // The input table and the output table are the same for sensors.

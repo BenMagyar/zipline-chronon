@@ -212,6 +212,67 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
     sensorNames should have size 2
   }
 
+  "sensorNodes" should "give sensors distinct names when confs depend on the same table with different grids" in {
+    def metaDataFor(name: String, intervalMillis: Long, offsetMillis: Long): MetaData = {
+      val tableInfo = new TableInfo()
+        .setTable("data.table_a")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH-mm")
+        .setPartitionInterval(WindowUtils.fromMillis(intervalMillis))
+      if (offsetMillis != 0L) tableInfo.setPartitionOffset(WindowUtils.fromMillis(offsetMillis))
+      val executionInfo = new ExecutionInfo()
+        .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+      new MetaData().setName(name).setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+    }
+
+    // Two confs watching the same table on different grids (a 3h@1h staging query and a 1d@1h
+    // groupBy) used to emit sensors with the SAME node name. branch_nodes keys nodes by name, so
+    // whichever conf synced last clobbered the other's sensor grid and the loser failed its
+    // partition-grid check every run.
+    val hourMillis = 60 * 60 * 1000L
+    val threeHourly =
+      ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.sq__3", 3 * hourMillis, hourMillis)).head
+    val dailyOffset =
+      ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.gb__1", 24 * hourMillis, hourMillis)).head
+
+    threeHourly.metaData.name should not equal dailyOffset.metaData.name
+    threeHourly.metaData.name shouldBe "data.table_a__3h-1h__sensor"
+    dailyOffset.metaData.name shouldBe "data.table_a__1d-1h__sensor"
+  }
+
+  it should "use the interval-only qualifier when the offset is zero" in {
+    val hourMillis = 60 * 60 * 1000L
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd-HH-mm")
+      .setPartitionInterval(WindowUtils.fromMillis(3 * hourMillis))
+    val executionInfo = new ExecutionInfo()
+      .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+    val metaData =
+      new MetaData().setName("test_team.sq__3").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+    sensor.metaData.name shouldBe "data.table_a__3h__sensor"
+  }
+
+  it should "keep the legacy name for plain daily dependencies" in {
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd")
+
+    val executionInfo = new ExecutionInfo()
+      .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+    val metaData =
+      new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    // Daily-no-offset is the overwhelmingly common case — its sensor names must not change, or
+    // every existing customer's sensors would be renamed on upgrade.
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+    sensor.metaData.name shouldBe "data.table_a__sensor"
+  }
+
   "sensorNodes" should "set correct sensor metadata for grouped dependencies" in {
     // Create multiple dependencies to test comprehensive metadata structure
     val dependencies = (1 to 3).map { i =>
