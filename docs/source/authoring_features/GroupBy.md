@@ -190,6 +190,39 @@ your_gb = GroupBy(
 > you don't accidentally merge a change that release modified features out-of-band with model updates. You can overwrite
 > this behavior by deleting the older compiled output. Our recommendation is to create a new version `your_gb_v2` instead.
 
+### Key Filter
+
+`key_filter` is an optional `EntitySource` that limits which keys are written by the batch upload for an online
+`GroupBy`. It is useful when the aggregation source has many possible keys, but only a smaller active set should be
+materialized in the online KV store. This only affects online batch uploads; it does not change the backfilled offline
+`GroupBy` table.
+
+The filter is read from its `snapshotTable` at the upload date's partition. Chronon takes the distinct key tuples from
+the filter source and semi-joins the aggregated upload rows against them after aggregation. The filter must be an entity
+source with a `snapshotTable`, and its `query.selects` must produce columns named after at least one of the `GroupBy`
+keys. For multi-key `GroupBy`s, the filter may select a subset of the keys and Chronon joins on the matching key
+columns. If the filter produces no matching key columns, or no keys for that upload date, the upload fails instead of
+writing an empty online snapshot.
+
+```python
+active_users = Source(
+    entities=EntitySource(
+        snapshotTable="data.active_users",
+        query=Query(
+            selects=select("user_id"),
+        ),
+    )
+)
+
+user_purchases = GroupBy(
+    sources=[purchase_events],
+    keys=["user_id"],
+    aggregations=[Aggregation(input_column="amount", operation=Operation.SUM)],
+    online=True,
+    key_filter=active_users,
+)
+```
+
 
 ### Tuning
 
