@@ -387,8 +387,15 @@ class MetadataStore(fetchContext: FetchContext) {
         val startTimeMs = System.currentTimeMillis()
         val batchDataset = s"${name.sanitize.toUpperCase()}_BATCH"
         val metaData =
-          fetchContext.kvStore
-            .getString(Constants.GroupByServingInfoKey, batchDataset, fetchContext.timeoutMillis)
+          // getString throws (rather than returning a Failure) when the batch dataset is reachable but the
+          // serving-info key is absent - e.g. a client still calling a version whose upload has been retired.
+          // Production stores surface that miss as Success(empty), which getString turns into a raw
+          // NoSuchElementException. Capture it here so it flows as a Failure instead of escaping the TTLCache
+          // loader unhandled and collapsing the whole (join) fetch into an opaque 500.
+          Try {
+            fetchContext.kvStore
+              .getString(Constants.GroupByServingInfoKey, batchDataset, fetchContext.timeoutMillis)
+          }.flatten
             .recover {
               case e: java.util.NoSuchElementException =>
                 logger.error(
