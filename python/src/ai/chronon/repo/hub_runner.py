@@ -35,6 +35,7 @@ from ai.chronon.repo.constants import VALID_CLOUDS, RunMode
 from ai.chronon.repo.utils import print_possible_confs, upload_to_blob_store
 from ai.chronon.repo.zipline_hub import ZiplineHub
 from gen_thrift.api.ttypes import DataKind, Environment
+from gen_thrift.common import ttypes as common
 from gen_thrift.planner.ttypes import Mode
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ _PARTITION_DS_FORMATS = (
     ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d-%H-%M"),
 )
 _PARTITION_DS_FORMAT_HELP = "YYYY-MM-DD, YYYY-MM-DD-HH, YYYY-MM-DD-HH-mm, ISO, or space-separated datetime"
+_EPOCH = datetime.datetime(1970, 1, 1)
 
 
 def _validate_partition_ds_precision(parsed, value):
@@ -140,6 +142,62 @@ def _format_partition_ds(value):
         parsed = _parse_partition_ds(value)
         return parsed.strftime("%Y-%m-%d-%H-%M" if parsed.time() != datetime.time.min else "%Y-%m-%d")
     raise ValueError(f"'{value}' does not match any supported date format: {_PARTITION_DS_FORMAT_HELP}")
+
+
+def _is_day_partition_value(value):
+    if isinstance(value, datetime.datetime):
+        return value.time() == datetime.time.min
+    if isinstance(value, date):
+        return True
+    raw = str(value).strip()
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d") == raw
+    except ValueError:
+        return False
+
+
+def _window_json_to_millis(window, default=0):
+    if not window:
+        return default
+    try:
+        thrift_window = common.Window(
+            length=int(window["length"]),
+            timeUnit=int(window["timeUnit"]),
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"Invalid partition window metadata: {window}") from e
+    return window_utils.window_millis(thrift_window)
+
+
+def _snap_date_to_grid(value, interval_millis, offset_millis):
+    if (
+        value is None
+        or interval_millis is None
+        or (interval_millis == window_utils.DAY_MILLIS and offset_millis == 0)
+        or not _is_day_partition_value(value)
+    ):
+        return value
+    millis = int((_parse_partition_ds(value) - _EPOCH).total_seconds() * 1000)
+    snapped = (
+        ((millis - offset_millis) // interval_millis) * interval_millis
+        + offset_millis
+    )
+    return _format_partition_ds(_EPOCH + datetime.timedelta(milliseconds=snapped))
+
+
+def _normalize_submission_partitions(repo, conf, start_ds, end_ds):
+    output_info = (
+        get_metadata_map(os.path.join(repo, conf))
+        .get("executionInfo", {})
+        .get("outputTableInfo", {})
+        or {}
+    )
+    interval_millis = _window_json_to_millis(output_info.get("partitionInterval"), default=None)
+    offset_millis = _window_json_to_millis(output_info.get("partitionOffset"))
+    return (
+        _snap_date_to_grid(start_ds, interval_millis, offset_millis),
+        _snap_date_to_grid(end_ds, interval_millis, offset_millis),
+    )
 
 
 class PartitionDsParamType(click.ParamType):
@@ -313,11 +371,11 @@ def validate_end_ds_after_start_ds(start_ds, end_ds):
     """
     if start_ds is None or end_ds is None:
         return
-    start_value = start_ds.date() if hasattr(start_ds, "date") else start_ds
-    end_value = end_ds.date() if hasattr(end_ds, "date") else end_ds
+    start_value = _parse_partition_ds(start_ds)
+    end_value = _parse_partition_ds(end_ds)
     if end_value < start_value:
         raise click.BadParameter(
-            f"End date {end_value} is before start date {start_value}. "
+            f"End date {end_ds} is before start date {start_ds}. "
             "End date must be greater than or equal to start date."
         )
 
@@ -701,6 +759,7 @@ def submit_workflow(
             root_dir=repo, env=_env_from_conf_path(conf)
         )
     branch = get_current_branch()
+    start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
     with status_spinner("Syncing confs with Hub...", format=format):
         hub_uploader.compute_and_upload_diffs(
@@ -1012,6 +1071,7 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
     conf_name = utils.get_metadata_name_from_conf(repo, conf)
     branch = get_current_branch()
     user = get_user_email()
+    start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
     with status_spinner("Computing downstream node ranges...", format=format):
         preview_json = zipline_hub.preview_clear_downstream(

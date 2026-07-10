@@ -12,6 +12,8 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 import datetime
+import json
+import os
 from unittest.mock import Mock, patch
 
 import click
@@ -80,6 +82,21 @@ class TestHubRunner:
             traceback.print_exception(type(result.exception), result.exception, result.exception.__traceback__)
 
         return result
+
+    def _subdaily_conf(self, canary, tmp_path, conf):
+        conf_path = tmp_path / conf
+        conf_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(canary, conf), "r") as f:
+            data = json.load(f)
+        data["metaData"]["executionInfo"]["outputTableInfo"] = {
+            "partitionColumn": "ds",
+            "partitionFormat": "yyyy-MM-dd-HH-mm",
+            "partitionInterval": {"length": 3, "timeUnit": 0},
+            "partitionOffset": {"length": 1, "timeUnit": 0},
+        }
+        with open(conf_path, "w") as f:
+            json.dump(data, f)
+        return str(tmp_path), conf
 
     def test_hub_runner(self):
         """Test that hub command group can be invoked."""
@@ -281,6 +298,35 @@ class TestHubRunner:
         json_payload = mock_post.call_args[1]['json']
         assert json_payload['start'] == "2024-01-15-03-30"
         assert json_payload['end'] == "2024-01-15-06-30"
+
+    @patch('requests.post')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    def test_backfill_maps_date_only_input_to_containing_subdaily_partition(
+        self,
+        mock_get_current_branch,
+        mock_post,
+        canary,
+        online_join_conf,
+        tmp_path,
+    ):
+        mock_get_current_branch.return_value = "test-branch"
+        chronon_root, conf = self._subdaily_conf(canary, tmp_path, online_join_conf)
+
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'backfill',
+            conf,
+            '--chronon-root', chronon_root,
+            '--no-use-auth',
+            '--start-ds', '2024-01-15',
+            '--end-ds', '2024-01-15',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code == 0
+        json_payload = mock_post.call_args[1]['json']
+        assert json_payload['start'] == "2024-01-14-22-00"
+        assert json_payload['end'] == "2024-01-14-22-00"
 
     def test_backfill_rejects_invalid_date_formats(self, canary, online_join_conf):
         runner = CliRunner()
