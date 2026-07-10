@@ -152,7 +152,8 @@ object AksFlinkSubmitter {
       defaultJarsBasePath: String = DefaultAzureFlinkJarsBasePath,
       k8sConfig: Option[Config] = None,
       ingressBaseUrl: Option[String] = None,
-      env: Map[String, String] = sys.env
+      env: Map[String, String] = sys.env,
+      flinkUiProxyEnabled: Option[Boolean] = None
   ): K8sFlinkSubmitter =
     new K8sFlinkSubmitter(
       flinkImage = flinkImage,
@@ -162,6 +163,7 @@ object AksFlinkSubmitter {
       defaultJarsBasePath = defaultJarsBasePath,
       k8sConfig = k8sConfig,
       ingressBaseUrl = ingressBaseUrl,
-      podTemplateLabels = WorkloadIdentityPodLabels
+      podTemplateLabels = WorkloadIdentityPodLabels,
+      flinkUiProxyEnabled = flinkUiProxyEnabled.getOrElse(K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(env))
     )
 }

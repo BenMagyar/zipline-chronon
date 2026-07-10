@@ -32,6 +32,7 @@ class AzureSubmitter(
     aksServiceAccount: Option[String] = None,
     aksNamespace: Option[String] = None,
     ingressBaseUrl: Option[String] = None,
+    flinkUiProxyEnabled: Boolean = false,
     storageClient: Option[StorageClient] = None,
     flinkHealthCheckFn: Option[String] => Boolean = _ => true,
     flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
@@ -138,8 +139,9 @@ class AzureSubmitter(
     if (!jobId.startsWith(AzureSubmitter.FlinkJobIdPrefix)) return None
     val parts = jobId.split(":", 3)
     if (parts.length != 3) return None
+    val namespace = parts(1)
     val deploymentName = parts(2)
-    ingressBaseUrl.map(base => s"${base.stripSuffix("/")}/flink/$deploymentName/")
+    ingressBaseUrl.map(base => K8sFlinkSubmitter.flinkUiUrl(base, namespace, deploymentName, flinkUiProxyEnabled))
   }
 
   override def getSparkUrl(jobId: String): Option[String] =
@@ -213,6 +215,7 @@ object AzureSubmitter {
     val aksServiceAccount = sys.env.get("FLINK_AKS_SERVICE_ACCOUNT")
     val aksNamespace = sys.env.get("FLINK_AKS_NAMESPACE")
     val ingressBaseUrl = sys.env.get("HUB_BASE_URL")
+    val flinkUiProxyEnabled = K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv()
     val storageAccountUrl = sys.env.get("AZURE_STORAGE_ACCOUNT_URL")
 
     val storageClient = storageAccountUrl.map { url =>
@@ -224,7 +227,8 @@ object AzureSubmitter {
     val aksFlinkSubmitter = AksFlinkSubmitter(
       flinkImage = flinkImage,
       defaultJarsBasePath = flinkJarsBasePath,
-      ingressBaseUrl = ingressBaseUrl
+      ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = Some(flinkUiProxyEnabled)
     )
     val flinkStatusProvider = new K8sFlinkStatusProvider()
     implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newCachedThreadPool())
@@ -235,6 +239,7 @@ object AzureSubmitter {
       aksServiceAccount = aksServiceAccount,
       aksNamespace = aksNamespace,
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       storageClient = storageClient,
       flinkHealthCheckFn = uri => Await.result(flinkStatusProvider.isFlinkJobHealthy(uri), 30.seconds),
       flinkInternalJobIdFetchFn = uri => Await.result(flinkStatusProvider.getFlinkInternalJobId(uri), 30.seconds)

@@ -44,6 +44,7 @@ class EmrSubmitter(customerId: String,
                    flinkEksNamespace: Option[String] = None,
                    eksClusterName: Option[String] = None,
                    ingressBaseUrl: Option[String] = None,
+                   flinkUiProxyEnabled: Boolean = false,
                    flinkHealthCheckFn: Option[String] => Boolean = _ => true,
                    flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None)
     extends JobSubmitter {
@@ -708,8 +709,9 @@ class EmrSubmitter(customerId: String,
     if (!jobId.startsWith("flink:")) return None
     val parts = jobId.split(":", 3)
     if (parts.length != 3) return None
+    val namespace = parts(1)
     val deploymentName = parts(2)
-    ingressBaseUrl.map(base => s"${base.stripSuffix("/")}/flink/$deploymentName/")
+    ingressBaseUrl.map(base => K8sFlinkSubmitter.flinkUiUrl(base, namespace, deploymentName, flinkUiProxyEnabled))
   }
 
   override def getFlinkInternalJobId(jobId: String): Option[String] =
@@ -787,17 +789,20 @@ object EmrSubmitter {
     val customerId = sys.env.getOrElse("CUSTOMER_ID", throw new Exception("CUSTOMER_ID not set")).toLowerCase
     val awsRegion = sys.env.getOrElse("AWS_REGION", sys.env.getOrElse("AWS_DEFAULT_REGION", ""))
     val ingressBaseUrl = sys.env.get("HUB_BASE_URL")
+    val flinkUiProxyEnabled = K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv()
 
     new EmrSubmitter(
       customerId,
       EmrClient.builder().build(),
       Ec2Client.builder().build(),
-      eksFlinkSubmitter = Some(EksFlinkSubmitter(k8sConfig, ingressBaseUrl = ingressBaseUrl)),
+      eksFlinkSubmitter = Some(
+        EksFlinkSubmitter(k8sConfig, ingressBaseUrl = ingressBaseUrl, flinkUiProxyEnabled = Some(flinkUiProxyEnabled))),
       awsRegion = awsRegion,
       flinkEksServiceAccount = sys.env.get("FLINK_EKS_SERVICE_ACCOUNT"),
       flinkEksNamespace = sys.env.get("FLINK_EKS_NAMESPACE"),
       eksClusterName = sys.env.get("EKS_CLUSTER_NAME"),
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       flinkHealthCheckFn = flinkHealthCheckFn,
       flinkInternalJobIdFetchFn = flinkInternalJobIdFetchFn
     )

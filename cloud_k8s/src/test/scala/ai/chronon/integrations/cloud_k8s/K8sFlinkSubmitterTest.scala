@@ -2,7 +2,10 @@ package ai.chronon.integrations.cloud_k8s
 
 import ai.chronon.api.JobStatusType
 import ai.chronon.spark.submission.JobSubmitterConstants.MaxRetainedCheckpoints
-import K8sFlinkSubmitter.{DeploymentPendingTimeout, InitContainerSpec}
+import K8sFlinkSubmitter.{
+  DeploymentPendingTimeout,
+  InitContainerSpec
+}
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource
 import org.junit.Assert.{assertEquals, assertFalse, assertNull, assertTrue}
 import org.scalatest.flatspec.AnyFlatSpec
@@ -163,6 +166,53 @@ class K8sFlinkSubmitterTest extends AnyFlatSpec {
 
   it should "strip leading and trailing dashes" in {
     assertEquals("foo-bar", K8sFlinkSubmitter.sanitizeDeploymentName("--foo-bar--"))
+  }
+
+  "flinkRestServiceUrl" should "build the internal Kubernetes service URL for the Flink REST service" in {
+    assertEquals(
+      "http://my-deploy-rest.zipline-flink.svc.cluster.local:8081",
+      K8sFlinkSubmitter.flinkRestServiceUrl("zipline-flink", "my-deploy")
+    )
+  }
+
+  "flinkUiProxyEnabledFromEnv" should "read FLINK_UI_PROXY_ENABLED from the environment map" in {
+    assertTrue(
+      K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(Map(K8sFlinkSubmitter.FlinkUiProxyEnabledEnvVar -> " true ")))
+    assertTrue(K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(Map(K8sFlinkSubmitter.FlinkUiProxyEnabledEnvVar -> "1")))
+  }
+
+  it should "return false when FLINK_UI_PROXY_ENABLED is unset or false" in {
+    assertFalse(K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(Map.empty))
+    assertFalse(K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(Map(K8sFlinkSubmitter.FlinkUiProxyEnabledEnvVar -> "false")))
+  }
+
+  "shouldCreateFlinkIngress" should "return false when Flink UI proxy mode is enabled" in {
+    assertFalse(K8sFlinkSubmitter.shouldCreateFlinkIngress(flinkUiProxyEnabled = true))
+  }
+
+  it should "return true when Flink UI proxy mode is disabled" in {
+    assertTrue(K8sFlinkSubmitter.shouldCreateFlinkIngress(flinkUiProxyEnabled = false))
+  }
+
+  "flinkIngressPath" should "use the legacy /flink path when Flink UI proxy mode is disabled" in {
+    assertEquals(
+      "/flink/my-deploy(/|$)(.*)",
+      K8sFlinkSubmitter.flinkIngressPath(flinkUiProxyEnabled = false, "my-deploy")
+    )
+  }
+
+  "flinkUiUrl" should "return a proxy URL when Flink UI proxy mode is enabled" in {
+    assertEquals(
+      "https://hub.example.com/services/hub/engines/flink/job/my-deploy",
+      K8sFlinkSubmitter.flinkUiUrl("https://hub.example.com/services/hub/", "zipline-flink", "my-deploy", true)
+    )
+  }
+
+  it should "return the legacy /flink URL when Flink UI proxy mode is disabled" in {
+    assertEquals(
+      "https://hub.example.com/flink/my-deploy/",
+      K8sFlinkSubmitter.flinkUiUrl("https://hub.example.com/", "zipline-flink", "my-deploy", false)
+    )
   }
 
   // --- resolveStatus ---

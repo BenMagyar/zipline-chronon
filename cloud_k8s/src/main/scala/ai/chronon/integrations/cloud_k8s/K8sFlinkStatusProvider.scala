@@ -85,7 +85,7 @@ class K8sFlinkStatusProvider(k8sClient: Option[KubernetesClient] = None) {
   // Try svc.cluster.local DNS first; fall back to port-forward when k8sClient is available.
   private[cloud_k8s] def resolveServiceUrl(namespace: String, deploymentName: String): Option[String] = {
     val service = s"$deploymentName-rest"
-    val directUrl = s"http://$service.$namespace.svc.cluster.local:${K8sFlinkStatusProvider.FlinkRestPort}"
+    val directUrl = K8sFlinkSubmitter.flinkRestServiceUrl(namespace, deploymentName)
     if (isReachable(directUrl)) return Some(directUrl)
     k8sClient
       .flatMap(c => openPortForward(c, namespace, service))

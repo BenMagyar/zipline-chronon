@@ -219,6 +219,18 @@ class EksFlinkSubmitterTest extends AnyFlatSpec {
       emr.getFlinkUrl("flink:zipline-flink:my-deployment"))
   }
 
+  it should "return services proxy URL when Flink UI proxy mode is enabled" in {
+    val emr = new EmrSubmitter(
+      customerId = "test",
+      emrClient = null,
+      ec2Client = null,
+      ingressBaseUrl = Some("https://hub.example.com/services/hub"),
+      flinkUiProxyEnabled = true
+    )
+    assertEquals(Some("https://hub.example.com/services/hub/engines/flink/job/my-deployment"),
+      emr.getFlinkUrl("flink:zipline-flink:my-deployment"))
+  }
+
   "resolveStatus" should "return RUNNING when lifecycleState is STABLE" in {
     assertEquals(JobStatusType.RUNNING,
       submitter.resolveStatus("d", "STABLE", "READY", Some(Instant.now())))

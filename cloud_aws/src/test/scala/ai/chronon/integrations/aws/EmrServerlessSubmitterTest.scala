@@ -56,6 +56,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       awsRegion: String = "us-east-1",
       eksClusterName: Option[String] = None,
       ingressBaseUrl: Option[String] = None,
+      flinkUiProxyEnabled: Boolean = false,
       emrStudioId: Option[String] = None,
       applicationName: String = "test-app",
       kvStoreApiProperties: Map[String, String] = Map(
@@ -71,6 +72,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       awsRegion = awsRegion,
       eksClusterName = eksClusterName,
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       emrStudioId = emrStudioId,
       applicationName = applicationName,
       kvStoreApiProperties = kvStoreApiProperties,
@@ -690,6 +692,18 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     val url = submitter.getFlinkUrl("flink:my-ns:my-deploy")
     assert(url.isDefined)
     assertEquals("https://hub.example.com/flink/my-deploy/", url.get)
+  }
+
+  it should "return services proxy Flink UI URL when Flink UI proxy mode is enabled" in {
+    val mockClient = mock[EmrServerlessClient]
+    val submitter = createSubmitter(
+      mockClient,
+      ingressBaseUrl = Some("https://hub.example.com/services/hub"),
+      flinkUiProxyEnabled = true
+    )
+    val url = submitter.getFlinkUrl("flink:my-ns:my-deploy")
+    assert(url.isDefined)
+    assertEquals("https://hub.example.com/services/hub/engines/flink/job/my-deploy", url.get)
   }
 
   it should "return None for getFlinkUrl on non-flink job" in {

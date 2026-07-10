@@ -30,6 +30,7 @@ import scala.jdk.CollectionConverters._
   * @param extraJarNames      Additional JARs to include in the image (typically cloud specific jars that need to be added)
   * @param k8sConfig          Optional fabric8 K8s client config (defaults to in-cluster / kubeconfig).
   * @param ingressBaseUrl     Optional base URL for nginx ingress creation (enables Flink UI proxying).
+  * @param flinkUiProxyEnabled Whether Flink UI links should use the hub proxy instead of creating per-job ingress.
   */
 class K8sFlinkSubmitter(
     flinkImage: String,
@@ -42,7 +43,8 @@ class K8sFlinkSubmitter(
     defaultJarsBasePath: String,
     k8sConfig: Option[Config] = None,
     ingressBaseUrl: Option[String] = None,
-    podTemplateLabels: Map[String, String] = Map.empty
+    podTemplateLabels: Map[String, String] = Map.empty,
+    flinkUiProxyEnabled: Boolean = false
 ) {
   import K8sFlinkSubmitter._
 
@@ -425,16 +427,23 @@ class K8sFlinkSubmitter(
 
       logger.info(s"Created FlinkDeployment: $deploymentName in namespace: $namespace")
 
-      if (ingressBaseUrl.isDefined) {
-        try {
-          createFlinkIngress(client, deploymentName, namespace, created.getMetadata.getUid)
-        } catch {
-          case e: Exception =>
-            logger.warn(
-              s"FlinkDeployment '$deploymentName' (namespace=$namespace, uid=${created.getMetadata.getUid}) " +
-                s"was created successfully but ingress setup failed — Flink UI may be unavailable: ${e.getMessage}",
-              e
-            )
+      ingressBaseUrl.foreach { baseUrl =>
+        if (shouldCreateFlinkIngress(flinkUiProxyEnabled)) {
+          try {
+            createFlinkIngress(client, deploymentName, namespace, created.getMetadata.getUid)
+          } catch {
+            case e: Exception =>
+              logger.warn(
+                s"FlinkDeployment '$deploymentName' (namespace=$namespace, uid=${created.getMetadata.getUid}) " +
+                  s"was created successfully but ingress setup failed — Flink UI may be unavailable: ${e.getMessage}",
+                e
+              )
+          }
+        } else {
+          logger.info(
+            s"Skipping Flink ingress creation for $deploymentName in namespace $namespace; " +
+              s"hub proxy URL ${flinkUiUrl(baseUrl, namespace, deploymentName, flinkUiProxyEnabled)} will route to " +
+              s"${flinkRestServiceUrl(namespace, deploymentName)}")
         }
       }
 
@@ -445,22 +454,26 @@ class K8sFlinkSubmitter(
   }
 
   // Create an Ingress resource for the Flink REST UI, with rules specific to this deployment. This allows
-  // nginx-ingress to route /flink/{deploymentName} to the correct Flink
-  // REST service, and ensures the Ingress is automatically deleted when the FlinkDeployment is removed.
+  // nginx-ingress to route the Flink UI path to the correct Flink REST service, and ensures the
+  // Ingress is automatically deleted when the FlinkDeployment is removed.
   def createFlinkIngress(client: io.fabric8.kubernetes.client.KubernetesClient,
                          deploymentName: String,
                          namespace: String,
                          ownerUid: String): Unit = {
+    val baseUrl = ingressBaseUrl.getOrElse(
+      throw new IllegalArgumentException("ingressBaseUrl must be set to create a Flink ingress")
+    )
     // Extract host from ingressBaseUrl so the ingress rule is host-specific, matching at the
     // same specificity level as the hub catch-all ingress. Without a host, nginx-ingress prefers
     // host-specific rules (even with path: /) over wildcard-host rules with longer paths.
-    val host = ingressBaseUrl
-      .flatMap { url =>
-        scala.util.Try(new java.net.URI(url).getHost).toOption.filter(_ != null)
-      }
+    val host = scala.util
+      .Try(new java.net.URI(baseUrl).getHost)
+      .toOption
+      .filter(_ != null)
       .getOrElse(throw new IllegalArgumentException(
         s"Could not extract host from ingressBaseUrl: $ingressBaseUrl — cannot create host-specific ingress rule"
       ))
+    val ingressPath = flinkIngressPath(flinkUiProxyEnabled, deploymentName)
 
     val ingress = new IngressBuilder()
       .withNewMetadata()
@@ -488,13 +501,13 @@ class K8sFlinkSubmitter(
       .withHost(host)
       .withNewHttp()
       .addNewPath()
-      .withPath(s"/flink/$deploymentName(/|$$)(.*)")
+      .withPath(ingressPath)
       .withPathType("ImplementationSpecific")
       .withNewBackend()
       .withNewService()
       .withName(s"$deploymentName-rest")
       .withNewPort()
-      .withNumber(8081)
+      .withNumber(K8sFlinkStatusProvider.FlinkRestPort)
       .endPort()
       .endService()
       .endBackend()
@@ -591,6 +604,35 @@ object K8sFlinkSubmitter {
   // (CPU, memory — kubelet-collected, tagged via this pod label) with Flink-emitted app
   // metrics (throughput, backpressure — already tagged with `job_name` by Flink natively).
   val JobNamePodLabel: String = "chronon/job_name"
+  val FlinkUiProxyEnabledEnvVar: String = "FLINK_UI_PROXY_ENABLED"
+
+  def flinkUiProxyEnabledFromEnv(env: Map[String, String] = sys.env): Boolean =
+    env.get(FlinkUiProxyEnabledEnvVar).exists { value =>
+      val normalized = value.trim.toLowerCase
+      normalized == "true" || normalized == "1"
+    }
+
+  def flinkRestServiceUrl(namespace: String, deploymentName: String): String = {
+    val service = s"$deploymentName-rest"
+    s"http://$service.$namespace.svc.cluster.local:${K8sFlinkStatusProvider.FlinkRestPort}"
+  }
+
+  def shouldCreateFlinkIngress(flinkUiProxyEnabled: Boolean): Boolean =
+    !flinkUiProxyEnabled
+
+  def flinkIngressPath(flinkUiProxyEnabled: Boolean, workflowId: String): String = {
+    require(shouldCreateFlinkIngress(flinkUiProxyEnabled), "Flink UI proxy mode does not create ingress paths")
+    s"/flink/$workflowId(/|$$)(.*)"
+  }
+
+  def flinkUiUrl(baseUrl: String, namespace: String, workflowId: String, flinkUiProxyEnabled: Boolean): String = {
+    val normalizedBase = baseUrl.stripSuffix("/")
+    if (flinkUiProxyEnabled) {
+      s"$normalizedBase/engines/flink/job/$workflowId"
+    } else {
+      s"$normalizedBase/flink/$workflowId/"
+    }
+  }
 
   // K8s label-value max length (https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set).
   val MaxLabelValueLength: Int = 63

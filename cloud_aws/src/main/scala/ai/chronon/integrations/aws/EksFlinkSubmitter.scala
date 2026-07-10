@@ -116,7 +116,12 @@ object EksFlinkSubmitter {
   }
 
   /** Creates a [[K8sFlinkSubmitter]] configured for AWS EKS. */
-  def apply(k8sConfig: Option[Config] = None, ingressBaseUrl: Option[String] = None): K8sFlinkSubmitter =
+  def apply(
+      k8sConfig: Option[Config] = None,
+      ingressBaseUrl: Option[String] = None,
+      env: Map[String, String] = sys.env,
+      flinkUiProxyEnabled: Option[Boolean] = None
+  ): K8sFlinkSubmitter =
     new K8sFlinkSubmitter(
       flinkImage = FlinkImage,
       buildInitContainerSpec = buildInitContainerSpec,
@@ -125,6 +130,7 @@ object EksFlinkSubmitter {
       defaultJarsBasePath = DefaultS3FlinkJarsBasePath,
       k8sConfig = k8sConfig,
       ingressBaseUrl = ingressBaseUrl,
-      podTemplateLabels = parsePodTemplateLabels(sys.env.get(PodTemplateLabelsEnvVar))
+      podTemplateLabels = parsePodTemplateLabels(env.get(PodTemplateLabelsEnvVar)),
+      flinkUiProxyEnabled = flinkUiProxyEnabled.getOrElse(K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(env))
     )
 }
