@@ -1,14 +1,16 @@
 package ai.chronon.spark.batch.iceberg
 
 import ai.chronon.api.ScalaJavaConversions.JMapOps
-import ai.chronon.api.{PartitionSpec, ThriftJsonCodec}
+import ai.chronon.api.{PartitionRange, PartitionSpec, ThriftJsonCodec}
 import ai.chronon.observability._
 import ai.chronon.online.KVStore.PutRequest
 import ai.chronon.spark.catalog.Format
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import org.apache.iceberg.expressions.{Expression, Expressions}
 import org.apache.iceberg.spark.source.SparkTable
-import org.apache.iceberg.{DataFile, ManifestFiles}
+import org.apache.iceberg.types.Type
+import org.apache.iceberg.{DataFile, FileScanTask}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.TableCatalog
 
@@ -23,6 +25,73 @@ object IcebergPartitionStatsExtractor {
       tileSummaries: Map[TileSummaryKey, TileSummary],
       partitionRowCounts: Map[PartitionKey, Long]
   )
+
+  private[iceberg] def partitionKeyInRange(partitionKey: PartitionKey, requestedRange: Option[PartitionRange])(implicit
+      partitionSpec: PartitionSpec): Boolean =
+    requestedRange.forall { range =>
+      val startMillis = Option(range.start)
+        .map(range.partitionSpec.epochMillis)
+        .getOrElse(Long.MinValue)
+      val endExclusiveMillis = Option(range.end)
+        .map(end => range.partitionSpec.epochMillis(end) + range.partitionSpec.spanMillis)
+        .getOrElse(Long.MaxValue)
+
+      partitionKey.toMap.get(partitionSpec.column).exists { value =>
+        val partitionMillis = partitionSpec.epochMillis(value)
+        partitionMillis >= startMillis && partitionMillis < endExclusiveMillis
+      }
+    }
+
+  private[iceberg] def scanFiles(table: org.apache.iceberg.Table, range: Option[PartitionRange])(implicit
+      partitionSpec: PartitionSpec): org.apache.iceberg.io.CloseableIterable[FileScanTask] = {
+    val scan = rangeFilterExpression(table.schema(), range)
+      .map(table.newScan().filter)
+      .getOrElse(table.newScan())
+      .includeColumnStats()
+
+    scan.planFiles()
+  }
+
+  private[iceberg] def rangeFilterExpression(schema: org.apache.iceberg.Schema, range: Option[PartitionRange])(implicit
+      partitionSpec: PartitionSpec): Option[Expression] =
+    for {
+      requestedRange <- range
+      field <- Option(schema.findField(partitionSpec.column))
+      expression <- buildRangeExpression(requestedRange, field.`type`())
+    } yield expression
+
+  private def buildRangeExpression(range: PartitionRange, fieldType: Type)(implicit
+      partitionSpec: PartitionSpec): Option[Expression] = {
+    // Normalize through millis so mixed PartitionSpec formats still produce one half-open typed Iceberg predicate.
+    val lower = Option(range.start).flatMap { start =>
+      literalForMillis(range.partitionSpec.epochMillis(start), fieldType)
+    }
+    val upper = Option(range.end).flatMap { end =>
+      val endExclusiveMillis = range.partitionSpec.epochMillis(end) + range.partitionSpec.spanMillis
+      literalForMillis(endExclusiveMillis, fieldType)
+    }
+
+    val predicates = Seq(
+      lower.map(value => Expressions.greaterThanOrEqual[AnyRef](partitionSpec.column, value)),
+      upper.map(value => Expressions.lessThan[AnyRef](partitionSpec.column, value))
+    ).flatten
+
+    predicates.reduceOption(Expressions.and)
+  }
+
+  private def literalForMillis(millis: Long, fieldType: Type)(implicit partitionSpec: PartitionSpec): Option[AnyRef] =
+    fieldType.typeId() match {
+      case Type.TypeID.STRING =>
+        Some(partitionSpec.at(millis))
+      case Type.TypeID.DATE =>
+        // Iceberg DateLiteral uses days since epoch, matching DATE file-stat bounds.
+        Some(Integer.valueOf(Math.toIntExact(Math.floorDiv(millis, 24L * 60 * 60 * 1000))))
+      case Type.TypeID.TIMESTAMP =>
+        // Iceberg TimestampLiteral uses micros since epoch, matching TIMESTAMP file-stat bounds.
+        Some(java.lang.Long.valueOf(Math.multiplyExact(millis, 1000L)))
+      case _ =>
+        None
+    }
 
   def extractPartitionMillisFromSlice(slice: String, partitionSpec: PartitionSpec): Long = {
     // Parse hive-style partition string (e.g., "day=2024-01-15/hour=00") to extract partition value
@@ -211,81 +280,79 @@ class IcebergPartitionStatsExtractor(spark: SparkSession) {
     }
   }
 
-  def extractPartitionedStats(fullTableName: String, confName: String)(implicit
+  def extractPartitionedStats(fullTableName: String, confName: String, range: Option[PartitionRange] = None)(implicit
       partitionSpec: PartitionSpec): Option[Map[TileSummaryKey, TileSummary]] = {
-    extractPartitionStatsWithRowCounts(fullTableName, confName).map(_.tileSummaries)
+    extractPartitionStatsWithRowCounts(fullTableName, confName, range).map(_.tileSummaries)
   }
 
-  def extractPartitionStatsWithRowCounts(fullTableName: String, confName: String)(implicit
-      partitionSpec: PartitionSpec): Option[IcebergPartitionStatsResult] = {
+  def extractPartitionStatsWithRowCounts(fullTableName: String, confName: String, range: Option[PartitionRange] = None)(
+      implicit partitionSpec: PartitionSpec): Option[IcebergPartitionStatsResult] = {
     loadIcebergTable(fullTableName).flatMap { table =>
       val tableSpec = Option(table.spec())
 
       if (tableSpec.isEmpty) {
         None
       } else if (!tableSpec.get.isPartitioned) {
-        IcebergClusteredStatsExtractor.extractWithRowCounts(fullTableName, table, confName)
+        IcebergClusteredStatsExtractor.extractWithRowCounts(fullTableName, table, confName, range)
       } else {
-        val partitionAccumulators = buildPartitionAccumulators(table, confName)
+        val partitionAccumulators = buildPartitionAccumulators(table, confName, range)
         Some(resultFromAccumulators(partitionAccumulators))
       }
     }
   }
 
-  private def buildPartitionAccumulators(table: org.apache.iceberg.Table, confName: String)(implicit
+  private def buildPartitionAccumulators(table: org.apache.iceberg.Table,
+                                         confName: String,
+                                         range: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): mutable.Map[PartitionKey, PartitionAccumulator] = {
     val partitionAccumulators = mutable.Map[PartitionKey, PartitionAccumulator]()
     val currentSnapshot = Option(table.currentSnapshot())
 
-    currentSnapshot.foreach { snapshot =>
-      val manifestFiles = snapshot.allManifests(table.io()).asScala
-      manifestFiles.foreach { manifestFile =>
-        val manifestReader = ManifestFiles.read(manifestFile, table.io())
+    currentSnapshot.foreach { _ =>
+      val tasks = IcebergPartitionStatsExtractor.scanFiles(table, range)
+      try {
+        val iterator = tasks.iterator().asScala
+        while (iterator.hasNext) {
+          val file: DataFile = iterator.next().file()
+          val rowCount: Long = file.recordCount()
+          val schema = Option(table.schema())
+            .getOrElse(throw new IllegalStateException("Table schema is null"))
+          val specs = Option(table.specs())
+            .getOrElse(throw new IllegalStateException("Table specs is null"))
+          val icebergPartitionSpec: org.apache.iceberg.PartitionSpec = Option(specs.get(file.specId()))
+            .getOrElse(throw new IllegalStateException(s"Partition spec not found for specId: ${file.specId()}"))
+          val partitionFieldIds = Option(icebergPartitionSpec.fields())
+            .map(_.asScala.map(_.sourceId()).toSet)
+            .getOrElse(Set.empty[Int])
 
-        try {
-          manifestReader.forEach((file: DataFile) => {
+          // Extract partition key using Iceberg's partitionToPath which properly formats all types
+          val partition = Option(file.partition())
+            .getOrElse(throw new IllegalStateException("File partition data is null"))
+          val partitionPath = icebergPartitionSpec.partitionToPath(partition)
 
-            val rowCount: Long = file.recordCount()
-            val schema = Option(table.schema())
-              .getOrElse(throw new IllegalStateException("Table schema is null"))
-            val specs = Option(table.specs())
-              .getOrElse(throw new IllegalStateException("Table specs is null"))
-            val icebergPartitionSpec: org.apache.iceberg.PartitionSpec = Option(specs.get(file.specId()))
-              .getOrElse(throw new IllegalStateException(s"Partition spec not found for specId: ${file.specId()}"))
-            val partitionFieldIds = Option(icebergPartitionSpec.fields())
-              .map(_.asScala.map(_.sourceId()).toSet)
-              .getOrElse(Set.empty[Int])
-
-            // Extract partition key using Iceberg's partitionToPath which properly formats all types
-            val partition = Option(file.partition())
-              .getOrElse(throw new IllegalStateException("File partition data is null"))
-            val partitionPath = icebergPartitionSpec.partitionToPath(partition)
-
-            val partitionColToValue: PartitionKey = partitionPath
-              .split("/")
-              .map { pair =>
-                val parts = pair.split("=", 2)
-                if (parts.length == 2) {
-                  parts(0) -> parts(1)
-                } else {
-                  throw new IllegalStateException(s"Invalid partition format: $pair in path $partitionPath")
-                }
+          val partitionColToValue: PartitionKey = partitionPath
+            .split("/")
+            .map { pair =>
+              val parts = pair.split("=", 2)
+              if (parts.length == 2) {
+                parts(0) -> parts(1)
+              } else {
+                throw new IllegalStateException(s"Invalid partition format: $pair in path $partitionPath")
               }
-              .toList
+            }
+            .toList
 
-            // Extract column statistics for this file
+          if (IcebergPartitionStatsExtractor.partitionKeyInRange(partitionColToValue, range)) {
             val columnStats = extractColumnStats(file, schema, partitionFieldIds)
-
-            // Get or create partition accumulator and add file stats
             val accumulator = partitionAccumulators.getOrElseUpdate(
               partitionColToValue,
               new PartitionAccumulator(partitionColToValue, confName, schema)
             )
             accumulator.addFileStats(rowCount, columnStats)
-          })
-        } finally {
-          manifestReader.close()
+          }
         }
+      } finally {
+        tasks.close()
       }
     }
 

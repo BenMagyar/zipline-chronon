@@ -1,6 +1,6 @@
 package ai.chronon.spark.batch.iceberg
 
-import ai.chronon.api.PartitionSpec
+import ai.chronon.api.{PartitionRange, PartitionSpec}
 import ai.chronon.observability.TileSummary
 import org.apache.iceberg.types.Types
 import org.apache.spark.sql.SparkSession
@@ -25,14 +25,26 @@ class IcebergPartitionStatsExtractorTest
 
   // Helper function to get fieldId from column name
   def getFieldId(tableName: String, columnName: String): Option[String] = {
-    val table = spark.sessionState.catalogManager
+    val table = loadTable(tableName)
+    val schema = table.schema()
+    Option(schema.findField(columnName)).map(_.fieldId().toString)
+  }
+
+  private def loadTable(tableName: String): org.apache.iceberg.Table =
+    spark.sessionState.catalogManager
       .catalog("spark_catalog")
       .asInstanceOf[org.apache.spark.sql.connector.catalog.TableCatalog]
       .loadTable(org.apache.spark.sql.connector.catalog.Identifier.of(Array("default"), tableName))
       .asInstanceOf[org.apache.iceberg.spark.source.SparkTable]
       .table()
-    val schema = table.schema()
-    Option(schema.findField(columnName)).map(_.fieldId().toString)
+
+  private def plannedFileCount(table: org.apache.iceberg.Table, range: Option[PartitionRange]): Int = {
+    val tasks = IcebergPartitionStatsExtractor.scanFiles(table, range)
+    try {
+      tasks.iterator().asScala.size
+    } finally {
+      tasks.close()
+    }
   }
 
   override def beforeAll(): Unit = {
@@ -155,6 +167,17 @@ class IcebergPartitionStatsExtractorTest
       }
 
       tileSummaries.keys.map(_.getColumn) should not contain dsFieldId.toString
+
+      val rangedTileSummaries = extractor
+        .extractPartitionedStats("spark_catalog.default.test_unpartitioned_ds_stats",
+                                 "test_conf",
+                                 Some(PartitionRange("2024-01-16", "2024-01-16")))
+        .get
+
+      rangedTileSummaries.keys.map(_.getSlice).toSet should be(Set("ds=2024-01-16"))
+
+      val rangedFileCount = plannedFileCount(table, Some(PartitionRange("2024-01-16", "2024-01-16")))
+      rangedFileCount should be < plannedFileCount(table, None)
     } finally {
       spark.sql("DROP TABLE IF EXISTS test_unpartitioned_ds_stats")
     }
@@ -223,6 +246,50 @@ class IcebergPartitionStatsExtractorTest
     }
   }
 
+  it should "limit unpartitioned timestamp stats to the requested output range" in {
+    try {
+      spark.sql("""
+        CREATE TABLE test_unpartitioned_timestamp_stats (
+          id BIGINT,
+          name STRING,
+          ds TIMESTAMP,
+          value DOUBLE
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full',
+          'write.metadata.metrics.column.ds' = 'full'
+        )
+        """)
+
+      spark.sql("""
+        INSERT INTO test_unpartitioned_timestamp_stats VALUES
+        (1, 'Alice', TIMESTAMP '2024-01-15 10:00:00', 100.0),
+        (2, 'Bob', TIMESTAMP '2024-01-15 14:00:00', 200.0)
+        """)
+      spark.sql("""
+        INSERT INTO test_unpartitioned_timestamp_stats VALUES
+        (3, 'Charlie', TIMESTAMP '2024-01-16 10:00:00', 150.0)
+        """)
+
+      spark.sql("REFRESH TABLE test_unpartitioned_timestamp_stats")
+
+      val extractor = new IcebergPartitionStatsExtractor(spark)
+      val range = Some(PartitionRange("2024-01-16", "2024-01-16"))
+      val maybeTileSummaries =
+        extractor.extractPartitionedStats("spark_catalog.default.test_unpartitioned_timestamp_stats", "test_conf", range)
+
+      maybeTileSummaries should be(defined)
+      val tileSummaries = maybeTileSummaries.get
+      tileSummaries should not be empty
+      tileSummaries.keys.map(_.getSlice).toSet should be(Set("ds=2024-01-16"))
+
+      val table = loadTable("test_unpartitioned_timestamp_stats")
+      plannedFileCount(table, range) should be < plannedFileCount(table, None)
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS test_unpartitioned_timestamp_stats")
+    }
+  }
+
   it should "return empty map for empty partitioned table" in {
     spark.sql("""
       CREATE TABLE test_partitioned_table (
@@ -238,6 +305,44 @@ class IcebergPartitionStatsExtractorTest
     val tileSummaries = extractor.extractPartitionedStats("spark_catalog.default.test_partitioned_table", "test_conf")
 
     tileSummaries should be(Some(Map.empty))
+  }
+
+  it should "limit partition stats to the requested output range" in {
+    spark.sql("""
+      CREATE TABLE test_partitioned_table (
+        id BIGINT,
+        name STRING,
+        ds STRING,
+        value DOUBLE
+      ) USING iceberg
+      PARTITIONED BY (ds)
+      """)
+
+    spark.sql("""
+      INSERT INTO test_partitioned_table VALUES
+      (1, 'Alice', '2024-01-15', 100.0),
+      (2, NULL, '2024-01-15', 200.0),
+      (3, 'Charlie', '2024-01-16', NULL)
+      """)
+
+    spark.sql("REFRESH TABLE test_partitioned_table")
+
+    val extractor = new IcebergPartitionStatsExtractor(spark)
+    val maybeTileSummaries = extractor.extractPartitionedStats(
+      "spark_catalog.default.test_partitioned_table",
+      "test_conf",
+      Some(PartitionRange("2024-01-16", "2024-01-16"))
+    )
+
+    maybeTileSummaries should be(defined)
+    val tileSummaries = maybeTileSummaries.get
+
+    tileSummaries should not be empty
+    tileSummaries.keys.map(_.getSlice).toSet should be(Set("ds=2024-01-16"))
+
+    val table = loadTable("test_partitioned_table")
+    val rangedFileCount = plannedFileCount(table, Some(PartitionRange("2024-01-16", "2024-01-16")))
+    rangedFileCount should be < plannedFileCount(table, None)
   }
 
   it should "extract partition stats from table with data" in {

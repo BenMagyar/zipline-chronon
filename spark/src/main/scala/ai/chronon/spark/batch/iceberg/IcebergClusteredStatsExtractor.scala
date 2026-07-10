@@ -1,6 +1,6 @@
 package ai.chronon.spark.batch.iceberg
 
-import ai.chronon.api.PartitionSpec
+import ai.chronon.api.{PartitionRange, PartitionSpec}
 import ai.chronon.observability.{TileSummary, TileSummaryKey}
 import ai.chronon.spark.batch.iceberg.IcebergPartitionStatsExtractor.IcebergPartitionStatsResult
 import org.apache.iceberg.DataFile
@@ -17,12 +17,18 @@ object IcebergClusteredStatsExtractor {
 
   @transient private lazy val logger = LoggerFactory.getLogger(getClass)
 
-  def extract(fullTableName: String, table: org.apache.iceberg.Table, confName: String)(implicit
+  def extract(fullTableName: String,
+              table: org.apache.iceberg.Table,
+              confName: String,
+              range: Option[PartitionRange] = None)(implicit
       partitionSpec: PartitionSpec): Option[Map[TileSummaryKey, TileSummary]] = {
-    extractWithRowCounts(fullTableName, table, confName).map(_.tileSummaries)
+    extractWithRowCounts(fullTableName, table, confName, range).map(_.tileSummaries)
   }
 
-  def extractWithRowCounts(fullTableName: String, table: org.apache.iceberg.Table, confName: String)(implicit
+  def extractWithRowCounts(fullTableName: String,
+                           table: org.apache.iceberg.Table,
+                           confName: String,
+                           range: Option[PartitionRange] = None)(implicit
       partitionSpec: PartitionSpec): Option[IcebergPartitionStatsResult] = {
     Option(table.schema()) match {
       case None =>
@@ -41,7 +47,8 @@ object IcebergClusteredStatsExtractor {
                                      confName,
                                      schema,
                                      partitionField.fieldId(),
-                                     partitionField.`type`())
+                                     partitionField.`type`(),
+                                     range)
         }
     }
   }
@@ -51,12 +58,13 @@ object IcebergClusteredStatsExtractor {
                                        confName: String,
                                        schema: org.apache.iceberg.Schema,
                                        partitionFieldId: Int,
-                                       partitionFieldType: Type)(implicit
+                                       partitionFieldType: Type,
+                                       range: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): Option[IcebergPartitionStatsResult] = {
     Option(table.currentSnapshot()) match {
       case None => Some(IcebergPartitionStatsResult(Map.empty, Map.empty))
       case Some(_) =>
-        val tasks = table.newScan().includeColumnStats().planFiles()
+        val tasks = IcebergPartitionStatsExtractor.scanFiles(table, range)
         val partitionAccumulators = mutable.Map[PartitionKey, PartitionAccumulator]()
         var complete = true
 
@@ -65,15 +73,19 @@ object IcebergClusteredStatsExtractor {
           while (iterator.hasNext && complete) {
             val file = iterator.next().file()
             val partitionKey = syntheticPartitionKey(file, partitionFieldId, partitionFieldType)
-            val columnStats = extractStrictColumnStats(file, schema, Set(partitionFieldId))
 
-            (partitionKey, columnStats) match {
-              case (Some(key), Some(stats)) =>
-                val accumulator = partitionAccumulators.getOrElseUpdate(
-                  key,
-                  new PartitionAccumulator(key, confName, schema)
-                )
-                accumulator.addFileStats(file.recordCount(), stats)
+            partitionKey match {
+              case Some(key) =>
+                extractStrictColumnStats(file, schema, Set(partitionFieldId)) match {
+                  case Some(stats) =>
+                    val accumulator = partitionAccumulators.getOrElseUpdate(
+                      key,
+                      new PartitionAccumulator(key, confName, schema)
+                    )
+                    accumulator.addFileStats(file.recordCount(), stats)
+                  case None =>
+                    complete = false
+                }
               case _ =>
                 complete = false
             }

@@ -329,17 +329,15 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
   private[batch] def extractAndPersistPartitionStats(metricsKvStore: KVStore,
                                                      outputTable: String,
                                                      confName: String,
-                                                     range: PartitionRange)(implicit
+                                                     outputRange: PartitionRange)(implicit
       partitionSpec: PartitionSpec): Unit = {
     try {
       logger.info(s"Extracting partition statistics for table: $outputTable")
       val statsExtractor = new IcebergPartitionStatsExtractor(tableUtils.sparkSession)
 
-      statsExtractor.extractPartitionStatsWithRowCounts(outputTable, confName) match {
+      statsExtractor.extractPartitionStatsWithRowCounts(outputTable, confName, Some(outputRange)) match {
         case Some(result) =>
-          // Reached after this runner has written the requested output partition(s); row-count
-          // logging is best-effort observability before KV-backed stats persistence below.
-          logIcebergPartitionRowCounts(outputTable, confName, range, result.partitionRowCounts)
+          logIcebergPartitionRowCounts(outputTable, confName, outputRange, result.partitionRowCounts)
 
           val tileSummaries = result.tileSummaries
           if (tileSummaries.nonEmpty) {
@@ -564,6 +562,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     // Validate by time, not by formatted partition strings.
     val watermark = tableUtils.dataWatermarkMillis(outputTable, Some(outputTablePartitionSpec))
     val requiredEndMillis = range.maxMillis
+    val statsExtractionRange = rangeCoveringOutputPartitions(range, outputTablePartitionSpec)
 
     logger.info(
       s"Output table data watermark for '${metadata.name}': ${watermark.map(TsUtils.toStr).getOrElse("none")}")
@@ -591,7 +590,8 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
         val metricsKvStore = api.genMetricsKvStore(tableStats)
         Option(metadata.outputTable) match {
           case Some(outputTable) =>
-            extractAndPersistPartitionStats(metricsKvStore, outputTable, metadata.name, range)(outputTablePartitionSpec)
+            extractAndPersistPartitionStats(metricsKvStore, outputTable, metadata.name, statsExtractionRange)(
+              outputTablePartitionSpec)
           case None =>
             logger.warn(s"Skipping partition stats extraction for '${metadata.name}' - outputTable is null")
         }
@@ -599,6 +599,19 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     } else {
       logger.info(s"Skipping data quality metrics persistence for EXTERNAL_SOURCE_SENSOR node '${metadata.name}'")
     }
+  }
+
+  private def rangeCoveringOutputPartitions(range: PartitionRange,
+                                            outputTablePartitionSpec: PartitionSpec): PartitionRange = {
+    val start = Option(range.start)
+      .map(partition => outputTablePartitionSpec.at(range.partitionSpec.epochMillis(partition)))
+      .orNull
+    val end = Option(range.end).map { partition =>
+      val endExclusiveMillis = range.partitionSpec.epochMillis(partition) + range.partitionSpec.spanMillis
+      outputTablePartitionSpec.at(endExclusiveMillis - 1)
+    }.orNull
+
+    PartitionRange(start, end)(outputTablePartitionSpec)
   }
 
   case class TablePartitionStatus(name: String,
