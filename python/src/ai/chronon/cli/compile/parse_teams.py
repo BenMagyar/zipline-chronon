@@ -326,9 +326,9 @@ def _resolve_namespace_placeholders_on(node: Any):
     to `node` itself, not nested configs.
 
     Covers: Source table names (Events/Entities on `node.sources` or `node.left`),
-    Join bootstrapParts tables, StagingQuery SQL bodies + setups + tableDependencies,
-    and `metaData.customJson` (for StagingQuery Airflow dep specs built at Python
-    authoring time before namespace propagation)."""
+    GroupBy keyFilter tables, Join bootstrapParts tables, StagingQuery SQL bodies
+    + setups + tableDependencies, and `metaData.customJson` (for StagingQuery
+    Airflow dep specs built at Python authoring time before namespace propagation)."""
     if node is None or node.metaData is None:
         return
     namespace = node.metaData.outputNamespace
@@ -345,6 +345,9 @@ def _resolve_namespace_placeholders_on(node: Any):
     if isinstance(node, (GroupBy, ModelTransforms)):
         for src in node.sources or []:
             _substitute_source_tables(src, namespace)
+        if isinstance(node, GroupBy) and node.keyFilter:
+            node.keyFilter.snapshotTable = _substitute(node.keyFilter.snapshotTable, namespace)
+            node.keyFilter.mutationTable = _substitute(node.keyFilter.mutationTable, namespace)
 
     if isinstance(node, StagingQuery):
         node.query = _substitute(node.query, namespace)

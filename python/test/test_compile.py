@@ -648,6 +648,63 @@ def test_compile_never_leaves_namespace_placeholder_in_thriftjson(tmp_path, monk
     _assert_no_namespace_placeholder_in_compiled(tmp_path / "compiled")
 
 
+def test_compile_substitutes_namespace_placeholder_in_key_filter(tmp_path, monkeypatch):
+    _scaffold_repo(tmp_path)
+    _write(
+        tmp_path / "staging_queries" / "sample_team" / "active.py",
+        dedent(
+            """
+            from ai.chronon.types import StagingQuery
+
+            subjects = StagingQuery(
+                query="SELECT 1 as subject",
+                version=1,
+            )
+            """
+        ).strip(),
+    )
+    _write(
+        tmp_path / "group_bys" / "sample_team" / "gb_with_key_filter.py",
+        dedent(
+            """
+            from ai.chronon.types import (
+                Aggregation,
+                EntitySource,
+                EventSource,
+                GroupBy,
+                Operation,
+                Query,
+                selects,
+            )
+            from staging_queries.sample_team.active import subjects
+
+            active_subjects = EntitySource(
+                snapshot_table=subjects.table,
+                query=Query(selects=selects("subject")),
+            )
+
+            v1 = GroupBy(
+                sources=[
+                    EventSource(
+                        table="external.events",
+                        query=Query(
+                            selects=selects(event="event_expr", subject="subject"),
+                            time_column="ts",
+                        ),
+                    )
+                ],
+                keys=["subject"],
+                aggregations=[Aggregation(input_column="event", operation=Operation.SUM, windows=["1d"])],
+                key_filter=active_subjects,
+            )
+            """
+        ).strip(),
+    )
+
+    _run_compile(tmp_path, monkeypatch)
+    _assert_no_namespace_placeholder_in_compiled(tmp_path / "compiled")
+
+
 def test_compile_rejects_lost_table_reference_grid_metadata(tmp_path, monkeypatch, capsys):
     _scaffold_repo(tmp_path)
     _write(
