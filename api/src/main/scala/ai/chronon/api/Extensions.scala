@@ -183,7 +183,14 @@ object Extensions {
       } yield token
 
     def mixGridToken(baseHash: String): String =
-      outputGridToken.map(token => HashUtils.md5Base64(s"$baseHash|$token")).getOrElse(baseHash)
+      outputGridToken
+        .map(token =>
+          HashUtils.md5Base64(s"$baseHash|$token").flatMap {
+            case '/' => "_s"
+            case '+' => "_p"
+            case c   => c.toString
+          })
+        .getOrElse(baseHash)
 
     def partitionSpec(defaultSpec: PartitionSpec): PartitionSpec =
       (for {

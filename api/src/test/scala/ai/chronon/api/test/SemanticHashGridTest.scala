@@ -75,6 +75,22 @@ class SemanticHashGridTest extends AnyFlatSpec with Matchers {
     onTheHour.semanticHash should be(delayed.semanticHash)
   }
 
+  "MetaData.mixGridToken" should "produce a path-safe hash suffix" in {
+    val metaData = buildGroupBy(Some(grid(new Window(3, TimeUnit.HOURS)))).metaData
+    val hash = metaData.mixGridToken("base-0")
+
+    hash should be("BoVWy24AI_s")
+    hash should fullyMatch regex "[A-Za-z0-9_]+"
+  }
+
+  it should "escape plus signs for table-name safety" in {
+    val metaData = buildGroupBy(Some(grid(new Window(3, TimeUnit.HOURS)))).metaData
+    val hash = metaData.mixGridToken("base-4")
+
+    hash should be("yPtKFv_pJAD")
+    hash should fullyMatch regex "[A-Za-z0-9_]+"
+  }
+
   "Join.semanticHash" should "mix the join output grid into the left hash" in {
     val daily = buildJoin(None)
     val dailyExplicit = buildJoin(Some(grid(new Window(1, TimeUnit.DAYS))))
