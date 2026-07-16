@@ -1,9 +1,11 @@
 package ai.chronon.flink.chaining
 
-import ai.chronon.api.{Builders, DoubleType, IntType, LongType, StringType}
+import ai.chronon.api.{Accuracy, Builders, DoubleType, GroupByServingInfo, IntType, LongType, Operation, StringType, StructField, StructType}
 import ai.chronon.flink.deser.ProjectedEvent
-import ai.chronon.online.{Api, JoinCodec}
-import ai.chronon.online.fetcher.Fetcher
+import ai.chronon.online.metrics.TTLCache
+import ai.chronon.online.serde.AvroConversions
+import ai.chronon.online.{Api, GroupByServingInfoParsed, JoinCodec}
+import ai.chronon.online.fetcher.{FetchContext, Fetcher, MetadataStore}
 import org.apache.flink.api.common.functions.RuntimeContext
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.metrics.{Counter, Histogram, MetricGroup}
@@ -16,6 +18,7 @@ import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 
 import scala.collection.mutable.ListBuffer
+import scala.util.{Success, Try}
 
 class JoinSourceQueryFunctionTest extends AnyFlatSpec with Matchers with MockitoSugar {
 
@@ -226,5 +229,96 @@ class JoinSourceQueryFunctionTest extends AnyFlatSpec with Matchers with Mockito
     function.open(new Configuration())
     
     verify(mockJoinCodec, org.mockito.Mockito.atLeast(1)).valueSchema // Should have accessed the join schema
+  }
+
+  it should "build a chained join codec from an already projected nested left key" in {
+    val productGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.product_hydrate.latest_value", online = true, version = 4),
+      sources = Seq(
+        Builders.Source.events(
+          query = Builders.Query(
+            selects = Map(
+              "product_id" -> "CAST(data.id AS BIGINT)",
+              "seller_id" -> "data.user_id"
+            ),
+            wheres = Seq("data.active_status = 'active'"),
+            timeColumn = "event_timestamp",
+            startPartition = "2026-06-09"
+          ),
+          table = "unit_test.product_hydrate",
+          topic = "product_hydrate.v3"
+        )),
+      keyColumns = Seq("product_id"),
+      aggregations = Seq(Builders.Aggregation(Operation.LAST, "seller_id")),
+      accuracy = Accuracy.TEMPORAL
+    )
+    val productJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.product_views.hydrated", online = true, version = 8),
+      left = Builders.Source.events(
+        query = Builders.Query(
+          selects = Map(
+            "user_id" -> "data.baseEvent.userId",
+            "product_id" -> "CAST(data.productId AS BIGINT)"
+          ),
+          timeColumn = "event_timestamp",
+          startPartition = "2026-06-09"
+        ),
+        table = "unit_test.product_views",
+        topic = "product_views_by_product_id.v2"
+      ),
+      joinParts = Seq(Builders.JoinPart(groupBy = productGroupBy))
+    )
+    val joinSource = Builders.Source.joinSource(
+      join = productJoin,
+      query = Builders.Query(
+        selects = Map(
+          "user_id" -> "user_id",
+          "product_id" -> "product_id"
+        ),
+        timeColumn = "ts"
+      )
+    ).getJoinSource
+
+    val groupByServingInfo = new GroupByServingInfo()
+    groupByServingInfo.setGroupBy(productGroupBy)
+    groupByServingInfo.setKeyAvroSchema(
+      AvroConversions.fromChrononSchema(StructType("Key", Array(StructField("product_id", LongType)))).toString)
+    groupByServingInfo.setInputAvroSchema(
+      AvroConversions
+        .fromChrononSchema(
+          StructType(
+            "Input",
+            Array(
+              StructField("product_id", LongType),
+              StructField("seller_id", StringType)
+            )))
+        .toString)
+    groupByServingInfo.setSelectedAvroSchema(
+      AvroConversions.fromChrononSchema(StructType("Selected", Array(StructField("seller_id", StringType)))).toString)
+    groupByServingInfo.setBatchEndTs(0L)
+    val servingInfo = new GroupByServingInfoParsed(groupByServingInfo)
+
+    val metadataStore = spy[MetadataStore](new MetadataStore(FetchContext(new TestKVStore())))
+    val servingInfoCache = mock[TTLCache[String, Try[GroupByServingInfoParsed]]]
+    when(metadataStore.getGroupByServingInfo).thenReturn(servingInfoCache)
+    when(servingInfoCache.apply(productGroupBy.metaData.name)).thenReturn(Success(servingInfo))
+
+    val mockApi = mock[Api]
+    val mockFetcher = mock[Fetcher]
+    when(mockApi.buildFetcher(debug = false)).thenReturn(mockFetcher)
+    when(mockFetcher.metadataStore).thenReturn(metadataStore)
+
+    val projectedInputSchema = Seq(
+      "user_id" -> StringType,
+      "product_id" -> LongType,
+      "ts" -> LongType
+    )
+
+    noException should be thrownBy JoinSourceQueryFunction.buildJoinSchema(
+      projectedInputSchema,
+      joinSource,
+      mockApi,
+      enableDebug = false
+    )
   }
 }

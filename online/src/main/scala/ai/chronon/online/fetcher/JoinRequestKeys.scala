@@ -19,7 +19,8 @@ import scala.util.Try
   *
   * The helper keeps that flow local to Join fetching:
   *   - `buildKeyMapping` is run while building the JoinCodec so SQL parsing, input-schema construction, and Catalyst
-  *     wrapper setup are cached with the Join metadata instead of repeated per request.
+  *     setup are attempted once and cached with the Join metadata instead of repeated per request. A Catalyst setup
+  *     failure is surfaced only if a request actually needs key derivation.
   *   - `requestKeyFields` reports the raw request keys needed to derive selected Join keys, plus the derived key aliases
   *     themselves so existing direct-key callers can still be logged against the Join key schema.
   *   - `valueInfoLeftKeys` reports only the raw request keys for selected Join keys, so fetchJoinSchema does not imply
@@ -34,7 +35,7 @@ private[online] object JoinRequestKeys {
                         requestKeyFields: Iterable[StructField],
                         rawInputsByLeftKey: Map[String, Seq[String]],
                         selectedLeftKeys: Seq[(String, String)],
-                        catalystUtil: Option[PooledCatalystUtil]) {
+                        catalystUtil: Option[Try[PooledCatalystUtil]]) {
     private val selectedExpressions = selectedLeftKeys.toMap
 
     private def shouldDeriveLeftKey(request: Request, leftKey: String): Boolean =
@@ -66,7 +67,7 @@ private[online] object JoinRequestKeys {
           Map.empty[String, Any]
         } else {
           val derivedValues = catalystUtil
-            .map(_.performSql(request.keys).headOption.getOrElse(Map.empty))
+            .map(_.get.performSql(request.keys).headOption.getOrElse(Map.empty))
             .getOrElse(Map.empty)
           keysToDerive.map { case (leftKey, _) =>
             leftKey -> derivedValues.getOrElse(leftKey, null)
@@ -175,7 +176,8 @@ private[online] object JoinRequestKeys {
     val catalystUtil =
       if (selectedLeftKeys.isEmpty) None
       else
-        Some(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join)))
+        Some(
+          Try(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join))))
 
     KeyMapping(joinPart.leftToRight, keyFields, rawInputsByLeftKey, selectedLeftKeys, catalystUtil)
   }
