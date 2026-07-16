@@ -24,8 +24,8 @@ trait ApiModule extends Cross.Module[String] with build.BaseModule {
       mvn"org.apache.commons:commons-lang3:3.18.0"
     )
 
-    override def publishVersion = Task {
-      sys.env.getOrElse("CHRONON_VERSION", "0.0.32")
+    override def publishVersion = Task.Input {
+      Task.env.getOrElse("CHRONON_VERSION", "0.0.32")
     }
 
     def pomSettings = build.Constants.pomSettingsFor("chronon-api-thrift-base")
@@ -45,8 +45,8 @@ trait ApiModule extends Cross.Module[String] with build.BaseModule {
       Seq(build.thrift.generateJavaThrift())
     }
 
-    override def publishVersion = Task {
-      sys.env.getOrElse("CHRONON_VERSION", "0.0.32")
+    override def publishVersion = Task.Input {
+      Task.env.getOrElse("CHRONON_VERSION", "0.0.32")
     }
 
     def pomSettings = build.Constants.pomSettingsFor("chronon-api-thrift-java")

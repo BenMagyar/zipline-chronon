@@ -346,8 +346,10 @@ trait BaseModule extends CrossScalaModule with ScalafmtModule with GcsPublishMod
     developers = Constants.developers
   )
 
-  // Override to read version from environment at task execution time
-  override def publishVersion = Task { sys.env.getOrElse("CHRONON_VERSION", "0.0.32") }
+  // Task.Input + Task.env so the version participates in cache invalidation: a plain Task
+  // reading sys.env is cached in out/ across commits (CI restores out/), which froze stale
+  // strings (0.0.32, 1.17.3+sha) into released jar manifests.
+  override def publishVersion = Task.Input { Task.env.getOrElse("CHRONON_VERSION", "0.0.32") }
 }
 
 // Common test module configuration

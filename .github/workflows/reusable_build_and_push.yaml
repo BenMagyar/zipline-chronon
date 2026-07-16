@@ -51,6 +51,10 @@ jobs:
           echo "Latest release tag: $TAG"
 
           echo "tag=$TAG" >> $GITHUB_OUTPUT
+          # Stamp every subsequent mill invocation (wheel AND jars): jar manifests read
+          # Implementation-Version from publishVersion, which falls back to a placeholder
+          # when CHRONON_VERSION is unset.
+          echo "CHRONON_VERSION=$TAG+${{ github.sha }}" >> $GITHUB_ENV
 
       - name: Build Python Wheel
         id: build-wheel
