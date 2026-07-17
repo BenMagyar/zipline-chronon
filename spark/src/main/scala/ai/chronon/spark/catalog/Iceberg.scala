@@ -14,6 +14,7 @@ import org.apache.spark.sql.types.StructType
 import java.nio.ByteBuffer
 import java.time.{LocalDate, ZoneOffset}
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
 
 case object Iceberg extends Format {
@@ -128,12 +129,15 @@ case object Iceberg extends Format {
     } else {
       val range = partitionRange(partitionColumn, partitionFilters)
       Some(currentDataFiles(table, filter = rangeExpression(table, partitionColumn, range)) { files =>
-        val partitions = files.flatMap { file =>
+        val distinctPartitions = mutable.LinkedHashSet.empty[String]
+        files.foreach { file =>
           val spec = Option(specs.get(file.specId())).getOrElse(table.spec())
           partitionFieldValue(spec, file, partitionColumn)
-        }.toList
+            .flatMap(Option(_))
+            .foreach(distinctPartitions += _)
+        }
 
-        filterStringRange(Format.sanitizePartitionValues(partitions).distinct, range)
+        filterStringRange(distinctPartitions.toList, range)
       }.getOrElse(List.empty))
     }
   }

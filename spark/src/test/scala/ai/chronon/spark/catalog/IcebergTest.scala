@@ -100,6 +100,8 @@ class IcebergTest extends SparkTestBase with Matchers {
         (1, '2024-02-01'),
         (2, '2024-02-02')
       """)
+      // A separate append creates another data file for the same logical partition.
+      spark.sql(s"INSERT INTO $tableName VALUES (3, '2024-02-02')")
 
       val table = Iceberg.loadIcebergTable(tableName).get
       val oneDay = PartitionRange("2024-02-02", "2024-02-02")(PartitionSpec.daily)

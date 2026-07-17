@@ -22,6 +22,7 @@ import org.apache.spark.sql.types.{
 import org.apache.spark.unsafe.types.UTF8String
 
 import java.time.{LocalDate, LocalDateTime, ZoneOffset}
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Success, Try}
 
@@ -52,22 +53,21 @@ case object DeltaLake extends Format {
         logicalName -> ColumnMapping.getPhysicalName(snapshot.getSchema(engine).get(logicalName))
       }
 
-      batches.asScala
-        .flatMap { batch =>
-          val rows = batch.getRows
-          try {
-            rows.asScala.map { file =>
-              val partitionValues = InternalScanFileUtils.getPartitionValues(file)
-              partitionColumns.map { case (logicalName, physicalName) =>
-                logicalName -> partitionValues.get(physicalName)
-              }.toMap
-            }.toList
-          } finally {
-            rows.close()
+      val distinctPartitions = mutable.LinkedHashSet.empty[Map[String, String]]
+      batches.asScala.foreach { batch =>
+        val rows = batch.getRows
+        try {
+          rows.asScala.foreach { file =>
+            val partitionValues = InternalScanFileUtils.getPartitionValues(file)
+            distinctPartitions += partitionColumns.map { case (logicalName, physicalName) =>
+              logicalName -> partitionValues.get(physicalName)
+            }.toMap
           }
+        } finally {
+          rows.close()
         }
-        .toList
-        .distinct
+      }
+      distinctPartitions.toList
     }
 
   // the spark catalog's listColumns doesn't expose partitioning for delta tables; the delta
