@@ -23,7 +23,7 @@ import ai.chronon.online.serde._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.FunctionAlreadyExistsException
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.{SparkSession, types}
+import org.apache.spark.sql.{DataFrame, SparkSession, functions, types}
 import org.slf4j.LoggerFactory
 
 import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap}
@@ -109,7 +109,11 @@ class PooledCatalystUtil(expressions: Seq[(String, String)], inputSchema: Struct
 class CatalystUtil(inputSchema: StructType,
                    selects: Seq[(String, String)],
                    wheres: Seq[String] = Seq.empty,
-                   setups: Seq[String] = Seq.empty) {
+                   setups: Seq[String] = Seq.empty,
+                   timestampMillisOutputColumns: Set[String] = Set.empty) {
+
+  def this(inputSchema: StructType, selects: Seq[(String, String)], wheres: Seq[String], setups: Seq[String]) =
+    this(inputSchema, selects, wheres, setups, Set.empty)
 
   @transient private lazy val logger = LoggerFactory.getLogger(this.getClass)
 
@@ -154,6 +158,14 @@ class CatalystUtil(inputSchema: StructType,
 
   def getOutputSparkSchema: types.StructType = outputSparkSchema
 
+  private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame =
+    df.schema.fields
+      .filter(field => timestampMillisOutputColumns.contains(field.name) && field.dataType == types.TimestampType)
+      .foldLeft(df) { case (currentDf, field) =>
+        val quotedColumn = s"`${field.name.replace("`", "``")}`"
+        currentDf.withColumn(field.name, functions.expr(s"unix_millis($quotedColumn)"))
+      }
+
   private def initialize(): (InternalRow => Seq[InternalRow], types.StructType) = {
     val session = CatalystUtil.session
 
@@ -176,11 +188,12 @@ class CatalystUtil(inputSchema: StructType,
     val inputSparkSchema = SparkConversions.fromChrononSchema(inputSchema)
     val emptyDf = session.createDataFrame(emptyRowRdd, inputSparkSchema)
     emptyDf.createOrReplaceTempView(sessionTable)
-    val df = session.sqlContext.table(sessionTable).selectExpr(selectClauses.toSeq: _*)
-    val filteredDf = whereClauseOpt.map(df.where(_)).getOrElse(df)
+    val projectedDf = session.sqlContext.table(sessionTable).selectExpr(selectClauses.toSeq: _*)
+    val normalizedDf = normalizeTimestampOutputs(projectedDf)
+    val df = whereClauseOpt.map(normalizedDf.where(_)).getOrElse(normalizedDf)
 
     // extract transform function from the df spark plan
-    val execPlan = filteredDf.queryExecution.executedPlan
+    val execPlan = df.queryExecution.executedPlan
     logger.info(s"Catalyst Execution Plan - ${execPlan}")
 
     // Use the new recursive approach to build a transformation chain

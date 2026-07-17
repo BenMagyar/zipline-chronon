@@ -378,6 +378,14 @@ class CatalystUtilTest extends AnyFlatSpec with CatalystUtilTestSparkSQLStructs 
     assertEquals(res.get("a"), Int.MaxValue)
   }
 
+  it should "resolve filters when an output alias differs from its source only by case" in {
+    val selects = Seq("INT32_X" -> "int32_x")
+    val wheres = Seq(s"int32_x = ${Int.MaxValue}")
+    val cu = new CatalystUtil(CommonScalarsStruct, selects, wheres)
+
+    assertEquals(cu.performSql(CommonScalarsRow).head("INT32_X"), Int.MaxValue)
+  }
+
   it should "select star with common scalars null should return nulls" in {
     val selects = Seq(
       "bool_x" -> "bool_x",

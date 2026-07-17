@@ -1,6 +1,6 @@
 package ai.chronon.flink
 
-import ai.chronon.api.{Constants, DataModel, GroupBy, Query, StructType => ChrononStructType}
+import ai.chronon.api.{ColumnExpression, Constants, DataModel, GroupBy, Query, StructType => ChrononStructType}
 import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, SourceOps}
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.online.CatalystUtil
@@ -37,8 +37,6 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
 
   import SparkExpressionEval._
 
-  private val (transforms, filters) = buildQueryTransformsAndFilters(query, dataModel)
-
   // Chronon's CatalystUtil expects a Chronon `StructType` so we convert the
   // Encoder[T]'s schema to one.
   val chrononSchema: ChrononStructType =
@@ -46,6 +44,11 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
       groupByName,
       SparkConversions.toChrononSchema(encoder.schema)
     )
+  private val (transforms, filters) = buildQueryTransformsAndFilters(query, dataModel)
+  private val timestampMillisOutputColumns = dataModel match {
+    case DataModel.EVENTS   => Set(Constants.TimeColumn)
+    case DataModel.ENTITIES => Set(Constants.TimeColumn, Constants.MutationTimeColumn)
+  }
 
   @transient private var catalystUtil: CatalystUtil = _
 
@@ -75,7 +78,13 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
 
     // Initialize CatalystUtil without acquiring session reference
     val setups = Option(query.setups).map(_.asScala.toSeq).getOrElse(Seq.empty)
-    catalystUtil = new CatalystUtil(chrononSchema, transforms, filters, setups)
+    catalystUtil = new CatalystUtil(
+      chrononSchema,
+      transforms,
+      filters,
+      setups,
+      timestampMillisOutputColumns
+    )
   }
 
   def performSql(row: InternalRow): Seq[Map[String, Any]] = {
@@ -110,7 +119,13 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
 
   def getOutputSchema: StructType = {
     val setups = Option(query.setups).map(_.asScala.toSeq).getOrElse(Seq.empty)
-    new CatalystUtil(chrononSchema, transforms, filters, setups).getOutputSparkSchema
+    new CatalystUtil(
+      chrononSchema,
+      transforms,
+      filters,
+      setups,
+      timestampMillisOutputColumns
+    ).getOutputSparkSchema
   }
 
   def close(): Unit = {
@@ -122,15 +137,20 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
 
   // Utility method to help with result validation. This method is used to match results of the core catalyst util based
   // eval against Spark DF based eval. To do the Spark Df based eval, we:
-  // 1. Create a df with the events + record_id tacked on
+  // 1. Create a df with the events + a validation record id tacked on.
   // 2. Apply the projections and filters based on how we've set up the CatalystUtil instance based on the input groupBy.
-  // 3. Collect the results and group them by record_id
+  // 3. Collect the results and group them by validation record id.
   def runSparkSQLBulk(idToRecords: Seq[(String, Row)]): Map[String, Seq[Map[String, Any]]] = {
 
-    val idField = StructField("__record_id", StringType, false)
+    val outputColumnNames = transforms.map(_._1)
+    val occupiedColumnNames = encoder.schema.fieldNames.toSeq ++ outputColumnNames
+    val recordIdColumn = Iterator
+      .iterate("__chronon_validation_record_id")(_ + "_")
+      .find(candidate => occupiedColumnNames.forall(existing => !candidate.equalsIgnoreCase(existing)))
+      .get
+    val idField = StructField(recordIdColumn, StringType, false)
     val fullSchema = StructType(idField +: encoder.schema.fields)
     val fullRows = idToRecords.map { case (id, row) =>
-      // Create a new Row with id as the first field, followed by all fields from the original row
       Row.fromSeq(id +: row.toSeq)
     }
 
@@ -139,33 +159,25 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
     val eventDfs = CatalystUtil.session
       .createDataFrame(rowsRdd, fullSchema)
 
-    // Apply filtering if needed
+    val selectedDf = eventDfs.selectExpr(
+      Array(recordIdColumn) ++ catalystUtil.selectClauses: _*
+    )
+    val normalizedDf = catalystUtil.normalizeTimestampOutputs(selectedDf)
     val filteredDf = catalystUtil.whereClauseOpt match {
-      case Some(whereClause) => eventDfs.where(whereClause)
-      case None              => eventDfs
+      case Some(whereClause) => normalizedDf.where(whereClause)
+      case None              => normalizedDf
     }
 
-    // Apply projections while preserving the index
-    val projectedDf = filteredDf.selectExpr(
-      // Include the index column and all the select clauses
-      Array("__record_id") ++ catalystUtil.selectClauses: _*
-    )
-
-    // Collect the results
-    val results = projectedDf.collect()
-
-    // Group results by record ID
+    val results = filteredDf.collect()
     val resultsByRecordId = results.groupBy(row => row.getString(0))
 
-    // Map back to the original record order
-    idToRecords.map { record =>
-      val recordId = record._1
+    idToRecords.map { case (recordId, _) =>
       val resultRows = resultsByRecordId.getOrElse(recordId, Array.empty)
 
       val maps = resultRows.map { row =>
-        val columnNames = projectedDf.columns.tail // Skip the record ID column
+        val columnNames = filteredDf.columns.tail
         columnNames.zipWithIndex.map { case (colName, i) =>
-          (colName, row.get(i + 1)) // +1 to skip the record ID column
+          (colName, row.get(i + 1))
         }.toMap
       }.toSeq
 
@@ -197,25 +209,32 @@ object SparkExpressionEval {
 
   def buildQueryTransformsAndFilters(query: Query,
                                      dataModel: DataModel = DataModel.EVENTS): (Seq[(String, String)], Seq[String]) = {
-    val timeColumn = Option(query.timeColumn).getOrElse(Constants.TimeColumn)
     val reversalColumn = Option(query.reversalColumn).getOrElse(Constants.ReversalColumn)
     val mutationTimeColumn = Option(query.mutationTimeColumn).getOrElse(Constants.MutationTimeColumn)
     val selects = Option(query.selects).map(_.toScala).getOrElse(Map.empty[String, String])
+    val timeColumnTransform = ColumnExpression
+      .getTimeExpression(query)
+      .expression
+      .getOrElse(Constants.TimeColumn)
+    val reversalColumnTransform = selects.getOrElse(reversalColumn, reversalColumn)
+    val mutationTimeColumnTransform = selects.getOrElse(mutationTimeColumn, mutationTimeColumn)
 
     val transforms: Seq[(String, String)] = dataModel match {
       case DataModel.EVENTS =>
-        (selects ++ Map(Constants.TimeColumn -> timeColumn)).toSeq
+        (selects ++ Map(Constants.TimeColumn -> timeColumnTransform)).toSeq
       case DataModel.ENTITIES =>
         (selects ++ Map(
-          Constants.TimeColumn -> timeColumn,
-          Constants.ReversalColumn -> reversalColumn,
-          Constants.MutationTimeColumn -> mutationTimeColumn
+          Constants.TimeColumn -> timeColumnTransform,
+          Constants.ReversalColumn -> reversalColumnTransform,
+          Constants.MutationTimeColumn -> mutationTimeColumnTransform
         )).toSeq
     }
 
     val timeFilters = dataModel match {
-      case DataModel.ENTITIES => Seq(s"${Constants.MutationTimeColumn} is NOT NULL", s"$timeColumn is NOT NULL")
-      case DataModel.EVENTS   => Seq(s"$timeColumn is NOT NULL")
+      case DataModel.ENTITIES =>
+        Seq(s"${Constants.MutationTimeColumn} is NOT NULL", s"${Constants.TimeColumn} is NOT NULL")
+      case DataModel.EVENTS =>
+        Seq(s"${Constants.TimeColumn} is NOT NULL")
     }
 
     val baseFilters: Seq[String] = Option(query.getWheres)
@@ -236,4 +255,5 @@ object SparkExpressionEval {
     val valueColumns = gb.aggregationInputs ++ additionalColumns
     (keyColumns, valueColumns, eventTimeColumn)
   }
+
 }
