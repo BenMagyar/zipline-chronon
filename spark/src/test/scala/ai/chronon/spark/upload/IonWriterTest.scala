@@ -154,6 +154,72 @@ class IonWriterTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "write ion files for sub-daily (hourly) timestamp partitions" in {
+    // Reproduces the hourly online-upload failure: to_timestamp(...) on a sub-daily grid produces a
+    // TimestampType column, which externalizes to java.time.Instant under java8 API and previously hit
+    // "Unsupported partition type: java.time.Instant".
+    val partitionValue = "2026-07-13-18-00"
+    val tsValueMillis = Instant.parse("2026-07-13T18:00:00Z").toEpochMilli
+    val rootPath = Some(tmpDir.toURI.toString)
+    val dataSetName = "ion-output-hourly"
+
+    val schema = StructType(
+      Seq(
+        StructField("key_bytes", BinaryType, nullable = true),
+        StructField("value_bytes", BinaryType, nullable = true),
+        StructField("key_json", StringType, nullable = true),
+        StructField("value_json", StringType, nullable = true),
+        StructField("ds", TimestampType, nullable = false)
+      )
+    )
+
+    val instant = Instant.ofEpochMilli(tsValueMillis)
+    val rows = Seq(
+      Row("k1".getBytes("UTF-8"), "v1-bytes".getBytes("UTF-8"), "k1-json", """{"v":"one"}""", instant),
+      Row("k2".getBytes("UTF-8"), "v2-bytes".getBytes("UTF-8"), "k2-json", """{"v":"two"}""", instant)
+    )
+
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(rows, numSlices = 2), schema)
+    val result = IonWriter.write(df, dataSetName, "ds", partitionValue, rootPath)
+
+    result.rowCount shouldBe rows.size
+
+    val partitionPath = IonWriter.resolvePartitionPath(dataSetName, "ds", partitionValue, rootPath)
+    val partitionDir = new File(partitionPath.toUri)
+    val ionFiles = partitionDir.listFiles().filter(_.getName.endsWith(".ion"))
+    ionFiles should not be empty
+
+    val ion = IonSystemBuilder.standard().build()
+    val parsed = ionFiles.flatMap { file =>
+      val datagram = Using.resource(new FileInputStream(file))(in => ion.getLoader.load(in))
+      datagram.iterator().asScala.map { value =>
+        val struct = value.asInstanceOf[IonStruct].get("Item").asInstanceOf[IonStruct]
+        Option(struct.get("ts")).map(_.asInstanceOf[IonDecimal])
+      }
+    }
+
+    parsed.size shouldBe rows.size
+    parsed.flatten.foreach(_.bigDecimalValue().longValueExact() shouldBe tsValueMillis)
+  }
+
+  it should "convert supported partition types to epoch millis" in {
+    val expected = Instant.parse("2026-07-13T18:00:00Z").toEpochMilli
+    // The upload path stamps the partition-start millis directly as a Long.
+    IonWriter.toMillis(expected).longValueExact() shouldBe expected
+    IonWriter.toMillis(Instant.ofEpochMilli(expected)).longValueExact() shouldBe expected
+    IonWriter.toMillis(new java.sql.Timestamp(expected)).longValueExact() shouldBe expected
+
+    // Daily types anchor to UTC midnight.
+    val midnightMillis = Instant.parse("2026-07-13T00:00:00Z").toEpochMilli
+    IonWriter.toMillis(LocalDate.parse("2026-07-13")).longValueExact() shouldBe midnightMillis
+    IonWriter.toMillis(java.sql.Date.valueOf("2026-07-13")).longValueExact() shouldBe midnightMillis
+  }
+
+  it should "reject unsupported partition types" in {
+    an[IllegalArgumentException] should be thrownBy IonWriter.toMillis(null)
+    an[IllegalArgumentException] should be thrownBy IonWriter.toMillis("2026-07-13")
+  }
+
   it should "validate root path with valid schemes" in {
     IonWriter.validateRootPath(Some("s3://my-bucket/path")) shouldBe "s3://my-bucket/path"
     IonWriter.validateRootPath(Some("s3a://my-bucket")) shouldBe "s3a://my-bucket"

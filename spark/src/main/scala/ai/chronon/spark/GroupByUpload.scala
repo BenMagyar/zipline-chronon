@@ -606,10 +606,13 @@ object GroupByUpload {
 
     if (uploadFormat == "ion") {
       val rootPath = sparkConf.getOption(IonPathConfig.UploadLocationKey)
-      val ionPartitionCol =
-        if (tableUtils.partitionSpec.spanMillis == PartitionSpec.daily.spanMillis) to_date(col(partitionCol))
-        else to_timestamp(col(partitionCol), tableUtils.partitionSpec.format)
-      val ionDf = uploadDf.withColumn(partitionCol, ionPartitionCol)
+      // Stamp the engine's canonical partition-start (partitionStartMillis == epochMillis): UTC and
+      // offset-aware for every grid. Round-tripping the ds string through to_date/to_timestamp was
+      // both type-fragile (sub-daily -> Instant, unhandled) and wrong for daily-span grids with a
+      // sub-daily offset (to_date dropped the offset, anchoring ts to midnight instead of the
+      // partition boundary). endDs is constant across the upload, so compute it once.
+      val partitionMillis = tableUtils.partitionSpec.epochMillis(endDs)
+      val ionDf = uploadDf.withColumn(partitionCol, lit(partitionMillis))
       val result = IonWriter.write(
         ionDf,
         groupByConf.metaData.uploadTable,

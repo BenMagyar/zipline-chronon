@@ -24,10 +24,12 @@ import ai.chronon.online.fetcher.Fetcher
 import ai.chronon.aggregator.windowing.{FiveMinuteResolution, SawtoothOnlineAggregator}
 import ai.chronon.online.serde.{AvroCodec, AvroConversions, SparkConversions}
 import ai.chronon.spark.Extensions.DataframeOps
-import ai.chronon.spark.{GroupByUpload, IonPathConfig}
+import ai.chronon.spark.{GroupByUpload, IonPathConfig, IonWriter}
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.{DataFrameGen, MockApi, OnlineUtils, SparkTestBase}
+import com.amazon.ion.system.IonSystemBuilder
+import com.amazon.ion.{IonDecimal, IonStruct}
 import com.google.gson.Gson
 import org.apache.spark.sql.{Row, SparkSession}
 import org.junit.Assert.assertEquals
@@ -35,9 +37,11 @@ import org.scalatest.matchers.should.Matchers.convertToAnyShouldWrapper
 import org.scalatest.matchers.should.Matchers
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.io.{File, FileInputStream}
 import java.util
 import scala.concurrent.Await
 import scala.concurrent.duration.DurationInt
+import scala.util.Using
 
 class GroupByUploadTest extends SparkTestBase with Matchers {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
@@ -135,6 +139,171 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         GroupByUpload.run(groupByConf, endDs = "1970-01-01")
       }
       ex.getMessage should include("zero rows")
+    } finally {
+      prevFormat.fold(spark.conf.unset(IonPathConfig.UploadFormatKey))(spark.conf.set(IonPathConfig.UploadFormatKey, _))
+      prevLocation.fold(spark.conf.unset(IonPathConfig.UploadLocationKey))(
+        spark.conf.set(IonPathConfig.UploadLocationKey, _))
+    }
+  }
+
+  // The ion upload stamps ts from partitionSpec.epochMillis(endDs) (the engine's partition start),
+  // not a to_date/to_timestamp round-trip of the ds string.
+  it should "stamp ion ts with the partition-start millis" in {
+    val namespace = testNamespace("ion_ts_partition_start")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "ion_ts_events"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("views", IntType, 10)
+    )
+    val eventDf = DataFrameGen.events(spark, eventSchema, count = 1000, partitions = 18)
+    eventDf.save(s"$namespace.$eventsTable")
+
+    val endDs = tableUtils.partitionSpec.before(tableUtils.partitionSpec.at(System.currentTimeMillis()))
+
+    val groupByConf =
+      Builders.GroupBy(
+        sources = Seq(Builders.Source.events(Builders.Query(), table = eventsTable)),
+        keyColumns = Seq("user"),
+        aggregations = Seq(Builders.Aggregation(Operation.SUM, "views", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = namespace, name = "ion_ts_upload"),
+        accuracy = Accuracy.SNAPSHOT
+      )
+
+    val tmpDir = java.nio.file.Files.createTempDirectory("ion_ts").toString
+    val rootPath = s"file://$tmpDir"
+    val prevFormat = spark.conf.getOption(IonPathConfig.UploadFormatKey)
+    val prevLocation = spark.conf.getOption(IonPathConfig.UploadLocationKey)
+    spark.conf.set(IonPathConfig.UploadFormatKey, "ion")
+    spark.conf.set(IonPathConfig.UploadLocationKey, rootPath)
+    try {
+      GroupByUpload.run(groupByConf, endDs = endDs)
+
+      val partitionPath =
+        IonWriter.resolvePartitionPath(groupByConf.metaData.uploadTable, "ds", endDs, Some(rootPath))
+      val ionFiles = new File(partitionPath.toUri).listFiles().filter(_.getName.endsWith(".ion"))
+      ionFiles should not be empty
+
+      val expectedMillis = tableUtils.partitionSpec.epochMillis(endDs)
+      val ion = IonSystemBuilder.standard().build()
+      val tsValues = ionFiles.flatMap { file =>
+        val datagram = Using.resource(new FileInputStream(file))(in => ion.getLoader.load(in))
+        val buf = scala.collection.mutable.ListBuffer[Long]()
+        val it = datagram.iterator()
+        while (it.hasNext) {
+          val struct = it.next().asInstanceOf[IonStruct].get("Item").asInstanceOf[IonStruct]
+          Option(struct.get("ts")).foreach(v => buf += v.asInstanceOf[IonDecimal].bigDecimalValue().longValueExact())
+        }
+        buf.toList
+      }
+      tsValues should not be empty
+      tsValues.foreach(_ shouldBe expectedMillis)
+    } finally {
+      prevFormat.fold(spark.conf.unset(IonPathConfig.UploadFormatKey))(spark.conf.set(IonPathConfig.UploadFormatKey, _))
+      prevLocation.fold(spark.conf.unset(IonPathConfig.UploadLocationKey))(
+        spark.conf.set(IonPathConfig.UploadLocationKey, _))
+    }
+  }
+
+  // End-to-end through GroupByUpload.run on a real sub-daily (hourly-span) grid: the ion ts must be
+  // the hourly boundary. Before the fix this path crashed with "Unsupported partition type:
+  // java.time.Instant" and no upload was written.
+  it should "stamp ion ts at the hourly boundary for a sub-daily-span upload" in {
+    val spec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", WindowUtils.Hour.millis)
+    val endDs = "2023-08-14-12-00"
+    val rows = Seq(
+      ("user1", 10L, instantMillis("2023-08-14T12:15:00Z"), endDs),
+      ("user2", 20L, instantMillis("2023-08-14T12:45:00Z"), endDs)
+    )
+    val tsValues = uploadIonAndReadTs(testNamespace("ion_hourly"), "ion_hourly_upload", spec, endDs, rows)
+    tsValues should not be empty
+    tsValues.foreach(_ shouldBe instantMillis("2023-08-14T12:00:00Z"))
+  }
+
+  // End-to-end on a daily-span grid with a 1h offset: partitions start at 01:00, not midnight. The
+  // old to_date path dropped the offset and anchored ts to UTC midnight.
+  it should "stamp ion ts at the offset boundary (not midnight) for a daily-span + hourly-offset upload" in {
+    val spec = PartitionSpec("ds", "yyyy-MM-dd-HH", WindowUtils.Day.millis, WindowUtils.Hour.millis)
+    val endDs = "2023-08-14-01"
+    val rows = Seq(
+      ("user1", 10L, instantMillis("2023-08-14T05:00:00Z"), endDs),
+      ("user2", 20L, instantMillis("2023-08-14T18:00:00Z"), endDs)
+    )
+    val tsValues = uploadIonAndReadTs(testNamespace("ion_offset"), "ion_offset_upload", spec, endDs, rows)
+    tsValues should not be empty
+    tsValues.foreach(_ shouldBe instantMillis("2023-08-14T01:00:00Z"))
+    tsValues.foreach(_ should not be instantMillis("2023-08-14T00:00:00Z"))
+  }
+
+  private def instantMillis(iso: String): Long = java.time.Instant.parse(iso).toEpochMilli
+
+  // Runs a real snapshot ion upload for the given partition grid and returns the ts decimals written
+  // into the .ion files. Source events are hand-placed so the snapshot at endDs is non-empty. The
+  // upload spec is carried through metaData.executionInfo.outputTableInfo (as in production).
+  private def uploadIonAndReadTs(namespace: String,
+                                 gbName: String,
+                                 spec: PartitionSpec,
+                                 endDs: String,
+                                 rows: Seq[(String, Long, Long, String)]): Seq[Long] = {
+    createDatabase(namespace)
+    val eventsTable = s"$namespace.${gbName}_events"
+    spark
+      .createDataFrame(rows)
+      .toDF("user", "value", "ts", "ds")
+      .save(eventsTable)
+
+    val outputTableInfo = new TableInfo()
+      .setPartitionColumn(spec.column)
+      .setPartitionFormat(spec.format)
+      .setPartitionInterval(spec.intervalWindow)
+    val query = Builders
+      .Query(selects = Builders.Selects("user", "value", "ts"))
+      .setPartitionColumn(spec.column)
+      .setPartitionFormat(spec.format)
+      .setPartitionInterval(spec.intervalWindow)
+    if (spec.offsetMillis != 0) {
+      outputTableInfo.setPartitionOffset(WindowUtils.fromMillis(spec.offsetMillis))
+      query.setPartitionOffset(WindowUtils.fromMillis(spec.offsetMillis))
+    }
+
+    val groupByConf =
+      Builders.GroupBy(
+        sources = Seq(Builders.Source.events(query = query, table = eventsTable)),
+        keyColumns = Seq("user"),
+        aggregations = Seq(Builders.Aggregation(Operation.SUM, "value", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = namespace,
+                                     name = gbName,
+                                     executionInfo = new ExecutionInfo().setOutputTableInfo(outputTableInfo)),
+        accuracy = Accuracy.SNAPSHOT
+      )
+
+    val tmpDir = java.nio.file.Files.createTempDirectory(gbName).toString
+    val rootPath = s"file://$tmpDir"
+    val prevFormat = spark.conf.getOption(IonPathConfig.UploadFormatKey)
+    val prevLocation = spark.conf.getOption(IonPathConfig.UploadLocationKey)
+    spark.conf.set(IonPathConfig.UploadFormatKey, "ion")
+    spark.conf.set(IonPathConfig.UploadLocationKey, rootPath)
+    try {
+      GroupByUpload.run(groupByConf, endDs = endDs)
+
+      val partitionPath =
+        IonWriter.resolvePartitionPath(groupByConf.metaData.uploadTable, "ds", endDs, Some(rootPath))
+      val ionFiles = new File(partitionPath.toUri).listFiles().filter(_.getName.endsWith(".ion"))
+      ionFiles should not be empty
+
+      val ion = IonSystemBuilder.standard().build()
+      ionFiles.flatMap { file =>
+        val datagram = Using.resource(new FileInputStream(file))(in => ion.getLoader.load(in))
+        val buf = scala.collection.mutable.ListBuffer[Long]()
+        val it = datagram.iterator()
+        while (it.hasNext) {
+          val struct = it.next().asInstanceOf[IonStruct].get("Item").asInstanceOf[IonStruct]
+          Option(struct.get("ts")).foreach(v => buf += v.asInstanceOf[IonDecimal].bigDecimalValue().longValueExact())
+        }
+        buf.toList
+      }.toList
     } finally {
       prevFormat.fold(spark.conf.unset(IonPathConfig.UploadFormatKey))(spark.conf.set(IonPathConfig.UploadFormatKey, _))
       prevLocation.fold(spark.conf.unset(IonPathConfig.UploadLocationKey))(

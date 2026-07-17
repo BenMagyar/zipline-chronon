@@ -9,8 +9,8 @@ import org.apache.spark.util.SerializableConfiguration
 import org.slf4j.LoggerFactory
 
 import java.math.BigDecimal
-import java.sql.Date
-import java.time.{LocalDate, ZoneOffset}
+import java.sql.{Date, Timestamp}
+import java.time.{Instant, LocalDate, ZoneOffset}
 import java.util.UUID
 import scala.util.control.NonFatal
 
@@ -167,13 +167,25 @@ object IonWriter {
     trimmed
   }
 
+  // The upload stamps the partition column with the partition-start epoch millis directly (a Long).
+  // Date/timestamp cases remain for callers that pass a converted partition column: to_timestamp(...)
+  // externalizes to java.time.Instant (java8 API on) / java.sql.Timestamp (off); to_date(...) yields
+  // java.time.LocalDate / java.sql.Date. All map to the epoch-millis this writer emits.
   def toMillis(value: Any): BigDecimal = {
     value match {
       case null => throw new IllegalArgumentException("Partition column is blank; cannot write Ion timestamp")
-      case date: Date =>
-        BigDecimal.valueOf(date.toInstant.toEpochMilli)
+      case millis: Long =>
+        BigDecimal.valueOf(millis)
+      case instant: Instant =>
+        BigDecimal.valueOf(instant.toEpochMilli)
+      case ts: Timestamp =>
+        BigDecimal.valueOf(ts.getTime)
       case localDate: LocalDate =>
         BigDecimal.valueOf(localDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
+      case date: Date =>
+        // java.sql.Date.toInstant() throws UnsupportedOperationException; go through LocalDate so
+        // the value is anchored to UTC midnight, matching the LocalDate case above.
+        BigDecimal.valueOf(date.toLocalDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
       case other =>
         throw new IllegalArgumentException(s"Unsupported partition type: ${other.getClass.getName}")
     }
