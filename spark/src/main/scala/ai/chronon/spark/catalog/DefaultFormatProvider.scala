@@ -6,13 +6,15 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.slf4j.{Logger, LoggerFactory}
 
-import scala.util.{Failure, Success, Try}
+import scala.util.{Success, Try}
 
 /** Default format provider implementation based on default Chronon supported open source library versions.
   */
 class DefaultFormatProvider(val sparkSession: SparkSession) extends FormatProvider {
 
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+  // delta-spark is compile-only, so format detection must not link Delta runtime classes.
+  private val DeltaTableV2ClassName = "org.apache.spark.sql.delta.catalog.DeltaTableV2"
 
   // Checks the format of a given table if it exists.
   override def readFormat(tableName: String): Option[Format] = {
@@ -54,19 +56,18 @@ class DefaultFormatProvider(val sparkSession: SparkSession) extends FormatProvid
     }
   }
 
-  private def isDeltaTable(tableName: String): Boolean = {
+  private def isDeltaTable(tableName: String): Boolean =
     Try {
-      val describeResult = sparkSession.sql(s"DESCRIBE DETAIL $tableName")
-      describeResult.select("format").first().getString(0).toLowerCase
-    } match {
-      case Success(format) =>
-        logger.info(s"Delta check: Successfully read the format of table: $tableName as $format")
-        format == "delta"
-      case Failure(e) =>
-        logger.info(
-          s"Delta check: Unable to read the format of the table $tableName using DESCRIBE DETAIL. Error: ${e.getMessage}",
-          e)
-        false
-    }
-  }
+      val resolved = Format.resolveTableName(tableName)(sparkSession)
+      val catalog = sparkSession.sessionState.catalogManager.catalog(resolved.catalog).asInstanceOf[TableCatalog]
+      val table = catalog.loadTable(resolved.toIdentifier)
+      val provider =
+        Option(table.properties()).flatMap(properties => Option(properties.get(TableCatalog.PROP_PROVIDER)))
+      val isDeltaTableV2 = Iterator
+        .iterate[Class[_]](table.getClass)(_.getSuperclass)
+        .takeWhile(_ != null)
+        .exists(_.getName == DeltaTableV2ClassName)
+
+      isDeltaTableV2 || provider.exists(_.equalsIgnoreCase("delta"))
+    }.getOrElse(false)
 }

@@ -97,6 +97,35 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     }
   }
 
+  it should "keep exact timestamp_ntz boundaries exclusive for sub-daily readiness" in {
+    val dbName = s"delta_timestamp_ntz_boundary_${System.nanoTime()}"
+    val tableName = s"$dbName.time_with_stats"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    val threeHourSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000)
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          created_at TIMESTAMP_NTZ,
+          user_id STRING
+        ) USING DELTA
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          (CAST('2024-01-01 09:17:00' AS TIMESTAMP_NTZ), 'user1'),
+          (CAST('2024-01-01 12:00:00' AS TIMESTAMP_NTZ), 'user2')
+      """)
+
+      DeltaLake.statsDateRange(tableName, "created_at", threeHourSpec) shouldBe
+        Some(StatsDateRange(start = "2024-01-01-09-00", end = "2024-01-01-09-00"))
+      DeltaLake.lastAvailablePartition(tableName, "created_at", threeHourSpec) shouldBe Some("2024-01-01-09-00")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
   it should "apply readiness semantics to epoch-millis numeric columns in Delta log stats" in {
     val dbName = s"delta_numeric_stats_${System.nanoTime()}"
     val tableName = s"$dbName.numeric_epoch_with_stats"
@@ -250,7 +279,35 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     }
   }
 
-  it should "fall back to scanning when Delta log stats do not cover the timestamp column" in {
+  it should "parse timestamp-shaped string stats when the partition format is daily" in {
+    val dbName = s"delta_string_timestamp_stats_${System.nanoTime()}"
+    val tableName = s"$dbName.string_timestamp_with_stats"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          created_at STRING,
+          user_id STRING
+        ) USING DELTA
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+          ('2024-01-01 12:00:00', 'user1'),
+          ('2024-01-03 12:00:00', 'user2')
+      """)
+
+      DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
+        Some(StatsDateRange(start = "2024-01-01", end = "2024-01-03"))
+      DeltaLake.firstAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-01")
+      DeltaLake.lastAvailablePartition(tableName, "created_at", PartitionSpec.daily) shouldBe Some("2024-01-03")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+      spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
+  it should "keep the readiness lookup on file stats when the timestamp column is not indexed" in {
     val dbName = s"delta_stats_fallback_${System.nanoTime()}"
     val tableName = s"$dbName.time_missing_stats"
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
