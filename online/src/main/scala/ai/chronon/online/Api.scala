@@ -22,6 +22,7 @@ import ai.chronon.online.KVStore._
 import ai.chronon.online.fetcher.Fetcher
 import ai.chronon.online.metrics.TTLCache
 import ai.chronon.online.serde._
+import org.apache.avro.generic.GenericRecord
 import org.apache.avro.util.Utf8
 import org.apache.spark.sql.SparkSession
 import org.slf4j.{Logger, LoggerFactory}
@@ -161,14 +162,17 @@ object LoggableResponse {
   lazy val loggableResponseSchema: StructType = StructType.from("loggableResponse", fields)
 
   lazy val loggableResponseAvroSchema: String = AvroConversions.fromChrononSchema(loggableResponseSchema).toString()
-  lazy val avroCodec: AvroCodec = AvroCodec.of(loggableResponseAvroSchema)
+  private lazy val threadedAvroCodec: ThreadLocal[AvroCodec] = AvroCodec.ofThreaded(loggableResponseAvroSchema)
 
-  private val responseToBytesFn = AvroConversions.encodeBytes(loggableResponseSchema, null)
+  def avroCodec: AvroCodec = threadedAvroCodec.get()
 
   def toAvroBytes(response: LoggableResponse): Array[Byte] = {
+    val codec = avroCodec
     val responseFields =
       Array(response.keyBytes, response.valueBytes, response.joinName, response.tsMillis, response.schemaHash)
-    responseToBytesFn(responseFields)
+    val record =
+      AvroConversions.fromChrononRow(responseFields, loggableResponseSchema, codec.schema).asInstanceOf[GenericRecord]
+    codec.encodeBinary(record)
   }
 
   def prependSchemaRegistryBytes(schemaId: Int, bytes: Array[Byte]): Array[Byte] = {

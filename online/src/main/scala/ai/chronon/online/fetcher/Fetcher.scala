@@ -161,6 +161,9 @@ object Fetcher {
     * @param batchEndDate - Date through which batch upload data is available in the KV store
     */
   case class GroupByStatusResponse(groupByName: String, batchEndDate: String)
+
+  private[fetcher] def codecForCurrentThread(codec: AvroCodec): AvroCodec =
+    AvroCodec.ofThreaded(codec.schemaStr, codec.writerSchemaStr).get()
 }
 
 private[online] case class FetcherResponseWithTs[T <: BaseResponse](responses: Seq[T], endTs: Long)
@@ -371,7 +374,7 @@ class Fetcher(val kvStore: KVStore,
 
     joinCodecTry.flatMap { joinCodec =>
       Try {
-        val response = encode(joinCodec.valueSchema, joinCodec.valueCodec, features)
+        val response = encode(joinCodec.valueSchema, Fetcher.codecForCurrentThread(joinCodec.valueCodec), features)
         ctx.distribution("avroconversionbytes.latency.millis", System.currentTimeMillis() - startTime)
         response
       }.recover { case exception =>
@@ -389,7 +392,7 @@ class Fetcher(val kvStore: KVStore,
 
     joinCodecTry.flatMap { joinCodec =>
       Try {
-        val avroBytes = encode(joinCodec.valueSchema, joinCodec.valueCodec, features)
+        val avroBytes = encode(joinCodec.valueSchema, Fetcher.codecForCurrentThread(joinCodec.valueCodec), features)
         val avroString = java.util.Base64.getEncoder.encodeToString(avroBytes)
         ctx.distribution("avroconversionstring.latency.millis", System.currentTimeMillis() - startTime)
         avroString
@@ -581,7 +584,8 @@ class Fetcher(val kvStore: KVStore,
     val loggingStartTs = System.currentTimeMillis()
     val loggingTs = resp.request.atMillis.getOrElse(ts)
 
-    val keyBytes = encode(codec.keySchema, codec.keyCodec, resp.request.keys, cast = true)
+    val keyBytes =
+      encode(codec.keySchema, Fetcher.codecForCurrentThread(codec.keyCodec), resp.request.keys, cast = true)
 
     val hash = if (samplePercent > 0) {
       Math.abs(HashUtils.md5Long(keyBytes))
@@ -609,7 +613,7 @@ class Fetcher(val kvStore: KVStore,
                |""".stripMargin)
       }
 
-      val valueBytes = encode(codec.valueSchema, codec.valueCodec, values)
+      val valueBytes = encode(codec.valueSchema, Fetcher.codecForCurrentThread(codec.valueCodec), values)
 
       val loggableResponse = LoggableResponse(
         keyBytes,
