@@ -311,12 +311,12 @@ class ExternalSourceSensorIntegrationTest extends AnyFlatSpec with Matchers {
 
     // Resource configs should be overridden to lightweight defaults
     sensorConf("spark.driver.memory") should equal("1g")
-    sensorConf("spark.driver.cores") should equal("4")
+    sensorConf("spark.driver.cores") should equal("2")
     sensorConf("spark.executor.memory") should equal("1g")
-    sensorConf("spark.executor.cores") should equal("4")
+    sensorConf("spark.executor.cores") should equal("2")
     sensorConf("spark.executor.instances") should equal("1")
-    sensorConf("spark.default.parallelism") should equal("4")
-    sensorConf("spark.sql.shuffle.partitions") should equal("4")
+    sensorConf("spark.default.parallelism") should equal("2")
+    sensorConf("spark.sql.shuffle.partitions") should equal("2")
 
     // Non-resource configs should be preserved from downstream
     sensorConf("spark.chronon.partition.format") should equal("yyyy-MM-dd")

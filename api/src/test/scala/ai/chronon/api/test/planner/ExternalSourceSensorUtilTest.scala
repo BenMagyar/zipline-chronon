@@ -315,4 +315,53 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
       sensor.metaData.version should equal("1")
     }
   }
+
+  it should "budget one partition interval of retries" in {
+    def sensorFor(tableInfo: TableInfo): ExternalSourceSensorNode = {
+      val executionInfo = new ExecutionInfo()
+        .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+      val metaData = new MetaData()
+        .setName("test_groupby")
+        .setTeam("test_team")
+        .setVersion("1")
+        .setExecutionInfo(executionInfo)
+      ExternalSourceSensorUtil.sensorNodes(metaData).head
+    }
+
+    // daily keeps the historical 96 x 15min = 24h budget exactly
+    val daily = sensorFor(new TableInfo().setTable("data.daily").setPartitionColumn("ds"))
+    daily.retryCount should equal(96L)
+    daily.retryIntervalMin should equal(15L)
+
+    // an hourly sensor is redundant with its successor after one hour
+    val hourly = sensorFor(
+      new TableInfo()
+        .setTable("data.hourly")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH")
+        .setPartitionInterval(new Window(1, TimeUnit.HOURS)))
+    hourly.retryCount should equal(4L)
+    hourly.retryIntervalMin should equal(15L)
+
+    // fine grids shrink the poll interval so the sensor still gets a few checks
+    val fifteenMin = sensorFor(
+      new TableInfo()
+        .setTable("data.fine")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH-mm")
+        .setPartitionInterval(new Window(15, TimeUnit.MINUTES)))
+    fifteenMin.retryIntervalMin should equal(3L)
+    fifteenMin.retryCount should equal(5L)
+
+    // coverage rounds up to at least one full interval when the poll interval doesn't divide it
+    val nineMin = sensorFor(
+      new TableInfo()
+        .setTable("data.nine")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH-mm")
+        .setPartitionInterval(new Window(9, TimeUnit.MINUTES)))
+    nineMin.retryIntervalMin should equal(2L)
+    nineMin.retryCount should equal(5L)
+    nineMin.retryCount * nineMin.retryIntervalMin should be >= 9L
+  }
 }

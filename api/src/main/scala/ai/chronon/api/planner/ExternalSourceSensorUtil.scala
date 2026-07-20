@@ -9,15 +9,19 @@ import scala.collection.JavaConverters._
 object ExternalSourceSensorUtil {
 
   // Sensors only run lightweight partition-check queries — override resource-heavy
-  // configs inherited from downstream nodes with minimal values.
+  // configs inherited from downstream nodes with minimal values. Sensors spend most of
+  // their runtime sleeping between polls while serverless platforms bill the held vCPUs,
+  // so cores stay near the floor: the driver does catalog/manifest metadata reads (2 cores
+  // so JVM housekeeping - GC, heartbeats - never starves the query thread), and the single
+  // 2-core executor only serves the rare full-scan fallback tier.
   private val SensorResourceOverrides: Map[String, String] = Map(
     "spark.driver.memory" -> "1g",
-    "spark.driver.cores" -> "4",
+    "spark.driver.cores" -> "2",
     "spark.executor.memory" -> "1g",
-    "spark.executor.cores" -> "4",
+    "spark.executor.cores" -> "2",
     "spark.executor.instances" -> "1",
-    "spark.default.parallelism" -> "4",
-    "spark.sql.shuffle.partitions" -> "4"
+    "spark.default.parallelism" -> "2",
+    "spark.sql.shuffle.partitions" -> "2"
   )
 
   def semanticExternalSourceSensor(sensorNode: ExternalSourceSensorNode): ExternalSourceSensorNode = {
@@ -54,13 +58,21 @@ object ExternalSourceSensorUtil {
 
         applySensorResourceOverrides(sensorMd)
 
-        val retryInterval = 15 // minutes
-        val retryCount = 96
+        // The retry budget is one partition interval: the schedule fires a fresh sensor every
+        // interval, so a sensor that outlives its own interval is redundant with its successor
+        // and only stacks up holding cluster slots. Daily grids keep the historical
+        // 96 x 15min = 24h budget exactly; an hourly sensor exits after ~1h. Poll interval
+        // scales down for fine grids so every sensor still gets at least a few checks.
+        val spanMinutes = math.max(1L, tdSpec.spanMillis / WindowUtils.MinuteMillis)
+        val retryIntervalMin = math.min(15L, math.max(1L, spanMinutes / 4))
+        // ceiling: coverage must reach at least one full interval even when the poll
+        // interval doesn't divide the span (e.g. a 9m grid polling every 2m)
+        val retryCount = (spanMinutes + retryIntervalMin - 1) / retryIntervalMin
         new ExternalSourceSensorNode()
           .setSourceTableDependency(td)
           .setMetaData(sensorMd)
           .setRetryCount(retryCount)
-          .setRetryIntervalMin(retryInterval)
+          .setRetryIntervalMin(retryIntervalMin)
       })
       .toList
   }
