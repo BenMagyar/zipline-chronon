@@ -4,8 +4,8 @@ import ai.chronon.api.JobStatusType
 import ai.chronon.spark.submission.JobSubmitterConstants.{MaxRetainedCheckpoints, additionalFlinkJars}
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource
 import io.fabric8.kubernetes.api.model.networking.v1.IngressBuilder
-import io.fabric8.kubernetes.client.{Config, KubernetesClientBuilder, KubernetesClientException}
-import io.fabric8.kubernetes.client.dsl.base.{CustomResourceDefinitionContext, PatchContext, PatchType}
+import io.fabric8.kubernetes.client.{Config, KubernetesClientBuilder}
+import io.fabric8.kubernetes.client.dsl.base.CustomResourceDefinitionContext
 import org.slf4j.LoggerFactory
 
 import java.time.Instant
@@ -258,43 +258,41 @@ class K8sFlinkSubmitter(
     }
   }
 
-  // Suspend rather than hard-delete: sends a JSON merge patch setting spec.job.state=suspended
-  // so the Flink operator triggers a graceful cancel (honouring upgradeMode) and sets
-  // lifecycleState=SUSPENDED. The FlinkDeployment resource stays alive so status() returns
-  // FAILED (terminal) on the next poll instead of UNKNOWN after the resource is GC'd.
-  // JSON merge patch is a single atomic API call with no resourceVersion — avoids the
-  // GET→mutate→update 409 conflict race against the operator's concurrent reconciliation.
+  // Hard-deletes the FlinkDeployment CRD. The resource is GC'd by K8s, so subsequent status()
+  // calls return UNKNOWN — callers that re-check status after kill must treat UNKNOWN as terminal.
+  // 404 is silenced: the deployment may already be gone (e.g. operator cleaned it up first).
   def delete(deploymentName: String, namespace: String): Unit = {
     val client = k8sClient
     try {
-      val patch = suspendPatch(deploymentName, namespace)
       client
         .genericKubernetesResources(flinkDeploymentCrdContext)
         .inNamespace(namespace)
         .withName(deploymentName)
-        .patch(PatchContext.of(PatchType.JSON_MERGE), patch)
-      logger.info(s"Suspended FlinkDeployment $deploymentName in namespace $namespace")
-    } catch {
-      case e: KubernetesClientException if e.getCode == 404 =>
-        logger.warn(s"FlinkDeployment $deploymentName not found in namespace $namespace, nothing to suspend")
+        .delete()
+      logger.info(s"Deleted FlinkDeployment $deploymentName in namespace $namespace")
     } finally {
       client.close()
     }
   }
 
-  // Builds a minimal GenericKubernetesResource suitable for a JSON merge patch that sets
-  // spec.job.state=suspended. Only the fields present in the patch are touched on the server;
-  // all other spec fields are left unchanged.
-  private[cloud_k8s] def suspendPatch(deploymentName: String, namespace: String): GenericKubernetesResource = {
-    val job = new java.util.LinkedHashMap[String, Object]()
-    job.put("state", "suspended")
-    val spec = new java.util.LinkedHashMap[String, Object]()
-    spec.put("job", job)
-    val patch = new GenericKubernetesResource()
-    patch.setApiVersion("flink.apache.org/v1beta1")
-    patch.setKind("FlinkDeployment")
-    patch.setAdditionalProperty("spec", spec)
-    patch
+  private[cloud_k8s] def buildJobSpec(localJarUri: String,
+                                      mainClass: String,
+                                      args: Seq[String],
+                                      maybeSavepointUri: Option[String]): java.util.HashMap[String, Object] = {
+    val job = new java.util.HashMap[String, Object]()
+    job.put("jarURI", localJarUri)
+    job.put("entryClass", mainClass)
+    job.put("args", args.toArray)
+    // Operator validates parallelism > 0; actual job-level parallelism is set inside the Flink job itself
+    job.put("parallelism", Integer.valueOf(1))
+    job.put("state", "running")
+    // Always use savepoint upgradeMode so the operator does not auto-restart cold in case the Flink Operator
+    // triggers a restart.
+    // Note: upgradeMode and initialSavepointPath are independent: omitting the path on a fresh submission starts
+    // cold but future operator driven restarts flow through the orchestrator checkpoint path.
+    job.put("upgradeMode", "savepoint")
+    maybeSavepointUri.foreach(uri => job.put("initialSavepointPath", uri))
+    job
   }
 
   def submit(jobId: String,
@@ -388,21 +386,7 @@ class K8sFlinkSubmitter(
     )
 
     val localJarUri = s"local:///opt/flink/usrlib/${mainJarUri.split("/").last}"
-    val job = new java.util.HashMap[String, Object]()
-    job.put("jarURI", localJarUri)
-    job.put("entryClass", mainClass)
-    job.put("args", args.toArray)
-    // Operator validates parallelism > 0; actual job-level parallelism is set inside the Flink job itself
-    job.put("parallelism", Integer.valueOf(1))
-    job.put("state", "running")
-    maybeSavepointUri match {
-      case Some(savepointUri) =>
-        job.put("upgradeMode", "savepoint")
-        job.put("initialSavepointPath", savepointUri)
-      case None =>
-        // stateless allows cold restarts without HA; last-state requires HA to be enabled
-        job.put("upgradeMode", "stateless")
-    }
+    val job = buildJobSpec(localJarUri, mainClass, args, maybeSavepointUri)
     spec.put("job", job)
 
     val client = k8sClient

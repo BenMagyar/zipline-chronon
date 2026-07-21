@@ -6,7 +6,6 @@ import K8sFlinkSubmitter.{
   DeploymentPendingTimeout,
   InitContainerSpec
 }
-import io.fabric8.kubernetes.api.model.GenericKubernetesResource
 import org.junit.Assert.{assertEquals, assertFalse, assertNull, assertTrue}
 import org.scalatest.flatspec.AnyFlatSpec
 
@@ -488,27 +487,26 @@ class K8sFlinkSubmitterTest extends AnyFlatSpec {
     assertEquals("secret-value", envMap("SASL_JAAS_CFG"))
   }
 
-  // --- suspendPatch ---
+  // --- buildJobSpec: upgradeMode ---
 
-  "suspendPatch" should "produce a patch document with spec.job.state=suspended" in {
-    val patch = s.suspendPatch("my-deployment", "my-namespace")
-    val spec = patch.getAdditionalProperties.get("spec").asInstanceOf[java.util.Map[String, Object]]
-    val job = spec.get("job").asInstanceOf[java.util.Map[String, Object]]
-    assertEquals("suspended", job.get("state"))
+  "buildJobSpec" should "set upgradeMode=savepoint and omit initialSavepointPath on cold start" in {
+    val job = s.buildJobSpec("local:///opt/flink/usrlib/job.jar", "com.example.Main", Seq.empty, None)
+    assertEquals("savepoint", job.get("upgradeMode"))
+    assertNull(job.get("initialSavepointPath"))
   }
 
-  it should "set the correct apiVersion and kind for a FlinkDeployment merge patch" in {
-    val patch = s.suspendPatch("my-deployment", "my-namespace")
-    assertEquals("flink.apache.org/v1beta1", patch.getApiVersion)
-    assertEquals("FlinkDeployment", patch.getKind)
+  it should "set upgradeMode=savepoint and initialSavepointPath on checkpoint resume" in {
+    val chk = "s3://bucket/flink-state/checkpoints/abc123/chk-42"
+    val job = s.buildJobSpec("local:///opt/flink/usrlib/job.jar", "com.example.Main", Seq.empty, Some(chk))
+    assertEquals("savepoint", job.get("upgradeMode"))
+    assertEquals(chk, job.get("initialSavepointPath"))
   }
 
-  it should "contain only spec.job.state in the patch — no other spec fields" in {
-    val patch = s.suspendPatch("my-deployment", "my-namespace")
-    val spec = patch.getAdditionalProperties.get("spec").asInstanceOf[java.util.Map[String, Object]]
-    assertEquals("spec should only contain 'job'", 1, spec.size())
-    val job = spec.get("job").asInstanceOf[java.util.Map[String, Object]]
-    assertEquals("job should only contain 'state'", 1, job.size())
+  it should "never set upgradeMode=stateless" in {
+    val jobCold = s.buildJobSpec("local:///opt/flink/usrlib/job.jar", "com.example.Main", Seq.empty, None)
+    val jobResume = s.buildJobSpec("local:///opt/flink/usrlib/job.jar", "com.example.Main", Seq.empty, Some("s3://bucket/chk-5"))
+    assertFalse("cold start should not be stateless", "stateless" == jobCold.get("upgradeMode"))
+    assertFalse("checkpoint resume should not be stateless", "stateless" == jobResume.get("upgradeMode"))
   }
 
   // --- createFlinkIngress ---
