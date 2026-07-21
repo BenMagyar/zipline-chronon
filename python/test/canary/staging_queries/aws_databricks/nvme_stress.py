@@ -24,7 +24,7 @@ scaled_dim_listings = StagingQuery(
     DISTRIBUTE BY shuffle_key
     SORT BY shuffle_key, stress_row_id
     """,
-    output_namespace="workspace_iceberg.poc",
+    output_namespace="zipline_catalog.default",
     engine_type=EngineType.SPARK,
     # This is an intentionally synthetic load test; dependency sensors would
     # reject the sparse fixture range before Spark can generate the scaled rows.

@@ -202,4 +202,16 @@ aws_databricks.conf.common['spark.chronon.table_write.upload.location'] = "s3://
 # UC's vended-creds default works on the K8sSubmitter path; only EMR needs the opt-out.
 del aws_databricks.conf.common['spark.sql.catalog.workspace.renewCredential.enabled']
 
+# Keep `workspace` for Databricks source tables; route output tables through
+# the Polaris-backed catalog exposed by Data Explorer.
+aws_databricks.conf.common.update({
+    "spark.sql.catalog.zipline_catalog": "org.apache.iceberg.spark.SparkCatalog",
+    "spark.sql.catalog.zipline_catalog.type": "rest",
+    "spark.sql.catalog.zipline_catalog.uri": "http://polaris-service.zipline-system.svc.cluster.local:8181/api/catalog",
+    "spark.sql.catalog.zipline_catalog.credential": "{OC_CREDENTIAL}",
+    "spark.sql.catalog.zipline_catalog.scope": "PRINCIPAL_ROLE:chronon-engine",
+    "spark.sql.catalog.zipline_catalog.warehouse": "polaris_crucible",
+    "spark.sql.catalog.zipline_catalog.header.X-Iceberg-Access-Delegation": "vended-credentials",
+})
+
 aws.env.common['ARTIFACT_PREFIX'] = "s3://zipline-artifacts-canary-aws"
