@@ -22,7 +22,7 @@ import org.apache.commons.lang3.time.FastDateFormat
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.text.{ParseException, ParsePosition, SimpleDateFormat}
-import java.time.{Instant, LocalDateTime, LocalTime}
+import java.time.{Instant, LocalDateTime, LocalTime, OffsetDateTime}
 import java.time.ZoneOffset
 import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder, ResolverStyle}
 import java.time.temporal.ChronoField
@@ -261,6 +261,11 @@ case class PartitionSpec(column: String, format: String, spanMillis: Long, offse
             Try(LocalDateTime.parse(candidate, PartitionSpec.DailyTimestampFormatter)).toOption
               .filter(_.toLocalTime == LocalTime.MIDNIGHT)
               .map(_.toInstant(ZoneOffset.UTC).toEpochMilli)
+              .orElse {
+                Try(OffsetDateTime.parse(candidate, DateTimeFormatter.ISO_OFFSET_DATE_TIME)).toOption
+                  .filter(_.toLocalTime == LocalTime.MIDNIGHT)
+                  .map(_.toInstant.toEpochMilli)
+              }
           } else {
             None
           }

@@ -120,6 +120,34 @@ class IcebergTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "normalize timestamp identity partitions for daily readiness" in {
+    val tableName = "default.iceberg_timestamp_ds_readiness_test"
+    val tableUtils = TableUtils(spark)
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds TIMESTAMP
+        ) USING iceberg
+        PARTITIONED BY (ds)
+      """)
+
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2026-03-01 00:00:00'),
+        (2, TIMESTAMP '2026-03-02 00:00:00'),
+        (3, TIMESTAMP '2026-03-03 00:00:00')
+      """)
+
+      tableUtils.dataWatermark(tableName, Some(PartitionSpec.daily)) shouldBe
+        Some("2026-03-03" -> PartitionSpec.daily.partitionEndMillis("2026-03-03"))
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
   it should "ignore null metadata partitions when computing the data watermark" in {
     val tableName = "default.iceberg_driver_null_metadata_watermark_test"
     spark.sql(s"DROP TABLE IF EXISTS $tableName")

@@ -190,6 +190,7 @@ class PartitionSpecTest extends AnyFlatSpec with Matchers {
   it should "read midnight timestamp strings only for catalog partition values" in {
     an[ParseException] should be thrownBy dailySpec.epochMillis("2024-03-02 00:00:00")
     dailySpec.parseCatalogPartition("2024-03-02 00:00:00") should be(Some("2024-03-02"))
+    dailySpec.parseCatalogPartition("2024-03-02T00:00:00+00:00") should be(Some("2024-03-02"))
     dailySpec.parseCatalogPartition("2024-03-02 00%3A00%3A00") should be(Some("2024-03-02"))
     compactSpec.parseCatalogPartition("2024-03-02 00:00:00") should be(Some("20240302"))
     dailySpec.parseCatalogPartition("2024-03-02 01:00:00") should be(None)
