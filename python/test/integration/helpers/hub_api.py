@@ -65,7 +65,12 @@ def get_continuous_node_names(hub_url: str, workflow_id: str) -> list[str]:
 
 
 def get_flink_job_ids(hub_url: str, workflow_id: str) -> list[str]:
-    """Return Dataproc job IDs for continuous (Flink) steps tracked by *workflow_id*."""
+    """Return Dataproc job IDs for continuous (Flink) steps tracked by *workflow_id*.
+
+    Workflow status responses deliberately omit per-step ``jobTrackingInfo`` to
+    keep the payload small. Fetch the detail for each streaming step separately,
+    where the Hub exposes that information on demand.
+    """
     headers = _get_auth_headers()
 
     resp = requests.get(f"{hub_url}/workflow/v2/{workflow_id}", headers=headers)
@@ -76,6 +81,11 @@ def get_flink_job_ids(hub_url: str, workflow_id: str) -> list[str]:
     mode = workflow["mode"]
     start = workflow["startPartition"]
     end = workflow["endPartition"]
+    continuous_nodes = {
+        node["name"]
+        for node in workflow.get("workflowPlan", {}).get("nodes", [])
+        if node.get("continuous")
+    }
 
     resp = requests.get(
         f"{hub_url}/confs/v2/{quote(conf_name, safe='')}/status/{quote(mode, safe='')}",
@@ -86,9 +96,19 @@ def get_flink_job_ids(hub_url: str, workflow_id: str) -> list[str]:
 
     job_ids = []
     for node in resp.json().get("nodeExecutions", []):
+        # ``continuous`` belongs to the workflow-plan node, not the step run.
+        if node.get("nodeName") not in continuous_nodes:
+            continue
         for step in node.get("stepRuns", []):
-            if step.get("continuous"):
-                tracking = step.get("jobTrackingInfo") or {}
-                if tracking.get("jobId"):
-                    job_ids.append(tracking["jobId"])
-    return job_ids
+            run_id = step.get("runId")
+            if not run_id:
+                continue
+            detail_resp = requests.get(
+                f"{hub_url}/confs/v2/steps/{quote(run_id, safe='')}/detail",
+                headers=headers,
+            )
+            detail_resp.raise_for_status()
+            tracking = (detail_resp.json().get("stepRun") or {}).get("jobTrackingInfo") or {}
+            if tracking.get("jobId"):
+                job_ids.append(tracking["jobId"])
+    return list(dict.fromkeys(job_ids))
