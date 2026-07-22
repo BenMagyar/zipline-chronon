@@ -1,9 +1,8 @@
 package ai.chronon.flink.chaining
 
 import ai.chronon.api.{Constants, DataType, JoinSource, StructField, StructType}
-import ai.chronon.flink.{ERROR, FlinkLogging, INFO}
 import ai.chronon.flink.deser.ProjectedEvent
-import ai.chronon.online.{Api, CatalystUtil, JoinCodec}
+import ai.chronon.online.{Api, CatalystUtil, ERROR, INFO, JoinCodec, ThrottledLogging}
 import ai.chronon.online.serde.SparkConversions
 import org.apache.flink.api.common.functions.RichFlatMapFunction
 import org.apache.flink.configuration.Configuration
@@ -31,7 +30,7 @@ class JoinSourceQueryFunction(joinSource: JoinSource,
                               api: Api,
                               enableDebug: Boolean)
     extends RichFlatMapFunction[ProjectedEvent, ProjectedEvent]
-    with FlinkLogging {
+    with ThrottledLogging {
   @transient private var catalystUtil: CatalystUtil = _
   @transient private var successCounter: Counter = _
   @transient private var errorCounter: Counter = _

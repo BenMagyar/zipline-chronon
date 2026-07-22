@@ -10,13 +10,16 @@ import ai.chronon.online.KVStore.TimedValue
 import ai.chronon.online.metrics.Metrics.Name
 import ai.chronon.online.fetcher.FetcherCache.{BatchResponses, CachedBatchResponse, KvStoreBatchResponse}
 import ai.chronon.online.metrics.Metrics
+import ai.chronon.online.{ERROR, ThrottledLogging, WARN}
 import com.google.gson.Gson
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.util
 import scala.util.{Failure, Success, Try}
 
-class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: MetadataStore) extends FetcherCache {
+class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: MetadataStore)
+    extends FetcherCache
+    with ThrottledLogging {
 
   @transient private implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
@@ -160,9 +163,10 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
       Try(selectedCodec.decodeRow(timedValue.bytes, timedValue.millis, mutations)) match {
         case Success(row) => row
         case Failure(_) =>
-          logger.error(
-            s"Failed to decode streaming row for groupBy $gbName" +
-              "Streaming rows will be ignored")
+          logThrottled(ERROR,
+                       s"decode_streaming_row_$gbName",
+                       s"Failed to decode streaming row for groupBy $gbName" +
+                         "Streaming rows will be ignored")
 
           if (servingInfo.groupByOps.dontThrowOnDecodeFailFlag) {
             null
@@ -212,9 +216,12 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
           Try(servingInfo.tiledCodec.decodeTileIr(tVal.bytes)) match {
             case Success((tile, _)) => Array(TiledIr(tVal.millis, tile))
             case Failure(_) =>
-              logger.error(
+              logThrottled(
+                ERROR,
+                s"decode_tile_ir_${servingInfo.groupByOps.metaData.getName}",
                 s"Failed to decode tile ir for groupBy ${servingInfo.groupByOps.metaData.getName}" +
-                  "Streaming tiled IRs will be ignored")
+                  "Streaming tiled IRs will be ignored"
+              )
               val groupByFlag: Option[Boolean] = Option(fetchContext.flagStore)
                 .map(_.isSet(
                   "disable_streaming_decoding_error_throws",
@@ -335,9 +342,12 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                                          windows: Seq[Window]): Long = {
     val groupByContainsLongerWinThanTailBuffer = windows.exists(p => p.millis > tailBufferMillis)
     if (queryTimeMs > (tailBufferMillis + batchEndTsMillis) && groupByContainsLongerWinThanTailBuffer) {
-      logger.warn(
+      logThrottled(
+        WARN,
+        s"stale_batch_data_$groupByName",
         s"Encountered a request for $groupByName at $queryTimeMs which is more than $tailBufferMillis ms after the " +
-          s"batch dataset landing at $batchEndTsMillis. ")
+          s"batch dataset landing at $batchEndTsMillis. "
+      )
       1L
     } else
       0L

@@ -1,4 +1,4 @@
-package ai.chronon.flink
+package ai.chronon.online
 
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -10,7 +10,7 @@ case object INFO extends LogLevel
 case object WARN extends LogLevel
 case object ERROR extends LogLevel
 
-/** Unified logging trait for Flink operators.
+/** Unified logging trait for hot-path operators (fetcher, Flink, etc).
   *
   * Provides two methods:
   *   - `log(level, msg, t)` — immediate pass-through to SLF4J, for init/one-shot events.
@@ -21,11 +21,12 @@ case object ERROR extends LogLevel
   * the suppressed count is prepended to the message before logging.
   *
   * Convention: use `log` for INFO/DEBUG and any one-shot operational log. Use `logThrottled` for
-  * any ERROR/WARN that fires per Kafka message or on a tight loop.
+  * any ERROR/WARN that fires per request/message or on a tight loop.
   */
-trait FlinkLogging {
+trait ThrottledLogging {
 
-  @transient protected lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+  // Named distinctly from `logger` since most mixing-in classes already declare their own SLF4J logger val.
+  @transient private lazy val throttledLoggingLogger: Logger = LoggerFactory.getLogger(getClass)
 
   /** Throttle window duration. Override in the operator class if a different window is needed. */
   protected val throttleWindowMs: Long = 60000L
@@ -37,28 +38,37 @@ trait FlinkLogging {
 
   def logThrottled(level: LogLevel, key: String, msg: => String, t: Throwable = null): Unit = {
     val now = System.currentTimeMillis()
-    val entry = throttleState.get(key)
-    if (entry == null) {
-      throttleState.put(key, ThrottleEntry(now, 0L))
-      emit(level, msg, t)
-    } else if (now - entry.windowStartMs >= throttleWindowMs) {
-      val prefix =
-        if (entry.suppressedCount > 0)
-          s"[suppressed ${entry.suppressedCount} occurrences in last ${throttleWindowMs / 1000L}s] "
-        else ""
-      throttleState.put(key, ThrottleEntry(now, 0L))
-      emit(level, prefix + msg, t)
-    } else {
-      throttleState.put(key, entry.copy(suppressedCount = entry.suppressedCount + 1))
-    }
+    // Decided atomically inside compute (which serializes concurrent calls for the same key), then
+    // read out here to actually emit - keeps the by-name `msg` unevaluated for suppressed calls.
+    var emitPrefix: String = null
+
+    throttleState.compute(
+      key,
+      (_, entry) => {
+        if (entry == null) {
+          emitPrefix = ""
+          ThrottleEntry(now, 0L)
+        } else if (now - entry.windowStartMs >= throttleWindowMs) {
+          emitPrefix =
+            if (entry.suppressedCount > 0)
+              s"[suppressed ${entry.suppressedCount} occurrences in last ${throttleWindowMs / 1000L}s] "
+            else ""
+          ThrottleEntry(now, 0L)
+        } else {
+          entry.copy(suppressedCount = entry.suppressedCount + 1)
+        }
+      }
+    )
+
+    if (emitPrefix != null) emit(level, emitPrefix + msg, t)
   }
 
   // Protected so subclasses (e.g. in tests) can intercept emissions without a real SLF4J logger.
   protected def emit(level: LogLevel, msg: => String, t: Throwable): Unit = level match {
-    case DEBUG => if (t != null) logger.debug(msg, t) else logger.debug(msg)
-    case INFO  => if (t != null) logger.info(msg, t) else logger.info(msg)
-    case WARN  => if (t != null) logger.warn(msg, t) else logger.warn(msg)
-    case ERROR => if (t != null) logger.error(msg, t) else logger.error(msg)
+    case DEBUG => if (t != null) throttledLoggingLogger.debug(msg, t) else throttledLoggingLogger.debug(msg)
+    case INFO  => if (t != null) throttledLoggingLogger.info(msg, t) else throttledLoggingLogger.info(msg)
+    case WARN  => if (t != null) throttledLoggingLogger.warn(msg, t) else throttledLoggingLogger.warn(msg)
+    case ERROR => if (t != null) throttledLoggingLogger.error(msg, t) else throttledLoggingLogger.error(msg)
   }
 }
 

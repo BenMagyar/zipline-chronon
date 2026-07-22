@@ -1,9 +1,9 @@
 package ai.chronon.flink.chaining
 
-import ai.chronon.flink.{DirectExecutionContext, ERROR, FlinkLogging, INFO, WARN}
+import ai.chronon.flink.DirectExecutionContext
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.online.fetcher.Fetcher
-import ai.chronon.online.Api
+import ai.chronon.online.{Api, ERROR, INFO, ThrottledLogging, WARN}
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
 import org.apache.flink.metrics.{Counter, Histogram}
@@ -24,7 +24,7 @@ import scala.util.{Failure, Success}
   */
 class JoinEnrichmentAsyncFunction(joinRequestName: String, groupByName: String, api: Api, enableDebug: Boolean)
     extends RichAsyncFunction[ProjectedEvent, ProjectedEvent]
-    with FlinkLogging {
+    with ThrottledLogging {
   @transient private var fetcher: Fetcher = _
   @transient private var successCounter: Counter = _
   @transient private var errorCounter: Counter = _

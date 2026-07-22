@@ -10,7 +10,7 @@ import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.AvroCodecOutput
 import ai.chronon.flink.types.TimestampedTile
 import ai.chronon.online.serde.AvroConversions
-import ai.chronon.online.GroupByServingInfoParsed
+import ai.chronon.online.{ERROR, GroupByServingInfoParsed, INFO, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.api.common.functions.RichFlatMapFunction
 import org.apache.flink.configuration.Configuration
@@ -25,7 +25,7 @@ import org.apache.flink.util.Collector
   * @tparam IN The input data type which contains the data to be avro-converted to bytes.
   * @tparam OUT The output data type (generally a PutRequest).
   */
-sealed abstract class BaseAvroCodecFn[IN, OUT] extends RichFlatMapFunction[IN, OUT] with FlinkLogging {
+sealed abstract class BaseAvroCodecFn[IN, OUT] extends RichFlatMapFunction[IN, OUT] with ThrottledLogging {
   def groupByServingInfoParsed: GroupByServingInfoParsed
 
   @transient protected var avroConversionErrorCounter: Counter = _

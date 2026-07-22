@@ -14,7 +14,8 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
 class ModelTransformsFetcher(modelPlatformProvider: ModelPlatformProvider, debug: Boolean = false)(implicit
-    executionContext: ExecutionContext) {
+    executionContext: ExecutionContext)
+    extends ThrottledLogging {
 
   require(modelPlatformProvider != null, "ModelPlatformProvider is required for ModelTransformsFetcher")
 
@@ -106,7 +107,10 @@ class ModelTransformsFetcher(modelPlatformProvider: ModelPlatformProvider, debug
       processBulkModelPredict(requests, model, keySchema)
         .recover { case exception =>
           ctx.incrementException(exception)
-          logger.error(s"Model ${model.metaData.name} failed, returning error features", exception)
+          logThrottled(ERROR,
+                       s"model_failure_${model.metaData.name}",
+                       s"Model ${model.metaData.name} failed, returning error features",
+                       exception)
           // Return error features for this model instead of failing entire request
           requests.map { request =>
             val errorFeatures =

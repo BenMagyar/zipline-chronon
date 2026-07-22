@@ -6,12 +6,12 @@ import ai.chronon.api.DataType
 import ai.chronon.api.GroupBy
 import ai.chronon.api.Row
 import ai.chronon.api.ScalaJavaConversions.IteratorOps
-import ai.chronon.flink.{ERROR, FlinkLogging, INFO}
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.TimestampedIR
 import ai.chronon.flink.types.TimestampedTile
 import ai.chronon.online.TileCodec
 import ai.chronon.online.serde.ArrayRow
+import ai.chronon.online.{ERROR, INFO, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.api.common.functions.AggregateFunction
 import org.apache.flink.configuration.Configuration
@@ -174,7 +174,7 @@ class FlinkRowAggProcessFunction(
     inputSchema: Seq[(String, DataType)],
     enableDebug: Boolean = false
 ) extends ProcessWindowFunction[TimestampedIR, TimestampedTile, java.util.List[Any], TimeWindow]
-    with FlinkLogging {
+    with ThrottledLogging {
 
   @transient private[flink] var tileCodec: TileCodec = _
 

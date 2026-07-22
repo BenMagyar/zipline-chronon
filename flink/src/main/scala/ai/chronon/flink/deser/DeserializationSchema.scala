@@ -1,8 +1,9 @@
 package ai.chronon.flink.deser
 
 import ai.chronon.api.{DataModel, DataType, Query}
-import ai.chronon.flink.{ERROR, FlinkLogging, INFO, SparkExpressionEval}
+import ai.chronon.flink.SparkExpressionEval
 import ai.chronon.online.serde.{Mutation, SerDe, SparkConversions}
+import ai.chronon.online.{ERROR, INFO, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.api.common.serialization.DeserializationSchema
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
@@ -16,7 +17,7 @@ abstract class BaseDeserializationSchema[T](deserSchemaProvider: SerDe,
                                             groupByName: String,
                                             enableDebug: Boolean = false)
     extends ChrononDeserializationSchema[T]
-    with FlinkLogging {
+    with ThrottledLogging {
 
   // these are created on instantiation in the various task manager processes in the open() call
   @transient protected var deserializationErrorCounter: Counter = _

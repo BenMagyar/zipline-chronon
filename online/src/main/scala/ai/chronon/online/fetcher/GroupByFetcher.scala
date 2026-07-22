@@ -42,7 +42,10 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
     .getGroupByServingInfo(request.name)
     .recover { case ex: Throwable =>
       metadataStore.getGroupByServingInfo.refresh(request.name)
-      logger.error(s"Couldn't fetch GroupByServingInfo for ${request.name}", ex)
+      logThrottled(ERROR,
+                   s"missing_serving_info_${request.name}",
+                   s"Couldn't fetch GroupByServingInfo for ${request.name}",
+                   ex)
       request.context.foreach(_.incrementException(ex))
       throw ex
 
@@ -138,7 +141,10 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
         derivedMap
       case Failure(exception) =>
         requestContext.metricsContext.incrementException(exception)
-        logger.error(s"Failed to derive values for request: ${request.name}@${request.keys}", exception)
+        logThrottled(ERROR,
+                     s"derivation_failure_${request.name}",
+                     s"Failed to derive values for request: ${request.name}@${request.keys}",
+                     exception)
         Map(s"derivation${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString.asInstanceOf[AnyRef])
     }
   }

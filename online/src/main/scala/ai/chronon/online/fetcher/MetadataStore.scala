@@ -54,7 +54,7 @@ case class ConfPathOrName(confPath: Option[String] = None, confName: Option[Stri
   }
 }
 
-class MetadataStore(fetchContext: FetchContext) {
+class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
 
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
   private val CONF_BATCH_SIZE = 50
@@ -91,8 +91,11 @@ class MetadataStore(fetchContext: FetchContext) {
       val startTimeMs = System.currentTimeMillis()
       val result = getConf[Join](ConfPathOrName(confName = Some(name)))
         .recover { case e: java.util.NoSuchElementException =>
-          logger.error(
-            s"Failed to fetch conf for join $name at joins/$name, please check metadata upload to make sure the join metadata for $name has been uploaded")
+          logThrottled(
+            ERROR,
+            s"missing_join_conf_$name",
+            s"Failed to fetch conf for join $name at joins/$name, please check metadata upload to make sure the join metadata for $name has been uploaded"
+          )
           throw e
         }
         .map(new JoinOps(_))
@@ -143,8 +146,11 @@ class MetadataStore(fetchContext: FetchContext) {
       val startTimeMs = System.currentTimeMillis()
       val result = getConf[ModelTransforms](ConfPathOrName(confName = Some(name)))
         .recover { case e: java.util.NoSuchElementException =>
-          logger.error(
-            s"Failed to fetch conf for model transforms $name at models/$name, please check metadata upload to make sure the model transforms metadata for $name has been uploaded")
+          logThrottled(
+            ERROR,
+            s"missing_model_transforms_conf_$name",
+            s"Failed to fetch conf for model transforms $name at models/$name, please check metadata upload to make sure the model transforms metadata for $name has been uploaded"
+          )
           throw e
         }
       val context = metrics.Metrics.Context(metrics.Metrics.Environment.MetaDataFetching, modelTransforms = name)
@@ -367,7 +373,9 @@ class MetadataStore(fetchContext: FetchContext) {
     fetchContext.kvStore
       .getString(key, dataset, fetchContext.timeoutMillis)
       .recover { case e: java.util.NoSuchElementException =>
-        logger.error(s"Failed to retrieve $key for $dataset. Is it possible that hasn't been uploaded?")
+        logThrottled(ERROR,
+                     s"missing_schema_${dataset}_$key",
+                     s"Failed to retrieve $key for $dataset. Is it possible that hasn't been uploaded?")
         throw e
       }
       .map(AvroCodec.of(_))
@@ -398,11 +406,17 @@ class MetadataStore(fetchContext: FetchContext) {
           }.flatten
             .recover {
               case e: java.util.NoSuchElementException =>
-                logger.error(
-                  s"Failed to fetch metadata for $batchDataset, is it possible Group By Upload for $name has not succeeded?")
+                logThrottled(
+                  ERROR,
+                  s"missing_group_by_serving_info_$batchDataset",
+                  s"Failed to fetch metadata for $batchDataset, is it possible Group By Upload for $name has not succeeded?"
+                )
                 throw e
               case e: Throwable =>
-                logger.error(s"Failed to fetch metadata for $batchDataset", e)
+                logThrottled(ERROR,
+                             s"group_by_serving_info_failure_$batchDataset",
+                             s"Failed to fetch metadata for $batchDataset",
+                             e)
                 throw e
             }
         logger.info(s"Fetched ${Constants.GroupByServingInfoKey} from : $batchDataset")

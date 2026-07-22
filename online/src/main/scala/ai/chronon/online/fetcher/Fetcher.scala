@@ -181,7 +181,8 @@ class Fetcher(val kvStore: KVStore,
               disableErrorThrows: Boolean = false,
               executionContextOverride: ExecutionContext = null,
               joinConfTtlMillis: Long = TTLCache.DefaultTtlMillis,
-              joinCodecTtlMillis: Long = TTLCache.DefaultTtlMillis) {
+              joinCodecTtlMillis: Long = TTLCache.DefaultTtlMillis)
+    extends ThrottledLogging {
 
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
@@ -378,7 +379,10 @@ class Fetcher(val kvStore: KVStore,
         ctx.distribution("avroconversionbytes.latency.millis", System.currentTimeMillis() - startTime)
         response
       }.recover { case exception =>
-        logger.error(s"Failed to convert features to avro for $joinName", exception)
+        logThrottled(ERROR,
+                     s"avro_encode_bytes_$joinName",
+                     s"Failed to convert features to avro for $joinName",
+                     exception)
         throw exception
       }
     }
@@ -397,7 +401,10 @@ class Fetcher(val kvStore: KVStore,
         ctx.distribution("avroconversionstring.latency.millis", System.currentTimeMillis() - startTime)
         avroString
       }.recover { case exception =>
-        logger.error(s"Failed to convert features to avro for $joinName", exception)
+        logThrottled(ERROR,
+                     s"avro_encode_string_$joinName",
+                     s"Failed to convert features to avro for $joinName",
+                     exception)
         throw exception
       }
     }
@@ -783,7 +790,7 @@ class Fetcher(val kvStore: KVStore,
         response
       }
       .recover { case exception =>
-        logger.error(s"Failed to fetch join schema for $joinName", exception)
+        logThrottled(ERROR, s"join_schema_failure_$joinName", s"Failed to fetch join schema for $joinName", exception)
         ctx.incrementException(exception)
         throw exception
       }
@@ -818,7 +825,10 @@ class Fetcher(val kvStore: KVStore,
         response
       }
       .recover { case exception =>
-        logger.error(s"Failed to fetch groupBy schema for $groupByName", exception)
+        logThrottled(ERROR,
+                     s"group_by_schema_failure_$groupByName",
+                     s"Failed to fetch groupBy schema for $groupByName",
+                     exception)
         ctx.incrementException(exception)
         throw exception
       }
@@ -848,7 +858,10 @@ class Fetcher(val kvStore: KVStore,
         response
       }
       .recover { case exception =>
-        logger.error(s"Failed to fetch groupBy status for $groupByName", exception)
+        logThrottled(ERROR,
+                     s"group_by_status_failure_$groupByName",
+                     s"Failed to fetch groupBy status for $groupByName",
+                     exception)
         ctx.incrementException(exception)
         throw exception
       }

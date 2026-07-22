@@ -5,6 +5,7 @@ import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, SourceOps}
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.online.CatalystUtil
 import ai.chronon.online.serde.SparkConversions
+import ai.chronon.online.{ERROR, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
 import org.apache.flink.metrics.{Counter, Histogram, MetricGroup}
@@ -33,7 +34,7 @@ class SparkExpressionEval[EventType](encoder: Encoder[EventType],
                                      groupByName: String,
                                      dataModel: DataModel = DataModel.EVENTS)
     extends Serializable
-    with FlinkLogging {
+    with ThrottledLogging {
 
   import SparkExpressionEval._
 

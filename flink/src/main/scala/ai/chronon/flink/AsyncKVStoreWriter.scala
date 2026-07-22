@@ -5,6 +5,7 @@ import ai.chronon.flink.types.WriteResponse
 import ai.chronon.online.Api
 import ai.chronon.online.KVStore
 import ai.chronon.online.KVStore.PutRequest
+import ai.chronon.online.{ERROR, INFO, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
@@ -54,7 +55,7 @@ object AsyncKVStoreWriter {
   */
 class AsyncKVStoreWriter(onlineImpl: Api, featureGroupName: String, enableDebug: Boolean = false)
     extends RichAsyncFunction[AvroCodecOutput, WriteResponse]
-    with FlinkLogging {
+    with ThrottledLogging {
 
   @transient private var kvStore: KVStore = _
 

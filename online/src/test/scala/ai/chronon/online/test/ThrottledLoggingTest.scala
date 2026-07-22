@@ -1,29 +1,30 @@
-package ai.chronon.flink.test
+package ai.chronon.online.test
 
-import ai.chronon.flink.{DEBUG, ERROR, FlinkLogging, INFO, LogLevel, WARN}
+import ai.chronon.online.{DEBUG, ERROR, INFO, LogLevel, ThrottledLogging, WARN}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 
 /** Captures all emissions via the protected emit() hook so we can test throttle logic
   * without needing a real SLF4J logger or a mocking framework.
   */
-class CapturingLogging(windowMs: Long) extends FlinkLogging {
+class CapturingLogging(windowMs: Long) extends ThrottledLogging {
   override protected val throttleWindowMs: Long = windowMs
   val emitCount: AtomicInteger = new AtomicInteger(0)
   val messages: mutable.ListBuffer[String] = mutable.ListBuffer.empty
 
   override protected def emit(level: LogLevel, msg: => String, t: Throwable): Unit = {
     emitCount.incrementAndGet()
-    messages += msg
+    messages.synchronized(messages += msg)
   }
 }
 
-class FlinkLoggingTest extends AnyFlatSpec with Matchers {
+class ThrottledLoggingTest extends AnyFlatSpec with Matchers {
 
-  behavior of "FlinkLogging.logThrottled"
+  behavior of "ThrottledLogging.logThrottled"
 
   it should "emit the first occurrence immediately" in {
     val op = new CapturingLogging(60000L)
@@ -72,6 +73,39 @@ class FlinkLoggingTest extends AnyFlatSpec with Matchers {
     op.messages.last shouldBe "second"
   }
 
+  it should "emit exactly once and lose no suppressed-count updates under concurrent calls to the same key" in {
+    val threadCount = 50
+    val op = new CapturingLogging(windowMs = 300L)
+    val pool = Executors.newFixedThreadPool(threadCount)
+    val startLatch = new CountDownLatch(1)
+    val doneLatch = new CountDownLatch(threadCount)
+
+    try {
+      (0 until threadCount).foreach { i =>
+        pool.submit(new Runnable {
+          override def run(): Unit = {
+            startLatch.await()
+            op.logThrottled(ERROR, "concurrent_key", s"message $i")
+            doneLatch.countDown()
+          }
+        })
+      }
+      startLatch.countDown()
+      doneLatch.await(10, TimeUnit.SECONDS)
+
+      // Exactly one of the threadCount concurrent calls should have gotten through.
+      op.emitCount.get() shouldBe 1
+
+      // The other (threadCount - 1) calls must have been counted as suppressed, with no lost updates.
+      Thread.sleep(400)
+      op.logThrottled(ERROR, "concurrent_key", "after window")
+      op.emitCount.get() shouldBe 2
+      op.messages.last should include(s"suppressed ${threadCount - 1} occurrences")
+    } finally {
+      pool.shutdownNow()
+    }
+  }
+
   it should "not evaluate the message string for suppressed calls" in {
     val op = new CapturingLogging(60000L)
     var evaluated = 0
@@ -83,7 +117,7 @@ class FlinkLoggingTest extends AnyFlatSpec with Matchers {
     evaluated shouldBe 1
   }
 
-  behavior of "FlinkLogging.log"
+  behavior of "ThrottledLogging.log"
 
   it should "always emit regardless of window state" in {
     val op = new CapturingLogging(60000L)
