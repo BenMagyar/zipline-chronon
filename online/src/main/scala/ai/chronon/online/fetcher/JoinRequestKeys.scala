@@ -21,8 +21,9 @@ import scala.util.Try
   *   - `buildKeyMapping` is run while building the JoinCodec so SQL parsing, input-schema construction, and Catalyst
   *     setup are attempted once and cached with the Join metadata instead of repeated per request. A Catalyst setup
   *     failure is surfaced only if a request actually needs key derivation.
-  *   - `requestKeyFields` reports the raw request keys needed to derive selected Join keys, plus the derived key aliases
-  *     themselves so existing direct-key callers can still be logged against the Join key schema.
+  *   - `requestKeyFields` uses the GroupBy key schema for direct Join keys. For selected Join keys it reports the raw
+  *     request keys needed for derivation, plus the derived key aliases themselves so existing direct-key callers can
+  *     still be logged against the Join key schema.
   *   - `valueInfoLeftKeys` reports only the raw request keys for selected Join keys, so fetchJoinSchema does not imply
   *     that callers must provide derived keys.
   *   - `missingRequestKeys` validates against those raw inputs, while still accepting a derived key if the caller
@@ -146,10 +147,13 @@ private[online] object JoinRequestKeys {
               s"but $rightKey is not present in GroupBy key schema ${keySchema.fields.map(_.name).mkString(", ")}")
         )
         .fieldType
+      val derivesLeftKey = selectExpression(join, leftKey).isDefined
       val requestKeys = rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
       requestKeys.foreach { requestKey =>
         if (!fieldsByRequestKey.contains(requestKey)) {
-          fieldsByRequestKey.put(requestKey, StructField(requestKey, rawInputType(servingInfo, requestKey, fieldType)))
+          val requestFieldType =
+            if (derivesLeftKey) rawInputType(servingInfo, requestKey, fieldType) else fieldType
+          fieldsByRequestKey.put(requestKey, StructField(requestKey, requestFieldType))
         }
       }
       if (!fieldsByRequestKey.contains(leftKey)) {
