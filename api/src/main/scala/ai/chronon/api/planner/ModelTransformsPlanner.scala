@@ -50,7 +50,15 @@ class ModelTransformsPlanner(modelTransforms: ModelTransforms)(implicit outputPa
   }
 
   def backfillNode: Node = {
-    val sourceDeps = sources.flatMap(source => fromSource(source))
+    // A ModelTransform is a 1:1 row-level transform, not an aggregation, so its input
+    // dependency is day-for-day. TableDependencies.fromSource, called with no maxWindow,
+    // returns a null startOffset (meaning "unbounded lookback") for EVENTS sources — that
+    // propagates a null-start PartitionRange through RangeCalculator.findNodeRanges and
+    // eventually trips DependencyResolver.computeInputRange's require(start != null).
+    // Substitute endOffset (which is zero or lag) so the dep is 1:1 with the target range.
+    val sourceDeps = sources.flatMap(source => fromSource(source)).map { dep =>
+      if (dep.getStartOffset == null) dep.setStartOffset(dep.getEndOffset) else dep
+    }
 
     // add model dependencies - we depend on the deployed model endpoint for models that are custom and trained by us
     val modelDeps = Option(modelTransforms.models)

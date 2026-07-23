@@ -380,6 +380,25 @@ class ModelTransformsPlannerTest extends AnyFlatSpec with Matchers {
     deps.head.tableInfo.table shouldBe "test_namespace.test_table"
   }
 
+  it should "produce a day-for-day dep (non-null startOffset) for an EVENTS source" in {
+    // Regression: fromSource returns null startOffset for EVENTS + no maxWindow, which
+    // propagates a null-start PartitionRange through RangeCalculator.findNodeRanges and
+    // trips DependencyResolver.computeInputRange's require(start != null) on the next
+    // recursion hop. A ModelTransform is a 1:1 row-level transform, so its dep must be
+    // day-for-day: startOffset should equal endOffset (both zero when no lag).
+    val source = B.Source.events(
+      query = B.Query(),
+      table = "test_namespace.test_table"
+    )
+    val modelTransforms = buildModelTransforms("test_model_transforms_day_for_day", source)
+    val planner = new ModelTransformsPlanner(modelTransforms)
+
+    val deps = planner.backfillNode.metaData.executionInfo.tableDependencies.asScala
+    deps should have size 1
+    deps.head.getStartOffset should not be null
+    deps.head.getStartOffset shouldBe deps.head.getEndOffset
+  }
+
   it should "create backfill node with table dependencies for join source" in {
     val joinOutputTable = "test_namespace.test_join_output"
     val joinMetadata = B.MetaData(
