@@ -265,11 +265,18 @@ class EksFlinkSubmitterTest extends AnyFlatSpec {
       submitter.resolveStatus("d", "UPGRADING", "READY", recentTs))
   }
 
-  it should "return FAILED immediately when jmDeploymentStatus is ERROR regardless of age" in {
-    // Brand new deployment — should still fail immediately on ERROR
+  it should "return PENDING when jmDeploymentStatus is ERROR and deployment is new (transient pod failure)" in {
+    // ERROR can be a transient pod failure (e.g. CrashLoopBackOff during init-container startup)
+    // that clears once K8s reschedules the pod — only escalate to FAILED once timed out.
     val recentTs = Some(Instant.now())
-    assertEquals(JobStatusType.FAILED,
+    assertEquals(JobStatusType.PENDING,
       submitter.resolveStatus("d", "DEPLOYED", "ERROR", recentTs))
+  }
+
+  it should "return FAILED when jmDeploymentStatus is ERROR and deployment has timed out" in {
+    val oldTs = Some(Instant.now().minusSeconds(K8sFlinkSubmitter.DeploymentPendingTimeout.toSeconds + 60))
+    assertEquals(JobStatusType.FAILED,
+      submitter.resolveStatus("d", "DEPLOYED", "ERROR", oldTs))
   }
 
   it should "return PENDING when jmDeploymentStatus is MISSING and deployment is new" in {

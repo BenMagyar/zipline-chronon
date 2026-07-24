@@ -136,11 +136,20 @@ class K8sFlinkSubmitter(
     base ++ optional
   }
 
-  // Appends the job-name pod label (sanitized GroupBy name) onto constructor-level
-  // podTemplateLabels when provided. The value is sanitized to satisfy K8s label-value
-  // constraints — without this, a long GroupBy name would make the FlinkDeployment invalid.
-  private[cloud_k8s] def buildEffectivePodLabels(groupByName: Option[String]): Map[String, String] =
-    groupByName.fold(podTemplateLabels)(name => podTemplateLabels + (JobNamePodLabel -> sanitizeLabelValue(name)))
+  // Merges constructor-level podTemplateLabels with per-submission extraLabels (e.g. branch,
+  // zipline-version — see JobSubmitterConstants) and the job-name pod label (sanitized GroupBy
+  // name). All values are sanitized to satisfy K8s label-value constraints — without this, a
+  // branch name containing '/' or a long GroupBy name would make the FlinkDeployment invalid.
+  // groupByName's JobNamePodLabel wins over any same-keyed entry in extraLabels or podTemplateLabels.
+  private[cloud_k8s] def buildEffectivePodLabels(groupByName: Option[String],
+                                                 extraLabels: Map[String, String] = Map.empty): Map[String, String] = {
+    val sanitizedExtra = extraLabels.flatMap { case (k, v) =>
+      val sanitized = sanitizeGenericLabelValue(v)
+      if (sanitized.nonEmpty) Some(k -> sanitized) else None
+    }
+    val withExtra = podTemplateLabels ++ sanitizedExtra
+    groupByName.fold(withExtra)(name => withExtra + (JobNamePodLabel -> sanitizeLabelValue(name)))
+  }
 
   def buildFlinkConfiguration(flinkCheckpointUri: String, jobProperties: Map[String, String]): Map[String, String] = {
     val tier = parseTmMemoryTier(jobProperties)
@@ -224,32 +233,36 @@ class K8sFlinkSubmitter(
       case "SUSPENDED" | "FAILED"                                => JobStatusType.FAILED
       case "DEPLOYED" | "CREATED" | "UPGRADING" | "ROLLING_BACK" =>
         // The operator sets jobManagerDeploymentStatus=ERROR for detected pod failures (e.g.
-        // CrashLoopBackOff on the init container), but lifecycleState stays DEPLOYED. Similarly, unschedulable TMs
-        // leave the deployment stuck in DEPLOYED indefinitely. In these cases we want to fail relatively
-        // quickly so the orchestrator can surface the error and avoid long waits, but we also want to give
-        // the operator some time to react to transient issues (e.g. scheduling delays due to cluster
-        // autoscaling or temporary capacity shortages) before we declare failure.
+        // CrashLoopBackOff on the init container), but lifecycleState stays DEPLOYED. Similarly,
+        // unschedulable TMs leave the deployment stuck in DEPLOYED indefinitely. In these cases we
+        // want to fail once the deployment has been stuck long enough that recovery is unlikely, but
+        // we also want to give the operator time to react to transient issues (e.g. a pod that
+        // briefly enters CrashLoopBackOff during init-container startup before K8s reschedules it,
+        // scheduling delays due to cluster autoscaling, or temporary capacity shortages).
         val timedOut = creationTimestamp.exists { created =>
           Instant.now().isAfter(created.plusSeconds(DeploymentPendingTimeout.toSeconds))
         }
-        if (jmDeploymentStatus == "ERROR") {
-          // ERROR means the operator has positively detected a pod failure (e.g. CrashLoopBackOff)
-          // — safe to fail immediately regardless of age.
-          logger.warn(s"FlinkDeployment $deploymentName has jobManagerDeploymentStatus=ERROR, treating as FAILED")
-          JobStatusType.FAILED
-        } else if (timedOut && jmDeploymentStatus == "MISSING") {
-          // MISSING is the normal state immediately after creation before the JM pod starts.
-          // Only treat it as a failure once the deployment has been around long enough that
-          // the JM should have started by now.
-          logger.warn(
-            s"FlinkDeployment $deploymentName has jobManagerDeploymentStatus=MISSING after $DeploymentPendingTimeout, treating as FAILED")
-          JobStatusType.FAILED
-        } else if (timedOut) {
-          logger.warn(
-            s"FlinkDeployment $deploymentName has been in $lifecycleState for more than $DeploymentPendingTimeout without reaching STABLE, treating as FAILED")
-          JobStatusType.FAILED
-        } else {
-          JobStatusType.PENDING
+        jmDeploymentStatus match {
+          case "ERROR" if timedOut =>
+            // ERROR means the operator detected a pod failure (CrashLoopBackOff, ImagePullBackOff,
+            // etc.). We wait for the timeout rather than failing immediately because ERROR can be
+            // transient: K8s may restart the pod and the operator will clear the status once the
+            // JM recovers. Only escalate to FAILED once recovery is clearly not happening.
+            logger.warn(
+              s"FlinkDeployment $deploymentName has jobManagerDeploymentStatus=ERROR after $DeploymentPendingTimeout, treating as FAILED")
+            JobStatusType.FAILED
+          case "MISSING" if timedOut =>
+            // MISSING is normal immediately after creation before the JM pod starts.
+            // Only fail once the deployment has been around long enough that the JM should be up.
+            logger.warn(
+              s"FlinkDeployment $deploymentName has jobManagerDeploymentStatus=MISSING after $DeploymentPendingTimeout, treating as FAILED")
+            JobStatusType.FAILED
+          case _ if timedOut =>
+            logger.warn(
+              s"FlinkDeployment $deploymentName has been in $lifecycleState for more than $DeploymentPendingTimeout without reaching STABLE, treating as FAILED")
+            JobStatusType.FAILED
+          case _ =>
+            JobStatusType.PENDING
         }
       case _ =>
         logger.warn(
@@ -308,7 +321,8 @@ class K8sFlinkSubmitter(
              namespace: String,
              envVars: Map[String, String] = Map.empty,
              nodeSelector: Map[String, String] = Map.empty,
-             groupByName: Option[String] = None): String = {
+             groupByName: Option[String] = None,
+             labels: Map[String, String] = Map.empty): String = {
 
     val deploymentName = sanitizeDeploymentName(s"flink-$jobId")
     val basePath = maybeFlinkJarsUri.getOrElse(defaultJarsBasePath)
@@ -320,7 +334,7 @@ class K8sFlinkSubmitter(
     val tier = parseTmMemoryTier(jobProperties)
 
     val flinkConfiguration = buildFlinkConfiguration(flinkCheckpointUri, jobProperties)
-    val effectivePodLabels = buildEffectivePodLabels(groupByName)
+    val effectivePodLabels = buildEffectivePodLabels(groupByName, labels)
 
     val spec = new java.util.HashMap[String, Object]()
     spec.put("image", flinkImage)
@@ -643,6 +657,31 @@ object K8sFlinkSubmitter {
       val hash = "%08x".format(raw.hashCode)
       val keep = MaxLabelValueLength - hash.length - 1
       cleaned.take(keep).replaceAll("_+$", "") + "_" + hash
+    }
+  }
+
+  /** Coerces an arbitrary string into a valid Kubernetes label value, per the full K8s syntax
+    * (unlike [[sanitizeLabelValue]], which additionally restricts to the Prometheus-safe
+    * intersection for the job-name label):
+    *   - Allowed chars: [A-Za-z0-9_.-]
+    *   - Must start/end with alphanumeric
+    *   - Length ≤ 63
+    *
+    * Used for human-facing labels like branch and zipline-version, where preserving dots/dashes
+    * (e.g. "1.18.0", "nikhil-fix") keeps the value legible. Returns "" for input with no
+    * alphanumeric characters, which callers should filter out rather than submit.
+    */
+  def sanitizeGenericLabelValue(raw: String): String = {
+    val cleaned = raw
+      .replaceAll("[^A-Za-z0-9_.-]", "_")
+      .replaceAll("^[^A-Za-z0-9]+", "")
+      .replaceAll("[^A-Za-z0-9]+$", "")
+    if (cleaned.isEmpty) ""
+    else if (cleaned.length <= MaxLabelValueLength) cleaned
+    else {
+      val hash = "%08x".format(raw.hashCode)
+      val keep = MaxLabelValueLength - hash.length - 1
+      cleaned.take(keep).replaceAll("[^A-Za-z0-9]+$", "") + "_" + hash
     }
   }
 

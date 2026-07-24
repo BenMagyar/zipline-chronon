@@ -547,7 +547,8 @@ class EmrSubmitter(customerId: String,
             namespace = namespace,
             envVars = envVars,
             nodeSelector = nodeSelector,
-            groupByName = groupByName
+            groupByName = groupByName,
+            labels = labels
           )
         // Encode namespace into the job ID so status/kill can target the right namespace
         s"flink:$namespace:$deploymentName"

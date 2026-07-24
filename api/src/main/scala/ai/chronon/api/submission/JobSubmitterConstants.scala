@@ -17,6 +17,8 @@ object JobSubmitterConstants {
   val JobType = "job-type"
   val MetadataName = "metadata-name"
   val ZiplineVersion = "zipline-version"
+  // Branch that triggered the submission
+  val BranchLabel = "branch"
 
   val SparkJobType = "spark"
   val FlinkJobType = "flink"

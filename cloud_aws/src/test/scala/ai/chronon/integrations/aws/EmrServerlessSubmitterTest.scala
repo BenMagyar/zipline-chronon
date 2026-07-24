@@ -958,7 +958,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = org.mockito.ArgumentMatchers.any()
+        groupByName = org.mockito.ArgumentMatchers.any(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 
@@ -983,6 +984,52 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     jobId shouldBe "flink:zipline-flink:flink-abc123"
   }
 
+  it should "pass labels (e.g. branch, zipline-version) through to eksFlinkSubmitter.submit for FlinkJob" in {
+    val mockClient = mock[EmrServerlessClient]
+    val mockEks = mock[K8sFlinkSubmitter]
+    val labelsCaptor = ArgumentCaptor.forClass(classOf[Map[String, String]])
+    when(
+      mockEks.submit(
+        jobId = anyString(),
+        mainClass = anyString(),
+        mainJarUri = anyString(),
+        jarUris = any(),
+        flinkCheckpointUri = anyString(),
+        maybeSavepointUri = any(),
+        maybeFlinkJarsUri = any(),
+        jobProperties = any(),
+        args = any(),
+        serviceAccount = anyString(),
+        namespace = anyString(),
+        envVars = any(),
+        nodeSelector = any(),
+        groupByName = any(),
+        labels = labelsCaptor.capture()
+      )
+    ).thenReturn("flink-abc123")
+
+    val submitter = createSubmitter(mockClient, eksFlinkSubmitter = Some(mockEks))
+    val inputLabels = Map("branch" -> "nikhil-fix", ZiplineVersion -> "1.18.0")
+    submitter.submit(
+      jobType = FlinkJob,
+      submissionProperties = Map(
+        JobId -> "test-job-id",
+        MainClass -> "ai.chronon.flink.FlinkJob",
+        JarURI -> "s3://bucket/cloud_aws_lib_deploy.jar",
+        FlinkMainJarURI -> "s3://bucket/flink_assembly_deploy.jar",
+        FlinkCheckpointUri -> "s3://bucket/checkpoints",
+        EksServiceAccount -> "zipline-flink-sa",
+        EksNamespace -> "zipline-flink"
+      ),
+      jobProperties = Map.empty,
+      files = List.empty,
+      labels = inputLabels,
+      envVars = Map.empty
+    )
+
+    labelsCaptor.getValue shouldBe inputLabels
+  }
+
   it should "extract groupByName from --groupby-name arg" in {
     val mockClient = mock[EmrServerlessClient]
     val mockEks = mock[K8sFlinkSubmitter]
@@ -1002,7 +1049,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = groupByCaptor.capture()
+        groupByName = groupByCaptor.capture(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 
@@ -1048,7 +1096,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = groupByCaptor.capture()
+        groupByName = groupByCaptor.capture(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 

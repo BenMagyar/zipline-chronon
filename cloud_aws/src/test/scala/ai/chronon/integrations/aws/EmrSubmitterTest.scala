@@ -321,7 +321,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = org.mockito.ArgumentMatchers.any()
+        groupByName = org.mockito.ArgumentMatchers.any(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 
@@ -346,6 +347,51 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     jobId shouldBe "flink:zipline-flink:flink-abc123"
   }
 
+  it should "pass labels (e.g. branch, zipline-version) through to eksFlinkSubmitter.submit for FlinkJob" in {
+    val mockEks = mock[K8sFlinkSubmitter]
+    val labelsCaptor = org.mockito.ArgumentCaptor.forClass(classOf[Map[String, String]])
+    when(
+      mockEks.submit(
+        jobId = org.mockito.ArgumentMatchers.anyString(),
+        mainClass = org.mockito.ArgumentMatchers.anyString(),
+        mainJarUri = org.mockito.ArgumentMatchers.anyString(),
+        jarUris = org.mockito.ArgumentMatchers.any(),
+        flinkCheckpointUri = org.mockito.ArgumentMatchers.anyString(),
+        maybeSavepointUri = org.mockito.ArgumentMatchers.any(),
+        maybeFlinkJarsUri = org.mockito.ArgumentMatchers.any(),
+        jobProperties = org.mockito.ArgumentMatchers.any(),
+        args = org.mockito.ArgumentMatchers.any(),
+        serviceAccount = org.mockito.ArgumentMatchers.anyString(),
+        namespace = org.mockito.ArgumentMatchers.anyString(),
+        envVars = org.mockito.ArgumentMatchers.any(),
+        nodeSelector = org.mockito.ArgumentMatchers.any(),
+        groupByName = org.mockito.ArgumentMatchers.any(),
+        labels = labelsCaptor.capture()
+      )
+    ).thenReturn("flink-abc123")
+
+    val submitter = new EmrSubmitter("test-customer", mock[EmrClient], mock[Ec2Client], Some(mockEks))
+    val inputLabels = Map("branch" -> "nikhil-fix", ZiplineVersion -> "1.18.0")
+    submitter.submit(
+      jobType = FlinkJob,
+      submissionProperties = Map(
+        JobId -> "test-job-id",
+        MainClass -> "ai.chronon.flink.FlinkJob",
+        JarURI -> "s3://bucket/cloud_aws_lib_deploy.jar",
+        FlinkMainJarURI -> "s3://bucket/flink_assembly_deploy.jar",
+        FlinkCheckpointUri -> "s3://bucket/checkpoints",
+        EksServiceAccount -> "zipline-flink-sa",
+        EksNamespace -> "zipline-flink"
+      ),
+      jobProperties = Map.empty,
+      files = List.empty,
+      labels = inputLabels,
+      envVars = Map.empty
+    )
+
+    labelsCaptor.getValue shouldBe inputLabels
+  }
+
   it should "pass nodeSelector to K8sFlinkSubmitter when present in submissionProperties" in {
     val mockEks = mock[K8sFlinkSubmitter]
     val nodeSelectorCaptor = org.mockito.ArgumentCaptor.forClass(classOf[Map[String, String]])
@@ -364,7 +410,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = nodeSelectorCaptor.capture(),
-        groupByName = org.mockito.ArgumentMatchers.any()
+        groupByName = org.mockito.ArgumentMatchers.any(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 
@@ -408,7 +455,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = groupByCaptor.capture()
+        groupByName = groupByCaptor.capture(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 
@@ -453,7 +501,8 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = org.mockito.ArgumentMatchers.anyString(),
         envVars = org.mockito.ArgumentMatchers.any(),
         nodeSelector = org.mockito.ArgumentMatchers.any(),
-        groupByName = groupByCaptor.capture()
+        groupByName = groupByCaptor.capture(),
+        labels = org.mockito.ArgumentMatchers.any()
       )
     ).thenReturn("flink-abc123")
 

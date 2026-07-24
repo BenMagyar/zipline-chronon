@@ -250,8 +250,12 @@ class K8sFlinkSubmitterTest extends AnyFlatSpec {
     assertEquals(JobStatusType.PENDING, resolveStatus(s, "UPGRADING", "READY", now))
   }
 
-  it should "return FAILED immediately when jmDeploymentStatus is ERROR regardless of age" in {
-    assertEquals(JobStatusType.FAILED, resolveStatus(s, "DEPLOYED", "ERROR", now))
+  it should "return PENDING when jmDeploymentStatus is ERROR and deployment is new (transient pod failure)" in {
+    assertEquals(JobStatusType.PENDING, resolveStatus(s, "DEPLOYED", "ERROR", now))
+  }
+
+  it should "return FAILED when jmDeploymentStatus is ERROR and deployment has timed out" in {
+    assertEquals(JobStatusType.FAILED, resolveStatus(s, "DEPLOYED", "ERROR", old))
   }
 
   it should "return PENDING when jmDeploymentStatus is MISSING and deployment is new" in {
@@ -370,6 +374,34 @@ class K8sFlinkSubmitterTest extends AnyFlatSpec {
     assertEquals("fresh_v1", labels(K8sFlinkSubmitter.JobNamePodLabel))
   }
 
+  it should "merge extraLabels (e.g. branch, zipline-version) onto constructor labels" in {
+    val submitter = submitterWithExtra(podLabels = Map("foo" -> "bar"))
+    val labels = submitter.buildEffectivePodLabels(None, Map("branch" -> "nikhil-fix", "zipline-version" -> "1.18.0"))
+    assertEquals("bar", labels("foo"))
+    assertEquals("nikhil-fix", labels("branch"))
+    assertEquals("1.18.0", labels("zipline-version"))
+  }
+
+  it should "sanitize extraLabels values that contain characters invalid in K8s label values" in {
+    val submitter = submitterWithExtra()
+    // Branch names commonly look like "nikhil/customer-timeout" — '/' is invalid in a label value.
+    val labels = submitter.buildEffectivePodLabels(None, Map("branch" -> "nikhil/customer-timeout"))
+    assertEquals("nikhil_customer-timeout", labels("branch"))
+  }
+
+  it should "drop extraLabels entries with an empty value instead of throwing" in {
+    val submitter = submitterWithExtra()
+    val labels = submitter.buildEffectivePodLabels(None, Map("branch" -> "", "user" -> "piyush"))
+    assertEquals(Map("user" -> "piyush"), labels)
+  }
+
+  it should "let the GroupBy job-name label win over an extraLabels entry with the same key" in {
+    val submitter = submitterWithExtra()
+    val labels =
+      submitter.buildEffectivePodLabels(Some("fresh.v1"), Map(K8sFlinkSubmitter.JobNamePodLabel -> "stale-value"))
+    assertEquals("fresh_v1", labels(K8sFlinkSubmitter.JobNamePodLabel))
+  }
+
   // --- sanitizeLabelValue ---
 
   "sanitizeLabelValue" should "leave an already-strict name unchanged" in {
@@ -412,6 +444,32 @@ class K8sFlinkSubmitterTest extends AnyFlatSpec {
   it should "produce values that contain only [A-Za-z0-9_] (Prometheus-safe intersection)" in {
     val sanitized = K8sFlinkSubmitter.sanitizeLabelValue("ranking.user.last_n.v1__2")
     assertTrue(s"value should match strict pattern, got '$sanitized'", sanitized.matches("[A-Za-z0-9_]+"))
+  }
+
+  // --- sanitizeGenericLabelValue ---
+
+  "sanitizeGenericLabelValue" should "leave dots and dashes intact, unlike sanitizeLabelValue" in {
+    assertEquals("1.18.0", K8sFlinkSubmitter.sanitizeGenericLabelValue("1.18.0"))
+    assertEquals("nikhil-fix", K8sFlinkSubmitter.sanitizeGenericLabelValue("nikhil-fix"))
+  }
+
+  it should "replace disallowed characters (e.g. '/' in a branch name) with underscore" in {
+    assertEquals("nikhil_customer-timeout", K8sFlinkSubmitter.sanitizeGenericLabelValue("nikhil/customer-timeout"))
+  }
+
+  it should "strip leading and trailing non-alphanumeric characters after sanitization" in {
+    assertEquals("a.b", K8sFlinkSubmitter.sanitizeGenericLabelValue("..a.b--"))
+  }
+
+  it should "truncate values longer than 63 chars and append a hash for distinguishability" in {
+    val long = "1." + "0" * 80
+    val sanitized = K8sFlinkSubmitter.sanitizeGenericLabelValue(long)
+    assertTrue(s"length should be <= 63, got ${sanitized.length}", sanitized.length <= 63)
+  }
+
+  it should "return an empty string for input with no alphanumeric characters, rather than throwing" in {
+    assertEquals("", K8sFlinkSubmitter.sanitizeGenericLabelValue(""))
+    assertEquals("", K8sFlinkSubmitter.sanitizeGenericLabelValue("---"))
   }
 
   // --- buildEffectivePodLabels: sanitization ---

@@ -164,7 +164,8 @@ class EmrServerlessSubmitter(
             namespace = namespace,
             envVars = envVars,
             nodeSelector = nodeSelector,
-            groupByName = groupByName
+            groupByName = groupByName,
+            labels = labels
           )
         s"flink:$namespace:$deploymentName"
 

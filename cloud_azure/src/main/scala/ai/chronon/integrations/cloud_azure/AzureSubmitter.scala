@@ -96,7 +96,8 @@ class AzureSubmitter(
           args = userArgs.toSeq,
           serviceAccount = serviceAccount,
           namespace = namespace,
-          envVars = envVars
+          envVars = envVars,
+          labels = labels
         )
         s"flink:$namespace:$deploymentName"
     }

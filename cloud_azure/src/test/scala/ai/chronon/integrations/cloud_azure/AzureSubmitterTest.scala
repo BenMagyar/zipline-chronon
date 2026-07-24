@@ -173,7 +173,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = anyString(),
         envVars = any(),
         nodeSelector = any(),
-        groupByName = any()
+        groupByName = any(),
+        labels = any()
       )).thenReturn("flink-abc123")
 
     val result = submitter.submit(
@@ -186,6 +187,43 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     )
 
     result shouldBe "flink:zipline-flink:flink-abc123"
+  }
+
+  it should "pass labels (e.g. branch, zipline-version) through to K8sFlinkSubmitter for Flink jobs" in {
+    val mockAksFlink = mock[K8sFlinkSubmitter]
+    val submitter = createSubmitter(mockAksFlink = mockAksFlink)
+    val labelsCaptor = org.mockito.ArgumentCaptor.forClass(classOf[Map[String, String]])
+
+    when(
+      mockAksFlink.submit(
+        jobId = anyString(),
+        mainClass = anyString(),
+        mainJarUri = anyString(),
+        jarUris = any(),
+        flinkCheckpointUri = anyString(),
+        maybeSavepointUri = any(),
+        maybeFlinkJarsUri = any(),
+        jobProperties = any(),
+        args = any(),
+        serviceAccount = anyString(),
+        namespace = anyString(),
+        envVars = any(),
+        nodeSelector = any(),
+        groupByName = any(),
+        labels = labelsCaptor.capture()
+      )).thenReturn("flink-abc123")
+
+    val inputLabels = Map("branch" -> "nikhil-fix", ZiplineVersion -> "1.18.0")
+    submitter.submit(
+      jobType = FlinkJob,
+      submissionProperties = baseFlinkSubmissionProps,
+      jobProperties = Map.empty,
+      files = List.empty,
+      labels = inputLabels,
+      envVars = Map.empty
+    )
+
+    labelsCaptor.getValue shouldBe inputLabels
   }
 
   it should "forward custom savepoint URI to K8sFlinkSubmitter" in {
@@ -208,7 +246,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = anyString(),
         envVars = any(),
         nodeSelector = any(),
-        groupByName = any()
+        groupByName = any(),
+        labels = any()
       )).thenReturn("flink-abc123")
 
     submitter.submit(
@@ -234,7 +273,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       namespace = anyString(),
       envVars = any(),
       nodeSelector = any(),
-      groupByName = any()
+      groupByName = any(),
+      labels = any()
     )
   }
 
@@ -257,7 +297,8 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
         namespace = anyString(),
         envVars = any(),
         nodeSelector = any(),
-        groupByName = any()
+        groupByName = any(),
+        labels = any()
       )).thenReturn("flink-no-sp")
 
     val result = submitter.submit(
