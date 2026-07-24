@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai.chronon.repo.admin_utils import _run_kubectl, print_check_table, run_infra_checks
+from ai.chronon.repo.admin_utils import (
+    _run_kubectl,
+    print_check_table,
+    run_health_checks,
+    run_infra_checks,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -509,3 +514,160 @@ class TestPrintCheckTable:
         ]
         with patch("ai.chronon.repo.admin_utils.console"):
             print_check_table("Test", results)  # no SystemExit
+
+
+# ---------------------------------------------------------------------------
+# run_health_checks (infra-health groups)
+# ---------------------------------------------------------------------------
+
+
+class TestHealthGroups:
+    """Tests for the grouped infra-health checks (network, karpenter, etc.)."""
+
+    HUB_ENV = json.dumps([
+        {"name": "HUB_BASE_URL", "value": "http://hub.example.com/services/hub"},
+        {"name": "CRUCIBLE_SPARK_HISTORY_PUBLIC_URL", "value": "http://hub.example.com/spark-history"},
+        {"name": "CRUCIBLE_FLINK_SERVICE_ACCOUNT", "value": "flink"},
+        {"name": "CRUCIBLE_DEFAULT_NAMESPACE", "value": "zipline-default"},
+        {"name": "CHRONON_METRICS_EXPORTER_URL", "value": "http://otel:4317"},
+    ])
+
+    NODEPOOLS_JSON = json.dumps({
+        "items": [{
+            "metadata": {"name": "default"},
+            "spec": {"template": {"spec": {"requirements": [{"key": "kubernetes.io/arch"}]}}},
+        }]
+    })
+
+    def _base_kubectl(self, overrides=None):
+        overrides = overrides or {}
+
+        def side_effect(args, **kwargs):
+            joined = " ".join(args)
+            for key, response in overrides.items():
+                if key in joined:
+                    return response
+            # availableReplicas / numberReady, dispatched by resource name
+            if "deployment coredns" in joined:
+                return _ok(stdout="2")
+            if "deployment karpenter" in joined:
+                return _ok(stdout="2")
+            if "deployment zipline-orchestration-hub" in joined and "availableReplicas" in joined:
+                return _ok(stdout="1")
+            if "deployment spark-history-server" in joined:
+                return _ok(stdout="1")
+            if "flink-kubernetes-operator" in joined:
+                return _ok(stdout="1")
+            if "zipline.ai/namespace-type=compute" in joined:
+                return _ok(stdout="zipline-default;")
+            if "daemonset zipline-orchestration-promtail" in joined:
+                return _ok(stdout="3")
+            if "service zipline-orchestration-loki" in joined:
+                return _ok()
+            if "get nodes" in joined:
+                return _ok(stdout="ip-1=True;ip-2=True;")
+            if "get pods -n zipline-system" in joined:
+                return _ok(stdout="hub-x=;ui-y=;")
+            if "ec2nodeclasses" in joined:
+                return _ok(stdout="zipline=True;")
+            if "nodeclaims.karpenter" in joined:
+                return _ok(stdout="nc-1=True;")
+            if "nodepools.karpenter.sh" in joined and "-o json" in joined:
+                return _ok(stdout=self.NODEPOOLS_JSON)
+            if "nodepools.karpenter.sh" in joined:
+                return _ok(stdout="default;")
+            if "jsonpath={.spec.template.spec.containers[0].env}" in joined:
+                return _ok(stdout=self.HUB_ENV)
+            if "orchestration-spark-history-ingress" in joined:
+                return _ok(stdout="hub.example.com")
+            if "orchestration-hub-ingress" in joined:
+                return _ok(stdout="hub.example.com")
+            return _ok(stdout="yes")
+
+        return side_effect
+
+    def _statuses(self, groups=None, overrides=None, cloud="aws"):
+        with patch("shutil.which", return_value="/usr/bin/kubectl"), \
+             patch("ai.chronon.repo.admin_utils._run_kubectl", side_effect=self._base_kubectl(overrides)):
+            results = run_health_checks(groups=groups, cloud=cloud)
+        return {r[0]: (r[2], r[3]) for r in results}
+
+    def test_all_groups_healthy_no_failures(self):
+        statuses = self._statuses()
+        fails = [name for name, (st, _) in statuses.items() if st not in ("ok", "WARN")]
+        assert fails == [], f"unexpected FAILs: {fails}"
+        # a representative check from each group is present
+        for name in ("nodes", "karpenter", "NodePool requirements", "Spark History Server", "HUB_BASE_URL", "promtail", "Flink operator"):
+            assert name in statuses
+
+    def test_group_selection_runs_only_requested(self):
+        statuses = self._statuses(groups=["karpenter"])
+        assert "karpenter" in statuses and "EC2NodeClass" in statuses
+        # network / streaming checks must not run
+        assert "nodes" not in statuses
+        assert "Flink operator" not in statuses
+
+    def test_flink_operator_down_fails(self):
+        statuses = self._statuses(groups=["streaming"], overrides={"flink-kubernetes-operator": _ok(stdout="0")})
+        assert statuses["Flink operator"][0] == "FAIL"
+
+    def test_missing_compute_namespace_fails(self):
+        statuses = self._statuses(groups=["streaming"], overrides={"zipline.ai/namespace-type=compute": _ok(stdout="")})
+        assert statuses["compute namespace"][0] == "FAIL"
+
+    def test_flink_submit_rbac_denied_fails(self):
+        statuses = self._statuses(groups=["streaming"], overrides={"create flinkdeployments.flink.apache.org": _ok(stdout="no")})
+        assert statuses["Flink submit RBAC"][0] == "FAIL"
+
+    def test_missing_flink_hub_env_warns(self):
+        env = json.dumps([{"name": "HUB_BASE_URL", "value": "http://hub.example.com"}])
+        statuses = self._statuses(groups=["streaming"], overrides={"jsonpath={.spec.template.spec.containers[0].env}": _ok(stdout=env)})
+        assert statuses["Flink hub env"][0] == "WARN"
+
+    def test_preconditions_short_circuit(self):
+        with patch("shutil.which", return_value=None):
+            results = run_health_checks(groups=["karpenter"])
+        assert results == [("kubectl", "kubectl binary present", "FAIL",
+                            "not found — install it and configure kubeconfig")]
+
+    def test_karpenter_controller_down_fails(self):
+        statuses = self._statuses(groups=["karpenter"], overrides={"deployment karpenter": _ok(stdout="0")})
+        assert statuses["karpenter"][0] == "FAIL"
+
+    def test_empty_nodepool_requirements_fails(self):
+        empty = json.dumps({"items": [{"metadata": {"name": "default"}, "spec": {"template": {"spec": {}}}}]})
+        statuses = self._statuses(groups=["autoscaling"], overrides={"nodepools.karpenter.sh -o json": _ok(stdout=empty)})
+        assert statuses["NodePool requirements"][0] == "FAIL"
+        assert "filter out all instance types" in statuses["NodePool requirements"][1]
+
+    def test_stuck_nodeclaim_fails(self):
+        statuses = self._statuses(groups=["autoscaling"], overrides={"nodeclaims.karpenter": _ok(stdout="nc-1=False;")})
+        assert statuses["NodeClaims"][0] == "FAIL"
+        assert "Spot service-linked role" in statuses["NodeClaims"][1]
+
+    def test_image_pull_backoff_fails(self):
+        statuses = self._statuses(groups=["network"], overrides={"get pods -n zipline-system": _ok(stdout="hub-x=ImagePullBackOff;")})
+        assert statuses["image pulls"][0] == "FAIL"
+
+    def test_not_ready_node_warns(self):
+        statuses = self._statuses(groups=["network"], overrides={"get nodes": _ok(stdout="ip-1=True;ip-2=False;")})
+        assert statuses["nodes"][0] == "WARN"
+
+    def test_hostless_shs_ingress_warns(self):
+        statuses = self._statuses(groups=["urls"], overrides={"orchestration-spark-history-ingress": _ok(stdout="")})
+        assert statuses["SHS ingress"][0] == "WARN"
+        assert "shadowed" in statuses["SHS ingress"][1]
+
+    def test_missing_shs_public_url_warns(self):
+        env = json.dumps([{"name": "HUB_BASE_URL", "value": "http://hub.example.com"}])
+        statuses = self._statuses(groups=["urls"], overrides={"jsonpath={.spec.template.spec.containers[0].env}": _ok(stdout=env)})
+        assert statuses["SHS public URL"][0] == "WARN"
+
+    def test_missing_metrics_env_warns(self):
+        env = json.dumps([{"name": "HUB_BASE_URL", "value": "http://hub.example.com"}])
+        statuses = self._statuses(groups=["observability"], overrides={"jsonpath={.spec.template.spec.containers[0].env}": _ok(stdout=env)})
+        assert statuses["metrics"][0] == "WARN"
+
+    def test_ec2nodeclass_not_ready_fails(self):
+        statuses = self._statuses(groups=["karpenter"], overrides={"ec2nodeclasses": _ok(stdout="zipline=False;")})
+        assert statuses["EC2NodeClass"][0] == "FAIL"

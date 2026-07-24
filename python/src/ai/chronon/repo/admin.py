@@ -23,7 +23,7 @@ from rich.progress import (
 from rich.table import Table
 
 from ai.chronon.cli.theme import STYLE_ERROR, STYLE_SUCCESS, console
-from ai.chronon.repo.admin_utils import print_check_table, run_infra_checks
+from ai.chronon.repo.admin_utils import print_check_table, run_health_checks, run_infra_checks
 from ai.chronon.repo.constants import (
     FLINK_IMAGE_TAG,
     SPARK_3_5_3_VERSION,
@@ -1168,6 +1168,57 @@ def streaming_health(cloud, assume_yes):
     console.print("[bold]Running Kubernetes infrastructure checks...[/bold]")
     results = run_infra_checks(cloud=cloud)
     print_check_table("Zipline Streaming Infrastructure Diagnostics", results)
+
+
+# Order here is the display/run order when no group flag is passed.
+_INFRA_HEALTH_GROUPS = ["network", "domain", "karpenter", "autoscaling", "streaming", "urls", "observability"]
+
+
+@doctor.command("infra-health")
+@click.option(
+    "--cloud",
+    type=click.Choice(VALID_CLOUDS, case_sensitive=False),
+    default="aws",
+    show_default=True,
+    help="Cloud provider variant.",
+)
+@click.option("--network", "groups", flag_value="network", multiple=True, help="Only run network-connectivity checks.")
+@click.option("--karpenter", "groups", flag_value="karpenter", multiple=True, help="Only run Karpenter checks.")
+@click.option("--autoscaling", "groups", flag_value="autoscaling", multiple=True, help="Only run autoscaling checks.")
+@click.option("--urls", "groups", flag_value="urls", multiple=True, help="Only run Spark/Flink URL checks.")
+@click.option("--domain", "groups", flag_value="domain", multiple=True, help="Only run hub URL / custom-domain checks.")
+@click.option("--observability", "groups", flag_value="observability", multiple=True, help="Only run logging/metrics checks.")
+@click.option("--streaming", "groups", flag_value="streaming", multiple=True, help="Only run Flink streaming checks.")
+@click.option(
+    "--report-file",
+    default=None,
+    help="Write non-passing checks (WARN/FAIL) as TSV lines to this file (for CI/Slack reporting).",
+)
+@assume_yes_option
+def infra_health(cloud, groups, report_file, assume_yes):
+    """Check that the Zipline deployment's infrastructure is healthy.
+
+    Runs every check group by default (network, Karpenter, autoscaling, Spark/Flink
+    URLs, hub domain wiring, observability, streaming). Pass one or more group flags
+    (e.g. --karpenter --network) to run only those. Requires kubectl configured for
+    the target cluster. Exits non-zero if any check FAILs; WARNs do not fail.
+    """
+    context = _get_current_kube_context()
+    _confirm_kube_context(context, assume_yes=assume_yes)
+    selected = [g for g in _INFRA_HEALTH_GROUPS if g in set(groups)] if groups else _INFRA_HEALTH_GROUPS
+    console.print(f"[bold]Running infra health checks: {', '.join(selected)}...[/bold]")
+    results = run_health_checks(groups=selected, cloud=cloud)
+
+    if report_file:
+        # Plain TSV of non-passing rows so CI can surface WARNs to Slack (a run can
+        # pass overall yet carry warnings worth a look) and echo FAILs.
+        with open(report_file, "w") as f:
+            for check, _what, status, detail in results:
+                if status != "ok":
+                    f.write(f"{status}\t{check}\t{detail}\n")
+
+    print_check_table("Zipline Infrastructure Health", results)
+
 
 if __name__ == "__main__":
     admin()
