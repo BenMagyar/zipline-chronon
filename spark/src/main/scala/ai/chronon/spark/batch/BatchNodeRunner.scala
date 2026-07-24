@@ -216,8 +216,15 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
 
       result match {
         case Some(df) =>
-          logger.info(s"\nShowing three rows of output above.\nQuery table '${metadata.outputTable}' for more.\n")
-          df.show(numRows = 3, truncate = 0, vertical = true)
+          // Log the output schema instead of df.show(). A row-preview via .show() collects
+          // three rows to the driver and stringifies every cell. Joins with wide payloads
+          // (embedding arrays, LAST_K structs of arrays) can OOM the driver here even though
+          // the write to the output table has already succeeded. The schema tree is a fixed-
+          // size sanity signal ("did the columns land in the shape I expected") that
+          // doesn't materialize a single row.
+          logger.info(
+            s"\nOutput schema for '${metadata.outputTable}':\n${df.schema.treeString}" +
+              s"Query table '${metadata.outputTable}' for row-level inspection.\n")
 
         case None =>
           throw new IllegalArgumentException(
