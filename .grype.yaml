@@ -23,16 +23,17 @@ ignore:
     package:
       name: "netty-transport-native-epoll"
 
-  # GHSA-5jmj-h7xm-6q6v (CVE-2026-54515): jackson-databind case-insensitive
-  # deserialization bypasses per-property @JsonIgnoreProperties. On the 2.18.x
-  # line this is fixed only in 2.18.9, which is NOT yet published on Maven
-  # Central (latest is 2.18.8); the 2.19.x line stays vulnerable until 2.21.5,
-  # also unpublished. We pin jackson-databind to 2.18.8 (see build.mill), which
-  # already patches the three sibling advisories CVE-2026-545{12,13,14}. Remove
-  # this ignore once jackson-databind 2.18.9 (or the 2.21.x train) ships.
-  - vulnerability: "GHSA-5jmj-h7xm-6q6v"
+  # GHSA-2fvj-hgj9-j2gr (CVE-2026-10050): Jetty Digest Authentication
+  # ISO-8859-1 lossy encoding auth bypass. jetty-security 9.4.x is pulled in
+  # transitively via hadoop-common:3.4.1 (service/package.mill) for its
+  # embedded HttpServer2; we don't use Hadoop's web UI/Digest auth path.
+  # First patched version per the advisory is 9.4.63, which is NOT yet
+  # published on Maven Central (latest is 9.4.58.v20250814); Hadoop's own
+  # latest release (3.4.3) still pins jetty 9.4.57. Remove this ignore once
+  # a patched 9.4.x jetty-security ships and hadoop-common picks it up.
+  - vulnerability: "GHSA-2fvj-hgj9-j2gr"
     package:
-      name: "jackson-databind"
+      name: "jetty-security"
 
   # Curl CVE exceptions - required for fetcher container functionality
   # Used for Amazon Corretto key download, Google Cloud Profiler download, and healthcheck

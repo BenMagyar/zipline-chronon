@@ -62,11 +62,10 @@ object Constants {
   // but jackson-annotations / jackson-databind aren't published at 2.21.x on
   // Maven Central yet (only 2.19.0 / 2.18.4). A unified jacksonVersion bump
   // is blocked until the full 2.21.x train ships; see .grype.yaml ignore.
-  // 2.18.8 patches the CVE-2026-545{12,13,14} jackson-databind advisories;
-  // CVE-2026-54515 needs 2.18.9 (unpublished) and is ignored in .grype.yaml.
+  // 2.18.9 patches CVE-2026-545{12,13,14,15} (GHSA-5jmj-h7xm-6q6v and siblings).
   // Staying on the 2.18.x line: the 2.19.x line is unpatched for these until
   // 2.21.4/2.21.5, which aren't on Maven Central either.
-  val jacksonVersion = "2.18.8"
+  val jacksonVersion = "2.18.9"
 
   // log4j-1.2-api is the Log4j 1.x bridge bundled with Spark; pin to fix GHSA-h383-gmxw-35v2.
   val log4jVersion = "2.25.4"
@@ -122,7 +121,8 @@ object Constants {
 
   val avroVersion = "1.12.1"
   val protobufVersion = "3.25.5"
-  val jettyVersion = "12.0.33"
+  // 12.0.36 fixes GHSA-f4v5-65jj-pcr2 and GHSA-7p3p-8qv8-m2vh.
+  val jettyVersion = "12.0.36"
   // GHSA-vhch-2wf3-m8rp (High): netty-codec-stomp heap buffer overflow, fixed in 4.1.136.Final
   val nettyVersion = "4.1.136.Final"
   
