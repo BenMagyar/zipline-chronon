@@ -129,19 +129,36 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
         request.copy(context = joinContext) -> decomposedTry
       }
 
-    val groupByRequests = joinDecomposed.flatMap { case (_, gbTry) =>
+    // Deduplicate GroupBy requests by (name, keys, atMillis) before fetching.
+    // Context is per-join-row and must not influence deduplication or the response lookup key.
+    // We keep one representative request (with its original context) per unique logical key so
+    // that GroupBy-level metrics continue to fire with the correct join+groupBy tags.
+    type GroupByKey = (String, Map[String, AnyRef], Option[Long])
+    def groupByKey(r: Request): GroupByKey = (r.name, r.keys, r.atMillis)
+
+    val allGroupByRequests = joinDecomposed.flatMap { case (_, gbTry) =>
       gbTry match {
         case Failure(_)        => Iterator.empty
         case Success(requests) => requests.iterator.flatMap(_.left.toOption).map(_.request)
       }
     }
 
+    // One representative request per unique (name, keys, atMillis) — first occurrence wins.
+    val groupByRequests: Seq[Request] = allGroupByRequests
+      .foldLeft((Set.empty[GroupByKey], List.empty[Request])) { case ((seen, acc), r) =>
+        val key = groupByKey(r)
+        if (seen.contains(key)) (seen, acc) else (seen + key, acc :+ r)
+      }
+      ._2
+
     val groupByResponsesFuture = fetchGroupBys(groupByRequests)
 
     // re-attach groupBy responses to join
     groupByResponsesFuture
       .map { groupByResponses =>
-        val responseMap = groupByResponses.iterator.map { response => response.request -> response.values }.toMap
+        // Key the response map by (name, keys, atMillis) so the fan-out lookup ignores context.
+        val responseMap: Map[GroupByKey, Try[Map[String, AnyRef]]] =
+          groupByResponses.iterator.map { response => groupByKey(response.request) -> response.values }.toMap
         val responses = joinDecomposed.iterator.map { case (joinRequest, decomposedRequestsTry) =>
           val joinValuesTry = decomposedRequestsTry.map { groupByRequestsWithPrefix =>
             groupByRequestsWithPrefix.iterator.flatMap {
@@ -151,7 +168,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
                   keyMissingException.requestName + FetcherUtil.FeatureExceptionSuffix -> keyMissingException.getMessage)
 
               case Left(PrefixedRequest(prefix, groupByRequest)) =>
-                parseGroupByResponse(prefix, groupByRequest, responseMap)
+                parseGroupByResponse(prefix, groupByKey(groupByRequest), responseMap)
             }.toMap
 
           }
@@ -173,17 +190,19 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
       }
   }
 
-  def parseGroupByResponse(prefix: String,
-                           groupByRequest: Request,
-                           responseMap: Map[Request, Try[Map[String, AnyRef]]]): Map[String, AnyRef] = {
+  def parseGroupByResponse(
+      prefix: String,
+      key: (String, Map[String, AnyRef], Option[Long]),
+      responseMap: Map[(String, Map[String, AnyRef], Option[Long]), Try[Map[String, AnyRef]]]
+  ): Map[String, AnyRef] = {
     // Group bys with all null keys won't be requested from the KV store and we don't expect a response.
-    val isRequiredRequest = groupByRequest.keys.values.exists(_ != null) || groupByRequest.keys.isEmpty
+    val isRequiredRequest = key._2.values.exists(_ != null) || key._2.isEmpty
 
-    val response: Try[Map[String, AnyRef]] = responseMap.get(groupByRequest) match {
+    val response: Try[Map[String, AnyRef]] = responseMap.get(key) match {
       case Some(value) => value
       case None =>
         if (isRequiredRequest)
-          Failure(new IllegalStateException(s"Couldn't find a groupBy response for $groupByRequest in response map"))
+          Failure(new IllegalStateException(s"Couldn't find a groupBy response for $key in response map"))
         else Success(null)
     }
 
@@ -195,13 +214,11 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           Map.empty[String, AnyRef]
         }
       }
-      // prefix feature names
-      .recover { // capture exception as a key
-        case ex: Throwable =>
-          if (fetchContext.debug || Math.random() < 0.001) {
-            println(s"Failed to fetch $groupByRequest with \n${ex.traceString}")
-          }
-          Map(prefix + "exception" -> ex.traceString)
+      .recover { case ex: Throwable =>
+        if (fetchContext.debug || Math.random() < 0.001) {
+          println(s"Failed to fetch $key with \n${ex.traceString}")
+        }
+        Map(prefix + "exception" -> ex.traceString)
       }
       .get
   }

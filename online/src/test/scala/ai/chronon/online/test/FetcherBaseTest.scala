@@ -204,47 +204,30 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
   it should "fetch in the happy case" in {
     val fetchContext = mock[FetchContext]
     val baseFetcher = new fetcher.JoinPartFetcher(fetchContext, mock[MetadataStore])
-    val request = Request(name = "name", keys = Map("email" -> "email"), atMillis = None, context = None)
-    val response: Map[Request, Try[Map[String, AnyRef]]] = Map(
-      request -> Success(
-        Map(
-          "key" -> "value"
-        ))
-    )
+    val key = ("name", Map("email" -> "email".asInstanceOf[AnyRef]), None: Option[Long])
+    val response = Map(key -> Success(Map("key" -> "value".asInstanceOf[AnyRef])))
 
-    val result = baseFetcher.parseGroupByResponse("prefix_", request, response)
+    val result = baseFetcher.parseGroupByResponse("prefix_", key, response)
     assertEquals(result, Map("prefix_key" -> "value"))
   }
 
   it should "Not fetch with null keys" in {
     val baseFetcher = new fetcher.JoinPartFetcher(mock[FetchContext], mock[MetadataStore])
-    val request = Request(name = "name", keys = Map("email" -> null), atMillis = None, context = None)
-    val request2 = Request(name = "name2", keys = Map("email" -> null), atMillis = None, context = None)
+    val key = ("name", Map("email" -> null.asInstanceOf[AnyRef]), None: Option[Long])
+    val key2 = ("name2", Map("email" -> null.asInstanceOf[AnyRef]), None: Option[Long])
+    val response = Map(key2 -> Success(Map("key" -> "value".asInstanceOf[AnyRef])))
 
-    val response: Map[Request, Try[Map[String, AnyRef]]] = Map(
-      request2 -> Success(
-        Map(
-          "key" -> "value"
-        ))
-    )
-
-    val result = baseFetcher.parseGroupByResponse("prefix_", request, response)
+    val result = baseFetcher.parseGroupByResponse("prefix_", key, response)
     result shouldBe Map()
   }
 
   it should "parse with missing keys" in {
     val baseFetcher = new fetcher.JoinPartFetcher(mock[FetchContext], mock[MetadataStore])
-    val request = Request(name = "name", keys = Map("email" -> "email"), atMillis = None, context = None)
-    val request2 = Request(name = "name2", keys = Map("email" -> "email"), atMillis = None, context = None)
+    val key = ("name", Map("email" -> "email".asInstanceOf[AnyRef]), None: Option[Long])
+    val key2 = ("name2", Map("email" -> "email".asInstanceOf[AnyRef]), None: Option[Long])
+    val response = Map(key2 -> Success(Map("key" -> "value".asInstanceOf[AnyRef])))
 
-    val response: Map[Request, Try[Map[String, AnyRef]]] = Map(
-      request2 -> Success(
-        Map(
-          "key" -> "value"
-        ))
-    )
-
-    val result = baseFetcher.parseGroupByResponse("prefix_", request, response)
+    val result = baseFetcher.parseGroupByResponse("prefix_", key, response)
     result.keySet shouldBe Set(s"prefix${FetcherUtil.FeatureExceptionSuffix}")
   }
 
