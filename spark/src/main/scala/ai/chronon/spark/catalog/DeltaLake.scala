@@ -3,17 +3,31 @@ package ai.chronon.spark.catalog
 import ai.chronon.api.PartitionSpec
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import io.delta.kernel.{Table => KernelTable}
+import io.delta.kernel.data.{Row => KernelRow}
 import io.delta.kernel.defaults.engine.DefaultEngine
-import io.delta.kernel.internal.{InternalScanFileUtils, ScanImpl}
+import io.delta.kernel.internal.replay.ActionsIterator
+import io.delta.kernel.internal.{InternalScanFileUtils, ScanImpl, SnapshotImpl}
 import io.delta.kernel.internal.util.ColumnMapping
+import io.delta.kernel.types.{
+  LongType => KernelLongType,
+  StringType => KernelStringType,
+  StructType => KernelStructType
+}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.connector.catalog.{Table, TableCatalog}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.types.{
+  ByteType,
   DataType,
   DateType,
+  DecimalType,
+  DoubleType,
+  FloatType,
+  IntegerType,
+  LongType,
   NumericType,
+  ShortType,
   StringType,
   StructType,
   TimestampNTZType,
@@ -141,13 +155,30 @@ case object DeltaLake extends Format {
       val deltaTable = tableMetadataOrThrow(tableName)
       val field = deltaTable.schema(columnName)
       withScanFiles(deltaTable, includeStats = true) { (engine, snapshot, batches) =>
-        val physicalColumnName = ColumnMapping.getPhysicalName(snapshot.getSchema(engine).get(columnName))
+        val kernelField = snapshot.getSchema(engine).get(columnName)
+        val physicalColumnName = ColumnMapping.getPhysicalName(kernelField)
+        lazy val parsedCheckpointStats =
+          checkpointParsedStats(snapshot.asInstanceOf[SnapshotImpl],
+                                engine,
+                                deltaTable.path,
+                                physicalColumnName,
+                                kernelField.getDataType,
+                                field.dataType,
+                                partitionSpec)
         StatsDateRange
           .fromFileStats(
             batches.asScala.flatMap { batch =>
               val rows = batch.getRows
               try {
-                rows.asScala.map(fileDateRange(_, physicalColumnName, field.dataType, partitionSpec)).toList
+                rows.asScala
+                  .map(file =>
+                    fileDateRange(file,
+                                  deltaTable.path,
+                                  physicalColumnName,
+                                  field.dataType,
+                                  partitionSpec,
+                                  parsedCheckpointStats))
+                  .toList
               } finally {
                 rows.close()
               }
@@ -177,15 +208,18 @@ case object DeltaLake extends Format {
     }
   }
 
-  private def fileDateRange(file: io.delta.kernel.data.Row,
-                            columnName: String,
-                            columnType: DataType,
-                            partitionSpec: PartitionSpec): Option[(Long, Long)] = {
+  private def fileDateRange(
+      file: KernelRow,
+      tablePath: String,
+      columnName: String,
+      columnType: DataType,
+      partitionSpec: PartitionSpec,
+      parsedCheckpointStats: => scala.collection.Map[String, (Long, Long)]): Option[(Long, Long)] = {
     val partitionValue = Option(InternalScanFileUtils.getPartitionValues(file).get(columnName))
+    lazy val addFile = file.getStruct(InternalScanFileUtils.ADD_FILE_ORDINAL)
     partitionValue
       .flatMap(value => boundaryMillis(value, columnType, partitionSpec).map(millis => millis -> millis))
       .orElse {
-        val addFile = file.getStruct(InternalScanFileUtils.ADD_FILE_ORDINAL)
         val stats =
           if (addFile.isNullAt(InternalScanFileUtils.ADD_FILE_STATS_ORDINAL)) None
           else Some(objectMapper.readTree(addFile.getString(InternalScanFileUtils.ADD_FILE_STATS_ORDINAL)))
@@ -198,6 +232,7 @@ case object DeltaLake extends Format {
           } yield lowerMillis -> upperMillis
         }
       }
+      .orElse(addPath(addFile).flatMap(path => pathKeys(path, tablePath).flatMap(parsedCheckpointStats.get).headOption))
   }
 
   private def statsValue(stats: JsonNode, boundary: String, columnName: String): Option[JsonNode] =
@@ -226,6 +261,124 @@ case object DeltaLake extends Format {
 
   private def parsePartitionOrTimestamp(value: String, partitionSpec: PartitionSpec): Long =
     Try(partitionSpec.epochMillis(value)).getOrElse(parseTimestamp(value))
+
+  private def checkpointParsedStats(snapshot: SnapshotImpl,
+                                    engine: io.delta.kernel.engine.Engine,
+                                    tablePath: String,
+                                    columnName: String,
+                                    kernelColumnType: io.delta.kernel.types.DataType,
+                                    columnType: DataType,
+                                    partitionSpec: PartitionSpec): scala.collection.Map[String, (Long, Long)] = {
+    val checkpointFiles = snapshot.getLogSegment.checkpoints
+    if (checkpointFiles.isEmpty) {
+      Map.empty
+    } else {
+      val valueSchema = new KernelStructType().add(columnName, kernelColumnType)
+      val statsParsedSchema = new KernelStructType()
+        .add("numRecords", KernelLongType.LONG)
+        .add("minValues", valueSchema)
+        .add("maxValues", valueSchema)
+      val readSchema = new KernelStructType()
+        .add("add",
+             new KernelStructType()
+               .add("path", KernelStringType.STRING)
+               .add("stats_parsed", statsParsedSchema))
+      val actions = new ActionsIterator(engine, checkpointFiles, readSchema, java.util.Optional.empty())
+      try checkpointStatsRows(actions, tablePath, columnName, columnType, partitionSpec)
+      finally actions.close()
+    }
+  }
+
+  private def checkpointStatsRows(actions: ActionsIterator,
+                                  tablePath: String,
+                                  columnName: String,
+                                  columnType: DataType,
+                                  partitionSpec: PartitionSpec): scala.collection.Map[String, (Long, Long)] = {
+    val stats = mutable.Map.empty[String, (Long, Long)]
+    actions.asScala.foreach { action =>
+      val batch = action.getColumnarBatch
+      val rows = batch.getRows
+      try {
+        rows.asScala.foreach { row =>
+          if (!row.isNullAt(0)) {
+            val add = row.getStruct(0)
+            for {
+              path <- addPath(add)
+              statsParsed <- nestedStruct(add, "stats_parsed")
+              range <- parsedStatsRange(statsParsed, columnName, columnType, partitionSpec)
+            } {
+              pathKeys(path, tablePath).foreach(stats += _ -> range)
+            }
+          }
+        }
+      } finally {
+        rows.close()
+      }
+    }
+    stats
+  }
+
+  private def parsedStatsRange(stats: KernelRow,
+                               columnName: String,
+                               columnType: DataType,
+                               partitionSpec: PartitionSpec): Option[(Long, Long)] =
+    for {
+      lower <- parsedStatsBoundary(stats, "minValues", columnName, columnType, partitionSpec)
+      upper <- parsedStatsBoundary(stats, "maxValues", columnName, columnType, partitionSpec)
+    } yield lower -> upper
+
+  private def parsedStatsBoundary(stats: KernelRow,
+                                  boundaryName: String,
+                                  columnName: String,
+                                  columnType: DataType,
+                                  partitionSpec: PartitionSpec): Option[Long] =
+    nestedStruct(stats, boundaryName).flatMap { values =>
+      val valueOrdinal = values.getSchema.indexOf(columnName)
+      if (valueOrdinal < 0 || values.isNullAt(valueOrdinal)) None
+      else typedBoundaryMillis(values, valueOrdinal, columnType, partitionSpec)
+    }
+
+  private def typedBoundaryMillis(row: KernelRow,
+                                  ordinal: Int,
+                                  columnType: DataType,
+                                  partitionSpec: PartitionSpec): Option[Long] =
+    Try {
+      columnType match {
+        // Kernel exposes parsed Delta timestamp stats as epoch micros, while JSON stats use timestamp strings.
+        case TimestampType | TimestampNTZType => Math.floorDiv(row.getLong(ordinal), 1000L)
+        case DateType =>
+          LocalDate.ofEpochDay(row.getInt(ordinal).toLong).atStartOfDay().toInstant(ZoneOffset.UTC).toEpochMilli
+        case StringType     => parsePartitionOrTimestamp(row.getString(ordinal), partitionSpec)
+        case ByteType       => row.getByte(ordinal).toLong
+        case ShortType      => row.getShort(ordinal).toLong
+        case IntegerType    => row.getInt(ordinal).toLong
+        case LongType       => row.getLong(ordinal)
+        case FloatType      => BigDecimal(row.getFloat(ordinal).toString).toLong
+        case DoubleType     => BigDecimal(row.getDouble(ordinal).toString).toLong
+        case _: DecimalType => BigDecimal(row.getDecimal(ordinal).toString).toLong
+        case other          => throw new IllegalArgumentException(s"Unsupported Delta stats type $other")
+      }
+    }.toOption
+
+  private def addPath(addFile: KernelRow): Option[String] = {
+    val pathOrdinal = addFile.getSchema.indexOf("path")
+    if (pathOrdinal < 0 || addFile.isNullAt(pathOrdinal)) None else Some(addFile.getString(pathOrdinal))
+  }
+
+  private def nestedStruct(row: KernelRow, name: String): Option[KernelRow] = {
+    val ordinal = row.getSchema.indexOf(name)
+    if (ordinal < 0 || row.isNullAt(ordinal)) None else Some(row.getStruct(ordinal))
+  }
+
+  private def pathKeys(path: String, tablePath: String): Seq[String] = {
+    val tableRoot = tablePath.stripSuffix("/")
+    val relative = path.stripPrefix("/")
+    val rooted = if (path.contains("://") || path.startsWith("/")) path else s"$tableRoot/$relative"
+    val unrooted =
+      if (path.startsWith(s"$tableRoot/")) path.substring(tableRoot.length + 1)
+      else relative
+    Seq(path, rooted, unrooted).distinct
+  }
 
   private def tableMetadataOrThrow(tableName: String)(implicit sparkSession: SparkSession): TableMetadata =
     tableMetadata(tableName).getOrElse(throw new IllegalArgumentException(s"Not a Delta table: $tableName"))

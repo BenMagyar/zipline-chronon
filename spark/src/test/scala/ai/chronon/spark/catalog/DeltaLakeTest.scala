@@ -3,6 +3,8 @@ package ai.chronon.spark.catalog
 import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.submission.SparkSessionBuilder
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.delta.DeltaLog
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers._
@@ -15,6 +17,7 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       local = true,
       additionalConfig = Some(
         Map(
+          "spark.serializer" -> "org.apache.spark.serializer.JavaSerializer",
           "spark.sql.extensions" -> "io.delta.sql.DeltaSparkSessionExtension",
           "spark.sql.catalog.spark_catalog" -> "org.apache.spark.sql.delta.catalog.DeltaCatalog"
         ))
@@ -53,6 +56,55 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
       spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+    }
+  }
+
+  private def hasPatchedDeltaRuntime: Boolean =
+    Option(classOf[org.apache.spark.sql.delta.CheckpointProvider].getProtectionDomain)
+      .flatMap(domain => Option(domain.getCodeSource))
+      .flatMap(source => Option(source.getLocation))
+      .exists(_.toString.contains("cloud_aws/delta-spark_2.12-3.3.2.jar"))
+
+  // Do not register this case against upstream Delta, which does not include the checkpoint stats patch.
+  if (hasPatchedDeltaRuntime) {
+    it should "derive virtual partitions from parsed checkpoint stats when JSON stats are disabled" in {
+      val dbName = s"delta_struct_stats_${System.nanoTime()}"
+      val tableName = s"$dbName.time_with_struct_stats"
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+      try {
+        spark.sql(s"""
+          CREATE TABLE $tableName (
+            created_at TIMESTAMP,
+            user_id STRING
+          ) USING DELTA
+          TBLPROPERTIES (
+            'delta.checkpoint.writeStatsAsJson' = 'false',
+            'delta.checkpoint.writeStatsAsStruct' = 'true',
+            'delta.columnMapping.mode' = 'name'
+          )
+        """)
+        spark.sql(s"INSERT INTO $tableName VALUES (TIMESTAMP '2024-01-01 12:00:00', 'user1')")
+        spark.sql(s"INSERT INTO $tableName VALUES (TIMESTAMP '2024-01-03 12:00:00', 'user2')")
+        DeltaLog.forTable(spark, TableIdentifier("time_with_struct_stats", Some(dbName))).checkpoint()
+
+        DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
+          Some(StatsDateRange(start = "2024-01-01", end = "2024-01-03"))
+        DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
+          List("2024-01-01", "2024-01-02")
+
+        spark.sql(s"INSERT INTO $tableName VALUES (TIMESTAMP '2024-01-05 12:00:00', 'user3')")
+        spark.sql(s"DELETE FROM $tableName WHERE created_at = TIMESTAMP '2024-01-01 12:00:00'")
+
+        // Jan 3 is read from checkpoint stats_parsed, Jan 5 from the post-checkpoint JSON log.
+        DeltaLake.statsDateRange(tableName, "created_at", PartitionSpec.daily) shouldBe
+          Some(StatsDateRange(start = "2024-01-03", end = "2024-01-05"))
+        DeltaLake.virtualPartitions(tableName, "created_at", PartitionSpec.daily) shouldBe
+          List("2024-01-03", "2024-01-04")
+      } finally {
+        spark.sql(s"DROP TABLE IF EXISTS $tableName")
+        spark.sql(s"DROP DATABASE IF EXISTS $dbName")
+      }
     }
   }
 
