@@ -61,11 +61,21 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
       .connectionTimeout(connectionTimeout)
       .build()
 
-    val clientConfig = ClientOverrideConfiguration
+    val sdkMetricsEnabled = getOptional(DynamoSdkMetricsEnabled, conf)
+      .map(_.toBoolean)
+      .getOrElse(false)
+
+    val configBuilder = ClientOverrideConfiguration
       .builder()
       .apiCallTimeout(apiCallTimeout)
       .apiCallAttemptTimeout(apiCallAttemptTimeout)
-      .build()
+
+    if (sdkMetricsEnabled) {
+      logger.info("DynamoDB SDK metrics enabled — attaching OtelDynamoMetricPublisher")
+      configBuilder.addMetricPublisher(new OtelDynamoMetricPublisher())
+    }
+
+    val clientConfig = configBuilder.build()
 
     var builder = DynamoDbAsyncClient
       .builder()
@@ -128,6 +138,7 @@ object AwsApiImpl {
   private[aws] val DynamoConnectionTimeout = "DYNAMO_CONNECTION_TIMEOUT"
   private[aws] val DynamoApiCallTimeout = "DYNAMO_API_CALL_TIMEOUT"
   private[aws] val DynamoApiCallAttemptTimeout = "DYNAMO_API_CALL_ATTEMPT_TIMEOUT"
+  private[aws] val DynamoSdkMetricsEnabled = "DYNAMO_SDK_METRICS_ENABLED"
 
   private[aws] def getOptional(key: String, conf: Map[String, String]): Option[String] =
     sys.env

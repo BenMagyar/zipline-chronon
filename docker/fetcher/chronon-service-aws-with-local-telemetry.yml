@@ -1,0 +1,54 @@
+name: chronon-service-aws
+
+services:
+  chronon-fetcher:
+    image: ziplineai/chronon-fetcher:latest
+    restart: "no"
+    ports:
+      - "9000:9000"
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    environment:
+      - PROVIDER=aws
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
+      - AWS_CREDENTIALS_PROVIDER=software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+      - DYNAMO_API_CALL_ATTEMPT_TIMEOUT=${DYNAMO_API_CALL_ATTEMPT_TIMEOUT:-PT1.0S}
+      - DYNAMO_SDK_METRICS_ENABLED=true
+      - CHRONON_METRICS_READER=http
+      - EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=chronon-fetcher
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    restart: "no"
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./resources/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "9464:9464"
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: "no"
+    volumes:
+      - ./resources/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: "no"
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    depends_on:
+      - prometheus

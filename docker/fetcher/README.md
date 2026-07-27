@@ -24,6 +24,7 @@ There's some additional environment variables that the Docker container can be s
 |-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------|
 | **AWS Configuration**
 | KV_TABLE_PREFIX                   | Prefix to prepend to DynamoDB table names when fetching features. Allows the service to fetch from prefixed DynamoDB tables (e.g., if set to "dev_", table "my_table" becomes "dev_my_table")                                                                                                                                 | ``                      |
+| DYNAMO_SDK_METRICS_ENABLED        | When set to `true`, attaches a metric publisher to the DynamoDB client that forwards AWS SDK transport-level metrics (per-operation latency breakdown, retry counts, connection pool state, error types) into the Chronon OTel pipeline. Requires `CHRONON_METRICS_READER` to be configured. Metrics are emitted under the `kv_store.dynamodb.sdk.*` namespace and tagged with the DynamoDB operation name (e.g. `GetItem`, `PutItem`, `Query`). | `false`                 |
 | **Google Cloud Configuration**
 | GCP_PROJECT_ID                    | GCloud Zipline BigTable project                                                                                                                                                                                                                                                                                               | ``                      |
 | GOOGLE_CLOUD_PROJECT              | GCloud Zipline BigTable project                                                                                                                                                                                                                                                                                               | ``                      |
@@ -180,4 +181,29 @@ curl -s "http://localhost:9091/api/v1/label/__name__/values" | jq '.data[]'
 
 # Query metrics in Prometheus UI
 open http://localhost:9091
+```
+
+### AWS DynamoDB SDK Metrics
+
+When `PROVIDER=AWS` and `DYNAMO_SDK_METRICS_ENABLED=true`, the fetcher bridges AWS SDK v2 per-request metrics (latency breakdowns, retry counts, connection pool state) into the Chronon OTel pipeline. See the [AWS SDK metrics documentation](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/metrics.html) for the full list of available metrics.
+
+Use the included AWS compose file, which has `DYNAMO_SDK_METRICS_ENABLED=true` and the full telemetry stack pre-configured:
+
+```shell
+./scripts/distribution/publish_docker_images.sh --local
+docker compose -f chronon-service-aws-with-local-telemetry.yml up
+```
+
+Confirm the publisher attached on startup:
+
+```bash
+docker logs <fetcher-container> 2>&1 | grep "sdk metrics"
+# Expected: DynamoDB SDK metrics enabled — attaching OtelDynamoMetricPublisher
+```
+
+Then trigger some calls and verify metrics are flowing through to the OTEL collector:
+
+```bash
+curl http://localhost:9000/v1/joins
+curl -s http://localhost:9464/metrics | grep dynamodb_sdk
 ```
