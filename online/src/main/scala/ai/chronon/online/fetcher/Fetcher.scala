@@ -40,6 +40,7 @@ import com.google.gson.Gson
 import org.apache.avro.generic.GenericRecord
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -409,6 +410,36 @@ class Fetcher(val kvStore: KVStore,
       }
     }
   }
+
+  // Bridges a Scala Future onto a plain CompletableFuture, completing it directly on the
+  // chronon-fetcher ExecutionContext thread. Unlike FutureConverters.toJava, which returns a
+  // subclass that overrides thenApply/thenCompose/etc. to always dispatch via thenApplyAsync
+  // (i.e. ForkJoinPool.commonPool), a plain CompletableFuture runs synchronous continuations
+  // on the completing thread — avoiding an unnecessary commonPool hop on every response.
+  private def toCompletableFuture[T](f: Future[T]): CompletableFuture[T] = {
+    val cf = new CompletableFuture[T]()
+    f.onComplete {
+      case Success(v)  => cf.complete(v)
+      case Failure(ex) => cf.completeExceptionally(ex)
+    }
+    cf
+  }
+
+  // Java-friendly overloads: accept java.util.List and return CompletableFuture so JavaFetcher
+  // can call these directly without going through FutureConverters. The .map(_.asJava) runs on
+  // the chronon-fetcher EC (implicit in scope), so the CompletableFuture completes on that thread.
+  def fetchJoin(requests: java.util.List[Request]): CompletableFuture[java.util.List[Response]] =
+    toCompletableFuture(fetchJoin(requests.asScala.toSeq).map(_.asJava))
+
+  def fetchGroupBys(requests: java.util.List[Request]): CompletableFuture[java.util.List[Response]] =
+    toCompletableFuture(fetchGroupBys(requests.asScala.toSeq).map(_.asJava))
+
+  def fetchJoinV2(requests: java.util.List[Request],
+                  responseType: ResponseType): CompletableFuture[java.util.List[ResponseV2]] =
+    toCompletableFuture(fetchJoinV2(requests.asScala.toSeq, None, responseType).map(_.asJava))
+
+  def fetchModelTransforms(requests: java.util.List[Request]): CompletableFuture[java.util.List[Response]] =
+    toCompletableFuture(fetchModelTransforms(requests.asScala.toSeq, None).map(_.asJava))
 
   def fetchJoinV2(requests: Seq[Request],
                   joinConf: Option[api.Join] = None,

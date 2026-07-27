@@ -19,12 +19,7 @@ package ai.chronon.online;
 import ai.chronon.api.ScalaJavaConversions;
 import ai.chronon.online.fetcher.Fetcher;
 import ai.chronon.online.fetcher.FeaturesResponseType;
-import ai.chronon.online.fetcher.FetcherResponseWithTs;
-import scala.collection.Iterator;
-import scala.Option;
-import scala.collection.mutable.ArrayBuffer;
 import scala.compat.java8.FutureConverters;
-import scala.concurrent.Future;
 import scala.concurrent.ExecutionContext;
 import scala.util.Try;
 import ai.chronon.online.metrics.Metrics;
@@ -144,73 +139,51 @@ public class JavaFetcher {
     }
   }
 
-  private <T extends ai.chronon.online.fetcher.Fetcher.BaseResponse> CompletableFuture<List<JavaResponse>> convertResponsesWithTs(
-            Future<FetcherResponseWithTs<T>> responses,
-            boolean isGroupBy,
-            long startTs) {
-    return FutureConverters.toJava(responses).toCompletableFuture().thenApply(resps -> {
-        scala.collection.immutable.List<T> scalaList = resps.responses().toList();
-        List<JavaResponse> jResps = new ArrayList<>(scalaList.size());
-        Iterator<T> it = scalaList.iterator();
-        while (it.hasNext()) {
-            jResps.add(new JavaResponse(it.next()));
-        }
-        List<String> requestNames = jResps.stream().map(jResp -> jResp.request.name).collect(Collectors.toList());
-        instrument(requestNames, isGroupBy, "java.response_conversion.latency.millis", resps.endTs());
-        instrument(requestNames, isGroupBy, "java.overall.latency.millis", startTs);
-        return jResps;
-    });
-  }
-
-  private List<Fetcher.Request> convertJavaRequestList(List<JavaRequest> requests, boolean isGroupBy, long startTs) {
+  private List<Fetcher.Request> toScalaRequests(List<JavaRequest> requests, boolean isGroupBy, long startTs) {
     List<Fetcher.Request> scalaRequests = new ArrayList<>();
     for (JavaRequest request : requests) {
-      Fetcher.Request convertedRequest = request.toScalaRequest();
-      scalaRequests.add(convertedRequest);
+      scalaRequests.add(request.toScalaRequest());
     }
     instrument(requests.stream().map(jReq -> jReq.name).collect(Collectors.toList()), isGroupBy, "java.request_conversion.latency.millis", startTs);
     return scalaRequests;
   }
 
+  private <T extends Fetcher.BaseResponse> CompletableFuture<List<JavaResponse>> wrapResponses(
+          CompletableFuture<java.util.List<T>> cf,
+          boolean isGroupBy,
+          long startTs) {
+    return cf.thenApply(responses -> {
+        long conversionStartTs = System.currentTimeMillis();
+        List<JavaResponse> jResps = responses.stream()
+            .map(JavaResponse::new)
+            .collect(Collectors.toList());
+        List<String> names = jResps.stream().map(r -> r.request.name).collect(Collectors.toList());
+        instrument(names, isGroupBy, "java.response_conversion.latency.millis", conversionStartTs);
+        instrument(names, isGroupBy, "java.overall.latency.millis", startTs);
+        return jResps;
+    });
+  }
+
   public CompletableFuture<List<JavaResponse>> fetchGroupBys(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
-    // Convert java requests to scala requests
-    List<Fetcher.Request> scalaRequests = convertJavaRequestList(requests, true, startTs);
-
-    // Get responses from the fetcher
-    Future<FetcherResponseWithTs<Fetcher.Response>> scalaResponses = this.fetcher.withTs(this.fetcher.fetchGroupBys(ScalaJavaConversions.toScala(scalaRequests)));
-    // Convert responses to CompletableFuture
-    return convertResponsesWithTs(scalaResponses, true, startTs);
+    return wrapResponses(this.fetcher.fetchGroupBys(toScalaRequests(requests, true, startTs)), true, startTs);
   }
 
   public CompletableFuture<List<JavaResponse>> fetchJoin(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
-    // Convert java requests to scala requests
-    List<Fetcher.Request> scalaRequests = convertJavaRequestList(requests, false, startTs);
-    // Get responses from the fetcher
-    Future<FetcherResponseWithTs<Fetcher.Response>> scalaResponses = this.fetcher.withTs(this.fetcher.fetchJoin(ScalaJavaConversions.toScala(scalaRequests), Option.empty()));
-    // Convert responses to CompletableFuture
-    return convertResponsesWithTs(scalaResponses, false, startTs);
+    return wrapResponses(this.fetcher.fetchJoin(toScalaRequests(requests, false, startTs)), false, startTs);
   }
 
   public CompletableFuture<List<JavaResponse>> fetchJoinBase64Avro(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
-    // Convert java requests to scala requests
-    List<Fetcher.Request> scalaRequests = convertJavaRequestList(requests, false, startTs);
-    // Get responses from the fetcher
-      Future<FetcherResponseWithTs<Fetcher.ResponseV2>> scalaResponses = this.fetcher.withTs(this.fetcher.fetchJoinV2(ScalaJavaConversions.toScala(scalaRequests), Option.empty(), FeaturesResponseType.AvroString()));
-    // Convert responses to CompletableFuture
-    return convertResponsesWithTs(scalaResponses, false, startTs);
+    return wrapResponses(
+        this.fetcher.fetchJoinV2(toScalaRequests(requests, false, startTs), FeaturesResponseType.AvroString()),
+        false, startTs);
   }
 
   public CompletableFuture<List<JavaResponse>> fetchModelTransforms(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
-    // Convert java requests to scala requests
-    List<Fetcher.Request> scalaRequests = convertJavaRequestList(requests, false, startTs);
-    // Get responses from the fetcher
-    Future<FetcherResponseWithTs<Fetcher.Response>> scalaResponses = this.fetcher.withTs(this.fetcher.fetchModelTransforms(ScalaJavaConversions.toScala(scalaRequests), Option.empty()));
-    // Convert responses to CompletableFuture
-    return convertResponsesWithTs(scalaResponses, false, startTs);
+    return wrapResponses(this.fetcher.fetchModelTransforms(toScalaRequests(requests, false, startTs)), false, startTs);
   }
 
   public CompletableFuture<List<String>> listJoins(boolean isOnline) {
