@@ -35,7 +35,26 @@ class TTLCache[I, O](f: I => O,
                      ttlMillis: Long = TTLCache.DefaultTtlMillis,
                      nowFunc: () => Long = { () => System.currentTimeMillis() },
                      refreshIntervalMillis: Long = 8 * 1000, // 8 seconds
-                     onCreateFunc: Option[O => Unit] = None) {
+                     onCreateFunc: Option[O => Unit] = None,
+                     // A background refresh that fails - the creator throws, or returns a value rejected by
+                     // isValid - must NOT evict a previously cached valid value. We keep serving the
+                     // last-known-good instead. The default accepts everything, which is correct for creators
+                     // that throw on failure (a throw never reaches the cache). Caches whose creator returns a
+                     // Failure sentinel (e.g. Try) must pass `_.isSuccess`, otherwise a single backing-store
+                     // blip during refresh poisons a good entry and every subsequent read serves the failure.
+                     isValid: O => Boolean = (_: O) => true,
+                     // Deterministic per-key jitter shrinks the effective interval by up to this fraction so
+                     // entries loaded together (e.g. at startup) don't all expire on the same tick and stampede
+                     // the backing store when they refresh.
+                     refreshJitterRatio: Double = 0.1) {
+
+  // Fail fast on a misconfigured ratio: >= 1.0 would jitter away the whole interval (refresh on every read).
+  // The range check also rejects NaN/Infinity, since any comparison with NaN is false and the infinities fall
+  // outside [0, 1). Reject at construction rather than silently degrading.
+  require(
+    refreshJitterRatio >= 0.0 && refreshJitterRatio < 1.0,
+    s"refreshJitterRatio must be in [0, 1), got $refreshJitterRatio"
+  )
 
   private def wrappedCreator(i: I): O = {
     val result = f(i)
@@ -51,7 +70,12 @@ class TTLCache[I, O](f: I => O,
       override def apply(t: I, u: Entry): Entry = {
         val now = nowFunc()
         if (u == null) {
-          Entry(wrappedCreator(t), now)
+          val result = wrappedCreator(t)
+          // A failed cold load is stamped as already-expired (ts = 0) so the next read re-attempts it at the
+          // refresh cadence instead of caching the failure for the full ttl (potentially hours). Once it loads
+          // successfully it is stamped normally and cached for ttl.
+          val ts = if (isValid(result)) now else 0L
+          Entry(result, ts)
         } else {
           u
         }
@@ -59,6 +83,16 @@ class TTLCache[I, O](f: I => O,
     }
 
   val cMap = new ConcurrentHashMap[I, Entry]()
+
+  // Stable per-key offset in [0, intervalMillis * refreshJitterRatio) subtracted from the interval, so an
+  // entry expires slightly early. Deterministic in the key so a given entry's cadence stays stable, and 0 when
+  // the interval is 0 (force) so forced refreshes remain immediate.
+  private def effectiveInterval(i: I, intervalMillis: Long): Long = {
+    val jitterWindow = (intervalMillis * refreshJitterRatio).toLong
+    if (jitterWindow <= 0 || jitterWindow >= intervalMillis) intervalMillis
+    else intervalMillis - Math.floorMod(i.hashCode.toLong, jitterWindow)
+  }
+
   // use the fact that cache update is not immediately necessary during regular reads
   // sync update would block the calling threads on every update
   private def asyncUpdateOnExpiry(i: I, intervalMillis: Long): O = {
@@ -70,7 +104,7 @@ class TTLCache[I, O](f: I => O,
       entry.value
     } else {
       if (
-        (nowFunc() - entry.updatedAtMillis > intervalMillis) &&
+        (nowFunc() - entry.updatedAtMillis > effectiveInterval(i, intervalMillis)) &&
         // CAS so that update is enqueued only once per expired entry
         entry.markedForUpdate.compareAndSet(false, true)
       ) {
@@ -78,13 +112,22 @@ class TTLCache[I, O](f: I => O,
         TTLCache.executor.execute(new Runnable {
           override def run(): Unit = {
             try {
-              cMap.put(i, Entry(wrappedCreator(i), nowFunc()))
-              contextBuilder(i).increment("cache.update")
+              val updated = wrappedCreator(i)
+              if (isValid(updated)) {
+                cMap.put(i, Entry(updated, nowFunc()))
+                contextBuilder(i).increment("cache.update")
+              } else {
+                // refresh produced an invalid value (e.g. a Failure): keep the last-known-good entry and let a
+                // later read re-enqueue the refresh once the interval elapses again.
+                cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                contextBuilder(i).increment("cache.refresh_failure")
+              }
             } catch {
               case ex: Exception =>
-                // reset the mark so that another thread can retry
-                cMap.get(i).markedForUpdate.compareAndSet(true, false);
-                contextBuilder(i).incrementException(ex);
+                // creator threw: keep serving the stale value, reset the mark so another read can retry
+                cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                contextBuilder(i).increment("cache.refresh_failure")
+                contextBuilder(i).incrementException(ex)
             }
           }
         })

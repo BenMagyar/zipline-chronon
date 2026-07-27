@@ -280,7 +280,11 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
         metrics.Metrics.Context(environment = "join.codec.fetch", join = join)
       },
       ttlMillis = fetchContext.joinCodecTtlMillis,
-      onCreateFunc = onCreateFunc
+      onCreateFunc = onCreateFunc,
+      // Serve stale on refresh failure: codecBuilder returns Failure (rather than throwing) when the join conf
+      // can't be fetched, so keep the last-known-good codec instead of caching the failure. A Success carrying
+      // hasPartialFailure is still valid here and is refreshed via the existing partial-failure path.
+      isValid = (codec: Try[JoinCodec]) => codec.isSuccess
     )
   }
 
@@ -443,7 +447,11 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
       { gb =>
         import ai.chronon.online.metrics
         metrics.Metrics.Context(environment = "group_by.serving_info.fetch", groupBy = gb)
-      }
+      },
+      // Serve stale on refresh failure: this loader returns Failure (rather than throwing) on a KV miss/timeout,
+      // so without this a transient BigTable blip during refresh would poison a previously-good entry and every
+      // subsequent request for the join would fail until a refresh finally succeeded.
+      isValid = (servingInfo: Try[GroupByServingInfoParsed]) => servingInfo.isSuccess
     )
 
   def put(
