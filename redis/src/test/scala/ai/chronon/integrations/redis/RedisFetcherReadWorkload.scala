@@ -51,7 +51,7 @@ private[redis] object RedisFetcherReadWorkload {
     require(
       candidateEmbeddingGroupBys >= 0 &&
         candidateEmbeddingGroupBys <= candidateGroupBys - candidateLastGroupBys - candidateTiledGroupBys)
-    require(tiledPoints > 0 && tileSizeMillis > 0)
+    require(tiledPoints > 1 && tileSizeMillis > 0)
     require(scalarPayloadBytes > 0 && embeddingPayloadBytes > 0)
 
     val contextSnapshotGroupBys: Int = contextGroupBys - contextLastGroupBys - contextTiledGroupBys
@@ -80,7 +80,19 @@ private[redis] object RedisFetcherReadWorkload {
       expectedTimedValues: Long,
       expectedPayloadBytes: Long
   ) {
-    val groupByRequests: Int = requests.count(_.startTsMillis.isEmpty)
+    val batchGetCommands: Int = requests.count(_.startTsMillis.isEmpty)
+    val zrangeCommands: Int = requests.iterator
+      .filter(_.startTsMillis.isDefined)
+      .map { request =>
+        val startTs = request.startTsMillis.get
+        val endTs = request.endTsMillis.getOrElse(startTs)
+        val startDay = startTs - (startTs % 1.day.toMillis)
+        val endDay = endTs - (endTs % 1.day.toMillis)
+        ((endDay - startDay) / 1.day.toMillis + 1L).toInt
+      }
+      .sum
+    val redisCommands: Int = batchGetCommands + zrangeCommands
+    val groupByRequests: Int = batchGetCommands
   }
 
   final case class Workload(
@@ -90,11 +102,19 @@ private[redis] object RedisFetcherReadWorkload {
       puts: Vector[PutRequest],
       logical: ReadProfile,
       deduplicated: ReadProfile,
+      deduplicatedCrossDay: ReadProfile,
+      batchOnly: ReadProfile,
+      batchCacheDemand: Vector[ReadProfile],
       uniqueBatchRequests: Int,
       uniqueStreamingRequests: Int
   ) {
     val logicalGroupByRequests: Int = config.candidates * config.totalGroupBys
     val uniqueGroupByRequests: Int = uniqueBatchRequests
+
+    def batchCacheDemandAt(hitPercent: Int): ReadProfile =
+      batchCacheDemand.find(_.name == s"synthetic-context-hot-candidate-hit-$hitPercent").getOrElse {
+        throw new IllegalArgumentException(s"No batch cache demand profile for $hitPercent%")
+      }
   }
 
   private final case class PlannedGet(request: GetRequest, expectedTimedValues: Int, expectedPayloadBytes: Long)
@@ -151,6 +171,25 @@ private[redis] object RedisFetcherReadWorkload {
       uniqueReads.getOrElseUpdate(identity(planned.request), planned)
     }
     val plannedUniqueReads = uniqueReads.values.toVector
+    val plannedCrossDayReads = plannedUniqueReads.map { planned =>
+      if (planned.request.startTsMillis.isDefined) {
+        planned.copy(request = planned.request.copy(
+          startTsMillis = Some(RangeStartMillis - config.tileSizeMillis),
+          endTsMillis = Some(rangeEndMillis - config.tileSizeMillis)
+        ))
+      } else {
+        planned
+      }
+    }
+    val plannedUniqueBatchReads = plannedUniqueReads.filter(_.request.startTsMillis.isEmpty)
+    val batchCacheDemand = Vector(50, 80, 100).map { hitPercent =>
+      val candidateMisses = math.ceil(config.candidates * (100 - hitPercent) / 100.0).toInt
+      val missingCandidateKeys = candidateKeys.take(candidateMisses).iterator.map(_.toVector).toSet
+      val reads = plannedUniqueReads.filter { planned =>
+        planned.request.startTsMillis.isDefined || missingCandidateKeys.contains(planned.request.keyBytes.toVector)
+      }
+      profile(s"synthetic-context-hot-candidate-hit-$hitPercent", reads)
+    }
 
     val puts = groupBys.flatMap { groupBy =>
       val ownerKeys = groupBy.ownership match {
@@ -167,9 +206,12 @@ private[redis] object RedisFetcherReadWorkload {
         groupBy.streamingDataset match {
           case None => Vector(batchPut)
           case Some(streamingDataset) =>
-            val points = groupBy.readShape.streamingPoints(config)
-            val firstPoint = config.tiledPoints - points
-            val streamingPuts = (firstPoint until config.tiledPoints).map { pointIndex =>
+            val pointIndexes = groupBy.readShape match {
+              case LastValue   => Seq(-1, config.tiledPoints - 1)
+              case HourlyTiled => -1 until config.tiledPoints
+              case Snapshot    => Seq.empty
+            }
+            val streamingPuts = pointIndexes.map { pointIndex =>
               val tileStartMillis = RangeStartMillis + pointIndex.toLong * config.tileSizeMillis
               val tileKey = TilingUtils.buildTileKey(
                 streamingDataset,
@@ -200,6 +242,9 @@ private[redis] object RedisFetcherReadWorkload {
       puts,
       profile("logical", plannedLogicalReads),
       profile("deduplicated", plannedUniqueReads),
+      profile("deduplicated-cross-day-24h", plannedCrossDayReads),
+      profile("batch-only", plannedUniqueBatchReads),
+      batchCacheDemand,
       uniqueBatchRequests,
       uniqueStreamingRequests
     )
