@@ -16,7 +16,7 @@ import redis.clients.jedis.exceptions.{
 }
 import redis.clients.jedis.{ClusterPipeline, Jedis, JedisCluster, Response}
 import redis.clients.jedis.params.ScanParams
-import redis.clients.jedis.resps.{ScanResult, Tuple}
+import redis.clients.jedis.resps.ScanResult
 
 import java.nio.charset.StandardCharsets
 import scala.collection.concurrent.TrieMap
@@ -162,7 +162,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
           redisKey,
           startTs,
           endTs,
-          pipeline.zrangeByScoreWithScores(redisKey, startTs.toDouble, endTs.toDouble)
+          pipeline.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble)
         )
       }
       PendingRead(request, () => Try(decodeStreamingValues(commands)))
@@ -295,7 +295,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         decodeBatchValue(jedisCluster.get(redisKey))
       case StreamingReadPlan(_, redisKeys, startTs, endTs) =>
         redisKeys.flatMap { redisKey =>
-          decodeStreamingTuples(jedisCluster.zrangeByScoreWithScores(redisKey, startTs.toDouble, endTs.toDouble))
+          decodeStreamingMembers(jedisCluster.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble))
         }
     }
   }
@@ -321,7 +321,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
       ()
     case StreamingReadPlan(_, redisKeys, startTs, endTs) =>
       redisKeys.headOption.foreach { redisKey =>
-        jedisCluster.zrangeByScoreWithScores(redisKey, startTs.toDouble, endTs.toDouble)
+        jedisCluster.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble)
       }
   }
 
@@ -344,15 +344,15 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
 
   private def decodeStreamingValues(commands: Seq[StreamingCommand]): Seq[TimedValue] = {
     commands.flatMap { command =>
-      decodeStreamingTuples(command.response.get())
+      decodeStreamingMembers(command.response.get())
     }
   }
 
-  private def decodeStreamingTuples(tuples: java.util.List[Tuple]): Seq[TimedValue] = {
-    tuples.asScala.flatMap { tuple =>
-      val memberBytes = tuple.getBinaryElement
+  private def decodeStreamingMembers(members: java.util.List[Array[Byte]]): Seq[TimedValue] = {
+    members.asScala.flatMap { memberBytes =>
       if (memberBytes.length >= 8) {
-        Some(TimedValue(memberBytes.drop(8), tuple.getScore.toLong))
+        val timestamp = java.nio.ByteBuffer.wrap(memberBytes, 0, 8).getLong
+        Some(TimedValue(memberBytes.drop(8), timestamp))
       } else {
         logger.warn(s"Malformed streaming data in Redis: member has ${memberBytes.length} bytes, expected >= 8")
         None
@@ -640,7 +640,7 @@ private[redis] object RedisKVStoreImpl {
       redisKey: Array[Byte],
       startTs: Long,
       endTs: Long,
-      response: Response[java.util.List[Tuple]]
+      response: Response[java.util.List[Array[Byte]]]
   )
 
   final case class PendingRead(request: GetRequest, resolve: () => Try[Seq[TimedValue]])
