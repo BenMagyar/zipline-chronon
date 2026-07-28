@@ -103,7 +103,7 @@ Response fields:
 |-------|-------------|
 | `groupByName` | GroupBy metadata name. |
 | `batchEndDate` | Formatted partition boundary through which batch upload data is available in the online KV store. |
-| `batchEndTs` | Epoch millis watermark through which batch upload data is available in the online KV store. Prefer this field for subdaily grids. |
+| `batchEndTs` | Explicit epoch millis watermark uploaded with the serving info, or `null` when absent. Prefer this field for subdaily grids. |
 
 ## CLI
 

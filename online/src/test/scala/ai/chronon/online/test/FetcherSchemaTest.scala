@@ -118,8 +118,28 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     val javaResponse = new JavaGroupByStatusResponse("legacy_group_by", "2026-05-20")
 
     scalaResponse.productArity shouldBe 2
-    scalaResponse.batchEndTs shouldBe 0L
-    javaResponse.batchEndTs shouldBe 0L
+    scalaResponse.batchEndTs shouldBe null
+    javaResponse.batchEndTs shouldBe null
+  }
+
+  it should "include batchEndTs in status response value semantics" in {
+    val batchEndTs = java.lang.Long.valueOf(1779235200000L)
+    val response = Fetcher.GroupByStatusResponse("test_group_by", "2026-05-20", batchEndTs)
+    val equalResponse = Fetcher.GroupByStatusResponse("test_group_by", "2026-05-20", batchEndTs)
+    val differentWatermark = Fetcher.GroupByStatusResponse("test_group_by", "2026-05-20", batchEndTs + 1L)
+
+    response shouldBe equalResponse
+    response.hashCode() shouldBe equalResponse.hashCode()
+    response.hashCode() shouldBe (response.groupByName, response.batchEndDate, response.batchEndTs).hashCode()
+    response should not be differentWatermark
+    response.toString shouldBe "GroupByStatusResponse(test_group_by,2026-05-20,1779235200000)"
+
+    val copied = response.copy(batchEndDate = "2026-05-21")
+    copied.groupByName shouldBe response.groupByName
+    copied.batchEndDate shouldBe "2026-05-21"
+    copied.batchEndTs shouldBe batchEndTs
+
+    response.copy(batchEndTs = batchEndTs + 1L) shouldBe differentWatermark
   }
 
   // A GroupBy that is only a join dependency is uploaded to <NAME>_BATCH (so the join can fetch it) but
