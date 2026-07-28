@@ -57,6 +57,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
   )
   private val workerThreadCounts = envInts("PERF_REDIS_THREAD_COUNTS", Seq(16, 32, 48, 64))
   private val queueCapacities = envInts("PERF_REDIS_QUEUE_CAPACITIES", Seq(10000))
+  private val candidates = envInt("PERF_CANDIDATES", RedisFetcherReadWorkload.Config().candidates)
   private val loadBatchSize = envInt("PERF_LOAD_BATCH_SIZE", 100)
   private val maxConnections = envInt("PERF_REDIS_MAX_CONNECTIONS", 64)
   private val maxIdleConnections =
@@ -96,6 +97,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
   require(batchConcurrencies.nonEmpty && batchConcurrencies.forall(_ > 0))
   require(workerThreadCounts.nonEmpty && workerThreadCounts.forall(_ > 0))
   require(queueCapacities.nonEmpty && queueCapacities.forall(_ > 0))
+  require(candidates > 0)
   require(loadBatchSize > 0)
   require(maxConnections > 0)
   require(localPrimaryCount >= 3)
@@ -168,10 +170,10 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     }
   }
 
-  "Redis fetcher read benchmark" should "measure the 50-candidate mixed GroupBy workload" in {
+  "Redis fetcher read benchmark" should "measure the mixed GroupBy workload" in {
     assume(enabled, "Set CHRONON_PERF_TEST_ENABLED=true to run Redis performance tests")
 
-    val workload = RedisFetcherReadWorkload.build()
+    val workload = RedisFetcherReadWorkload.build(RedisFetcherReadWorkload.Config(candidates = candidates))
     val profilesByName =
       (Seq(workload.deduplicated, workload.deduplicatedCrossDay, workload.logical, workload.batchOnly) ++
         workload.batchCacheDemand ++ workload.batchCacheDemandCrossDay)
