@@ -23,6 +23,7 @@ import ai.chronon.online.fetcher.Fetcher.{ColumnSpec, PrefixedRequest, Request, 
 import ai.chronon.online.fetcher.FetcherCache.BatchResponses
 import org.slf4j.{Logger, LoggerFactory}
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
@@ -144,12 +145,9 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
     }
 
     // One representative request per unique (name, keys, atMillis) — first occurrence wins.
-    val groupByRequests: Seq[Request] = allGroupByRequests
-      .foldLeft((Set.empty[GroupByKey], List.empty[Request])) { case ((seen, acc), r) =>
-        val key = groupByKey(r)
-        if (seen.contains(key)) (seen, acc) else (seen + key, acc :+ r)
-      }
-      ._2
+    val uniqueGroupByRequests = mutable.LinkedHashMap.empty[GroupByKey, Request]
+    allGroupByRequests.foreach(request => uniqueGroupByRequests.getOrElseUpdate(groupByKey(request), request))
+    val groupByRequests: Seq[Request] = uniqueGroupByRequests.values.toSeq
 
     val groupByResponsesFuture = fetchGroupBys(groupByRequests)
 
