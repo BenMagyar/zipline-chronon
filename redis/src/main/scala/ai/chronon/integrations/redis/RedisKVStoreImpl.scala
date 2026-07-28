@@ -128,11 +128,17 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         val responses: Seq[GetResponse] = tableType match {
           case BatchTable =>
             val pipeline = jedisCluster.pipelined()
-            val pipelinedGets = requests.map { request =>
-              val redisKey = buildRedisKey(request.keyBytes, dataset, keyPrefix = keyPrefix)
-              (request, pipeline.get(redisKey.getBytes(StandardCharsets.UTF_8)))
-            }
-            pipeline.sync()
+            val pipelinedGets =
+              try {
+                val queuedGets = requests.map { request =>
+                  val redisKey = buildRedisKey(request.keyBytes, dataset, keyPrefix = keyPrefix)
+                  (request, pipeline.get(redisKey.getBytes(StandardCharsets.UTF_8)))
+                }
+                queuedGets
+              } finally {
+                // ClusterPipeline.close performs the sync and returns borrowed node connections to their pools.
+                pipeline.close()
+              }
 
             pipelinedGets.map { case (request, response) =>
               val timedValues = Try {
