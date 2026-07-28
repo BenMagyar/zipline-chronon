@@ -5,6 +5,7 @@ import ai.chronon.online.KVStore.{GetRequest, PutRequest}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import redis.clients.jedis.util.JedisClusterCRC16
 
 import java.nio.charset.StandardCharsets
 import java.time.Instant
@@ -129,6 +130,38 @@ class RedisUnifiedReadPipelineTest extends AnyFlatSpec with BeforeAndAfterAll wi
     responses(4).values.get.map(value => new String(value.bytes, StandardCharsets.UTF_8)) shouldBe Seq("valid-stream")
     responses(5).values.isSuccess shouldBe true
     cluster.client.getClusterNodes.values().asScala.map(_.getNumActive).sum shouldBe 0
+  }
+
+  it should "co-locate entity hash-tagged batch reads while preserving dataset uniqueness" in {
+    val kvStore = new RedisKVStoreImpl(cluster.client, Map("redis.key.hash.tag.mode" -> RedisKVStore.EntityHashTagMode))
+    val entity = bytes("shared-entity")
+    val datasetA = "ENTITY_HASH_A_BATCH"
+    val datasetB = "ENTITY_HASH_B_BATCH"
+    val redisKeyA = RedisKVStore
+      .buildRedisKey(entity.toSeq, datasetA, hashTagMode = RedisKVStore.EntityHashTagMode)
+      .getBytes(StandardCharsets.UTF_8)
+    val redisKeyB = RedisKVStore
+      .buildRedisKey(entity.toSeq, datasetB, hashTagMode = RedisKVStore.EntityHashTagMode)
+      .getBytes(StandardCharsets.UTF_8)
+
+    redisKeyA.toSeq should not equal redisKeyB.toSeq
+    JedisClusterCRC16.getSlot(redisKeyA) shouldBe JedisClusterCRC16.getSlot(redisKeyB)
+
+    Await.result(
+      kvStore.multiPut(
+        Seq(
+          PutRequest(entity, bytes("value-a"), datasetA, Some(DayStartMillis)),
+          PutRequest(entity, bytes("value-b"), datasetB, Some(DayStartMillis))
+        )),
+      10.seconds
+    ) shouldBe Seq(true, true)
+
+    val requests = Seq(GetRequest(entity, datasetA), GetRequest(entity, datasetB))
+    val responses = Await.result(kvStore.multiGet(requests), 10.seconds)
+
+    responses.map(_.request) shouldBe requests
+    responses.map(response => new String(response.values.get.head.bytes, StandardCharsets.UTF_8)) shouldBe
+      Seq("value-a", "value-b")
   }
 
   private def bytes(value: String): Array[Byte] = value.getBytes(StandardCharsets.UTF_8)
