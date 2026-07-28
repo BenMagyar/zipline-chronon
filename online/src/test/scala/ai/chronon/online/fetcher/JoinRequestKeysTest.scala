@@ -32,14 +32,22 @@ class JoinRequestKeysTest extends AnyFlatSpec {
         ))
     )
 
-  private def servingInfo(inputSchema: StructType): GroupByServingInfoParsed = {
+  private def servingInfo(groupByConf: GroupBy,
+                          inputSchema: StructType,
+                          keySchema: StructType): GroupByServingInfoParsed = {
     val groupByServingInfo = new GroupByServingInfo()
-    groupByServingInfo.setGroupBy(groupBy)
-    groupByServingInfo.setKeyAvroSchema(
-      AvroConversions.fromChrononSchema(StructType("Key", Array(StructField("query_normalized", StringType)))).toString)
+    groupByServingInfo.setGroupBy(groupByConf)
+    groupByServingInfo.setKeyAvroSchema(AvroConversions.fromChrononSchema(keySchema).toString)
     groupByServingInfo.setInputAvroSchema(AvroConversions.fromChrononSchema(inputSchema).toString)
     new GroupByServingInfoParsed(groupByServingInfo)
   }
+
+  private def servingInfo(inputSchema: StructType): GroupByServingInfoParsed =
+    servingInfo(
+      groupBy,
+      inputSchema,
+      StructType("Key", Array(StructField("query_normalized", StringType)))
+    )
 
   it should "include join left selects in cached key mapping keys" in {
     val firstJoin = join("lower(query)")
@@ -94,6 +102,40 @@ class JoinRequestKeysTest extends AnyFlatSpec {
       JoinRequestKeys.partKey(firstJoin, firstJoin.joinPartOps.head),
       JoinRequestKeys.partKey(secondJoin, secondJoin.joinPartOps.head)
     )
+  }
+
+  it should "use GroupBy key types for direct Join request keys" in {
+    Seq("user_id", "seller_id").foreach { keyName =>
+      val directGroupBy = Builders.GroupBy(
+        metaData = Builders.MetaData(name = s"unit_test.${keyName}_group_by"),
+        keyColumns = Seq(keyName)
+      )
+      val directJoin = Builders.Join(
+        metaData = Builders.MetaData(name = s"unit_test.${keyName}_join"),
+        left = Builders.Source.events(
+          query = Builders.Query(selects = Map(keyName -> keyName)),
+          table = "unit_test.requests"
+        ),
+        joinParts = Seq(
+          Builders.JoinPart(
+            groupBy = directGroupBy,
+            keyMapping = Map(keyName -> keyName)
+          ))
+      )
+      val directServingInfo = servingInfo(
+        directGroupBy,
+        StructType("Input", Array(StructField(keyName, IntType))),
+        StructType("Key", Array(StructField(keyName, LongType)))
+      )
+
+      assertEquals(
+        Seq(StructField(keyName, LongType)),
+        JoinRequestKeys
+          .buildKeyMapping(directJoin, directJoin.joinPartOps.head, directServingInfo)
+          .requestKeyFields
+          .toSeq
+      )
+    }
   }
 
   it should "validate missing request keys against raw selected inputs" in {

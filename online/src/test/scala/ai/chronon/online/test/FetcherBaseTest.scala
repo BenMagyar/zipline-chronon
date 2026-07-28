@@ -17,7 +17,7 @@
 package ai.chronon.online.test
 
 import ai.chronon.aggregator.windowing.FinalBatchIr
-import ai.chronon.api.{Accuracy, Builders, GroupByServingInfo, MetaData, StringType, StructField, StructType, TimeUnit, Window}
+import ai.chronon.api.{Accuracy, Builders, GroupByServingInfo, IntType, LongType, MetaData, StringType, StructField, StructType, TimeUnit, Window}
 import ai.chronon.api.Extensions.{GroupByOps, WindowOps}
 import ai.chronon.online.fetcher.Fetcher.ColumnSpec
 import ai.chronon.online.fetcher.Fetcher.Request
@@ -286,6 +286,165 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
     groupByRequest.name shouldBe queryGroupBy.metaData.name
     groupByRequest.keys shouldBe Map("query_normalized" -> "shoes")
     verify(ttlCache, times(1)).apply(queryGroupBy.metaData.name)
+  }
+
+  it should "deduplicate direct Join request keys using GroupBy key types" in {
+    val intInputGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.int_input_group_by"),
+      keyColumns = Seq("user_id")
+    )
+    val longInputGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.long_input_group_by"),
+      keyColumns = Seq("user_id")
+    )
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.direct_key_type_join"),
+      left = Builders.Source.events(
+        query = Builders.Query(selects = Map("user_id" -> "user_id")),
+        table = "unit_test.requests"
+      ),
+      joinParts = Seq(
+        Builders.JoinPart(intInputGroupBy, keyMapping = Map("user_id" -> "user_id")),
+        Builders.JoinPart(longInputGroupBy, keyMapping = Map("user_id" -> "user_id"))
+      )
+    )
+
+    stubServingInfos(
+      intInputGroupBy -> servingInfo(intInputGroupBy, IntType, LongType),
+      longInputGroupBy -> servingInfo(longInputGroupBy, LongType, LongType)
+    )
+
+    metadataStore.buildJoinCodec(join, refreshOnFail = false).keySchema.fields shouldBe
+      Array(StructField("user_id", LongType))
+  }
+
+  it should "reject incompatible Join request key types with their origins" in {
+    val longKeyGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.long_key_group_by"),
+      keyColumns = Seq("user_id")
+    )
+    val stringKeyGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.string_key_group_by"),
+      keyColumns = Seq("user_id")
+    )
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.conflicting_key_type_join"),
+      left = Builders.Source.events(query = Builders.Query(), table = "unit_test.requests"),
+      joinParts = Seq(
+        Builders.JoinPart(longKeyGroupBy, keyMapping = Map("user_id" -> "user_id")),
+        Builders.JoinPart(stringKeyGroupBy, keyMapping = Map("user_id" -> "user_id"))
+      )
+    )
+
+    stubServingInfos(
+      longKeyGroupBy -> servingInfo(longKeyGroupBy, LongType, LongType),
+      stringKeyGroupBy -> servingInfo(stringKeyGroupBy, StringType, StringType)
+    )
+
+    Seq(false, true).foreach { refreshOnFail =>
+      val exception = intercept[IllegalArgumentException] {
+        metadataStore.buildJoinCodec(join, refreshOnFail)
+      }
+      exception.getMessage should include("unit_test.conflicting_key_type_join")
+      exception.getMessage should include("user_id")
+      exception.getMessage should include("LongType")
+      exception.getMessage should include("unit_test.long_key_group_by")
+      exception.getMessage should include("StringType")
+      exception.getMessage should include("unit_test.string_key_group_by")
+    }
+  }
+
+  it should "reject incompatible raw key types shared by derived Join keys" in {
+    val intInputGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.derived_int_input_group_by"),
+      keyColumns = Seq("normalized_user_id")
+    )
+    val stringInputGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.derived_string_input_group_by"),
+      keyColumns = Seq("normalized_user_id")
+    )
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.conflicting_derived_input_join"),
+      left = Builders.Source.events(
+        query = Builders.Query(selects = Map("normalized_user_id" -> "cast(user_id as bigint)")),
+        table = "unit_test.requests"
+      ),
+      joinParts = Seq(
+        Builders.JoinPart(intInputGroupBy, keyMapping = Map("normalized_user_id" -> "normalized_user_id")),
+        Builders.JoinPart(stringInputGroupBy, keyMapping = Map("normalized_user_id" -> "normalized_user_id"))
+      )
+    )
+
+    stubServingInfos(
+      intInputGroupBy -> servingInfo(
+        intInputGroupBy,
+        IntType,
+        LongType,
+        inputName = "user_id",
+        keyName = "normalized_user_id"),
+      stringInputGroupBy -> servingInfo(
+        stringInputGroupBy,
+        StringType,
+        LongType,
+        inputName = "user_id",
+        keyName = "normalized_user_id")
+    )
+
+    val exception = intercept[IllegalArgumentException] {
+      metadataStore.buildJoinCodec(join, refreshOnFail = false)
+    }
+    exception.getMessage should include("user_id")
+    exception.getMessage should include("IntType")
+    exception.getMessage should include("StringType")
+  }
+
+  it should "reject incompatible request key types from Join and external parts" in {
+    val groupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.external_conflict_group_by"),
+      keyColumns = Seq("user_id")
+    )
+    val externalSource = Builders.ExternalSource(
+      Builders.MetaData(name = "unit_test.external_user_source"),
+      StructType("ExternalKey", Array(StructField("user_id", StringType))),
+      StructType("ExternalValue", Array.empty)
+    )
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.external_key_conflict_join"),
+      left = Builders.Source.events(query = Builders.Query(), table = "unit_test.requests"),
+      joinParts = Seq(Builders.JoinPart(groupBy, keyMapping = Map("user_id" -> "user_id"))),
+      externalParts = Seq(Builders.ExternalPart(externalSource))
+    )
+
+    stubServingInfos(groupBy -> servingInfo(groupBy, LongType, LongType))
+
+    val exception = intercept[IllegalArgumentException] {
+      metadataStore.buildJoinCodec(join, refreshOnFail = false)
+    }
+    exception.getMessage should include("user_id")
+    exception.getMessage should include("unit_test.external_conflict_group_by")
+    exception.getMessage should include("unit_test.external_user_source")
+  }
+
+  private def servingInfo(groupBy: ai.chronon.api.GroupBy,
+                          inputType: ai.chronon.api.DataType,
+                          keyType: ai.chronon.api.DataType,
+                          inputName: String = "user_id",
+                          keyName: String = "user_id"): GroupByServingInfoParsed = {
+    val info = new GroupByServingInfo()
+    info.setGroupBy(groupBy)
+    info.setKeyAvroSchema(
+      AvroConversions.fromChrononSchema(StructType("Key", Array(StructField(keyName, keyType)))).toString)
+    info.setInputAvroSchema(
+      AvroConversions.fromChrononSchema(StructType("Input", Array(StructField(inputName, inputType)))).toString)
+    info.setSelectedAvroSchema(AvroConversions.fromChrononSchema(StructType("Selected", Array.empty)).toString)
+    new GroupByServingInfoParsed(info)
+  }
+
+  private def stubServingInfos(infos: (ai.chronon.api.GroupBy, GroupByServingInfoParsed)*): Unit = {
+    val byName = infos.map { case (groupBy, info) => groupBy.metaData.name -> Success(info) }.toMap
+    val ttlCache = mock[TTLCache[String, Try[GroupByServingInfoParsed]]]
+    doReturn(ttlCache).when(metadataStore).getGroupByServingInfo
+    doAnswer((invocation: InvocationOnMock) => byName(invocation.getArgument[String](0))).when(ttlCache).apply(any())
   }
 
   it should "skip join codec lookup when join keys are direct" in {

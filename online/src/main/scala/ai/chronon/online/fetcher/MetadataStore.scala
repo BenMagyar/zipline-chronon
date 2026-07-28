@@ -289,7 +289,28 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
   }
 
   def buildJoinCodec(joinConf: Join, refreshOnFail: Boolean): JoinCodec = {
-    val keyFields = new mutable.LinkedHashSet[StructField]
+    final case class KeyOrigin(description: String, fieldType: DataType)
+    final class JoinKeySchemaConflictException(message: String) extends IllegalArgumentException(message)
+
+    val keyFieldsByName = mutable.LinkedHashMap.empty[String, StructField]
+    val keyOriginsByName = mutable.Map.empty[String, mutable.ListBuffer[KeyOrigin]]
+
+    def addKeyField(field: StructField, origin: String): Unit = {
+      keyFieldsByName.get(field.name) match {
+        case None =>
+          keyFieldsByName.put(field.name, field)
+          keyOriginsByName.put(field.name, mutable.ListBuffer(KeyOrigin(origin, field.fieldType)))
+        case Some(existing) if existing.fieldType == field.fieldType =>
+          keyOriginsByName(field.name).append(KeyOrigin(origin, field.fieldType))
+        case Some(_) =>
+          val origins = keyOriginsByName(field.name).toSeq :+ KeyOrigin(origin, field.fieldType)
+          val details = origins.map(item => s"${item.fieldType} from ${item.description}").mkString("; ")
+          throw new JoinKeySchemaConflictException(
+            s"Incompatible request key schema for join ${joinConf.metaData.name}: " +
+              s"field '${field.name}' has conflicting types: $details")
+      }
+    }
+
     val valueFields = new mutable.ListBuffer[StructField]
     val valueInfos = mutable.ListBuffer.empty[JoinCodec.ValueInfo]
     val joinPartKeyMappings = mutable.Map.empty[String, JoinRequestKeys.KeyMapping]
@@ -300,7 +321,8 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
         .map { servingInfo =>
           val (keys, values, keyMapping) = buildJoinPartCodec(joinConf, joinPart, servingInfo)
 
-          keys.foreach(k => keyFields.add(k))
+          val origin = s"join part ${joinPart.fullPrefix} (GroupBy ${joinPart.groupBy.metaData.getName})"
+          keys.foreach(key => addKeyField(key, origin))
           values.foreach(v => valueFields.append(v))
           joinPartKeyMappings.put(JoinRequestKeys.partKey(joinConf, joinPart), keyMapping)
           joinPartKeyMappings.put(JoinRequestKeys.partKey(joinConf, joinPart, servingInfo), keyMapping)
@@ -313,6 +335,7 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
           }
         }
         .recoverWith {
+          case exception: JoinKeySchemaConflictException => Failure(exception)
           case exception: Throwable => {
             if (refreshOnFail) {
               getGroupByServingInfo.refresh(joinPart.groupBy.metaData.getName)
@@ -345,7 +368,8 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
 
           val keyStructFields =
             buildFields(source.getKeySchema).map(f => f.copy(name = part.rightToLeft.getOrElse(f.name, f.name)))
-          keyStructFields.foreach(keyFields.add)
+          val origin = s"online external part ${part.fullName} (source ${source.metadata.getName})"
+          keyStructFields.foreach(key => addKeyField(key, origin))
           val leftKeys = keyStructFields.map(_.name)
 
           buildFields(source.getValueSchema, part.fullName + "_").foreach { f =>
@@ -359,7 +383,7 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
     }
 
     val joinName = joinConf.metaData.nameToFilePath
-    val keySchema = StructType(s"${joinName.sanitize}_key", keyFields.toArray)
+    val keySchema = StructType(s"${joinName.sanitize}_key", keyFieldsByName.values.toArray)
     val keyCodec = AvroCodec.of(AvroConversions.fromChrononSchema(keySchema).toString)
     val baseValueSchema = StructType(s"${joinName.sanitize}_value", valueFields.toArray)
     val baseValueCodec = serde.AvroCodec.of(AvroConversions.fromChrononSchema(baseValueSchema).toString)
