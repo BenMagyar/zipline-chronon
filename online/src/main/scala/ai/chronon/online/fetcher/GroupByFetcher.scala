@@ -211,15 +211,20 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             .flatMap(_.get.map(v => Option(v.bytes).map(_.length).getOrElse(0)))
             .sum
 
-        val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
-          val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>
-            val LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, _, context) =
-              requestMeta
-
+        groupByRequestToKvRequest.iterator
+          .flatMap(_._2.toOption.map(_.context))
+          .toSet
+          .foreach { context: metrics.Metrics.Context =>
             context.count("multi_get.batch.size", allRequestsToFetch.length)
             context.distribution("multi_get.bytes", totalResponseValueBytes)
             context.distribution("multi_get.response.length", kvResponses.length)
             context.distribution("multi_get.latency.millis", multiGetMillis)
+          }
+
+        val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
+          val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>
+            val LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, _, context) =
+              requestMeta
 
             // pick the batch version with highest timestamp
             val batchResponses: BatchResponses =

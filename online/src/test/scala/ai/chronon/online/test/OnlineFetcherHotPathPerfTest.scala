@@ -176,7 +176,7 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
     validation.keyEncodes shouldBe KvRequestCount.toLong
     validation.kvRequests shouldBe KvRequestCount
     val metricsValidation = validateGroupByResponseMetricsShape()
-    Set(LegacyMultiGetMetricWrites, DeduplicatedMultiGetMetricWrites) should contain(metricsValidation.metricWrites)
+    metricsValidation.metricWrites shouldBe DeduplicatedMultiGetMetricWrites
 
     Seq(0, 50, 80, 100).foreach { hitPercent =>
       val fixture = newCacheFixture(hitPercent)
@@ -296,7 +296,7 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
     val batchConcurrencies = envPositiveInts("CHRONON_ONLINE_FETCHER_BATCH_CONCURRENCIES", Seq(1, 4))
     val executorThreadCounts = envPositiveInts("CHRONON_ONLINE_FETCHER_EXECUTOR_THREADS", Seq(1, 4))
     val metricsValidation = validateGroupByResponseMetricsShape()
-    Set(LegacyMultiGetMetricWrites, DeduplicatedMultiGetMetricWrites) should contain(metricsValidation.metricWrites)
+    metricsValidation.metricWrites shouldBe DeduplicatedMultiGetMetricWrites
 
     println(
       "ONLINE_FETCHER_HOT_PATH_SCOPE scenario=groupby_response_metrics " +
