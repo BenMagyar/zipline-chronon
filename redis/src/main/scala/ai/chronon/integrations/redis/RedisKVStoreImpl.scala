@@ -80,7 +80,8 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
 
   // Configurable key prefix (can be empty for dedicated Redis deployments)
   private val keyPrefix: String = conf.getOrElse("redis.key.prefix", DefaultKeyPrefix)
-  private val keyHashTagMode: String = conf.getOrElse("redis.key.hash.tag.mode", RedisKVStore.DatasetAndEntityHashTagMode)
+  private val keyHashTagMode: String =
+    conf.getOrElse("redis.key.hash.tag.mode", RedisKVStore.DatasetAndEntityHashTagMode)
   private val recordReadMetrics: Boolean =
     !conf.get("redis.read.metrics.enabled").exists(_.equalsIgnoreCase("false"))
 
@@ -132,7 +133,8 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
     val planned = Try {
       getTableType(request.dataset) match {
         case BatchTable =>
-          val redisKey = buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode)
+          val redisKey =
+            buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode)
           BatchReadPlan(request, redisKey.getBytes(StandardCharsets.UTF_8))
         case StreamingTable if request.startTsMillis.isDefined =>
           val startTs = request.startTsMillis.get
@@ -257,8 +259,8 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
     PipelineAttempt(results, activePlan)
   }
 
-  private def queueJedisReads(plans: Seq[RedisReadPlan], pipeline: ClusterPipeline)(markActive: RedisReadPlan => Unit)
-      : Seq[PendingRead] = {
+  private def queueJedisReads(plans: Seq[RedisReadPlan], pipeline: ClusterPipeline)(
+      markActive: RedisReadPlan => Unit): Seq[PendingRead] = {
     val pendingReads = Array.ofDim[PendingRead](plans.size)
     val mgetGroups = new java.util.LinkedHashMap[Int, java.util.ArrayList[(Int, BatchReadPlan)]]()
 
@@ -295,8 +297,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
           val pendingIndex = group.get(index)._1
           val plan = group.get(index)._2
           val responseIndex = index
-          pendingReads(pendingIndex) =
-            PendingRead(plan.request, () => Try(decodeBatchValue(values.get(responseIndex))))
+          pendingReads(pendingIndex) = PendingRead(plan.request, () => Try(decodeBatchValue(values.get(responseIndex))))
           index += 1
         }
       }
@@ -784,10 +785,10 @@ object RedisKVStore {
 
   private def buildBaseKey(prefix: String, dataset: String, base64Key: String, hashTagMode: String): String = {
     hashTagMode match {
-      case EntityHashTagMode             => s"$prefix$dataset$KeySeparator{$base64Key}"
-      case DatasetAndEntityHashTagMode   => s"$prefix{$dataset$KeySeparator$base64Key}"
-      case null | ""                     => s"$prefix{$dataset$KeySeparator$base64Key}"
-      case other                         => throw new IllegalArgumentException(s"Unknown Redis hash tag mode: $other")
+      case EntityHashTagMode           => s"$prefix$dataset$KeySeparator{$base64Key}"
+      case DatasetAndEntityHashTagMode => s"$prefix{$dataset$KeySeparator$base64Key}"
+      case null | ""                   => s"$prefix{$dataset$KeySeparator$base64Key}"
+      case other                       => throw new IllegalArgumentException(s"Unknown Redis hash tag mode: $other")
     }
   }
 
