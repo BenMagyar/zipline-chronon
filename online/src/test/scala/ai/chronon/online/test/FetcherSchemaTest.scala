@@ -2,10 +2,10 @@ package ai.chronon.online.test
 
 import ai.chronon.api.Extensions.GroupByOps
 import ai.chronon.api.{Constants, ThriftJsonCodec}
+import ai.chronon.online.{GroupByServingInfoParsed, InMemoryKvStore, JavaGroupByStatusResponse}
 import ai.chronon.online.KVStore.PutRequest
 import ai.chronon.online.fetcher.Fetcher
 import ai.chronon.online.serde.AvroCodec
-import ai.chronon.online.InMemoryKvStore
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -14,8 +14,14 @@ import scala.concurrent.duration.DurationInt
 
 class FetcherSchemaTest extends AnyFlatSpec with Matchers {
 
-  private def putString(kvStore: InMemoryKvStore, key: String, value: String, dataset: String): Unit = {
-    Await.result(kvStore.put(PutRequest(key.getBytes(Constants.UTF8), value.getBytes(Constants.UTF8), dataset)), 1.second)
+  private def putString(kvStore: InMemoryKvStore,
+                        key: String,
+                        value: String,
+                        dataset: String,
+                        tsMillis: Option[Long] = None): Unit = {
+    Await.result(
+      kvStore.put(PutRequest(key.getBytes(Constants.UTF8), value.getBytes(Constants.UTF8), dataset, tsMillis)),
+      1.second)
   }
 
   it should "fetch schema for online groupBys" in {
@@ -43,24 +49,47 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     valueCodec.fieldNames.toSet shouldBe Set("int_val", "id_last2_1d", "id2_last2_1d")
   }
 
-  it should "fetch status for online groupBys" in {
+  it should "fetch current status directly from batch serving info" in {
     val kvStore = InMemoryKvStore.build(s"FetcherSchemaTest_status_${System.nanoTime()}")
     kvStore.create(Constants.MetadataDataset)
 
     val servingInfo = GroupByDerivationsTest.makeTestGroupByServingInfoParsed().groupByServingInfo
     servingInfo.groupBy.metaData.setOnline(true)
+    servingInfo.setBatchEndDate("2026-06-03-04-00")
+    servingInfo.setDateFormat("yyyy-MM-dd-HH-mm")
+    servingInfo.setBatchEndTs(1780459200000L)
     val groupByName = servingInfo.groupBy.metaData.name
     val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
     kvStore.create(batchDataset)
 
-    putString(kvStore, servingInfo.groupBy.keyNameForKvStore, ThriftJsonCodec.toJsonStr(servingInfo.groupBy), Constants.MetadataDataset)
-    putString(kvStore, Constants.GroupByServingInfoKey, ThriftJsonCodec.toJsonStr(servingInfo), batchDataset)
+    putString(kvStore,
+              servingInfo.groupBy.keyNameForKvStore,
+              ThriftJsonCodec.toJsonStr(servingInfo.groupBy),
+              Constants.MetadataDataset)
+    putString(kvStore,
+              Constants.GroupByServingInfoKey,
+              ThriftJsonCodec.toJsonStr(servingInfo),
+              batchDataset,
+              Some(1L))
 
     val fetcher = new Fetcher(kvStore, Constants.MetadataDataset)
-    val response = fetcher.fetchGroupByStatus(groupByName).get
+    val firstResponse = fetcher.fetchGroupByStatus(groupByName).get
 
-    response.groupByName shouldBe groupByName
-    response.batchEndDate shouldBe servingInfo.batchEndDate
+    firstResponse.groupByName shouldBe groupByName
+    firstResponse.batchEndDate shouldBe servingInfo.batchEndDate
+    firstResponse.batchEndTs shouldBe new GroupByServingInfoParsed(servingInfo).batchEndTsMillis
+
+    servingInfo.setBatchEndDate("2026-07-23")
+    servingInfo.setBatchEndTs(1784764800000L)
+    putString(kvStore,
+              Constants.GroupByServingInfoKey,
+              ThriftJsonCodec.toJsonStr(servingInfo),
+              batchDataset,
+              Some(2L))
+
+    val refreshedResponse = fetcher.fetchGroupByStatus(groupByName).get
+    refreshedResponse.batchEndDate shouldBe "2026-07-23"
+    refreshedResponse.batchEndTs shouldBe 1784764800000L
   }
 
   it should "return a user-facing status error for offline groupBys" in {
@@ -70,17 +99,27 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     val servingInfo = GroupByDerivationsTest.makeTestGroupByServingInfoParsed().groupByServingInfo
     servingInfo.groupBy.metaData.setOnline(false)
     val groupByName = servingInfo.groupBy.metaData.name
-    val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
-    kvStore.create(batchDataset)
 
-    putString(kvStore, servingInfo.groupBy.keyNameForKvStore, ThriftJsonCodec.toJsonStr(servingInfo.groupBy), Constants.MetadataDataset)
-    putString(kvStore, Constants.GroupByServingInfoKey, ThriftJsonCodec.toJsonStr(servingInfo), batchDataset)
+    putString(kvStore,
+              servingInfo.groupBy.keyNameForKvStore,
+              ThriftJsonCodec.toJsonStr(servingInfo.groupBy),
+              Constants.MetadataDataset)
 
     val fetcher = new Fetcher(kvStore, Constants.MetadataDataset)
     val failure = fetcher.fetchGroupByStatus(groupByName).failed.get
 
     failure shouldBe a[IllegalArgumentException]
     failure.getMessage should include("online=True")
+    failure.getMessage should include("upload the GroupBy")
+  }
+
+  it should "retain the two-field status response API" in {
+    val scalaResponse = Fetcher.GroupByStatusResponse("legacy_group_by", "2026-05-20")
+    val javaResponse = new JavaGroupByStatusResponse("legacy_group_by", "2026-05-20")
+
+    scalaResponse.productArity shouldBe 2
+    scalaResponse.batchEndTs shouldBe 0L
+    javaResponse.batchEndTs shouldBe 0L
   }
 
   // A GroupBy that is only a join dependency is uploaded to <NAME>_BATCH (so the join can fetch it) but

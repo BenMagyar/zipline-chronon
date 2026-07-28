@@ -57,18 +57,26 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("dynamodb")
 
+  private def loadBatchTableName(dataset: String, stronglyConsistent: Boolean): String = {
+    val keyMap = Map(
+      partitionKeyColumn -> AttributeValue.builder.b(SdkBytes.fromByteArray(dataset.getBytes(Constants.UTF8))).build)
+    val request = GetItemRequest.builder
+      .tableName(batchTableRegistry)
+      .key(keyMap.toJava)
+      .build
+    val response =
+      if (stronglyConsistent) prefixedDynamoDbClient.getItemStronglyConsistent(request)
+      else prefixedDynamoDbClient.getItem(request)
+    val item = response.join().item().toScala
+    item
+      .get("valueBytes")
+      .map(value => new String(value.b().asByteArray(), Constants.UTF8))
+      .getOrElse(dataset)
+  }
+
   // TTLCache: resolves logical batch dataset names to physical date-suffixed table names
   private val batchTableCache: TTLCache[String, String] = new TTLCache[String, String](
-    f = { dataset =>
-      val keyMap = Map(partitionKeyColumn -> AttributeValue.builder.b(SdkBytes.fromByteArray(dataset.getBytes)).build)
-      val request = GetItemRequest.builder
-        .tableName(batchTableRegistry)
-        .key(keyMap.toJava)
-        .build
-
-      val item = prefixedDynamoDbClient.getItem(request).join().item().toScala
-      item.get("valueBytes").map(v => new String(v.b().asByteArray())).getOrElse(dataset)
-    },
+    f = { dataset => loadBatchTableName(dataset, stronglyConsistent = false) },
     contextBuilder = { _ => metricsContext.withSuffix("batch_table_cache") }
   )
 
@@ -168,29 +176,59 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     Future.sequence(getItemResults ++ aggregatedQueryResults)
   }
 
+  override def getFresh(request: KVStore.GetRequest): Future[KVStore.GetResponse] = {
+    if (request.startTsMillis.isDefined || request.endTsMillis.isDefined) {
+      Future.successful(
+        GetResponse(request,
+                    Failure(new UnsupportedOperationException("DynamoDB fresh reads only support exact-key lookups"))))
+    } else {
+      Try {
+        if (request.dataset.endsWith(batchSuffix)) loadBatchTableName(request.dataset, stronglyConsistent = true)
+        else request.dataset
+      } match {
+        case Success(tableName) =>
+          getLookup(request,
+                    tableName,
+                    stronglyConsistent = true,
+                    metricsSuffix = "get_fresh",
+                    defaultTimestamp = Instant.now().toEpochMilli)
+        case Failure(exception) => Future.successful(GetResponse(request, Failure(exception)))
+      }
+    }
+  }
+
+  private def getLookup(request: KVStore.GetRequest,
+                        tableName: String,
+                        stronglyConsistent: Boolean,
+                        metricsSuffix: String,
+                        defaultTimestamp: Long): Future[GetResponse] = {
+    val keyAttributeMap = primaryKeyMap(request.keyBytes)
+    val getItemRequest = GetItemRequest.builder.key(keyAttributeMap.toJava).tableName(tableName).build
+    val startTs = System.currentTimeMillis()
+    val response =
+      if (stronglyConsistent) prefixedDynamoDbClient.getItemStronglyConsistent(getItemRequest)
+      else prefixedDynamoDbClient.getItem(getItemRequest)
+
+    handleDynamoDbOperation(metricsContext.withSuffix(metricsSuffix), request.dataset, startTs)(response)
+      .transform {
+        case Success(getItemResponse) =>
+          val resultValue = extractTimedValues(List(getItemResponse.item()).toJava, defaultTimestamp)
+          Success(GetResponse(request, resultValue))
+        case Failure(exception) =>
+          Success(GetResponse(request, Failure(exception)))
+      }
+  }
+
   protected def doGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
-    val getItemCompletables = getLookups.map { req =>
-      val keyAttributeMap = primaryKeyMap(req.keyBytes)
-      val tableName = resolveTableName(req.dataset)
-      val getItemReq = GetItemRequest.builder.key(keyAttributeMap.toJava).tableName(tableName).build
-      val startTs = System.currentTimeMillis()
-      (req, prefixedDynamoDbClient.getItem(getItemReq), startTs)
-    }
-
-    // timestamp to use for all get responses when the underlying tables don't have a ts field
+    // Keep the existing behavior of assigning one fallback timestamp to all exact reads in this multiGet.
     val defaultTimestamp = Instant.now().toEpochMilli
-
-    val getItemResults = getItemCompletables.map { case (req, completableFuture, startTs) =>
-      handleDynamoDbOperation(metricsContext.withSuffix("multiget"), req.dataset, startTs)(completableFuture)
-        .transform {
-          case Success(response) =>
-            val resultValue = extractTimedValues(List(response.item()).toJava, defaultTimestamp)
-            Success(GetResponse(req, resultValue))
-          case Failure(e) =>
-            Success(GetResponse(req, Failure(e)))
-        }
+    getLookups.map { request =>
+      getLookup(request,
+                resolveTableName(request.dataset),
+                stronglyConsistent = false,
+                metricsSuffix = "multiget",
+                defaultTimestamp = defaultTimestamp)
     }
-    getItemResults
   }
 
   protected def queryPartition(dataset: String,

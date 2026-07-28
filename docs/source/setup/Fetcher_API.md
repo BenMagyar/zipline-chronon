@@ -18,7 +18,7 @@ Names in path parameters are Chronon metadata names. URL-encode names that conta
 | `GET` | `/v1/joins` | Lists Chronon joins marked `online=True`. |
 | `GET` | `/v1/join/:name/schema` | Returns the online fetch schema for a join. |
 | `GET` | `/v1/groupby/:name/schema` | Returns the online fetch schema for a GroupBy. |
-| `GET` | `/v1/groupby/:name/status` | Returns online GroupBy upload status. |
+| `GET` | `/v1/groupby/:name/status` | Returns the latest uploaded batch watermark for an online GroupBy. |
 | `GET` | `/v1/stats/:tableName` | Returns enhanced statistics for a table when stats are available. |
 | `POST` | `/v1/fetch/groupby/:name` | Fetches features for one GroupBy. |
 | `POST` | `/v1/fetch/join/:name` | Fetches features for one join. |
@@ -91,7 +91,7 @@ GroupBy schema fetching is available only for online GroupBys. If a GroupBy is n
 
 ## GroupBy Status
 
-`GET /v1/groupby/:name/status` returns the latest uploaded batch watermark for an online GroupBy.
+`GET /v1/groupby/:name/status` returns the latest uploaded batch serving watermark for an online GroupBy.
 
 ```bash
 curl "http://localhost:9000/v1/groupby/quickstart.user_activity_v1/status" | jq
@@ -102,7 +102,8 @@ Response fields:
 | Field | Description |
 |-------|-------------|
 | `groupByName` | GroupBy metadata name. |
-| `batchEndDate` | Date through which batch upload data is available in the online KV store. |
+| `batchEndDate` | Formatted partition boundary through which batch upload data is available in the online KV store. |
+| `batchEndTs` | Epoch millis watermark through which batch upload data is available in the online KV store. Prefer this field for subdaily grids. |
 
 ## CLI
 

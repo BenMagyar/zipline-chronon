@@ -98,6 +98,44 @@ class DynamoDBBatchTableRegistryTest extends AnyFlatSpec with BeforeAndAfterAll 
     resolved2 shouldBe physicalName
   }
 
+  it should "bypass the cached batch generation for fresh metadata reads" in {
+    val kvStore = new DynamoDBKVStoreImpl(client)
+
+    kvStore.create(batchTableRegistry)
+
+    val logicalName = "FRESH_METADATA_GROUPBY_BATCH"
+    val oldPhysicalName = "FRESH_METADATA_GROUPBY_BATCH_2026_02_17"
+    val newPhysicalName = "FRESH_METADATA_GROUPBY_BATCH_2026_02_18"
+    val metadataKey = "group_by_serving_info"
+    val metadataKeyBytes = metadataKey.getBytes(StandardCharsets.UTF_8)
+
+    Seq(oldPhysicalName, newPhysicalName).foreach(kvStore.create(_, Map.empty))
+    Await.result(
+      kvStore.multiPut(
+        Seq(
+          PutRequest(metadataKeyBytes, "old".getBytes(StandardCharsets.UTF_8), oldPhysicalName),
+          PutRequest(metadataKeyBytes, "new".getBytes(StandardCharsets.UTF_8), newPhysicalName),
+          PutRequest(logicalName.getBytes(StandardCharsets.UTF_8),
+                     oldPhysicalName.getBytes(StandardCharsets.UTF_8),
+                     batchTableRegistry)
+        )),
+      1.minute
+    )
+
+    kvStore.getString(metadataKey, logicalName, 5.seconds.toMillis).get shouldBe "old"
+
+    Await.result(
+      kvStore.multiPut(
+        Seq(PutRequest(logicalName.getBytes(StandardCharsets.UTF_8),
+                       newPhysicalName.getBytes(StandardCharsets.UTF_8),
+                       batchTableRegistry))),
+      1.minute
+    )
+
+    kvStore.getString(metadataKey, logicalName, 5.seconds.toMillis).get shouldBe "old"
+    kvStore.getStringFresh(metadataKey, logicalName, 5.seconds.toMillis).get shouldBe "new"
+  }
+
   it should "resolve batch table names in multiGet for get lookups" in {
     val kvStore = new DynamoDBKVStoreImpl(client)
 

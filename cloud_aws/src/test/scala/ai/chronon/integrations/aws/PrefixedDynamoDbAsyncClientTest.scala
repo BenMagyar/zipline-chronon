@@ -41,6 +41,23 @@ class PrefixedDynamoDbAsyncClientTest extends AnyFlatSpec with Matchers with Moc
     captor.getValue.tableName() shouldBe s"$testPrefix$originalTableName"
   }
 
+  it should "prefix and strongly consistency-mark fresh getItem requests" in {
+    val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
+    val originalTableName = "metadata_table"
+    val request = GetItemRequest.builder().tableName(originalTableName).consistentRead(false).build()
+
+    when(mockDelegate.getItem(any[GetItemRequest]())).thenReturn(
+      CompletableFuture.completedFuture(GetItemResponse.builder().build())
+    )
+
+    client.getItemStronglyConsistent(request)
+
+    val captor = ArgumentCaptor.forClass(classOf[GetItemRequest])
+    verify(mockDelegate).getItem(captor.capture())
+    captor.getValue.tableName() shouldBe s"$testPrefix$originalTableName"
+    captor.getValue.consistentRead() shouldBe true
+  }
+
   it should "prefix table name in putItem request" in {
     val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
     val originalTableName = "my_table"

@@ -392,58 +392,62 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
       { _ => Metrics.Context(environment = "stats.serving_info.fetch") }
     )
 
-  // pull and cache groupByServingInfo from the groupBy uploads
+  private def loadGroupByServingInfo(name: String, fresh: Boolean = false): Try[GroupByServingInfoParsed] = {
+    val startTimeMs = System.currentTimeMillis()
+    val batchDataset = s"${name.sanitize.toUpperCase()}_BATCH"
+    val metaData =
+      // Metadata string reads can throw when the batch dataset is reachable but the serving-info key is absent.
+      // Capture that miss so it flows as a Failure instead of escaping the cache loader and collapsing the fetch.
+      Try {
+        if (fresh) {
+          fetchContext.kvStore
+            .getStringFresh(Constants.GroupByServingInfoKey, batchDataset, fetchContext.timeoutMillis)
+        } else {
+          fetchContext.kvStore
+            .getString(Constants.GroupByServingInfoKey, batchDataset, fetchContext.timeoutMillis)
+        }
+      }.flatten
+        .recover {
+          case e: java.util.NoSuchElementException =>
+            logThrottled(
+              ERROR,
+              s"missing_group_by_serving_info_$batchDataset",
+              s"Failed to fetch metadata for $batchDataset, is it possible Group By Upload for $name has not succeeded?"
+            )
+            throw e
+          case e: Throwable =>
+            logThrottled(ERROR,
+                         s"group_by_serving_info_failure_$batchDataset",
+                         s"Failed to fetch metadata for $batchDataset",
+                         e)
+            throw e
+        }
+    logger.info(s"Fetched ${Constants.GroupByServingInfoKey} from: $batchDataset (fresh=$fresh)")
+    if (metaData.isFailure) {
+      Metrics
+        .Context(Metrics.Environment.MetaDataFetching, groupBy = name)
+        .withSuffix("group_by")
+        .incrementException(metaData.failed.get)
+      Failure(
+        new RuntimeException(s"Couldn't fetch group by serving info for $batchDataset, " +
+                               "please make sure a batch upload was successful",
+                             metaData.failed.get))
+    } else {
+      import ai.chronon.online.metrics
+      val groupByServingInfo = ThriftJsonCodec
+        .fromJsonStr[GroupByServingInfo](metaData.get, check = false, classOf[GroupByServingInfo])
+      metrics.Metrics
+        .Context(metrics.Metrics.Environment.MetaDataFetching, groupByServingInfo.groupBy)
+        .withSuffix("group_by")
+        .distribution(metrics.Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTimeMs)
+      Success(new GroupByServingInfoParsed(groupByServingInfo))
+    }
+  }
+
+  // Pull and cache GroupByServingInfo for feature-serving hot paths.
   lazy val getGroupByServingInfo: TTLCache[String, Try[GroupByServingInfoParsed]] =
     new TTLCache[String, Try[GroupByServingInfoParsed]](
-      { name =>
-        val startTimeMs = System.currentTimeMillis()
-        val batchDataset = s"${name.sanitize.toUpperCase()}_BATCH"
-        val metaData =
-          // getString throws (rather than returning a Failure) when the batch dataset is reachable but the
-          // serving-info key is absent - e.g. a client still calling a version whose upload has been retired.
-          // Production stores surface that miss as Success(empty), which getString turns into a raw
-          // NoSuchElementException. Capture it here so it flows as a Failure instead of escaping the TTLCache
-          // loader unhandled and collapsing the whole (join) fetch into an opaque 500.
-          Try {
-            fetchContext.kvStore
-              .getString(Constants.GroupByServingInfoKey, batchDataset, fetchContext.timeoutMillis)
-          }.flatten
-            .recover {
-              case e: java.util.NoSuchElementException =>
-                logThrottled(
-                  ERROR,
-                  s"missing_group_by_serving_info_$batchDataset",
-                  s"Failed to fetch metadata for $batchDataset, is it possible Group By Upload for $name has not succeeded?"
-                )
-                throw e
-              case e: Throwable =>
-                logThrottled(ERROR,
-                             s"group_by_serving_info_failure_$batchDataset",
-                             s"Failed to fetch metadata for $batchDataset",
-                             e)
-                throw e
-            }
-        logger.info(s"Fetched ${Constants.GroupByServingInfoKey} from : $batchDataset")
-        if (metaData.isFailure) {
-          Metrics
-            .Context(Metrics.Environment.MetaDataFetching, groupBy = name)
-            .withSuffix("group_by")
-            .incrementException(metaData.failed.get)
-          Failure(
-            new RuntimeException(s"Couldn't fetch group by serving info for $batchDataset, " +
-                                   "please make sure a batch upload was successful",
-                                 metaData.failed.get))
-        } else {
-          import ai.chronon.online.metrics
-          val groupByServingInfo = ThriftJsonCodec
-            .fromJsonStr[GroupByServingInfo](metaData.get, check = false, classOf[GroupByServingInfo])
-          metrics.Metrics
-            .Context(metrics.Metrics.Environment.MetaDataFetching, groupByServingInfo.groupBy)
-            .withSuffix("group_by")
-            .distribution(metrics.Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTimeMs)
-          Success(new GroupByServingInfoParsed(groupByServingInfo))
-        }
-      },
+      loadGroupByServingInfo(_),
       { gb =>
         import ai.chronon.online.metrics
         metrics.Metrics.Context(environment = "group_by.serving_info.fetch", groupBy = gb)
@@ -453,6 +457,10 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
       // subsequent request for the join would fail until a refresh finally succeeded.
       isValid = (servingInfo: Try[GroupByServingInfoParsed]) => servingInfo.isSuccess
     )
+
+  /** Bypass serving-info and KV implementation caches for low-volume callers that require current metadata. */
+  def getGroupByServingInfoFresh(name: String): Try[GroupByServingInfoParsed] =
+    loadGroupByServingInfo(name, fresh = true)
 
   def put(
       kVPairs: Map[String, Seq[String]],

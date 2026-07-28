@@ -159,9 +159,24 @@ object Fetcher {
 
   /** Response for a groupBy status request.
     * @param groupByName - Name of the groupBy
-    * @param batchEndDate - Date through which batch upload data is available in the KV store
+    * @param batchEndDate - Formatted partition boundary through which batch upload data is available in the KV store
+    * @param batchEndTs - Epoch millis watermark through which batch upload data is available in the KV store
     */
-  case class GroupByStatusResponse(groupByName: String, batchEndDate: String)
+  case class GroupByStatusResponse(groupByName: String, batchEndDate: String) {
+    private var batchEndTsValue: Long = 0L
+
+    def this(groupByName: String, batchEndDate: String, batchEndTs: Long) = {
+      this(groupByName, batchEndDate)
+      batchEndTsValue = batchEndTs
+    }
+
+    def batchEndTs: Long = batchEndTsValue
+  }
+
+  object GroupByStatusResponse {
+    def apply(groupByName: String, batchEndDate: String, batchEndTs: Long): GroupByStatusResponse =
+      new GroupByStatusResponse(groupByName, batchEndDate, batchEndTs)
+  }
 
   private[fetcher] def codecForCurrentThread(codec: AvroCodec): AvroCodec =
     AvroCodec.ofThreaded(codec.schemaStr, codec.writerSchemaStr).get()
@@ -880,11 +895,12 @@ class Fetcher(val kvStore: KVStore,
               s"GroupBy $groupByName is not online. Fetcher status is only available for online GroupBys. " +
                 "Enable online=True and upload the GroupBy."))
         } else {
-          metadataStore.getGroupByServingInfo(groupByName)
+          // Serving info is the authoritative upload watermark; status bypasses its long-lived read caches.
+          metadataStore.getGroupByServingInfoFresh(groupByName)
         }
       }
       .map { servingInfo =>
-        val response = GroupByStatusResponse(groupByName, servingInfo.batchEndDate)
+        val response = GroupByStatusResponse(groupByName, servingInfo.batchEndDate, servingInfo.batchEndTsMillis)
         ctx.distribution(Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTime)
         response
       }
