@@ -14,7 +14,9 @@ private[redis] final class RedisClusterFixture private (
     val image: String,
     val primaryCount: Int,
     val replicasPerPrimary: Int,
-    val cpuLimit: Option[Double]
+    val cpuLimit: Option[Double],
+    val ioThreads: Int,
+    val ioThreadsDoReads: Boolean
 ) extends AutoCloseable {
 
   override def close(): Unit = {
@@ -33,13 +35,23 @@ private[redis] object RedisClusterFixture {
   private val DefaultReplicasPerPrimary = 1
   private val LegacyInternalPorts = (FirstInternalPort until FirstInternalPort + 6)
 
-  private def nativeClusterCommand(internalPorts: Seq[Int], replicasPerPrimary: Int): String = {
+  private def nativeClusterCommand(internalPorts: Seq[Int],
+                                   replicasPerPrimary: Int,
+                                   ioThreads: Int,
+                                   ioThreadsDoReads: Boolean): String = {
     val nodes = internalPorts.map(port => s"127.0.0.1:$port").mkString(" ")
+    val ioThreadArgs =
+      if (ioThreads > 1) {
+        val doReads = if (ioThreadsDoReads) "yes" else "no"
+        s"--io-threads $ioThreads --io-threads-do-reads $doReads"
+      } else {
+        ""
+      }
     s"""
        |set -eu
        |for port in ${internalPorts.mkString(" ")}; do
        |  mkdir -p /data/$$port
-       |  redis-server --port $$port --cluster-enabled yes --cluster-config-file /data/$$port/nodes.conf --cluster-node-timeout 5000 --appendonly no --save '' --protected-mode no --bind 0.0.0.0 --daemonize yes --dir /data/$$port
+       |  redis-server --port $$port --cluster-enabled yes --cluster-config-file /data/$$port/nodes.conf --cluster-node-timeout 5000 --appendonly no --save '' --protected-mode no --bind 0.0.0.0 --daemonize yes --dir /data/$$port $ioThreadArgs
        |done
        |for port in ${internalPorts.mkString(" ")}; do
        |  until redis-cli -p $$port ping >/dev/null 2>&1; do sleep 0.1; done
@@ -135,7 +147,17 @@ private[redis] object RedisClusterFixture {
     try {
       container.withExposedPorts(internalPorts.map(Integer.valueOf): _*)
       container.withStartupTimeout(Duration.ofSeconds(60))
-      if (native) container.withCommand("sh", "-c", nativeClusterCommand(internalPorts, replicasPerPrimary))
+      val ioThreads = if (native) sys.env.get("PERF_REDIS_IO_THREADS").map(_.toInt).getOrElse(1) else 1
+      val ioThreadsDoReads =
+        native && sys.env.get("PERF_REDIS_IO_THREADS_DO_READS").exists(_.equalsIgnoreCase("true"))
+      require(ioThreads > 0, s"PERF_REDIS_IO_THREADS must be positive, got $ioThreads")
+      if (native) {
+        container.withCommand(
+          "sh",
+          "-c",
+          nativeClusterCommand(internalPorts, replicasPerPrimary, ioThreads, ioThreadsDoReads)
+        )
+      }
       cpuLimit.foreach { cpus =>
         val nanoCpus = math.round(cpus * 1000000000L)
         container.withCreateContainerCmdModifier { command =>
@@ -173,7 +195,7 @@ private[redis] object RedisClusterFixture {
 
       val seed = new HostAndPort(container.getHost, container.getMappedPort(internalPorts.head))
       client = new JedisCluster(Set(seed).asJava, clientConfig, 5, poolConfig)
-      new RedisClusterFixture(container, client, image, primaryCount, replicasPerPrimary, cpuLimit)
+      new RedisClusterFixture(container, client, image, primaryCount, replicasPerPrimary, cpuLimit, ioThreads, ioThreadsDoReads)
     } catch {
       case throwable: Throwable =>
         if (client != null) {

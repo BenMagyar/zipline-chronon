@@ -105,6 +105,7 @@ private[redis] object RedisFetcherReadWorkload {
       deduplicatedCrossDay: ReadProfile,
       batchOnly: ReadProfile,
       batchCacheDemand: Vector[ReadProfile],
+      batchCacheDemandCrossDay: Vector[ReadProfile],
       uniqueBatchRequests: Int,
       uniqueStreamingRequests: Int
   ) {
@@ -114,6 +115,11 @@ private[redis] object RedisFetcherReadWorkload {
     def batchCacheDemandAt(hitPercent: Int): ReadProfile =
       batchCacheDemand.find(_.name == s"synthetic-context-hot-candidate-hit-$hitPercent").getOrElse {
         throw new IllegalArgumentException(s"No batch cache demand profile for $hitPercent%")
+      }
+
+    def batchCacheDemandCrossDayAt(hitPercent: Int): ReadProfile =
+      batchCacheDemandCrossDay.find(_.name == s"synthetic-context-hot-candidate-hit-$hitPercent-cross-day-24h").getOrElse {
+        throw new IllegalArgumentException(s"No cross-day batch cache demand profile for $hitPercent%")
       }
   }
 
@@ -190,6 +196,14 @@ private[redis] object RedisFetcherReadWorkload {
       }
       profile(s"synthetic-context-hot-candidate-hit-$hitPercent", reads)
     }
+    val batchCacheDemandCrossDay = Vector(50, 80, 100).map { hitPercent =>
+      val candidateMisses = math.ceil(config.candidates * (100 - hitPercent) / 100.0).toInt
+      val missingCandidateKeys = candidateKeys.take(candidateMisses).iterator.map(_.toVector).toSet
+      val reads = plannedCrossDayReads.filter { planned =>
+        planned.request.startTsMillis.isDefined || missingCandidateKeys.contains(planned.request.keyBytes.toVector)
+      }
+      profile(s"synthetic-context-hot-candidate-hit-$hitPercent-cross-day-24h", reads)
+    }
 
     val puts = groupBys.flatMap { groupBy =>
       val ownerKeys = groupBy.ownership match {
@@ -245,6 +259,7 @@ private[redis] object RedisFetcherReadWorkload {
       profile("deduplicated-cross-day-24h", plannedCrossDayReads),
       profile("batch-only", plannedUniqueBatchReads),
       batchCacheDemand,
+      batchCacheDemandCrossDay,
       uniqueBatchRequests,
       uniqueStreamingRequests
     )

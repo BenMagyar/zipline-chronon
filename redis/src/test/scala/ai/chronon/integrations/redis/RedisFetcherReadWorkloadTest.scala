@@ -38,9 +38,15 @@ class RedisFetcherReadWorkloadTest extends AnyFlatSpec with Matchers {
     workload.batchCacheDemandAt(50).requests should have size 880
     workload.batchCacheDemandAt(80).requests should have size 505
     workload.batchCacheDemandAt(100).requests should have size 255
+    workload.batchCacheDemandCrossDayAt(50).requests should have size 880
+    workload.batchCacheDemandCrossDayAt(80).requests should have size 505
+    workload.batchCacheDemandCrossDayAt(100).requests should have size 255
     workload.batchCacheDemandAt(50).redisCommands shouldBe 880
     workload.batchCacheDemandAt(80).redisCommands shouldBe 505
     workload.batchCacheDemandAt(100).redisCommands shouldBe 255
+    workload.batchCacheDemandCrossDayAt(50).redisCommands shouldBe 1135
+    workload.batchCacheDemandCrossDayAt(80).redisCommands shouldBe 760
+    workload.batchCacheDemandCrossDayAt(100).redisCommands shouldBe 510
     workload.logical.groupByRequests shouldBe 2500
     workload.deduplicated.groupByRequests shouldBe 1275
   }
@@ -61,6 +67,12 @@ class RedisFetcherReadWorkloadTest extends AnyFlatSpec with Matchers {
     workload.batchCacheDemandAt(80).expectedPayloadBytes shouldBe 56884L
     workload.batchCacheDemandAt(100).expectedTimedValues shouldBe 3751L
     workload.batchCacheDemandAt(100).expectedPayloadBytes shouldBe 15004L
+    workload.batchCacheDemandCrossDayAt(50).expectedTimedValues shouldBe 4376L
+    workload.batchCacheDemandCrossDayAt(50).expectedPayloadBytes shouldBe 119704L
+    workload.batchCacheDemandCrossDayAt(80).expectedTimedValues shouldBe 4001L
+    workload.batchCacheDemandCrossDayAt(80).expectedPayloadBytes shouldBe 56884L
+    workload.batchCacheDemandCrossDayAt(100).expectedTimedValues shouldBe 3751L
+    workload.batchCacheDemandCrossDayAt(100).expectedPayloadBytes shouldBe 15004L
     workload.logical.expectedTimedValues shouldBe 8750L
     workload.logical.expectedPayloadBytes shouldBe 239400L
 

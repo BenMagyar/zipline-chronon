@@ -12,6 +12,7 @@ import ai.chronon.online.metrics.{FlexibleExecutionContext, InstrumentedThreadPo
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import redis.clients.jedis.JedisCluster
+import redis.clients.jedis.util.JedisClusterCRC16
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import java.util.concurrent.{Executors, ThreadPoolExecutor, TimeUnit}
@@ -64,6 +65,10 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     envInt("PERF_REDIS_MIN_IDLE_CONNECTIONS", math.min(DefaultMinIdleConnections, maxIdleConnections))
   private val readTimeout = envInt("PERF_READ_TIMEOUT_SECONDS", 30).seconds
   private val keyPrefix = sys.env.getOrElse("PERF_REDIS_KEY_PREFIX", "chronon-perf")
+  private val keyHashTagMode =
+    sys.env.getOrElse("PERF_REDIS_HASH_TAG_MODE", RedisKVStore.DatasetAndEntityHashTagMode)
+  private val readMetricsEnabled =
+    !sys.env.get("PERF_REDIS_READ_METRICS_ENABLED").exists(_.equalsIgnoreCase("false"))
   private val useExternalCluster = sys.env.get("PERF_REDIS_USE_EXTERNAL").exists(_.equalsIgnoreCase("true"))
   private val useNativeLocalCluster =
     sys.env.getOrElse("PERF_REDIS_USE_NATIVE_LOCAL", "true").equalsIgnoreCase("true")
@@ -134,7 +139,9 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
             EnvRedisMaxConnections -> maxConnections.toString,
             EnvRedisMinIdleConnections -> minIdleConnections.toString,
             EnvRedisMaxIdleConnections -> maxIdleConnections.toString,
-            "redis.key.prefix" -> keyPrefix
+            "redis.key.prefix" -> keyPrefix,
+            "redis.key.hash.tag.mode" -> keyHashTagMode,
+            "redis.read.metrics.enabled" -> readMetricsEnabled.toString
           ))
       } else {
         localCluster =
@@ -167,7 +174,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     val workload = RedisFetcherReadWorkload.build()
     val profilesByName =
       (Seq(workload.deduplicated, workload.deduplicatedCrossDay, workload.logical, workload.batchOnly) ++
-        workload.batchCacheDemand)
+        workload.batchCacheDemand ++ workload.batchCacheDemandCrossDay)
         .map(profile => profile.name -> profile)
         .toMap
     val selectedProfiles = selectedProfileNames.map { name =>
@@ -193,7 +200,8 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       s"kvstore_multi_get_calls_per_batch=1 " +
       s"cluster_pipelines_per_batch=1 " +
       s"range_hours=${workload.config.tiledPoints} hourly_tiles=${workload.config.tiledPoints} " +
-      s"payload_bytes=${workload.deduplicated.expectedPayloadBytes} " +
+      s"payload_bytes=${workload.deduplicated.expectedPayloadBytes} redis_hash_tag_mode=$keyHashTagMode " +
+      s"redis_read_metrics_enabled=$readMetricsEnabled " +
       s"batch_concurrencies=${batchConcurrencies.mkString(",")} max_connections_per_node=$maxConnections " +
       s"min_idle_connections_per_node=$minIdleConnections max_idle_connections_per_node=$maxIdleConnections " +
       s"test_on_borrow=false test_on_return=false test_while_idle=true " +
@@ -203,6 +211,8 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       s"${Option(localCluster).map(_.replicasPerPrimary.toString).getOrElse("external")} " +
       s"redis_container_cpu_limit=" +
       s"${Option(localCluster).flatMap(_.cpuLimit).map(_.toString).getOrElse("unlimited")} " +
+      s"redis_io_threads=${Option(localCluster).map(_.ioThreads.toString).getOrElse("external")} " +
+      s"redis_io_threads_do_reads=${Option(localCluster).map(_.ioThreadsDoReads.toString).getOrElse("external")} " +
       s"pool_sample_interval_ms=$PoolSampleIntervalMillis " +
       s"jedis_pipeline_sync_workers_per_pipeline=" +
       s"${redis.clients.jedis.MultiNodePipelineBase.MULTI_NODE_PIPELINE_SYNC_WORKERS} " +
@@ -245,7 +255,11 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       val executor = newRedisExecutor(effectivePoolConfig)
       val kvStore = new BenchmarkRedisKVStore(
         localCluster.client,
-        Map("redis.key.prefix" -> keyPrefix),
+        Map(
+          "redis.key.prefix" -> keyPrefix,
+          "redis.key.hash.tag.mode" -> keyHashTagMode,
+          "redis.read.metrics.enabled" -> readMetricsEnabled.toString
+        ),
         ExecutionContext.fromExecutor(executor)
       )
       try run(kvStore, executor, Some(localCluster.client))
@@ -416,11 +430,14 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     val sorted = measurement.latenciesNanos.sorted
     val wallSeconds = measurement.wallNanos.toDouble / TimeUnit.SECONDS.toNanos(1)
     val demandBatchesPerSecond = measurement.latenciesNanos.length / wallSeconds
+    val effectiveBatchReadCommands = effectiveBatchCommands(profile)
+    val effectiveStreamingCommands = effectiveStreamingRangeCommands(profile)
+    val effectiveRedisCommands = effectiveBatchReadCommands + effectiveStreamingCommands
     val candidatesPerSecond = demandBatchesPerSecond * workload.config.candidates
     val logicalGroupBysPerSecond = demandBatchesPerSecond * workload.logicalGroupByRequests
-    val batchGetCommandsPerSecond = demandBatchesPerSecond * profile.batchGetCommands
-    val zrangeCommandsPerSecond = demandBatchesPerSecond * profile.zrangeCommands
-    val redisCommandsPerSecond = demandBatchesPerSecond * profile.redisCommands
+    val batchGetCommandsPerSecond = demandBatchesPerSecond * effectiveBatchReadCommands
+    val zrangeCommandsPerSecond = demandBatchesPerSecond * effectiveStreamingCommands
+    val redisCommandsPerSecond = demandBatchesPerSecond * effectiveRedisCommands
     val kvResponsesPerSecond = demandBatchesPerSecond * profile.requests.size
     val timedValuesPerSecond = demandBatchesPerSecond * profile.expectedTimedValues
     val payloadMiBPerSecond = demandBatchesPerSecond * profile.expectedPayloadBytes / (1024.0 * 1024.0)
@@ -459,12 +476,27 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
         f"jedis_sampled_peak_waiters_sum=${measurement.pool.peakJedisWaiters}%d " +
         f"jedis_pipeline_sync_workers_per_pipeline=" +
         f"${redis.clients.jedis.MultiNodePipelineBase.MULTI_NODE_PIPELINE_SYNC_WORKERS}%d " +
-        f"batch_get_commands_per_batch=${profile.batchGetCommands}%d " +
-        f"zrange_commands_per_batch=${profile.zrangeCommands}%d " +
-        f"redis_commands_per_batch=${profile.redisCommands}%d kv_responses_per_batch=${profile.requests.size}%d " +
+        f"batch_get_commands_per_batch=$effectiveBatchReadCommands%d " +
+        f"zrange_commands_per_batch=$effectiveStreamingCommands%d " +
+        f"redis_commands_per_batch=$effectiveRedisCommands%d kv_responses_per_batch=${profile.requests.size}%d " +
         f"timed_values_per_batch=${profile.expectedTimedValues}%d " +
         f"payload_bytes_per_batch=${profile.expectedPayloadBytes}%d"
     )
+  }
+
+  private def effectiveBatchCommands(profile: RedisFetcherReadWorkload.ReadProfile): Int = {
+    val slots = profile.requests.iterator.collect {
+      case request if request.startTsMillis.isEmpty =>
+        val redisKey = RedisKVStore
+          .buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode)
+          .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        JedisClusterCRC16.getSlot(redisKey)
+    }.toSet
+    slots.size
+  }
+
+  private def effectiveStreamingRangeCommands(profile: RedisFetcherReadWorkload.ReadProfile): Int = {
+    profile.zrangeCommands
   }
 
   private def requireSuccessful(profile: String, phase: String, measurement: Measurement): Unit = {
