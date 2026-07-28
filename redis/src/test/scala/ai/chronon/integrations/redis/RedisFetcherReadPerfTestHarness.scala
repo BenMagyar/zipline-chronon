@@ -191,6 +191,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       s"unique_kv_requests=${workload.deduplicated.requests.size} " +
       s"logical_redis_read_groups=${workload.config.totalGroupBys + workload.config.totalStreamingGroupBys} " +
       s"kvstore_multi_get_calls_per_batch=1 " +
+      s"cluster_pipelines_per_batch=1 " +
       s"range_hours=${workload.config.tiledPoints} hourly_tiles=${workload.config.tiledPoints} " +
       s"payload_bytes=${workload.deduplicated.expectedPayloadBytes} " +
       s"batch_concurrencies=${batchConcurrencies.mkString(",")} max_connections_per_node=$maxConnections " +
