@@ -196,7 +196,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       s"payload_bytes=${workload.deduplicated.expectedPayloadBytes} " +
       s"batch_concurrencies=${batchConcurrencies.mkString(",")} max_connections_per_node=$maxConnections " +
       s"min_idle_connections_per_node=$minIdleConnections max_idle_connections_per_node=$maxIdleConnections " +
-      s"test_on_borrow=true test_on_return=true test_while_idle=true " +
+      s"test_on_borrow=false test_on_return=false test_while_idle=true " +
       s"redis_cluster_image=${Option(localCluster).map(_.image).getOrElse("external")} " +
       s"redis_cluster_primaries=${Option(localCluster).map(_.primaryCount.toString).getOrElse("external")} " +
       s"redis_replicas_per_primary=" +

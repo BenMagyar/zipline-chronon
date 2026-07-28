@@ -13,7 +13,7 @@ object RedisKVStoreConstants {
   // Connection pool defaults (Commons Pool2 best practices)
   val DefaultMaxConnections = 50 // Production-ready default (Jedis default of 8 is too low)
   val DefaultMinIdleConnections = 5 // Keep connections warm to avoid cold-start latency
-  val DefaultMaxIdleConnections = 10 // Balance between responsiveness and resource usage
+  val DefaultMaxIdleConnections = 10 // Bound retained sockets per node; deployments can raise this for bursty traffic
   val DefaultConnectionTimeoutMs = 5000 // TCP connection timeout - allows for cluster topology discovery
   val DefaultPort = 6379
 

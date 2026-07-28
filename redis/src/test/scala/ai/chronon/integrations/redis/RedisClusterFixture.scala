@@ -2,8 +2,7 @@ package ai.chronon.integrations.redis
 
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.utility.DockerImageName
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig
-import redis.clients.jedis.{Connection, DefaultJedisClientConfig, HostAndPort, HostAndPortMapper, Jedis, JedisCluster}
+import redis.clients.jedis.{DefaultJedisClientConfig, HostAndPort, HostAndPortMapper, Jedis, JedisCluster}
 
 import java.time.Duration
 import scala.jdk.CollectionConverters._
@@ -166,13 +165,11 @@ private[redis] object RedisClusterFixture {
         }
       }
       val clientConfig = DefaultJedisClientConfig.builder().hostAndPortMapper(hostAndPortMapper).build()
-      val poolConfig = new GenericObjectPoolConfig[Connection]()
-      poolConfig.setMaxTotal(maxConnections)
-      poolConfig.setMaxIdle(maxIdleConnections)
-      poolConfig.setMinIdle(minIdleConnections)
-      poolConfig.setTestOnBorrow(true)
-      poolConfig.setTestOnReturn(true)
-      poolConfig.setTestWhileIdle(true)
+      val poolConfig = RedisKVStoreFactory.buildConnectionPoolConfig(
+        maxConnections,
+        minIdleConnections,
+        maxIdleConnections
+      )
 
       val seed = new HostAndPort(container.getHost, container.getMappedPort(internalPorts.head))
       client = new JedisCluster(Set(seed).asJava, clientConfig, 5, poolConfig)
