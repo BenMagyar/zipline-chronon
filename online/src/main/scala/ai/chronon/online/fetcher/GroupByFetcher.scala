@@ -58,6 +58,9 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       var batchKeyBytes: Array[Byte] = null
       var streamingKeyBytes: Array[Byte] = null
+      val needsStreamingRead =
+        groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL &&
+          groupByServingInfo.groupByOps.streamingSource.isDefined
 
       try {
         // The formats of key bytes for batch requests and key bytes for streaming requests may differ based
@@ -65,9 +68,11 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
         batchKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
                                                             groupByServingInfo,
                                                             groupByServingInfo.groupByOps.batchDataset)
-        streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
-                                                                groupByServingInfo,
-                                                                groupByServingInfo.groupByOps.streamingDataset)
+        if (needsStreamingRead) {
+          streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+                                                                  groupByServingInfo,
+                                                                  groupByServingInfo.groupByOps.streamingDataset)
+        }
 
       } catch {
 
@@ -81,9 +86,11 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                                                                 groupByServingInfo,
                                                                 groupByServingInfo.groupByOps.batchDataset)
 
-            streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
-                                                                    groupByServingInfo,
-                                                                    groupByServingInfo.groupByOps.streamingDataset)
+            if (needsStreamingRead) {
+              streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
+                                                                      groupByServingInfo,
+                                                                      groupByServingInfo.groupByOps.streamingDataset)
+            }
           } catch {
             case exInner: Exception =>
               exInner.addSuppressed(ex)
@@ -94,9 +101,8 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       val batchRequest = GetRequest(batchKeyBytes, groupByServingInfo.groupByOps.batchDataset)
 
-      val streamingRequestOpt = groupByServingInfo.groupByOps.inferredAccuracy match {
-        // fetch batch(ir) and streaming(input) and aggregate
-        case Accuracy.TEMPORAL =>
+      val streamingRequestOpt =
+        if (needsStreamingRead) {
           // Build a tile key for the streaming request
           // When we build support for layering, we can expand this out into a utility that builds n tile keys for n layers
           val keyBytes = if (fetchContext.isTilingEnabled) {
@@ -117,11 +123,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             GetRequest(keyBytes,
                        groupByServingInfo.groupByOps.streamingDataset,
                        Some(groupByServingInfo.batchEndTsMillis)))
-
-        // no further aggregation is required - the value in KvStore is good as is
-        case Accuracy.SNAPSHOT => None
-
-      }
+        } else None
 
       val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
       LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)

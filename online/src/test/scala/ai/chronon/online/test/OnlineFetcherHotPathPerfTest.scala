@@ -173,7 +173,7 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
     preparedRequests.map(_.request.context.get).distinct should have size DistinctMetricsContextCount
 
     val validation = validateGroupByPlanningShape()
-    Set(UniqueGroupByRequestCount * 2L, KvRequestCount.toLong) should contain(validation.keyEncodes)
+    validation.keyEncodes shouldBe KvRequestCount.toLong
     validation.kvRequests shouldBe KvRequestCount
     val metricsValidation = validateGroupByResponseMetricsShape()
     Set(LegacyMultiGetMetricWrites, DeduplicatedMultiGetMetricWrites) should contain(metricsValidation.metricWrites)
@@ -189,6 +189,36 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
         s"kv_requests=$KvRequestCount key_encodes_observed=${validation.keyEncodes} " +
         s"multi_get_metric_writes_observed=${metricsValidation.metricWrites} " +
         s"legacy_metric_writes=$LegacyMultiGetMetricWrites deduplicated_metric_writes=$DeduplicatedMultiGetMetricWrites")
+  }
+
+  it should "skip streaming reads for temporal GroupBys without a topic" in {
+    val name = "benchmark.batch_only_temporal"
+    val groupBy = Builders.GroupBy(
+      sources = Seq(Builders.Source.events(query = Builders.Query(), table = s"$name.events")),
+      metaData = Builders.MetaData(name = name),
+      keyColumns = Seq(KeyColumn),
+      accuracy = Accuracy.TEMPORAL
+    )
+    val servingInfo = new GroupByServingInfoParsed(
+      new GroupByServingInfo()
+        .setGroupBy(groupBy)
+        .setKeyAvroSchema(KeySchema)
+        .setBatchEndTs(BenchmarkAtMillis))
+    val fixture = newGroupByFixture(
+      executorThreads = 1,
+      failAfterPlanning = true,
+      countKeyEncodes = true,
+      servingInfos = Map(name -> servingInfo)
+    )
+    try {
+      awaitPlanningComplete(
+        fixture.fetcher.fetchGroupBys(
+          Seq(Request(name, Map(KeyColumn -> "batch-only".asInstanceOf[AnyRef]), Some(BenchmarkAtMillis)))))
+      fixture.store.keyEncodeCount.get() shouldBe 1L
+      fixture.store.lastMultiGetSize.get() shouldBe 1
+    } finally {
+      closeExecutor(fixture.executor)
+    }
   }
 
   it should "run the opt-in cache lookup benchmark" in {
@@ -411,12 +441,13 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
 
   private def newGroupByFixture(executorThreads: Int,
                                 failAfterPlanning: Boolean,
-                                countKeyEncodes: Boolean): GroupByFixture = {
+                                countKeyEncodes: Boolean,
+                                servingInfos: Map[String, GroupByServingInfoParsed] = servingInfoByName): GroupByFixture = {
     val executor = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(executorThreads))
     val store = new BenchmarkKVStore(failAfterPlanning, countKeyEncodes)
     val fetchContext = FetchContext(store, executionContextOverride = executor, kvTimeoutMillis = 0L)
-    val metadataStore = new StaticMetadataStore(fetchContext, servingInfoByName)
-    servingInfoByName.keys.foreach(metadataStore.getGroupByServingInfo(_))
+    val metadataStore = new StaticMetadataStore(fetchContext, servingInfos)
+    servingInfos.keys.foreach(metadataStore.getGroupByServingInfo(_))
     val fetcher = this.synchronized {
       val previousCacheSize = Option(System.getProperty(BatchIrCacheSizeProperty))
       System.setProperty(BatchIrCacheSizeProperty, "0")
