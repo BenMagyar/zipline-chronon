@@ -25,10 +25,23 @@ object RedisKVStoreConstants {
   val DefaultSoTimeoutMs = 2000 // Socket timeout for Redis commands (typical P99 < 10ms, 2s allows for network jitter)
   val DefaultPipelineSyncThreads = 12 // Set REDIS_PIPELINE_SYNC_THREADS=0 to restore Jedis' per-pipeline executors
 
+  // Incremental batch upload defaults. Every full snapshot refreshes this lease for active keys while value payloads
+  // are only rewritten when their digest changes.
+  val DefaultBulkUploadBatchSize = 1000
+  val DefaultBulkUploadMaxKeysPerSecond = 2500000
+  val DefaultBulkUploadWriterPartitions = 2
+  val DefaultBulkUploadStateBuckets = 256
+  val DefaultBulkUploadMaxRetries = 3
+  val DefaultBulkUploadRetryBackoffMs = 1000L
+  val DefaultBulkUploadTTLSeconds = DataTTLSeconds
+  val DefaultBulkUploadRequireNoEviction = true
+
   // Environment variable keys for Redis Cluster
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
   val EnvRedisUseSsl = "REDIS_USE_SSL"
   val EnvRedisPassword = "REDIS_PASSWORD"
+  val EnvRedisUsername = "REDIS_USERNAME"
+  val EnvRedisUseSSL = EnvRedisUseSsl
   val EnvRedisKeyPrefix = "REDIS_KEY_PREFIX"
   val EnvRedisMaxConnections = "REDIS_MAX_CONNECTIONS"
   val EnvRedisMinIdleConnections = "REDIS_MIN_IDLE_CONNECTIONS"
@@ -41,8 +54,26 @@ object RedisKVStoreConstants {
   // RedisKVStoreImpl configuration keys
   val ConfigPipelineSyncThreads = "redis.pipeline.sync.threads"
 
-  // Prop keys for create()
-  val PropTTLSeconds = "ttl-seconds"
-  val PropMaxConnections = "max-connections"
-  val PropKeyPrefix = "key-prefix"
+  // Canonical map/Spark properties. Environment variables above take precedence.
+  val PropRedisClusterNodes = "redis.cluster.nodes"
+  val PropRedisPassword = "redis.password"
+  val PropRedisUsername = "redis.username"
+  val PropRedisSSL = "redis.ssl"
+  val PropRedisKeyPrefix = "redis.key.prefix"
+  val PropRedisMaxConnections = "redis.max.connections"
+  val PropRedisMinIdleConnections = "redis.min.idle.connections"
+  val PropRedisMaxIdleConnections = "redis.max.idle.connections"
+  val PropRedisConnectionTimeoutMs = "redis.connection.timeout.ms"
+  val PropRedisSoTimeoutMs = "redis.so.timeout.ms"
+  val PropRedisMaxRedirections = "redis.max.redirections"
+
+  val PropRedisBulkUploadStateRoot = "spark.chronon.kv_upload.redis.state_root"
+  val PropRedisBulkUploadBatchSize = "spark.chronon.kv_upload.redis.batch_size"
+  val PropRedisBulkUploadMaxKeysPerSecond = "spark.chronon.kv_upload.redis.max_keys_per_second"
+  val PropRedisBulkUploadWriterPartitions = "spark.chronon.kv_upload.redis.writer_partitions"
+  val PropRedisBulkUploadStateBuckets = "spark.chronon.kv_upload.redis.state_buckets"
+  val PropRedisBulkUploadMaxRetries = "spark.chronon.kv_upload.redis.max_retries"
+  val PropRedisBulkUploadRetryBackoffMs = "spark.chronon.kv_upload.redis.retry_backoff_ms"
+  val PropRedisBulkUploadTTLSeconds = "spark.chronon.kv_upload.redis.ttl_seconds"
+  val PropRedisBulkUploadRequireNoEviction = "spark.chronon.kv_upload.redis.require_noeviction"
 }

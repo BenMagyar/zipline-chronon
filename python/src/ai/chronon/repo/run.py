@@ -133,6 +133,13 @@ def validate_additional_jars(ctx, param, value):
     return ",".join(jars)
 
 
+def build_runtime_args(mode, unknown_args, params):
+    online_args = params.get("online_args")
+    accepts_online_args = mode in ONLINE_MODES or mode == RunMode.UPLOAD_TO_KV
+    extra_args = (" " + online_args) if accepts_online_args and online_args else ""
+    return " ".join(unknown_args) + extra_args
+
+
 @click.command(
     name="run",
     context_settings=dict(allow_extra_args=True, ignore_unknown_options=True),
@@ -342,8 +349,7 @@ def main(
 
     set_runtime_env_v3(ctx.params, conf)
     set_defaults(ctx)
-    extra_args = (" " + online_args) if mode in ONLINE_MODES and online_args else ""
-    ctx.params["args"] = " ".join(unknown_args) + extra_args
+    ctx.params["args"] = build_runtime_args(ctx.params["mode"], unknown_args, ctx.params)
     os.makedirs(ZIPLINE_DIRECTORY, exist_ok=True)
 
     cloud_provider = get_environ_arg(CLOUD_PROVIDER_KEYWORD, ignoreError=True)

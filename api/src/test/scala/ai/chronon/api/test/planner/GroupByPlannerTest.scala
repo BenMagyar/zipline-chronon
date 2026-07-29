@@ -330,6 +330,13 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
 
   it should "GB planner uploadToKV node should have correct table dependencies" in {
     val gb = buildGroupBy()
+    gb.metaData.executionInfo.setConf(
+      new ai.chronon.api.ConfigProperties()
+        .setCommon(Map("common.setting" -> "common").asJava)
+        .setModeConfigs(Map("upload-to-kv" -> Map("mode.setting" -> "mode").asJava).asJava))
+    gb.metaData.executionInfo.setEnv(
+      new EnvironmentVariables()
+        .setModeEnvironments(Map("upload-to-kv" -> Map("MODE_SETTING" -> "mode").asJava).asJava))
     val planner = new GroupByPlanner(gb)
     val plan = planner.buildPlan
     validateGBPlan(gb, plan)
@@ -337,6 +344,12 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     val uploadToKVNode = plan.nodes.asScala.find(_.content.isSetGroupByUploadToKV).get
     val executionInfo = uploadToKVNode.metaData.executionInfo
     val tableDeps = executionInfo.tableDependencies.asScala
+
+    executionInfo.conf.common.asScala should contain allOf (
+      "common.setting" -> "common",
+      "mode.setting" -> "mode"
+    )
+    executionInfo.env.common.asScala should contain("MODE_SETTING" -> "mode")
 
     // Should have exactly one table dependency
     tableDeps should have size 1

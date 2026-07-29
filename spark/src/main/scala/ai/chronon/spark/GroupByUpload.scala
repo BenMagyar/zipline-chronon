@@ -361,6 +361,21 @@ class GroupByUpload(endPartition: String,
 }
 
 object GroupByUpload {
+  private val KvStoreTypeProperty = "kv.store.type"
+  private val KvStoreTypeEnv = "KV_STORE_TYPE"
+  private val RedisKvStoreType = "redis"
+
+  private[spark] def isRedisSelected(groupByConf: api.GroupBy,
+                                     runtimeProperties: Map[String, String],
+                                     env: Map[String, String] = sys.env): Boolean =
+    Seq(
+      env.get(KvStoreTypeEnv),
+      runtimeProperties.get(KvStoreTypeEnv),
+      runtimeProperties.get(KvStoreTypeProperty),
+      groupByConf.metaData.commonConf.get(KvStoreTypeEnv),
+      groupByConf.metaData.commonConf.get(KvStoreTypeProperty)
+    ).flatten.map(_.trim).find(_.nonEmpty).exists(_.equalsIgnoreCase(RedisKvStoreType))
+
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   case class UploadResult(kvDf: DataFrame, nullCounts: Map[String, Long])
@@ -590,7 +605,9 @@ object GroupByUpload {
     )
 
     val sparkConf = tableUtils.sparkSession.conf
-    val uploadFormat = sparkConf.getOption(IonPathConfig.UploadFormatKey).getOrElse("parquet")
+    val redisSelected = isRedisSelected(groupByConf, sparkConf.getAll)
+    val uploadFormat =
+      if (redisSelected) "catalog" else sparkConf.getOption(IonPathConfig.UploadFormatKey).getOrElse("parquet")
     val partitionCol =
       sparkConf.getOption(IonPathConfig.PartitionColumnKey).getOrElse(IonPathConfig.DefaultPartitionColumn)
     val uploadDf = kvDf.union(metaDf).withColumn(partitionCol, lit(endDs))

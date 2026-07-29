@@ -1,14 +1,17 @@
 package ai.chronon.integrations.redis
 
-import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, JoinFolder, ListEntityType, ListLimit}
-import ai.chronon.api.TilingUtils
+import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, GroupByServingInfoKey, JoinFolder, ListEntityType, ListLimit}
+import ai.chronon.api.{PartitionSpec, TilingUtils}
 import ai.chronon.online.KVStore._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import redis.clients.jedis.JedisCluster
 import java.nio.charset.StandardCharsets
-import scala.concurrent.Await
+import java.nio.file.Files
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
@@ -21,6 +24,33 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
 
   private var redisFixture: RedisClusterFixture = _
   private var jedisCluster: JedisCluster = _
+
+  private def leaseDeadlineBytes(seconds: Int = 300): Array[Byte] =
+    (System.currentTimeMillis() + seconds * 1000L).toString.getBytes(StandardCharsets.UTF_8)
+
+  private def listAll(kvStore: RedisKVStoreImpl,
+                      dataset: String,
+                      limit: Int,
+                      props: Map[String, Any] = Map.empty): Seq[ListValue] = {
+    val values = ArrayBuffer.empty[ListValue]
+    var continuation = Option.empty[Any]
+    var pageCount = 0
+    var hasMore = true
+
+    while (hasMore) {
+      val requestProps = props ++ Map(ListLimit -> limit) ++ continuation.map(ContinuationKey -> _)
+      val response = Await.result(kvStore.list(ListRequest(dataset, requestProps)), 10.seconds)
+      response.values.isSuccess shouldBe true
+      val page = response.values.get
+      page.size should be <= limit
+      values ++= page
+      continuation = response.resultProps.get(ContinuationKey)
+      hasMore = continuation.nonEmpty
+      pageCount += 1
+      pageCount should be <= 1000
+    }
+    values.toSeq
+  }
 
   override def beforeAll(): Unit = {
     super.beforeAll()
@@ -126,56 +156,39 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     val putResults = Await.result(kvStore.multiPut(putReqs), 10.seconds)
     putResults.foreach(r => r shouldBe true)
 
-    // let's try and read these with pagination
     val limit = 10
-    val listReq1 = ListRequest(dataset, Map(ListLimit -> limit))
-    val listResult1 = Await.result(kvStore.list(listReq1), 10.seconds)
-    listResult1.values.isSuccess shouldBe true
-    val listValues1 = listResult1.values.get
-    listValues1.size should be <= limit
-
-    // If we got a continuation key, try to get more
-    if (listResult1.resultProps.contains(ContinuationKey)) {
-      val limit2 = 1000
-      val continuationKey = listResult1.resultProps(ContinuationKey)
-      val listReq2 = ListRequest(dataset, Map(ListLimit -> limit2, ContinuationKey -> continuationKey))
-      val listResult2 = Await.result(kvStore.list(listReq2), 10.seconds)
-      listResult2.values.isSuccess shouldBe true
-    }
+    val listed = listAll(kvStore, dataset, limit)
+    listed.size shouldBe putReqs.size
+    listed.map(value => new String(value.keyBytes, StandardCharsets.UTF_8)).toSet shouldBe
+      (0 until 100).map(i => s"key-$i").toSet
+    listed.map(value => new String(value.valueBytes, StandardCharsets.UTF_8)).toSet shouldBe
+      (0 until 100).map(i => s"""{"name": "name-$i", "age": $i}""").toSet
   }
 
   it should "list entity types with pagination" in {
-    val dataset = "CHRONON_METADATA"
-    val kvStore = new RedisKVStoreImpl(jedisCluster)
-    kvStore.create(dataset)
+    Seq(DatasetAndEntityHashTagMode, EntityHashTagMode).zipWithIndex.foreach { case (hashTagMode, modeIndex) =>
+      val dataset = s"CHRONON_METADATA_$modeIndex"
+      val kvStore = new RedisKVStoreImpl(jedisCluster, Map("redis.key.hash.tag.mode" -> hashTagMode))
+      kvStore.create(dataset)
 
-    val putGrpByReqs = (0 until 50).map { i =>
-      val key = s"$GroupByFolder/gbkey-$i"
-      val value = s"""{"name": "name-$i", "age": $i}"""
-      PutRequest(key.getBytes, value.getBytes, dataset, None)
-    }
+      val putGrpByReqs = (0 until 50).map { i =>
+        val key = s"$GroupByFolder/gbkey-$i"
+        val value = s"""{"name": "group-by-$i"}"""
+        PutRequest(key.getBytes, value.getBytes, dataset, None)
+      }
+      val putJoinReqs = (0 until 50).map { i =>
+        val key = s"$JoinFolder/joinkey-$i"
+        val value = s"""{"name": "join-$i"}"""
+        PutRequest(key.getBytes, value.getBytes, dataset, None)
+      }
+      Await.result(kvStore.multiPut(putGrpByReqs ++ putJoinReqs), 10.seconds).foreach(_ shouldBe true)
 
-    val putJoinReqs = (0 until 50).map { i =>
-      val key = s"$JoinFolder/joinkey-$i"
-      val value = s"""{"name": "name-$i", "age": $i}"""
-      PutRequest(key.getBytes, value.getBytes, dataset, None)
-    }
-    val putResults = Await.result(kvStore.multiPut(putGrpByReqs ++ putJoinReqs), 10.seconds)
-    putResults.foreach(r => r shouldBe true)
-
-    // let's try and read just the joins - tests that filtering works correctly
-    val limit = 10
-    val listReq1 = ListRequest(dataset, Map(ListLimit -> limit, ListEntityType -> JoinFolder))
-    val listResult1 = Await.result(kvStore.list(listReq1), 10.seconds)
-    listResult1.values.isSuccess shouldBe true
-    val listValues1 = listResult1.values.get
-    listValues1.size should be <= limit
-
-    // Verify entity type filter works
-    listValues1.foreach { value =>
-      val keyStr = new String(value.keyBytes, StandardCharsets.UTF_8)
-      keyStr should include(JoinFolder)
-      keyStr should not include GroupByFolder
+      val listed = listAll(kvStore, dataset, limit = 7, props = Map(ListEntityType -> JoinFolder))
+      listed.size shouldBe putJoinReqs.size
+      listed.map(value => new String(value.keyBytes, StandardCharsets.UTF_8)).toSet shouldBe
+        (0 until 50).map(i => s"$JoinFolder/joinkey-$i").toSet
+      listed.map(value => new String(value.valueBytes, StandardCharsets.UTF_8)).toSet shouldBe
+        (0 until 50).map(i => s"""{"name": "join-$i"}""").toSet
     }
   }
 
@@ -736,6 +749,648 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     streamKey should include(s"{$streamingDataset:$base64Key}")
   }
 
+  it should "advance the recoverable batch status monotonically" in {
+    val statusKey = RedisBatchUpload.buildStatusKey("INCREMENTAL_BATCH", "chronon")
+    val initial = RedisBatchUpload.BatchStatus("generation-1", "2024-07-27-00", 1000L, 1L)
+    val replacement = RedisBatchUpload.BatchStatus("generation-2", "2024-07-27-01", 2000L, 2L)
+
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, initial) shouldBe 1L
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, initial) shouldBe 2L
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, replacement) shouldBe 1L
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, initial) shouldBe 0L
+    RedisBatchUpload.readStatus(jedisCluster, statusKey) shouldBe Some(replacement)
+
+    val retired = replacement.copy(generation = "generation-3", writeEpoch = 3L, retired = true)
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, retired) shouldBe 1L
+    RedisBatchUpload.writeStatus(
+      jedisCluster,
+      statusKey,
+      retired.copy(generation = "generation-4", writeEpoch = 4L, retired = false)) shouldBe 0L
+  }
+
+  it should "reserve one cluster-wide rate queue across independent writers" in {
+    val limiterKey = RedisBatchUpload.RateLimiterKey
+
+    // The first writer consumes the one-batch burst. Later writers reserve distinct positions on the shared timeline.
+    val firstWriterWait =
+      RedisBatchUpload.reserveRate(jedisCluster, limiterKey, keyCount = 600, maxKeysPerSecond = 10, maxBurst = 600)
+    val secondWriterWait =
+      RedisBatchUpload.reserveRate(jedisCluster, limiterKey, keyCount = 600, maxKeysPerSecond = 10, maxBurst = 600)
+    val thirdWriterWait =
+      RedisBatchUpload.reserveRate(jedisCluster, limiterKey, keyCount = 600, maxKeysPerSecond = 10, maxBurst = 600)
+
+    firstWriterWait shouldBe 0L
+    secondWriterWait should be >= 59000L
+    thirdWriterWait should be >= 119000L
+
+    val mismatch = the[redis.clients.jedis.exceptions.JedisDataException] thrownBy {
+      RedisBatchUpload.reserveRate(jedisCluster, limiterKey, keyCount = 1, maxKeysPerSecond = 20, maxBurst = 600)
+    }
+    mismatch.getMessage should include("different max keys per second")
+    jedisCluster.hget(limiterKey, "rate") shouldBe "10"
+  }
+
+  it should "not let an older generation overwrite a newer materialized base value" in {
+    val baseKey = RedisKVStore.buildRedisKey("entity-1".getBytes(StandardCharsets.UTF_8).toSeq,
+                                             "INCREMENTAL_BATCH")
+
+    def putBase(timestamp: Long, payload: String, writeEpoch: Long): Long = {
+      val encoded = RedisBatchUpload.encodeValue(
+        RedisBatchUpload.Upsert,
+        timestamp,
+        payload.getBytes(StandardCharsets.UTF_8),
+        writeEpoch
+      )
+      jedisCluster
+        .eval(
+          RedisBatchUpload.putBaseIfNewerScript,
+          List(baseKey.getBytes(StandardCharsets.UTF_8)).asJava,
+          List(
+            timestamp.toString.getBytes(StandardCharsets.UTF_8),
+            writeEpoch.toString.getBytes(StandardCharsets.UTF_8),
+            encoded,
+            leaseDeadlineBytes()
+          ).asJava
+        )
+        .asInstanceOf[java.lang.Long]
+        .longValue()
+    }
+
+    putBase(2000L, "new", writeEpoch = 2L) shouldBe 1L
+    putBase(2000L, "new", writeEpoch = 2L) shouldBe 2L
+    an[redis.clients.jedis.exceptions.JedisDataException] should be thrownBy {
+      putBase(2000L, "conflicting", writeEpoch = 2L)
+    }
+    putBase(2000L, "same-timestamp-old-generation", writeEpoch = 1L) shouldBe 0L
+    putBase(1000L, "old", writeEpoch = 3L) shouldBe 0L
+
+    val stored = RedisBatchUpload.decodeValue(
+      jedisCluster.get(baseKey.getBytes(StandardCharsets.UTF_8))
+    ).get
+    stored.storedTimestamp shouldBe 2000L
+    new String(stored.payload, StandardCharsets.UTF_8) shouldBe "new"
+
+    val missingKey = RedisKVStore.buildRedisKey("entity-missing".getBytes(StandardCharsets.UTF_8).toSeq,
+                                                "INCREMENTAL_BATCH")
+    val olderValue = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      1000L,
+      "older-but-missing".getBytes(StandardCharsets.UTF_8),
+      1L)
+    RedisBatchUpload.putBaseIfNewer(
+      jedisCluster,
+      missingKey.getBytes(StandardCharsets.UTF_8),
+      List("1000".getBytes(StandardCharsets.UTF_8),
+           "1".getBytes(StandardCharsets.UTF_8),
+           olderValue,
+           leaseDeadlineBytes())) shouldBe 1L
+  }
+
+  it should "replace a legacy value whose payload starts with an incomplete protocol marker" in {
+    val dataset = "LEGACY_PROTOCOL_PREFIX_BATCH"
+    val key = RedisKVStore.buildRedisKey("key".getBytes(StandardCharsets.UTF_8).toSeq, dataset)
+      .getBytes(StandardCharsets.UTF_8)
+    val timestamp = 1000L
+    val legacyPayload = "CRB2".getBytes(StandardCharsets.UTF_8) ++
+      Array[Byte](1, 3) ++ java.nio.ByteBuffer.allocate(8).putLong(99L).array()
+    val legacyValue = java.nio.ByteBuffer.allocate(8 + legacyPayload.length).putLong(timestamp).put(legacyPayload).array()
+    jedisCluster.set(key, legacyValue)
+
+    val replacement = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      timestamp,
+      "replacement".getBytes(StandardCharsets.UTF_8),
+      writeEpoch = 1L)
+    RedisBatchUpload.putBaseIfNewer(
+      jedisCluster,
+      key,
+      Seq(
+        timestamp.toString.getBytes(StandardCharsets.UTF_8),
+        "1".getBytes(StandardCharsets.UTF_8),
+        replacement,
+        leaseDeadlineBytes(),
+        "0".getBytes(StandardCharsets.UTF_8)
+      )) shouldBe 1L
+
+    val decoded = RedisBatchUpload.decodeValue(jedisCluster.get(key)).get
+    decoded.legacy shouldBe false
+    new String(decoded.payload, StandardCharsets.UTF_8) shouldBe "replacement"
+  }
+
+  it should "enforce absolute upload deadlines at the Redis command boundary" in {
+    val dataset = "EXPIRED_INCREMENTAL_BATCH"
+    val key = RedisKVStore.buildRedisKey("entity-1".getBytes(StandardCharsets.UTF_8).toSeq, dataset)
+    val encoded = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Delete,
+      batchTimestamp = 1000L,
+      payload = Array.emptyByteArray,
+      writeEpoch = 1L)
+    val expiredDeadline = (System.currentTimeMillis() - 1000L).toString.getBytes(StandardCharsets.UTF_8)
+    val mutationArgs = List(
+      "1000".getBytes(StandardCharsets.UTF_8),
+      "1".getBytes(StandardCharsets.UTF_8),
+      encoded,
+      expiredDeadline)
+
+    val mutationError = the[redis.clients.jedis.exceptions.JedisDataException] thrownBy {
+      RedisBatchUpload.putBaseIfNewer(jedisCluster, key.getBytes(StandardCharsets.UTF_8), mutationArgs)
+    }
+    mutationError.getMessage should include("mutation lease expired")
+    jedisCluster.exists(key.getBytes(StandardCharsets.UTF_8)) shouldBe false
+
+    RedisBatchUpload.putBaseIfNewer(
+      jedisCluster,
+      key.getBytes(StandardCharsets.UTF_8),
+      mutationArgs :+ "1".getBytes(StandardCharsets.UTF_8)) shouldBe 2L
+    jedisCluster.exists(key.getBytes(StandardCharsets.UTF_8)) shouldBe false
+
+    val staleValue = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      batchTimestamp = 999L,
+      payload = "stale".getBytes(StandardCharsets.UTF_8),
+      writeEpoch = 1L)
+    jedisCluster.set(key.getBytes(StandardCharsets.UTF_8), staleValue)
+    RedisBatchUpload.putBaseIfNewer(
+      jedisCluster,
+      key.getBytes(StandardCharsets.UTF_8),
+      mutationArgs :+ "1".getBytes(StandardCharsets.UTF_8)) shouldBe 1L
+    jedisCluster.exists(key.getBytes(StandardCharsets.UTF_8)) shouldBe false
+
+    jedisCluster.set(key.getBytes(StandardCharsets.UTF_8), encoded)
+    RedisBatchUpload.putBaseIfNewer(
+      jedisCluster,
+      key.getBytes(StandardCharsets.UTF_8),
+      mutationArgs :+ "1".getBytes(StandardCharsets.UTF_8)) shouldBe 1L
+    jedisCluster.exists(key.getBytes(StandardCharsets.UTF_8)) shouldBe false
+
+    val status = RedisBatchUpload.BatchStatus("generation-1", "2024-07-27", 1000L, 1L)
+    val statusError = the[redis.clients.jedis.exceptions.JedisDataException] thrownBy {
+      RedisBatchUpload.writeStatusUntil(
+        jedisCluster,
+        RedisBatchUpload.buildStatusKey(dataset, "chronon"),
+        status,
+        System.currentTimeMillis() - 1000L)
+    }
+    statusError.getMessage should include("status lease expired")
+  }
+
+  it should "never shorten an existing upload lease on an exact replay" in {
+    val dataset = "LEASE_EXTENSION_BATCH"
+    val key = RedisKVStore.buildRedisKey("entity-1".getBytes(StandardCharsets.UTF_8).toSeq, dataset)
+      .getBytes(StandardCharsets.UTF_8)
+    val timestamp = 1000L
+    val writeEpoch = 1L
+    val encoded = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      timestamp,
+      "value".getBytes(StandardCharsets.UTF_8),
+      writeEpoch)
+    val laterDeadline = System.currentTimeMillis() + 300000L
+    val earlierDeadline = laterDeadline - 120000L
+
+    def mutationArgs(deadline: Long): List[Array[Byte]] =
+      List(
+        timestamp.toString.getBytes(StandardCharsets.UTF_8),
+        writeEpoch.toString.getBytes(StandardCharsets.UTF_8),
+        encoded,
+        deadline.toString.getBytes(StandardCharsets.UTF_8))
+
+    RedisBatchUpload.putBaseIfNewer(jedisCluster, key, mutationArgs(laterDeadline)) shouldBe 1L
+    RedisBatchUpload.putBaseIfNewer(jedisCluster, key, mutationArgs(earlierDeadline)) shouldBe 2L
+    jedisCluster.pttl(key) should be > 250000L
+
+    RedisBatchUpload.validateAndExpire(
+      jedisCluster,
+      key,
+      List(
+        timestamp.toString.getBytes(StandardCharsets.UTF_8),
+        writeEpoch.toString.getBytes(StandardCharsets.UTF_8),
+        earlierDeadline.toString.getBytes(StandardCharsets.UTF_8))) shouldBe 1L
+    jedisCluster.pttl(key) should be > 250000L
+
+    val statusKey = RedisBatchUpload.buildStatusKey(dataset, "chronon")
+    val status = RedisBatchUpload.BatchStatus("generation-1", "2024-07-27", timestamp, writeEpoch)
+    RedisBatchUpload.writeStatusUntil(jedisCluster, statusKey, status, laterDeadline) shouldBe 1L
+    RedisBatchUpload.writeStatusUntil(jedisCluster, statusKey, status, earlierDeadline) shouldBe 2L
+    jedisCluster.pttl(statusKey.getBytes(StandardCharsets.UTF_8)) should be > 250000L
+  }
+
+  it should "decode a versioned direct batch value" in {
+    val dataset = "BOOTSTRAP_BATCH"
+    val key = "bootstrap-key".getBytes(StandardCharsets.UTF_8)
+    val timestamp = 4000L
+    val payload = "bootstrap-value".getBytes(StandardCharsets.UTF_8)
+    val baseKey = RedisKVStore.buildRedisKey(key.toSeq, dataset)
+    jedisCluster.set(
+      baseKey.getBytes(StandardCharsets.UTF_8),
+      RedisBatchUpload.encodeValue(RedisBatchUpload.Upsert, timestamp, payload)
+    )
+
+    val response = Await.result(
+      new RedisKVStoreImpl(jedisCluster).multiGet(Seq(GetRequest(key, dataset, None, None))),
+      10.seconds
+    ).head
+    val value = response.values.get.head
+    value.bytes shouldBe payload
+    value.millis shouldBe timestamp
+  }
+
+  it should "gate incremental reads on status and hide direct tombstones" in {
+    val dataset = "INCREMENTAL_BATCH"
+    val publishedTimestamp = 3000L
+    val valueKeyBytes = "value".getBytes(StandardCharsets.UTF_8)
+    val deletedKeyBytes = "deleted".getBytes(StandardCharsets.UTF_8)
+    val missingKeyBytes = "missing".getBytes(StandardCharsets.UTF_8)
+    val aheadKeyBytes = "ahead".getBytes(StandardCharsets.UTF_8)
+
+    def baseKey(key: Array[Byte]): String = RedisKVStore.buildRedisKey(key.toSeq, dataset)
+    def put(key: Array[Byte],
+            operation: RedisBatchUpload.Operation,
+            value: String = "",
+            timestamp: Long = 1000L,
+            writeEpoch: Long = 1L): Unit =
+      jedisCluster.set(
+        baseKey(key).getBytes(StandardCharsets.UTF_8),
+        RedisBatchUpload.encodeValue(operation, timestamp, value.getBytes(StandardCharsets.UTF_8), writeEpoch)
+      )
+
+    put(valueKeyBytes, RedisBatchUpload.Upsert, "new-value")
+    put(deletedKeyBytes, RedisBatchUpload.Delete)
+    put(aheadKeyBytes, RedisBatchUpload.Upsert, "not-published", timestamp = 4000L, writeEpoch = 3L)
+    val status = RedisBatchUpload.BatchStatus("generation-2", "2024-07-27-02", publishedTimestamp, 2L)
+    RedisBatchUpload.writeStatus(jedisCluster, RedisBatchUpload.buildStatusKey(dataset, "chronon"), status)
+
+    val requests = Seq(valueKeyBytes, deletedKeyBytes, missingKeyBytes, aheadKeyBytes)
+      .map(key => GetRequest(key, dataset, None, None))
+    val responses = Await.result(
+      new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true).multiGet(requests),
+      10.seconds)
+    val byKey = responses
+      .map(response => new String(response.request.keyBytes, StandardCharsets.UTF_8) -> response)
+      .toMap
+
+    def assertValue(key: String, expected: String): Unit = {
+      val values = byKey(key).values.get
+      values should have size 1
+      new String(values.head.bytes, StandardCharsets.UTF_8) shouldBe expected
+      values.head.millis shouldBe publishedTimestamp
+    }
+
+    assertValue("value", "new-value")
+    byKey("deleted").values.get shouldBe empty
+    byKey("missing").values.get shouldBe empty
+    byKey("ahead").values.isFailure shouldBe true
+
+    val cachedStore = new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true)
+    Await.result(cachedStore.multiGet(requests.take(1)), 10.seconds).head.values.get should have size 1
+    jedisCluster.unlink(RedisBatchUpload.buildStatusKey(dataset, "chronon").getBytes(StandardCharsets.UTF_8)) shouldBe 1L
+    Await.result(cachedStore.multiGet(requests.take(1)), 10.seconds).head.values.get should have size 1
+    RedisBatchUpload.writeStatus(jedisCluster, RedisBatchUpload.buildStatusKey(dataset, "chronon"), status) shouldBe 1L
+
+    val missingStatusDataset = "NO_STATUS_BATCH"
+    val missingStatusRequest = GetRequest("key".getBytes(StandardCharsets.UTF_8), missingStatusDataset, None, None)
+    val missingStatusStore = new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true)
+    val missingStatus = Await.result(missingStatusStore.multiGet(Seq(missingStatusRequest)), 10.seconds)
+    missingStatus.head.values.isFailure shouldBe true
+    RedisBatchUpload.writeStatus(
+      jedisCluster,
+      RedisBatchUpload.buildStatusKey(missingStatusDataset, "chronon"),
+      status.copy(generation = "recovered-generation")) shouldBe 1L
+    Await.result(missingStatusStore.multiGet(Seq(missingStatusRequest)), 10.seconds).head.values.get shouldBe empty
+
+    val metadataDataset = "CHRONON_METADATA"
+    val metadataKey = "metadata-key".getBytes(StandardCharsets.UTF_8)
+    val metadataRedisKey = RedisKVStore.buildRedisKey(metadataKey.toSeq, metadataDataset)
+    jedisCluster.set(
+      metadataRedisKey.getBytes(StandardCharsets.UTF_8),
+      RedisBatchUpload.encodeValue(RedisBatchUpload.Upsert,
+                                   4000L,
+                                   "metadata-value".getBytes(StandardCharsets.UTF_8),
+                                   1L))
+    val metadataRead = Await.result(
+      new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true)
+        .multiGet(Seq(GetRequest(metadataKey, metadataDataset, None, None))),
+      10.seconds)
+    new String(metadataRead.head.values.get.head.bytes, StandardCharsets.UTF_8) shouldBe "metadata-value"
+    metadataRead.head.values.get.head.millis shouldBe 4000L
+
+    val retired = status.copy(generation = "generation-3", writeEpoch = 3L, retired = true)
+    RedisBatchUpload.writeStatus(jedisCluster, RedisBatchUpload.buildStatusKey(dataset, "chronon"), retired)
+    val retiredRead = Await.result(
+      new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true).multiGet(requests.take(1)),
+      10.seconds)
+    retiredRead.head.values.get shouldBe empty
+  }
+
+  it should "refresh a stale local status when a completed publication is already visible" in {
+    val dataset = "STATUS_REFRESH_BATCH"
+    val key = "key".getBytes(StandardCharsets.UTF_8)
+    val redisKey = RedisKVStore.buildRedisKey(key.toSeq, dataset)
+    val statusKey = RedisBatchUpload.buildStatusKey(dataset, "chronon")
+    val initial = RedisBatchUpload.BatchStatus("generation-1", "2024-07-27", 1000L, 1L)
+    val replacement = RedisBatchUpload.BatchStatus("generation-2", "2024-07-28", 2000L, 2L)
+    val store = new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true)
+    val request = GetRequest(key, dataset, None, None)
+
+    jedisCluster.set(
+      redisKey.getBytes(StandardCharsets.UTF_8),
+      RedisBatchUpload.encodeValue(RedisBatchUpload.Upsert,
+                                   initial.batchTimestamp,
+                                   "old".getBytes(StandardCharsets.UTF_8),
+                                   initial.writeEpoch))
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, initial) shouldBe 1L
+    new String(Await.result(store.multiGet(Seq(request)), 10.seconds).head.values.get.head.bytes,
+               StandardCharsets.UTF_8) shouldBe "old"
+
+    jedisCluster.set(
+      redisKey.getBytes(StandardCharsets.UTF_8),
+      RedisBatchUpload.encodeValue(RedisBatchUpload.Upsert,
+                                   replacement.batchTimestamp,
+                                   "new".getBytes(StandardCharsets.UTF_8),
+                                   replacement.writeEpoch))
+    RedisBatchUpload.writeStatus(jedisCluster, statusKey, replacement) shouldBe 1L
+
+    val refreshed = Await.result(store.multiGet(Seq(request)), 10.seconds).head.values.get.head
+    new String(refreshed.bytes, StandardCharsets.UTF_8) shouldBe "new"
+    refreshed.millis shouldBe replacement.batchTimestamp
+  }
+
+  it should "publish and materialize incremental generations end to end" in {
+    val container = redisFixture.container
+    val host = container.getHost
+    val port = container.getMappedPort(7000)
+    val internalPorts =
+      7000 until (7000 + redisFixture.primaryCount * (redisFixture.replicasPerPrimary + 1))
+    val spark = RedisSparkSessionTestHelper.acquire("RedisIncrementalUploadTest")
+    val sourceTable = s"redis_incremental_${System.nanoTime()}"
+    val destinationDataset = "incremental_e2e"
+    val partitionSpec = PartitionSpec.daily
+    val advertisedPortMappings = internalPorts.map { internalPort =>
+      internalPort -> RedisKVStoreFactory.RedisEndpoint(host, container.getMappedPort(internalPort))
+    }.toMap
+    val clientSettings = RedisKVStoreFactory
+      .settings(Map("redis.cluster.nodes" -> s"$host:$port"), env = Map.empty)
+      .copy(advertisedPortMappings = advertisedPortMappings)
+    val settings = Spark2RedisLoader.Settings(
+      sourceTable = sourceTable,
+      destinationDataset = destinationDataset,
+      sourcePartition = "2024-07-27",
+      partitionSpec = partitionSpec,
+      stateRoot = Files.createTempDirectory("redis-incremental-state").toUri.toString,
+      keyPrefix = "chronon",
+      clientSettings = clientSettings,
+      batchSize = 10,
+      maxKeysPerSecond = 100000,
+      writerPartitions = 1,
+      stateBuckets = 4,
+      liveTTLSeconds = 300
+    )
+    val batchDataset = settings.batchDataset
+    val statusKey = RedisBatchUpload.buildStatusKey(batchDataset, settings.keyPrefix)
+
+    def rows(partition: String, values: (String, String)*): org.apache.spark.sql.DataFrame = {
+      import spark.implicits._
+      (values.map { case (key, value) =>
+        (key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), partition)
+      } :+ (GroupByServingInfoKey.getBytes(StandardCharsets.UTF_8),
+            s"metadata-$partition".getBytes(StandardCharsets.UTF_8),
+            partition)).toDF("key_bytes", "value_bytes", "ds")
+    }
+
+    def read(keys: String*): Map[String, Seq[TimedValue]] = {
+      val requests = keys.map(key => GetRequest(key.getBytes(StandardCharsets.UTF_8), batchDataset, None, None))
+      Await
+        .result(
+          new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true).multiGet(requests),
+          10.seconds)
+        .map(response => new String(response.request.keyBytes, StandardCharsets.UTF_8) -> response.values.get)
+        .toMap
+    }
+
+    def replaceRows(partition: String, values: (String, String)*): Unit = {
+      val view = s"redis_replacement_${System.nanoTime()}"
+      rows(partition, values: _*).drop("ds").createOrReplaceTempView(view)
+      try {
+        spark.sql(
+          s"INSERT OVERWRITE TABLE $sourceTable PARTITION (ds='$partition') SELECT key_bytes, value_bytes FROM $view")
+      } finally {
+        spark.catalog.dropTempView(view)
+      }
+    }
+
+    try {
+      rows("2024-07-27", "a" -> "a-1", "b" -> "b-1", "d" -> "d-1")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(sourceTable)
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val contendersReady = new CountDownLatch(2)
+      val startContenders = new CountDownLatch(1)
+      val contenders = Seq.fill(2)(Future {
+        contendersReady.countDown()
+        startContenders.await(10, TimeUnit.SECONDS) shouldBe true
+        Spark2RedisLoader.run(settings, spark, jedisCluster)
+      })
+      contendersReady.await(10, TimeUnit.SECONDS) shouldBe true
+      startContenders.countDown()
+      val initialRuns = Await.result(Future.sequence(contenders), 2.minutes)
+      initialRuns.flatMap(_.generation).distinct should have size 1
+      initialRuns.map(_.changedKeys).sum shouldBe 3L
+      val initial = initialRuns.maxBy(_.changedKeys)
+      initial.changedKeys shouldBe 3L
+      initial.deletedKeys shouldBe 0L
+      initial.superseded shouldBe false
+      initial.fullRebuild shouldBe true
+      val initialStatus = RedisBatchUpload
+        .readStatus(jedisCluster, statusKey)
+        .get
+      initialStatus.generation shouldBe initial.generation.get
+      jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 300L)
+
+      val ttlDecrease = the[IllegalArgumentException] thrownBy {
+        Spark2RedisLoader.run(settings.copy(liveTTLSeconds = 299), spark, jedisCluster)
+      }
+      ttlDecrease.getMessage should include("Redis TTL cannot decrease within an active lineage")
+
+      val aRedisKey = RedisKVStore.buildRedisKey("a".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      jedisCluster.expire(aRedisKey.getBytes(StandardCharsets.UTF_8), 30L) shouldBe 1L
+
+      val refreshedInitial = Spark2RedisLoader.run(settings, spark, jedisCluster)
+      refreshedInitial.generation shouldBe initial.generation
+      refreshedInitial.refreshedKeys shouldBe 3L
+      jedisCluster.ttl(aRedisKey.getBytes(StandardCharsets.UTF_8)) should be > 250L
+
+      rows("2024-07-28", "a" -> "a-1", "b" -> "b-2", "c" -> "c-1")
+        .write
+        .mode("append")
+        .insertInto(sourceTable)
+      val second = Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
+      second.changedKeys shouldBe 2L
+      second.deletedKeys shouldBe 1L
+
+      val secondValues = read("a", "b", "c", "d")
+      new String(secondValues("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
+      new String(secondValues("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2"
+      new String(secondValues("c").head.bytes, StandardCharsets.UTF_8) shouldBe "c-1"
+      secondValues("d") shouldBe empty
+
+      val bRedisKey = RedisKVStore.buildRedisKey("b".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      jedisCluster.set(
+        bRedisKey.getBytes(StandardCharsets.UTF_8),
+        RedisBatchUpload.encodeValue(
+          RedisBatchUpload.Upsert,
+          settings.batchTimestamp,
+          "b-1".getBytes(StandardCharsets.UTF_8),
+          writeEpoch = 1L))
+      val staleValueRepair =
+        Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
+      staleValueRepair.fullRebuild shouldBe true
+      new String(read("b")("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2"
+
+      replaceRows("2024-07-28", "a" -> "a-1", "b" -> "b-2-corrected", "c" -> "c-1")
+      val samePartitionCorrection =
+        Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
+      samePartitionCorrection.changedKeys shouldBe 1L
+      samePartitionCorrection.deletedKeys shouldBe 0L
+      new String(read("b")("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2-corrected"
+
+      val dRedisKey = RedisKVStore.buildRedisKey("d".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      RedisBatchUpload
+        .decodeValue(jedisCluster.get(dRedisKey.getBytes(StandardCharsets.UTF_8)))
+        .get
+        .operation shouldBe RedisBatchUpload.Delete
+      jedisCluster.ttl(dRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 300L)
+
+      // Simulate restoring Redis to a snapshot from before d was deleted. Recovery from the current S3 head must
+      // replay retained tombstones, not just the current active values, and must not need the mutable source table.
+      jedisCluster.set(
+        dRedisKey.getBytes(StandardCharsets.UTF_8),
+        RedisBatchUpload.encodeValue(
+          RedisBatchUpload.Upsert,
+          settings.batchTimestamp,
+          "d-1".getBytes(StandardCharsets.UTF_8),
+          writeEpoch = 1L))
+      jedisCluster.unlink(statusKey.getBytes(StandardCharsets.UTF_8)) shouldBe 1L
+      spark.sql(s"DROP TABLE $sourceTable")
+      val statusLossRepair =
+        Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
+      statusLossRepair.generation shouldBe samePartitionCorrection.generation
+      statusLossRepair.superseded shouldBe false
+      statusLossRepair.fullRebuild shouldBe true
+      statusLossRepair.refreshedKeys shouldBe 0L
+      RedisBatchUpload.readStatus(jedisCluster, statusKey).get.generation shouldBe samePartitionCorrection.generation.get
+      val afterStaleRepair = read("a", "b", "c", "d")
+      new String(afterStaleRepair("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2-corrected"
+      afterStaleRepair("d") shouldBe empty
+      RedisBatchUpload.decodeValue(jedisCluster.get(dRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
+        RedisBatchUpload.Delete
+
+      rows("2024-07-28", "a" -> "a-1", "b" -> "b-2-corrected", "c" -> "c-1")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(sourceTable)
+
+      jedisCluster.unlink(aRedisKey.getBytes(StandardCharsets.UTF_8))
+      Spark2RedisLoader.run(settings, spark, jedisCluster)
+      new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
+
+      jedisCluster.unlink(bRedisKey.getBytes(StandardCharsets.UTF_8))
+      val repairedLatest = Spark2RedisLoader.run(settings, spark, jedisCluster)
+      repairedLatest.fullRebuild shouldBe true
+      new String(read("b")("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2-corrected"
+
+      rows("2024-07-29", "a" -> "a-1", "b" -> "b-3", "c" -> "c-1")
+        .write
+        .mode("append")
+        .insertInto(sourceTable)
+
+      var droppedHeadResponse = false
+      val lostHeadResponse = new ConditionalObjectWriter {
+        override def read(path: org.apache.hadoop.fs.Path,
+                          hadoopConf: org.apache.hadoop.conf.Configuration): Option[VersionedBytes] =
+          HadoopConditionalObjectWriter.read(path, hadoopConf)
+
+        override def putIfAbsent(path: org.apache.hadoop.fs.Path,
+                                 contents: Array[Byte],
+                                 hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes =
+          HadoopConditionalObjectWriter.putIfAbsent(path, contents, hadoopConf)
+
+        override def compareAndSet(path: org.apache.hadoop.fs.Path,
+                                   expectedVersion: String,
+                                   contents: Array[Byte],
+                                   hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes = {
+          val result = HadoopConditionalObjectWriter.compareAndSet(path, expectedVersion, contents, hadoopConf)
+          if (!droppedHeadResponse && path.getName == "_HEAD") {
+            droppedHeadResponse = true
+            throw new RuntimeException("simulated lost head response")
+          }
+          result
+        }
+      }
+      val interrupted = the[RuntimeException] thrownBy {
+        Spark2RedisLoader.run(
+          settings.copy(sourcePartition = "2024-07-29"),
+          spark,
+          jedisCluster,
+          lostHeadResponse)
+      }
+      interrupted.getMessage shouldBe "simulated lost head response"
+
+      // Recovery must use the immutable S3 state for the admitted generation even if the source partition is corrected
+      // before the retry. The same invocation can then publish the correction as a newer generation.
+      replaceRows("2024-07-29", "a" -> "a-1", "b" -> "b-4", "c" -> "c-1")
+
+      val thirdTimestamp = settings.copy(sourcePartition = "2024-07-29").batchTimestamp
+      val partialValue = RedisBatchUpload.encodeValue(
+        RedisBatchUpload.Upsert,
+          thirdTimestamp,
+          "b-3".getBytes(StandardCharsets.UTF_8),
+          writeEpoch = 4L)
+      RedisBatchUpload.putBaseIfNewer(
+        jedisCluster,
+        bRedisKey.getBytes(StandardCharsets.UTF_8),
+        List(
+          thirdTimestamp.toString.getBytes(StandardCharsets.UTF_8),
+          "4".getBytes(StandardCharsets.UTF_8),
+          partialValue,
+          leaseDeadlineBytes())) shouldBe 1L
+
+      val third = Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-29"), spark, jedisCluster)
+      third.changedKeys shouldBe 1L
+      third.deletedKeys shouldBe 0L
+      third.refreshedKeys shouldBe 2L
+      val thirdValues = read("a", "b", "c", "d")
+      new String(thirdValues("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-4"
+      thirdValues("d") shouldBe empty
+
+      rows("2024-07-30")
+        .write
+        .mode("append")
+        .insertInto(sourceTable)
+      val emptySnapshot = the[IllegalArgumentException] thrownBy {
+        Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-30"), spark, jedisCluster)
+      }
+      emptySnapshot.getMessage should include("contains no data keys")
+      new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
+
+      jedisCluster.unlink(aRedisKey.getBytes(StandardCharsets.UTF_8)) shouldBe 1L
+      val olderAfterEmpty = Spark2RedisLoader.run(
+        settings.copy(sourcePartition = "2024-07-29"),
+        spark,
+        jedisCluster)
+      olderAfterEmpty.superseded shouldBe false
+      olderAfterEmpty.fullRebuild shouldBe true
+      RedisBatchUpload.decodeValue(jedisCluster.get(aRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
+        RedisBatchUpload.Upsert
+      new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $sourceTable")
+      RedisSparkSessionTestHelper.release()
+    }
+  }
+
   it should "bulk put batch IR data from Spark" in {
     // Note: bulkPut appends "_BATCH" suffix via GroupBy.batchDataset (same as BigTable)
     val dataset = "TEST_GROUPBY"
@@ -752,19 +1407,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     val kvStore = new RedisKVStoreImpl(jedisCluster, clusterConfig)
     kvStore.create(batchDataset) // Create the actual dataset that will be written to
 
-    // Create SparkSession for test
-    // Note: Jedis must be on classpath for spark-redis connector
-    val spark = org.apache.spark.sql.SparkSession.builder()
-      .appName("RedisBulkPutTest")
-      .master("local[1]") // Single thread to avoid overwhelming Testcontainers Redis
-      .config("spark.sql.shuffle.partitions", "1")
-      .config("spark.ui.enabled", "false")
-      .config("spark.sql.warehouse.dir", java.nio.file.Files.createTempDirectory("spark-warehouse").toString)
-      // Explicitly set Redis config for connector
-      .config("spark.redis.host", host)
-      .config("spark.redis.port", port.toString)
-      .enableHiveSupport()
-      .getOrCreate()
+    val spark = RedisSparkSessionTestHelper.acquire("RedisBulkPutTest")
 
     try {
       import spark.implicits._
@@ -825,7 +1468,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       jedisCluster.exists(expectedKey1.getBytes(StandardCharsets.UTF_8)) shouldBe true
 
     } finally {
-      spark.stop()
+      RedisSparkSessionTestHelper.release()
     }
   }
 

@@ -63,6 +63,15 @@ def reset_env(default_env):
         os.environ[k] = v
 
 
+def test_upload_to_kv_accepts_resolved_online_args():
+    params = {"online_args": "-Zkv.store.type=redis -Zredis.cluster.nodes=redis:6379"}
+
+    assert run.build_runtime_args(RunMode.UPLOAD_TO_KV, ["--uploader=spark"], params) == (
+        "--uploader=spark -Zkv.store.type=redis -Zredis.cluster.nodes=redis:6379"
+    )
+    assert run.build_runtime_args(RunMode.BACKFILL, ["--step-days=1"], params) == "--step-days=1"
+
+
 def test_download_jar(monkeypatch, sleepless):
     def mock_cmd(url, path, skip_download):
         return url

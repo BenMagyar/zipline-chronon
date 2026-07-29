@@ -15,7 +15,6 @@ trait RedisModule extends Cross.Module[String] with build.BaseModule {
     mvn"org.rogach::scallop:5.1.0"
   )
 
-
   def mvnDeps = build.Constants.commonDeps ++
     build.Constants.loggingApiDeps ++
     build.Constants.utilityDeps ++

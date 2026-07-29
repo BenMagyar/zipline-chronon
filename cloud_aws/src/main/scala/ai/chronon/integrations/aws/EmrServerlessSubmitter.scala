@@ -20,6 +20,7 @@ import software.amazon.awssdk.services.s3.S3Client
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.regex.Matcher
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext}
 import scala.jdk.CollectionConverters._
@@ -48,14 +49,14 @@ class EmrServerlessSubmitter(
   // Cache of jobRunId → appId for reverse lookups in status/kill/URL
   private val jobAppIdCache = new ConcurrentHashMap[String, String]()
 
-  private val EnvVarPattern = """\{([A-Z_][A-Z0-9_]*)\}""".r
+  private val EnvVarPattern = """\$?\{([A-Z_][A-Z0-9_]*)\}""".r
 
-  private def resolveEnvVars(properties: Map[String, String]): Map[String, String] =
+  private def resolveEnvVars(properties: Map[String, String], env: Map[String, String]): Map[String, String] =
     properties.map { case (k, v) =>
       k -> EnvVarPattern.replaceAllIn(v,
                                       m => {
                                         val varName = m.group(1)
-                                        sys.env.getOrElse(varName, m.matched)
+                                        Matcher.quoteReplacement(env.getOrElse(varName, m.matched))
                                       })
     }
 
@@ -196,7 +197,7 @@ class EmrServerlessSubmitter(
     // without the console-side property-count limit).
     // envVars get expanded into EMR-Serverless-specific driver/executor Spark props here
     // (see envVarsToSparkProperties) and merged with caller-provided jobProperties.
-    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars))
+    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars), sys.env.toMap ++ envVars)
     val (inlineProps, overflowProps) = EmrServerlessSubmitter.splitForConfigCap(resolvedProps)
     if (overflowProps.nonEmpty) {
       logger.warn(

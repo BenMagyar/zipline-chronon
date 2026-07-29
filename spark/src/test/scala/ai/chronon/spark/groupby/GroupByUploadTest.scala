@@ -146,6 +146,61 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "ignore the ion upload format when Redis is selected" in {
+    val namespace = testNamespace("redis_ignores_ion")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "redis_ignores_ion_events"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("views", IntType, 10)
+    )
+    DataFrameGen.events(spark, eventSchema, count = 1000, partitions = 18).save(s"$namespace.$eventsTable")
+
+    val groupByConf =
+      Builders.GroupBy(
+        sources = Seq(Builders.Source.events(Builders.Query(), table = eventsTable)),
+        keyColumns = Seq("user"),
+        aggregations = Seq(Builders.Aggregation(Operation.SUM, "views", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = namespace, name = "redis_ignores_ion_upload"),
+        accuracy = Accuracy.SNAPSHOT
+      )
+
+    val endDs = tableUtils.partitionSpec.at(System.currentTimeMillis())
+    val previousFormat = spark.conf.getOption(IonPathConfig.UploadFormatKey)
+    val previousKvStoreType = spark.conf.getOption("kv.store.type")
+    spark.conf.set(IonPathConfig.UploadFormatKey, "ion")
+    spark.conf.set("kv.store.type", "redis")
+    try {
+      GroupByUpload.run(groupByConf, endDs)
+    } finally {
+      previousFormat.fold(spark.conf.unset(IonPathConfig.UploadFormatKey))(
+        spark.conf.set(IonPathConfig.UploadFormatKey, _))
+      previousKvStoreType.fold(spark.conf.unset("kv.store.type"))(spark.conf.set("kv.store.type", _))
+    }
+
+    val rows = tableUtils
+      .loadTable(groupByConf.metaData.uploadTable)
+      .where(s"ds = '$endDs'")
+      .collect()
+    rows.length should be > 1
+    rows.map(_.getAs[String]("key_json")) should contain(Constants.GroupByServingInfoKey)
+  }
+
+  it should "select Redis from the compiled GroupBy common configuration" in {
+    val metadata = Builders.MetaData(
+      namespace = "unit_test",
+      name = "redis_common_conf",
+      executionInfo = new ExecutionInfo().setConf(
+        new ConfigProperties().setCommon(Map("kv.store.type" -> "redis").toJava)
+      )
+    )
+    val groupByConf = new GroupBy().setMetaData(metadata)
+
+    GroupByUpload.isRedisSelected(groupByConf, Map.empty, Map.empty) shouldBe true
+  }
+
   // The ion upload stamps ts from partitionSpec.epochMillis(endDs) (the engine's partition start),
   // not a to_date/to_timestamp round-trip of the ds string.
   it should "stamp ion ts with the partition-start millis" in {
@@ -1285,4 +1340,3 @@ object GroupByUploadTest {
     tailHops.get(2).size() shouldBe 0
   }
 }
-

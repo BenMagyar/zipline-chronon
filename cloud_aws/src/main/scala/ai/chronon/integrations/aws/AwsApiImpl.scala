@@ -15,14 +15,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 /** Implementation of Chronon's API interface for AWS.
   *
-  * Supports multiple KV store backends based on configuration:
-  *   - DynamoDB (default): Set KV_STORE_TYPE=dynamodb (or omit)
-  *   - Redis: Set KV_STORE_TYPE=redis
-  *
-  * Redis Configuration:
-  *   - REDIS_CLUSTER_NODES: Comma-separated cluster nodes (e.g., "node1:6379,node2:6379") [required]
-  *   - REDIS_PASSWORD: Redis password (optional)
-  *   - See RedisKVStoreFactory for additional configuration options.
+  * DynamoDB remains the default KV store. Set `kv.store.type=redis` or `KV_STORE_TYPE=redis` to use the Redis
+  * implementation bundled in the AWS artifact. See RedisKVStoreFactory for Redis connection settings.
   */
 class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
 
@@ -123,17 +117,16 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
           Option(sharedKvStore.get()) match {
             case Some(store) => store
             case None =>
-              val kvStoreType = getOptional("KV_STORE_TYPE", conf).getOrElse("dynamodb")
-              val newStore = kvStoreType.toLowerCase match {
-                case "redis" =>
+              val newStore = configuredKvStoreType(conf) match {
+                case RedisKvStoreType =>
                   logger.info("Initializing Redis KV store")
-                  RedisKVStoreFactory.create(conf)
-                case "dynamodb" =>
+                  RedisKVStoreFactory.createManaged(conf, S3ConditionalObjectWriter)
+                case DynamoDbKvStoreType =>
                   logger.info("Initializing DynamoDB KV store")
                   new DynamoDBKVStoreImpl(ddbClient, conf)
                 case other =>
                   throw new IllegalArgumentException(
-                    s"Unsupported KV store type: $other. Supported types: dynamodb, redis")
+                    s"Unsupported KV store type: $other. Supported types: $DynamoDbKvStoreType, $RedisKvStoreType")
               }
               sharedKvStore.set(newStore)
               newStore
@@ -167,6 +160,11 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
 }
 
 object AwsApiImpl {
+  private[aws] val KvStoreTypeProperty = "kv.store.type"
+  private[aws] val KvStoreTypeEnv = "KV_STORE_TYPE"
+  private[aws] val DynamoDbKvStoreType = "dynamodb"
+  private[aws] val RedisKvStoreType = "redis"
+
   private val DefaultConnectionTimeout = Duration.ofMillis(1000L)
   private val DefaultApiTimeout = Duration.ofMillis(500L)
   private val DefaultTotalTimeout = Duration.ofMillis(3000L)
@@ -182,4 +180,11 @@ object AwsApiImpl {
     sys.env
       .get(key)
       .orElse(conf.get(key))
+
+  private[aws] def configuredKvStoreType(conf: Map[String, String], env: Map[String, String] = sys.env): String =
+    Seq(env.get(KvStoreTypeEnv), conf.get(KvStoreTypeEnv), conf.get(KvStoreTypeProperty)).flatten
+      .map(_.trim)
+      .find(_.nonEmpty)
+      .map(_.toLowerCase)
+      .getOrElse(DynamoDbKvStoreType)
 }

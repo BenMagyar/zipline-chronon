@@ -120,7 +120,8 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
     val metaData =
       MetaDataUtils.layer(
         groupBy.metaData,
-        GroupByPlanner.UploadToKV,
+        // Mode config uses the CLI run-mode spelling; the planner node identity below remains uploadToKV.
+        "upload-to-kv",
         groupBy.metaData.name + s"__${GroupByPlanner.UploadToKV}",
         uploadToKVTableDeps,
         None
