@@ -26,6 +26,7 @@ object RedisKVStoreConstants {
 
   // Environment variable keys for Redis Cluster
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
+  val EnvRedisUseSsl = "REDIS_USE_SSL"
   val EnvRedisPassword = "REDIS_PASSWORD"
   val EnvRedisKeyPrefix = "REDIS_KEY_PREFIX"
   val EnvRedisMaxConnections = "REDIS_MAX_CONNECTIONS"
@@ -39,4 +40,18 @@ object RedisKVStoreConstants {
   val PropTTLSeconds = "ttl-seconds"
   val PropMaxConnections = "max-connections"
   val PropKeyPrefix = "key-prefix"
+
+  /** SSLParameters that disable endpoint identification for ElastiCache cluster mode.
+    *
+    * ElastiCache returns individual node IPs (not hostnames) in the CLUSTER SLOTS response.
+    * The JVM's default HTTPS endpoint identification algorithm rejects TLS connections to IP
+    * addresses when the cert is issued for a hostname, causing connection failures on slot
+    * redirects. Disabling it keeps the connection encrypted while skipping the IP/hostname
+    * mismatch check. Certificate chain validation uses the JVM default trust store as normal.
+    */
+  def elastiCacheSslParams(): javax.net.ssl.SSLParameters = {
+    val p = new javax.net.ssl.SSLParameters()
+    p.setEndpointIdentificationAlgorithm("")
+    p
+  }
 }

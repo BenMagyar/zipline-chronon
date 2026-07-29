@@ -76,9 +76,11 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("redis")
   protected val tableToContext = new TrieMap[String, Metrics.Context]()
 
-  // Extract cluster nodes configuration for Spark executors
+  // Extract cluster nodes for Spark executors — check env-style key first (set via -Z args),
+  // then the conf-style key, then the actual env var, then fall back to localhost.
   private lazy val clusterNodesConfig: String = {
-    conf.getOrElse("redis.cluster.nodes", System.getenv().getOrDefault("REDIS_CLUSTER_NODES", "localhost:6379"))
+    conf.getOrElse(EnvRedisClusterNodes,
+                   conf.getOrElse("redis.cluster.nodes", sys.env.getOrElse(EnvRedisClusterNodes, "localhost:6379")))
   }
 
   override def create(dataset: String): Unit = {
@@ -409,6 +411,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
     try {
       // Use Spark2RedisLoader to load data from Hive/Delta tables
       // Similar to how BigTable calls Spark2BigTableLoader.main()
+      val useSsl = conf.getOrElse(EnvRedisUseSsl, sys.env.getOrElse(EnvRedisUseSsl, "false")).toBoolean
       val loaderArgs = Array(
         "--table-name",
         sourceOfflineTable,
@@ -422,7 +425,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         keyPrefix,
         "--ttl",
         DataTTLSeconds.toString
-      )
+      ) ++ (if (useSsl) Array("--use-ssl") else Array.empty[String])
 
       // Run the Spark job
       Spark2RedisLoader.main(loaderArgs)

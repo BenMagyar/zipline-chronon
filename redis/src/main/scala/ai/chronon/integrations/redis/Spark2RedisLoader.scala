@@ -64,6 +64,12 @@ object Spark2RedisLoader {
       default = Some(1000)
     )
 
+    val useSsl: ScallopOption[Boolean] = opt[Boolean](
+      name = "use-ssl",
+      descr = "Enable TLS/SSL for Redis connections (required for ElastiCache in-transit encryption)",
+      default = Some(false)
+    )
+
     verify()
   }
 
@@ -77,6 +83,7 @@ object Spark2RedisLoader {
     val keyPrefix = config.keyPrefix()
     val ttl = config.ttl()
     val batchSize = config.batchSize()
+    val useSsl = config.useSsl()
 
     logger.info(
       s"Starting Redis bulk load: table=$tableName, dataset=$dataset, partition=$endDate, batchSize=$batchSize")
@@ -113,7 +120,7 @@ object Spark2RedisLoader {
     val transformedDf = buildTransformedDataFrame(dataDf, keyPrefix, endDsPlusOne, spark)
 
     // Write to Redis using foreachPartition with direct Jedis API
-    writeToRedis(transformedDf, clusterNodes, ttl, batchSize)
+    writeToRedis(transformedDf, clusterNodes, ttl, batchSize, useSsl)
 
     logger.info(s"Successfully bulk loaded $recordCount records to Redis dataset $batchDataset")
   }
@@ -197,19 +204,23 @@ object Spark2RedisLoader {
     * Note: Redis cluster topology must be properly configured to announce
     * externally accessible IPs/ports for Spark executors to connect.
     */
-  private def writeToRedis(df: DataFrame, clusterNodes: String, ttl: Int, batchSize: Int): Unit = {
-    import redis.clients.jedis.{HostAndPort, JedisCluster}
+  private def writeToRedis(df: DataFrame,
+                           clusterNodes: String,
+                           ttl: Int,
+                           batchSize: Int,
+                           useSsl: Boolean = false): Unit = {
+    import redis.clients.jedis.{DefaultJedisClientConfig, HostAndPort, JedisCluster}
     import scala.jdk.CollectionConverters._
     import java.nio.charset.StandardCharsets
 
     val clusterNodesBroadcast = df.sparkSession.sparkContext.broadcast(clusterNodes)
     val ttlBroadcast = df.sparkSession.sparkContext.broadcast(ttl)
+    val useSslBroadcast = df.sparkSession.sparkContext.broadcast(useSsl)
 
-    logger.info(s"Writing to Redis using foreachPartition: nodes=${clusterNodes}, batchSize=$batchSize")
+    logger.info(s"Writing to Redis using foreachPartition: nodes=${clusterNodes}, ssl=$useSsl, batchSize=$batchSize")
 
     df.foreachPartition { rows: Iterator[org.apache.spark.sql.Row] =>
       if (rows.hasNext) {
-        // Create JedisCluster connection for this partition
         val nodes = clusterNodesBroadcast.value
           .split(",")
           .map { nodeStr =>
@@ -225,10 +236,22 @@ object Spark2RedisLoader {
         poolConfig.setMaxIdle(5)
         poolConfig.setMinIdle(1)
 
-        // Use longer timeouts for Testcontainers compatibility
-        // connectionTimeout: time to establish TCP connection
-        // soTimeout: socket read timeout for Redis commands
-        val jedisCluster = new JedisCluster(nodes, 10000, 30000, 5, poolConfig)
+        val clientConfigBuilder = DefaultJedisClientConfig
+          .builder()
+          .connectionTimeoutMillis(10000)
+          .socketTimeoutMillis(30000)
+          .ssl(useSslBroadcast.value)
+        if (useSslBroadcast.value) {
+          // ElastiCache cluster mode returns node IPs in the slot map; disable endpoint
+          // identification so Jedis can connect to those IPs without hostname mismatch.
+          // Certificate chain validation still uses the JVM default trust store.
+          clientConfigBuilder
+            .hostnameVerifier((_, _) => true)
+            .sslParameters(RedisKVStoreConstants.elastiCacheSslParams())
+        }
+        val clientConfig = clientConfigBuilder.build()
+
+        val jedisCluster = new JedisCluster(nodes, clientConfig, 5, poolConfig)
 
         try {
           // Use pipeline for batching within each partition

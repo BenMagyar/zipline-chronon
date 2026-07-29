@@ -16,7 +16,7 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
   private val jettyVersion = build.Constants.jettyVersion
   private val nimbusJoseJwtVersion = "9.37.4"
 
-  def moduleDeps = Seq(build.spark(crossValue), build.aggregator(crossValue), build.api(crossValue), build.online(crossValue), build.cloud_k8s(crossValue))
+  def moduleDeps = Seq(build.spark(crossValue), build.aggregator(crossValue), build.api(crossValue), build.online(crossValue), build.redis(crossValue), build.cloud_k8s(crossValue))
 
   // Built from zipline-ai/unitycatalog@spark-3.5-scala-2.12 (Zipline rebuild
   // commit on top of upstream UC HEAD). Spark connector now depends on the
