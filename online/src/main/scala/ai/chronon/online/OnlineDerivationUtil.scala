@@ -49,7 +49,8 @@ object OnlineDerivationUtil {
   def buildDerivationFunction(
       derivationsScala: List[Derivation],
       keySchema: StructType,
-      baseValueSchema: StructType
+      baseValueSchema: StructType,
+      setups: Seq[String] = Seq.empty
   ): DerivationFunc = {
 
     if (derivationsScala.isEmpty) {
@@ -62,7 +63,7 @@ object OnlineDerivationUtil {
 
     } else {
 
-      val catalystUtil = buildCatalystUtil(derivationsScala, keySchema, baseValueSchema)
+      val catalystUtil = buildCatalystUtil(derivationsScala, keySchema, baseValueSchema, setups)
       buildDerivationFunctionWithSql(catalystUtil)
 
     }
@@ -93,7 +94,8 @@ object OnlineDerivationUtil {
   private def buildCatalystUtil(
       derivationsScala: List[Derivation],
       keySchema: StructType,
-      baseValueSchema: StructType
+      baseValueSchema: StructType,
+      setups: Seq[String] = Seq.empty
   ): PooledCatalystUtil = {
     val baseExpressions = if (derivationsScala.derivationsContainStar) {
       baseValueSchema
@@ -101,13 +103,14 @@ object OnlineDerivationUtil {
         .map(sf => sf.name -> sf.name)
     } else { Seq.empty }
     val expressions = baseExpressions ++ derivationsScala.derivationsWithoutStar.map { d => d.name -> d.expression }
-    new PooledCatalystUtil(expressions, StructType("all", (keySchema ++ baseValueSchema).toArray ++ timeFields))
+    new PooledCatalystUtil(expressions, StructType("all", (keySchema ++ baseValueSchema).toArray ++ timeFields), setups)
   }
 
   def buildDerivedFields(
       derivationsScala: List[Derivation],
       keySchema: StructType,
-      baseValueSchema: StructType
+      baseValueSchema: StructType,
+      setups: Seq[String] = Seq.empty
   ): Seq[StructField] = {
     if (derivationsScala.areDerivationsRenameOnly) {
       val baseExpressions = if (derivationsScala.derivationsContainStar) {
@@ -128,7 +131,7 @@ object OnlineDerivationUtil {
       }
       expressions
     } else {
-      val catalystUtil = buildCatalystUtil(derivationsScala, keySchema, baseValueSchema)
+      val catalystUtil = buildCatalystUtil(derivationsScala, keySchema, baseValueSchema, setups)
       catalystUtil.outputChrononSchema.map(tup => StructField(tup._1, tup._2))
     }
   }

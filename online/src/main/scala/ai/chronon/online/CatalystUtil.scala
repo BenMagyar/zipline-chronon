@@ -51,9 +51,25 @@ object CatalystUtil {
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config(SQLConf.DATETIME_JAVA8API_ENABLED.key, true)
       .config(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, false)
-      // disable Hive support as this requires spark-hive as a hard dep and that fails grype tests
-//      .enableHiveSupport() // needed to support registering Hive UDFs via CREATE FUNCTION.. calls
+      // required for Hive UDF support
+      .enableHiveSupport()
       .getOrCreate()
+    // Allow callers to override the S3A credential provider via AWS_CREDENTIALS_PROVIDER.
+    // core-default.xml (bundled in hadoop-client-runtime) defaults to a narrow chain that
+    // excludes file-based credentials (~/.aws/credentials). Setting this on hadoopConf before
+    // any s3a:// filesystem is accessed (e.g. ADD JAR setup statements) overrides that default.
+    // Example: AWS_CREDENTIALS_PROVIDER=software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+    // for local fetcher runs with ~/.aws/credentials.
+    sys.env.get("AWS_CREDENTIALS_PROVIDER").foreach { provider =>
+      spark.sparkContext.hadoopConfiguration.set("fs.s3a.aws.credentials.provider", provider)
+    }
+    // Set fs.s3a.endpoint.region from the standard AWS env vars so ADD JAR s3a:// paths resolve
+    // to the correct region. S3A defaults to us-east-1 and returns a 301 redirect for other regions,
+    // which causes copyToLocalFile to write the redirect XML body instead of the jar.
+    val awsRegion = sys.env.getOrElse("AWS_DEFAULT_REGION", sys.env.getOrElse("AWS_REGION", ""))
+    if (awsRegion.nonEmpty && spark.sparkContext.hadoopConfiguration.get("fs.s3a.endpoint.region", "").isEmpty) {
+      spark.sparkContext.hadoopConfiguration.set("fs.s3a.endpoint.region", awsRegion)
+    }
     assert(spark.sessionState.conf.wholeStageEnabled)
     spark
   }
@@ -75,6 +91,11 @@ object CatalystUtil {
     * cost of constructing a CatalystUtil and depends only on the query and the input schema. Cache it so that
     * every CatalystUtil for a given query after the first is close to free.
     */
+  // Normalize s3:// → s3a:// in setup strings so that callers using either scheme produce the
+  // same BlueprintKey and share one blueprint (and therefore one jar download).
+  private def normalizeSetups(setups: Seq[String]): Seq[String] =
+    setups.map(_.replace("s3://", "s3a://"))
+
   def blueprintOf(inputSchema: StructType,
                   selects: Seq[(String, String)],
                   wheres: Seq[String],
@@ -82,7 +103,7 @@ object CatalystUtil {
                   timestampMillisOutputColumns: Set[String]): CatalystUtilBlueprint =
     blueprints
       .computeIfAbsent(
-        BlueprintKey(inputSchema, selects, wheres, setups, timestampMillisOutputColumns),
+        BlueprintKey(inputSchema, selects, wheres, normalizeSetups(setups), timestampMillisOutputColumns),
         new function.Function[BlueprintKey, Memo[CatalystUtilBlueprint]] {
           override def apply(k: BlueprintKey): Memo[CatalystUtilBlueprint] =
             new Memo(new CatalystUtilBlueprint(k))
@@ -135,7 +156,66 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
   val outputArrDecoder: Any => Any = SparkInternalRowConversions.from(outputSparkSchema, false)
   val outputChrononSchema: Array[(String, DataType)] = SparkConversions.toChrononSchema(outputSparkSchema)
 
+  val hasSetups: Boolean = key.setups.nonEmpty
+
   def newInstance(): CatalystUtil = new CatalystUtil(this)
+
+  // ADD JAR via session.sql() routes through HiveSessionResourceLoader, which lazily instantiates
+  // HiveExternalCatalog and the Derby metastore (DataNucleus). These aren't available in all
+  // environments. Intercept ADD JAR, download the jar locally, and register it directly so that
+  // CREATE FUNCTION calls that follow can resolve UDF classes via Utils.classForName.
+  // The thread context classloader must be set to jarClassLoader for SessionCatalog.makeFunctionBuilder.
+  private def executeSetups(session: SparkSession): Unit = {
+    if (key.setups.isEmpty) return
+    val addJarPattern = """(?i)^\s*ADD\s+JAR\s+['"]?([^\s'"]+)['"]?\s*;?\s*$""".r
+    val originalCL = Thread.currentThread().getContextClassLoader
+    Thread.currentThread().setContextClassLoader(session.sharedState.jarClassLoader)
+    try {
+      key.setups.foreach { statement =>
+        try {
+          statement.trim match {
+            case addJarPattern(jarPath) =>
+              val localFile = localizeJar(jarPath, session)
+              logger.info(s"Executed setup statement via localizeJar (${localFile.length()} bytes): $statement")
+            case _ =>
+              session.sql(statement)
+              logger.info(s"Executed setup statement: $statement")
+          }
+        } catch {
+          case _: FunctionAlreadyExistsException =>
+          // ignore - crops up in unit tests when blueprint is reused across test cases
+          case e: Exception =>
+            logger.warn(s"Failed to execute setup statement: $statement", e)
+            throw new RuntimeException(s"Error executing setup statement: $statement", e)
+        }
+      }
+    } finally {
+      Thread.currentThread().setContextClassLoader(originalCL)
+    }
+  }
+
+  // Downloads a remote jar (s3a://, gs://, or local path) to a temp file, registers it with
+  // SparkContext for executor distribution, and adds it to jarClassLoader so the driver can
+  // resolve UDF classes loaded from it.
+  //
+  // We bypass session.sql("ADD JAR") because that routes through HiveSessionResourceLoader, which
+  // lazily initializes HiveExternalCatalog → Derby metastore → DataNucleus. DataNucleus requires
+  // its three jars (core, api-jdo, rdbms) as separate classpath entries so each jar's plugin.xml
+  // is discoverable; in an uber-jar only one plugin.xml survives the merge and the JDO adapter
+  // registration is lost, causing a fatal startup error.
+  private def localizeJar(jarPath: String, session: SparkSession): java.io.File = {
+    val sc = session.sparkContext
+    // s3:// has no registered Hadoop FileSystem; rewrite to s3a:// which does.
+    val normalizedPath = if (jarPath.startsWith("s3://")) "s3a://" + jarPath.stripPrefix("s3://") else jarPath
+    val srcPath = new org.apache.hadoop.fs.Path(new java.net.URI(normalizedPath))
+    val fs = srcPath.getFileSystem(sc.hadoopConfiguration)
+    val localFile = java.io.File.createTempFile(srcPath.getName.stripSuffix(".jar") + "-", ".jar")
+    localFile.deleteOnExit()
+    fs.copyToLocalFile(srcPath, new org.apache.hadoop.fs.Path(localFile.toURI))
+    sc.addJar(localFile.getAbsolutePath)
+    session.sharedState.jarClassLoader.addURL(localFile.toURI.toURL)
+    localFile
+  }
 
   private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame =
     df.schema.fields
@@ -148,19 +228,7 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
   private def initialize(): (CatalystTransformBuilder.TransformFactory, types.StructType) = {
     val session = CatalystUtil.session
 
-    // run through and execute the setup statements
-    key.setups.foreach { statement =>
-      try {
-        session.sql(statement)
-        logger.info(s"Executed setup statement: $statement")
-      } catch {
-        case _: FunctionAlreadyExistsException =>
-        // ignore - this crops up in unit tests on occasion
-        case e: Exception =>
-          logger.warn(s"Failed to execute setup statement: $statement", e)
-          throw new RuntimeException(s"Error executing setup statement: $statement", e)
-      }
-    }
+    executeSetups(session)
 
     // create dummy df with sql query and schema
     val emptyRowRdd = session.emptyDataFrame.rdd
@@ -179,6 +247,12 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
 }
 
 class CatalystUtil(blueprint: CatalystUtilBlueprint) {
+
+  // If UDF jars were registered into jarClassLoader during blueprint setup, this thread must use
+  // jarClassLoader as its context CL so HiveShim.createFunction can find UDF classes at eval time.
+  if (blueprint.hasSetups) {
+    Thread.currentThread().setContextClassLoader(CatalystUtil.session.sharedState.jarClassLoader)
+  }
 
   def this(inputSchema: StructType,
            selects: Seq[(String, String)],

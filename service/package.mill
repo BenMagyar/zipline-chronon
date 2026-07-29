@@ -32,6 +32,12 @@ trait ServiceModule extends Cross.Module[String] with build.BaseModule {
         .exclude("org.apache.logging.log4j" -> "log4j-core")
         .exclude("org.apache.zookeeper" -> "zookeeper")
         .exclude("org.apache.zookeeper" -> "zookeeper-jute"),
+      // spark-hive is needed at runtime in the service assembly for Hive udf support in derivations
+      mvn"org.apache.spark::spark-hive:${build.Constants.sparkVersion}"
+        .exclude("org.apache.hadoop" -> "hadoop-client-runtime")
+        .exclude("org.apache.logging.log4j" -> "log4j-core")
+        .exclude("org.apache.zookeeper" -> "zookeeper")
+        .exclude("org.apache.zookeeper" -> "zookeeper-jute"),
       ) ++ Seq(
         // Force specific versions to get around security vulnerabilities in older versions
         mvn"com.fasterxml.woodstox:woodstox-core:5.4.0",
@@ -50,6 +56,13 @@ trait ServiceModule extends Cross.Module[String] with build.BaseModule {
         mvn"io.airlift:aircompressor:2.0.3",
         mvn"io.netty:netty-all:${build.Constants.nettyVersion}",
       ).map(_.forceVersion())
+
+  // spark-hive shades hive-exec + hive-llap-common but leaves the original pom metadata,
+  // which grype flags as vulnerable. Strip it since the code is shaded.
+  override def assemblyRules = super.assemblyRules ++ Seq(
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.hive/hive-exec/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.hive/hive-llap-common/.*"),
+  )
 
   override def resources = Task.Sources(
     moduleDir / "src" / "main" / "resources"

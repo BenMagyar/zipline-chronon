@@ -26,6 +26,25 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers._
 
 class GroupByDerivationsTest extends AnyFlatSpec {
+
+  it should "evaluate a Hive UDF derivation on a GroupBy via deriveFunc when setups are present" in {
+    val parsed = GroupByDerivationsTest.makeUdfGroupByServingInfoParsed()
+    val request = Request("udf_derivations_test_group_by", Map("id" -> "u1"), atMillis = Some(System.currentTimeMillis()))
+    val baseMap: Map[String, AnyRef] = Map("int_val_last_1d" -> java.lang.Integer.valueOf(10))
+
+    val result = applyDeriveFunc(parsed.deriveFunc, request, baseMap)
+
+    result("int_val_minus_two") shouldEqual java.lang.Integer.valueOf(8)
+    result("int_val_last_1d") shouldEqual java.lang.Integer.valueOf(10)
+  }
+
+  it should "resolve responseChrononSchema for a GroupBy whose derivations use a Hive UDF" in {
+    val parsed = GroupByDerivationsTest.makeUdfGroupByServingInfoParsed()
+    val fieldNames = parsed.responseChrononSchema.fields.map(_.name).toSet
+    fieldNames should contain("int_val_minus_two")
+    fieldNames should contain("int_val_last_1d")
+  }
+
   it should "parse and evaluate a groupBy with derivations" in {
 
     def makeArrayList(vals: Any*): util.ArrayList[Any] =
@@ -100,6 +119,60 @@ class GroupByDerivationsTest extends AnyFlatSpec {
 }
 
 object GroupByDerivationsTest {
+  val udfSetups: Seq[String] = Seq("CREATE FUNCTION MINUS_TWO AS 'ai.chronon.online.test.Minus_Two'")
+
+  // Builds a minimal GroupByServingInfo where the source query carries setups (UDF registration),
+  // the aggregation produces int_val_last_1d, and the derivation applies the UDF to it.
+  def makeUdfGroupByServingInfoParsed(): GroupByServingInfoParsed = {
+    val groupBy = Builders.GroupBy(
+      sources = Seq(
+        Builders.Source.events(
+          table = "events.my_stream_raw",
+          topic = "events.my_stream",
+          query = Builders.Query(
+            selects = Map("id" -> "id", "int_val" -> "int_val"),
+            timeColumn = "ts",
+            startPartition = "20231106",
+            setups = udfSetups
+          )
+        )
+      ),
+      keyColumns = Seq("id"),
+      aggregations = Seq(
+        Builders.Aggregation(
+          operation = Operation.LAST,
+          inputColumn = "int_val",
+          windows = Seq(new Window(1, TimeUnit.DAYS))
+        )
+      ),
+      metaData = Builders.MetaData(name = "udf_derivations_test_group_by"),
+      accuracy = Accuracy.TEMPORAL,
+      derivations = Seq(
+        Builders.Derivation(name = "int_val_minus_two", expression = "MINUS_TWO(int_val_last_1d)"),
+        Builders.Derivation(name = "*", expression = "*")
+      )
+    )
+
+    val groupByServingInfo = new GroupByServingInfo()
+    groupByServingInfo.setGroupBy(groupBy)
+    groupByServingInfo.setInputAvroSchema(
+      AvroConversions.fromChrononSchema(
+        StructType("Input", Array(StructField("id", StringType), StructField("int_val", IntType), StructField("ts", LongType)))
+      ).toString(true)
+    )
+    groupByServingInfo.setKeyAvroSchema(
+      AvroConversions.fromChrononSchema(StructType("Key", Array(StructField("id", StringType)))).toString(true)
+    )
+    groupByServingInfo.setSelectedAvroSchema(
+      AvroConversions.fromChrononSchema(
+        StructType("Selected", Array(StructField("id", StringType), StructField("int_val", IntType)))
+      ).toString(true)
+    )
+    groupByServingInfo.setBatchEndDate("2023-11-06")
+    groupByServingInfo.setDateFormat("yyyy-MM-dd")
+    new GroupByServingInfoParsed(groupByServingInfo)
+  }
+
   def makeTestGroupByServingInfoParsed(): GroupByServingInfoParsed = {
     val groupBy = makeGroupBy()
     val groupByServingInfo = new GroupByServingInfo()

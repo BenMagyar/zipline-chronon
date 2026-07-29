@@ -13,11 +13,38 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.aggregator(crossValue), build.api(crossValue), build.online(crossValue))
 
   def compileMvnDeps = build.Constants.providedFlinkDeps ++ Seq(
-    mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}",
-    mvn"org.apache.spark::spark-sql:${build.Constants.sparkVersion}",
+    mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}"
+      .exclude("org.rocksdb" -> "rocksdbjni"),
+    mvn"org.apache.spark::spark-sql:${build.Constants.sparkVersion}"
+      .exclude("org.rocksdb" -> "rocksdbjni"),
   )
 
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps ++ Seq(
+    // spark-hive + hive-common bundled into the assembly so they load from a local file:// path,
+    // not from the blob store via the Flink usrlib classloader. HiveConf.<clinit> calls new File(getCodeSource()
+    // .getLocation().toURI()) to find hive-site.xml — this crashes when the jar is loaded from blob store
+    mvn"org.apache.spark::spark-hive:${build.Constants.sparkVersion}"
+      .exclude("org.apache.hadoop" -> "hadoop-client-runtime")
+      .exclude("org.apache.logging.log4j" -> "log4j-core")
+      .exclude("org.apache.logging.log4j" -> "log4j-slf4j-impl")
+      .exclude("org.apache.logging.log4j" -> "log4j-slf4j2-impl")
+      .exclude("org.apache.logging.log4j" -> "log4j-web")
+      .exclude("org.slf4j" -> "slf4j-reload4j")
+      .exclude("org.apache.zookeeper" -> "zookeeper")
+      .exclude("org.apache.zookeeper" -> "zookeeper-jute")
+      // spark-network-common:3.5.x declares rocksdbjni:8.3.2 as compile scope; RocksDB 8.x
+      // dropped remove(ColumnFamilyHandle, byte[]) which Flink 1.17's RocksDBWriteBatchWrapper
+      // needs. RocksDB must be provided by the Flink cluster's flink-statebackend-rocksdb plugin.
+      .exclude("org.rocksdb" -> "rocksdbjni"),
+    mvn"org.apache.hive:hive-common:2.3.9"
+      .exclude("org.apache.logging.log4j" -> "log4j-core")
+      .exclude("org.apache.logging.log4j" -> "log4j-slf4j-impl")
+      .exclude("org.apache.logging.log4j" -> "log4j-slf4j2-impl")
+      .exclude("org.apache.logging.log4j" -> "log4j-web")
+      .exclude("org.slf4j" -> "slf4j-reload4j")
+      .exclude("org.apache.zookeeper" -> "zookeeper")
+      .exclude("org.apache.zookeeper" -> "zookeeper-jute")
+      .exclude("org.rocksdb" -> "rocksdbjni"),
     mvn"io.dropwizard.metrics:metrics-core:4.2.19",
     mvn"org.apache.flink:flink-metrics-dropwizard:$flinkVersion",
     mvn"org.apache.flink:flink-metrics-prometheus:$flinkVersion",
@@ -40,7 +67,33 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
   ) ++ Seq(
     mvn"io.netty:netty-codec-http2:${build.Constants.nettyVersion}",
     mvn"io.netty:netty-codec-http:${build.Constants.nettyVersion}",
+    // Force hadoop-client-runtime to 3.4.1 to match hadoop-aws:3.4.1 in cloud jars.
+    // Exclude rocksdbjni: hadoop 3.4.x pulls in RocksDB 8.x which dropped the remove() API
+    // that Flink 1.17's RocksDBWriteBatchWrapper calls, causing NoSuchMethodError at runtime.
+    // RocksDB must come from the Flink cluster's flink-statebackend-rocksdb plugin, not the fat jar.
+    mvn"org.apache.hadoop:hadoop-client-runtime:3.4.1"
+      .exclude("org.rocksdb" -> "rocksdbjni"),
+    // Force versions to fix CVEs introduced transitively by spark-hive + hive-common.
+    mvn"io.airlift:aircompressor:2.0.3",
+    mvn"commons-beanutils:commons-beanutils:1.11.0",
+    mvn"org.apache.commons:commons-configuration2:2.15.0",
+    mvn"com.nimbusds:nimbus-jose-jwt:9.37.4",
+    mvn"org.eclipse.jetty:jetty-server:${build.Constants.jettyVersion}",
+    mvn"org.eclipse.jetty:jetty-http:${build.Constants.jettyVersion}",
+    mvn"io.netty:netty-all:${build.Constants.nettyVersion}",
+    mvn"org.apache.avro:avro:${build.Constants.avroVersion}",
+    mvn"org.apache.hadoop:hadoop-common:3.4.1"
+      .exclude("org.apache.zookeeper" -> "zookeeper")
+      .exclude("org.apache.zookeeper" -> "zookeeper-jute")
+      .exclude("org.rocksdb" -> "rocksdbjni"),
   ).map(_.forceVersion())
+
+  // RocksDB must be provided by the Flink cluster's flink-statebackend-rocksdb plugin.
+  // Bundling a different version breaks the JNI ABI (remove() was dropped in RocksDB 7+).
+  override def assemblyRules = super.assemblyRules ++ build.Constants.hiveAssemblyRules ++ Seq(
+    Assembly.Rule.ExcludePattern("org/rocksdb/.*"),
+    Assembly.Rule.ExcludePattern("librocksdbjni.*"),
+  )
 
   def mainClass = Some("ai.chronon.flink.FlinkJob")
 
@@ -48,7 +101,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
 
   object test extends build.BaseTestModule {
     def scalaVersion = crossValue
-    def moduleDeps = Seq(build.flink(crossValue))
+    def moduleDeps = Seq(build.flink(crossValue), build.online(crossValue).test)
     def forkArgs = build.Constants.commonTestForkArgs
     def mvnDeps = super.mvnDeps() ++ super.compileMvnDeps() ++ build.Constants.testDeps ++ Seq(
       mvn"org.apache.flink:flink-test-utils:$flinkVersion"

@@ -485,6 +485,31 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
     groupByRequest.keys shouldBe Map("query" -> "SHOES")
   }
 
+  it should "build join codec when a join-part groupBy derivation uses a Hive UDF" in {
+    val servingInfo = GroupByDerivationsTest.makeUdfGroupByServingInfoParsed()
+    val udfGroupBy = servingInfo.groupByServingInfo.groupBy
+
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.udf_join"),
+      left = Builders.Source.events(
+        query = Builders.Query(selects = Map("id" -> "id")),
+        table = "unit_test.events"
+      ),
+      joinParts = Seq(Builders.JoinPart(groupBy = udfGroupBy))
+    )
+
+    val ttlCache = mock[TTLCache[String, Try[GroupByServingInfoParsed]]]
+    doReturn(ttlCache).when(metadataStore).getGroupByServingInfo
+    doReturn(Success(servingInfo)).when(ttlCache).apply(udfGroupBy.metaData.name)
+
+    // Before the fix this threw AnalysisException: undefined function MINUS_TWO
+    val joinCodec = metadataStore.buildJoinCodec(join, refreshOnFail = false)
+
+    // buildJoinPartCodec prefixes field names with the GroupBy name (sanitized); verify the UDF-derived field is present
+    val valueFieldNames = joinCodec.baseValueSchema.fields.map(_.name).toSet
+    valueFieldNames.exists(_.endsWith("_int_val_minus_two")) shouldBe true
+  }
+
   it should "check late batch data is handled correctly" in {
     // lookup request - 03/20/2024 01:00 UTC
     // batch landing time 03/17/2024 00:00 UTC

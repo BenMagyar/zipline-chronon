@@ -186,6 +186,75 @@ class JoinSourceQueryFunctionTest extends AnyFlatSpec with Matchers with Mockito
     outputs.isEmpty shouldBe true
   }
 
+  it should "evaluate a Hive UDF in joinSource query selects when setups are present" in {
+    val udfSetups = Seq("CREATE FUNCTION MINUS_TWO AS 'ai.chronon.online.test.Minus_Two'")
+
+    val parentJoin = Builders.Join(
+      left = Builders.Source.events(
+        query = Builders.Query(
+          selects = Map("user_id" -> "user_id", "price" -> "price"),
+          timeColumn = "timestamp"
+        ),
+        table = "test.events",
+        topic = "kafka://test-topic"
+      ),
+      joinParts = Seq(),
+      metaData = Builders.MetaData(name = "test.parent_join_udf")
+    )
+
+    val joinSource = Builders.Source.joinSource(
+      join = parentJoin,
+      query = Builders.Query(
+        selects = Map(
+          "user_id" -> "user_id",
+          "price_int" -> "CAST(price AS INT)",
+          "price_minus_two" -> "MINUS_TWO(CAST(price AS INT))"
+        ),
+        timeColumn = "timestamp",
+        setups = udfSetups
+      )
+    ).getJoinSource
+
+    val mockApi = mock[Api]
+    val mockFetcher = mock[Fetcher]
+    val mockMetadataStore = mock[ai.chronon.online.fetcher.MetadataStore]
+    val mockJoinCodec = mock[JoinCodec]
+
+    when(mockApi.buildFetcher(debug = false)).thenReturn(mockFetcher)
+    when(mockFetcher.metadataStore).thenReturn(mockMetadataStore)
+    when(mockMetadataStore.buildJoinCodec(parentJoin, refreshOnFail = false)).thenReturn(mockJoinCodec)
+
+    val joinValueSchema = ai.chronon.api.StructType("join_enriched", Array(
+      ai.chronon.api.StructField("user_category", StringType)
+    ))
+    when(mockJoinCodec.valueSchema).thenReturn(joinValueSchema)
+
+    // buildCatalystUtil must not throw — before the fix it fails with AnalysisException: undefined function MINUS_TWO
+    val result = JoinSourceQueryFunction.buildCatalystUtil(joinSource, inputSchema, mockApi, enableDebug = false)
+    result.outputSchema.map(_._1).toSet should contain("price_minus_two")
+
+    // Verify the UDF actually evaluates correctly end-to-end
+    val function = new JoinSourceQueryFunction(joinSource, inputSchema, groupByName = "testGB", mockApi, enableDebug = false)
+    setupFunctionWithMockedMetrics(function)
+    function.open(new Configuration())
+
+    val enrichedFields = Map(
+      "user_id" -> "u1",
+      "price" -> 10.0,
+      "timestamp" -> 1000L,
+      "user_category" -> "standard"
+    )
+    val outputs = ListBuffer[ProjectedEvent]()
+    val collector = new Collector[ProjectedEvent] {
+      override def collect(record: ProjectedEvent): Unit = outputs += record
+      override def close(): Unit = {}
+    }
+    function.flatMap(ProjectedEvent(enrichedFields, 500L), collector)
+
+    outputs should have size 1
+    outputs.head.fields("price_minus_two") shouldEqual 8  // 10 - 2
+  }
+
   it should "build join schema correctly" in {
     // Test that the schema building combines left source + join codec schemas
     val parentJoin = Builders.Join(

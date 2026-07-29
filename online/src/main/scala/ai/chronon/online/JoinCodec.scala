@@ -46,7 +46,7 @@ case class JoinCodec(conf: JoinOps,
     val fields = if (conf.join == null || conf.join.derivations == null || baseValueSchema.fields.isEmpty) {
       baseValueSchema
     } else {
-      buildDerivedFields(conf.derivationsScala, keySchema, baseValueSchema)
+      buildDerivedFields(conf.derivationsScala, keySchema, baseValueSchema, conf.setups)
     }
     val derivedSchema: StructType = StructType(s"join_derived_${conf.join.metaData.cleanName}", fields.toArray)
     if (conf.logFullValues) {
@@ -65,7 +65,7 @@ case class JoinCodec(conf: JoinOps,
   }
 
   @transient lazy val deriveFunc: DerivationFunc =
-    buildDerivationFunction(conf.derivationsScala, keySchema, baseValueSchema)
+    buildDerivationFunction(conf.derivationsScala, keySchema, baseValueSchema, conf.setups)
 
   @transient lazy val renameOnlyDeriveFunc: DerivationFunc =
     buildRenameOnlyDerivationFunction(conf.derivationsScala)

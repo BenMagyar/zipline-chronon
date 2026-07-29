@@ -66,7 +66,7 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
     } else {
       outputChrononSchema
     }
-    buildDerivationFunction(groupBy.derivationsScala, keySchema, baseValueSchema)
+    buildDerivationFunction(groupBy.derivationsScala, keySchema, baseValueSchema, groupByOps.setups)
   }
 
   val smallestTailHopMillis: Long = ResolutionUtils.getSmallestTailHopMillis(groupByServingInfo.groupBy)
@@ -116,8 +116,9 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
       if (groupByServingInfo.groupBy.aggregations == null) selectedChrononSchema
       else outputChrononSchema
     if (groupBy.hasDerivations) {
-      StructType(s"${groupBy.metaData.cleanName}_RESPONSE",
-                 buildDerivedFields(groupBy.derivationsScala, keyChrononSchema, baseValueSchema).toArray)
+      StructType(
+        s"${groupBy.metaData.cleanName}_RESPONSE",
+        buildDerivedFields(groupBy.derivationsScala, keyChrononSchema, baseValueSchema, groupByOps.setups).toArray)
     } else {
       baseValueSchema
     }

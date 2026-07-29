@@ -2,8 +2,7 @@ package ai.chronon.flink.test
 
 import ai.chronon.api.Extensions.GroupByOps
 import ai.chronon.api.Constants
-import ai.chronon.api.ScalaJavaConversions.IteratorOps
-import ai.chronon.api.ScalaJavaConversions.JListOps
+import ai.chronon.api.ScalaJavaConversions.{IteratorOps, JListOps, JMapOps}
 import ai.chronon.flink.{SparkExpressionEval, SparkExpressionEvalFn}
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup
 import org.apache.flink.streaming.api.datastream.DataStream

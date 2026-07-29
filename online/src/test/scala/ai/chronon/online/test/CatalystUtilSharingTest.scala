@@ -160,4 +160,60 @@ class CatalystUtilSharingTest extends AnyFlatSpec with Matchers {
       failures shouldBe empty
     }
   }
+
+  it should "produce correct results concurrently when a UDF is registered via setups" in {
+    val udfSetups = Seq(
+      "CREATE FUNCTION MINUS_TWO AS 'ai.chronon.online.test.Minus_Two'"
+    )
+    val udfSelects = Seq(
+      "user_id" -> "user_id",
+      "amount_cents" -> "CAST(amount * 100 AS LONG)",
+      // UDF call mixed in with normal Spark expressions — exercises the shared blueprint
+      // path where setups run once but the UDF must be visible on all per-thread instances
+      "adjusted_qty" -> "MINUS_TWO(CAST(quantity AS INT))"
+    )
+    val pooled = new PooledCatalystUtil(udfSelects, schema, setups = udfSetups)
+
+    val expected: Map[Int, Map[String, Any]] =
+      (0 until 100).map(i => i -> pooled.performSql(rowFor(i)).head).toMap
+
+    val threads = 16
+    val failures = new ConcurrentLinkedQueue[String]()
+    val executor = Executors.newFixedThreadPool(threads)
+    val ready = new CountDownLatch(threads)
+    val go = new CountDownLatch(1)
+    val done = new CountDownLatch(threads)
+
+    (0 until threads).foreach { t =>
+      executor.submit(new Runnable {
+        override def run(): Unit = {
+          ready.countDown()
+          go.await()
+          try {
+            (0 until 100).foreach { i =>
+              val got = pooled.performSql(rowFor(i)).head
+              expected(i).foreach { case (field, want) =>
+                if (got(field) != want)
+                  failures.add(s"thread $t row $i field $field: got ${got(field)} want $want")
+              }
+            }
+          } catch {
+            case e: Throwable => failures.add(s"thread $t threw: $e")
+          } finally {
+            done.countDown()
+          }
+        }
+      })
+    }
+
+    ready.await()
+    go.countDown()
+    val finished = done.await(2, TimeUnit.MINUTES)
+    executor.shutdownNow()
+
+    finished shouldBe true
+    withClue(s"${failures.size} mismatches, first few: ${failures.toArray.take(5).mkString("; ")} ") {
+      failures shouldBe empty
+    }
+  }
 }

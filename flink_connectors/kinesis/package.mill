@@ -44,6 +44,8 @@ trait KinesisConnectorModule extends Cross.Module[String] with build.BaseModule 
     mvn"at.yawk.lz4:lz4-java:1.11.1",
   ).map(_.forceVersion())
 
+  override def assemblyRules = super.assemblyRules ++ build.Constants.hiveAssemblyRules
+
   object test extends build.BaseTestModule {
     def scalaVersion = crossValue
     def moduleDeps = Seq(build.flink_connectors.kinesis(crossValue))
