@@ -20,6 +20,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
     "spark.sql.catalog.iceberg" -> "org.apache.iceberg.spark.SparkCatalog",
     "spark.sql.catalog.iceberg.type" -> "hadoop",
     "spark.sql.catalog.iceberg.warehouse" -> icebergWarehouse,
+    BatchNodeRunner.TimePartitionedReadinessCoverageConf -> "0.8",
     // Do not let a tiny test table hide a Spark-backed Delta file listing behind the CRC shortcut.
     "spark.databricks.delta.allFilesInCrc.thresholdNumFiles" -> "0"
   )
@@ -46,7 +47,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
         spark.sql(s"""
           INSERT INTO $deltaTable VALUES
             (TIMESTAMP '2024-01-01 12:00:00', 1),
-            (TIMESTAMP '2024-01-03 12:00:00', 2)
+            (TIMESTAMP '2024-01-02 12:00:00', 2)
         """)
         DeltaLog.forTable(spark, TableIdentifier("delta_events", Some(namespace))).checkpoint()
 
@@ -73,7 +74,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
         spark.sql(s"""
           INSERT INTO $icebergTable VALUES
             (TIMESTAMP '2024-01-01 12:00:00', 1),
-            (TIMESTAMP '2024-01-03 12:00:00', 2)
+            (TIMESTAMP '2024-01-02 12:00:00', 2)
         """)
 
         def dependency(table: String, partitionColumn: String = "created_at", timePartitioned: Boolean = true) =
@@ -115,11 +116,15 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
 
         val byTable = statuses.map(status => status.name -> status).toMap
         byTable.keySet shouldBe Set(deltaTable, partitionedDeltaTable, icebergTable)
+        byTable(deltaTable).ready shouldBe false
+        byTable(icebergTable).ready shouldBe false
+        byTable(partitionedDeltaTable).ready shouldBe true
         byTable.values.foreach { status =>
-          status.ready shouldBe true
           status.firstAvailablePartition shouldBe Some("2024-01-01")
-          status.lastAvailablePartition shouldBe Some("2024-01-03")
         }
+        byTable(deltaTable).lastAvailablePartition shouldBe Some("2024-01-02")
+        byTable(icebergTable).lastAvailablePartition shouldBe Some("2024-01-02")
+        byTable(partitionedDeltaTable).lastAvailablePartition shouldBe Some("2024-01-03")
         val submittedJobs = spark.sparkContext.statusTracker.getJobIdsForGroup(jobGroup).toSeq
         withClue(s"readiness submitted Spark jobs: ${submittedJobs.mkString(", ")}") {
           submittedJobs shouldBe empty

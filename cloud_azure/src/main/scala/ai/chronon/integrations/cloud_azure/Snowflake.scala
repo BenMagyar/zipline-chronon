@@ -2,6 +2,7 @@ package ai.chronon.integrations.cloud_azure
 
 import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.catalog.Format
+import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.types.StructType
 import org.slf4j.LoggerFactory
@@ -234,6 +235,31 @@ case object Snowflake extends Format {
       case Success(result) => result
       case Failure(e) =>
         snowflakeLogger.warn(s"Failed to get max timestamp date for $tableName: ${e.getMessage}")
+        None
+    }
+  }
+
+  override def maxTimestampMillis(tableName: String, timestampColumn: String)(implicit
+      sparkSession: SparkSession): Option[Long] = {
+    Try {
+      val maxDf = SnowflakeConnector.read(
+        sparkSession,
+        getSnowflakeOptions,
+        s"SELECT MAX($timestampColumn) AS max_val FROM $tableName"
+      )
+      val maxColumn = maxDf.columns.find(_.equalsIgnoreCase("max_val")).getOrElse("max_val")
+      val columnType = maxDf.schema(maxColumn).dataType
+
+      maxDf
+        .select(exactEpochMillisCol(col(maxColumn), columnType).as("max_millis"))
+        .collect()
+        .headOption
+        .filterNot(_.isNullAt(0))
+        .map(_.getLong(0))
+    } match {
+      case Success(result) => result
+      case Failure(e) =>
+        snowflakeLogger.warn(s"Failed to get max timestamp millis for $tableName.$timestampColumn: ${e.getMessage}")
         None
     }
   }

@@ -265,6 +265,10 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
   }
 
   override def beforeEach(): Unit = {
+    spark.conf.set(
+      BatchNodeRunner.TimePartitionedReadinessCoverageConf,
+      BatchNodeRunner.DefaultTimePartitionedReadinessCoverage.toString)
+
     // Drop all test tables to ensure fresh start
     spark.sql("DROP TABLE IF EXISTS test_db.input_table")
     spark.sql("DROP TABLE IF EXISTS test_db.left_table")
@@ -283,6 +287,7 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     spark.sql("DROP TABLE IF EXISTS test_db.yyyymmdd_sq_test")
     spark.sql("DROP TABLE IF EXISTS test_db.yyyymmdd_join_test")
     spark.sql("DROP TABLE IF EXISTS test_db.yyyymmdd_join_gb")
+    spark.sql("DROP TABLE IF EXISTS test_db.coverage_watermark")
 
     setupTestTables()
     mockKVStore.reset()
@@ -390,7 +395,7 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
       // ends at the next midnight.
       val lastPart = tps.lastAvailablePartition.get
       assertEquals(yesterday, lastPart)
-      assertEquals(PartitionSpec.daily.epochMillis(today) - 1, tps.requiredEndMillis)
+      assertEquals(PartitionSpec.daily.epochMillis(today), tps.requiredEndMillis)
     }
   }
 
@@ -1477,6 +1482,11 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     new BatchNodeRunner(node, tableUtils, mockApi)
   }
 
+  private def createCoverageWatermark(timestamp: String): Unit = {
+    spark.sql("CREATE TABLE test_db.coverage_watermark (id INT, created_at TIMESTAMP)")
+    spark.sql(s"INSERT INTO test_db.coverage_watermark VALUES (1, TIMESTAMP '$timestamp')")
+  }
+
   private def createSubDailyPartsTable(): Unit = {
     spark.sql("DROP TABLE IF EXISTS test_db.subdaily_parts")
     spark.sql(
@@ -1640,6 +1650,68 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
       case Success(_) => // ready
       case Failure(e) => fail(s"watermark inside the interval should be ready: ${e.getMessage}")
     }
+  }
+
+  it should "require the configured fraction of the final dependency partition" in {
+    BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe 0.0
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "1.1")
+    intercept[IllegalArgumentException](BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils))
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0.8")
+    createCoverageWatermark("2024-01-01 08:23:59.999")
+
+    // Deliberately omit timePartitioned: runtime column-type detection must still apply the knob.
+    val dep = TableDependencies.fromTable("test_db.coverage_watermark", subDailyQuery("created_at"))
+    val runner = defaultRunner()
+    val sixOClockFire = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
+
+    runner.checkPartitions(sensorFor(dep), sixOClockFire).isFailure shouldBe true
+
+    spark.sql(
+      "INSERT INTO test_db.coverage_watermark VALUES (2, TIMESTAMP '2024-01-01 08:24:00')")
+    runner.checkPartitions(sensorFor(dep), sixOClockFire).isSuccess shouldBe true
+
+    // Coverage is applied after dependency lag: a 09:00 fire with a 3h lag still targets 06:00.
+    val nineOClockFire = PartitionRange("2024-01-01-09-00", "2024-01-01-09-00")(threeHourSpec)
+    val laggedDep = TableDependencies.fromTable(
+      "test_db.coverage_watermark",
+      subDailyQuery("created_at").setPartitionLag(new Window(3, TimeUnit.HOURS)))
+    runner.checkPartitions(sensorFor(laggedDep), nineOClockFire).isSuccess shouldBe true
+    runner.checkPartitions(sensorFor(dep), nineOClockFire).isFailure shouldBe true
+  }
+
+  it should "apply configured coverage in preflight without changing physical partition readiness" in {
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0.8")
+    createCoverageWatermark("2024-01-01 08:23:59.999")
+
+    val timestampDep = TableDependencies.fromTable("test_db.coverage_watermark", subDailyQuery("created_at"))
+    implicit val partitionSpec: PartitionSpec = threeHourSpec
+    val metadata = MetaDataUtils.layer(
+      baseMetadata = new MetaData().setOutputNamespace("test_db").setTeam("test_team"),
+      modeName = "backfill",
+      nodeName = "coverage_preflight",
+      tableDependencies = Seq(timestampDep),
+      stepDays = Some(1),
+      outputTableOverride = Some("test_db.output_table")
+    )
+    val runner = new BatchNodeRunner(new Node().setMetaData(metadata), tableUtils, mockApi)
+    val range = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")
+
+    val belowThreshold = runner.computeInputTablePartitionStatuses(metadata, range, tableUtils).toSeq.head
+    belowThreshold.ready shouldBe false
+    belowThreshold.requiredEndMillis shouldBe
+      threeHourSpec.partitionStartMillis("2024-01-01-06-00") + (2 * 60 + 24) * 60 * 1000L
+
+    spark.sql(
+      "INSERT INTO test_db.coverage_watermark VALUES (2, TIMESTAMP '2024-01-01 08:24:00')")
+    runner.computeInputTablePartitionStatuses(metadata, range, tableUtils).toSeq.head.ready shouldBe true
+
+    val physicalMetadata = createTestMetadata("test_db.input_table", "test_db.output_table")
+    val physicalRange = PartitionRange(yesterday, yesterday)(tableUtils.partitionSpec)
+    val physicalStatus = runner
+      .computeInputTablePartitionStatuses(physicalMetadata, physicalRange, tableUtils)
+      .toSeq
+      .head
+    physicalStatus.ready shouldBe true
   }
 
   "Trigger expression sensors" should "preserve the daily contract" in {

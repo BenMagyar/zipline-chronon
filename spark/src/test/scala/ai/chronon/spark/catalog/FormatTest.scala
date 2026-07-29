@@ -1,5 +1,7 @@
 package ai.chronon.spark.catalog
 
+import java.time.Instant
+
 import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.utils.SparkTestBase
 import org.apache.spark.sql.SparkSession
@@ -217,6 +219,25 @@ class FormatTest extends SparkTestBase {
     fmt.lastAvailablePartition(tableName, "ds", PartitionSpec.daily)(spark) shouldBe Some("2024-04-03")
     fmt.virtualPartitions(tableName, "ds", PartitionSpec.daily)(spark) shouldBe
       List("2024-04-01", "2024-04-02", "2024-04-03")
+  }
+
+  it should "anchor an exact date watermark at UTC midnight regardless of the session timezone" in {
+    val tableName = "format_date_scan_exact_watermark_test"
+    val originalTimeZone = spark.conf.get("spark.sql.session.timeZone")
+    try {
+      spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+      spark.sql(s"CREATE OR REPLACE TEMP VIEW $tableName AS SELECT DATE '2024-04-03' AS ds")
+
+      val fmt = new Format {
+        override def supportSubPartitionsFilter = false
+        override def partitions(tableName: String, partitionFilters: String)(implicit ss: SparkSession) = Nil
+      }
+
+      fmt.maxTimestampMillis(tableName, "ds")(spark) shouldBe
+        Some(Instant.parse("2024-04-03T00:00:00Z").toEpochMilli)
+    } finally {
+      spark.conf.set("spark.sql.session.timeZone", originalTimeZone)
+    }
   }
 
   it should "resolve table names consistently with Spark SQL" in {

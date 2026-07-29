@@ -190,6 +190,13 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
       .flatMap(_.maxTimestampDate(tableName, timestampColumn, effectiveSpec)(sparkSession))
   }
 
+  /** Exact MAX of a timestamp/date/epoch-millis column, without virtual-partition rounding. */
+  def maxTimestampMillis(tableName: String, timestampColumn: String): Option[Long] = {
+    tableFormatProvider
+      .readFormat(tableName)
+      .flatMap(_.maxTimestampMillis(tableName, timestampColumn)(sparkSession))
+  }
+
   /** The table's last partition ds (in its own spec - no translation shim) and that partition's
     * exclusive epoch upper bound. Readiness questions compare epoch millis - spec-free - rather
     * than comparing ds values across specs.

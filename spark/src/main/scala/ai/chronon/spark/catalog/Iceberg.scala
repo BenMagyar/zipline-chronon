@@ -238,6 +238,12 @@ case object Iceberg extends Format {
       .orElse(statsLastAvailablePartition(tableName, partitionColumn, partitionSpec))
       .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
 
+  override def maxTimestampMillis(tableName: String, timestampColumn: String)(implicit
+      sparkSession: SparkSession): Option[Long] =
+    fileStatsDateRangeWithMax(tableName, timestampColumn, PartitionSpec.daily)
+      .map(_._2)
+      .orElse(super.maxTimestampMillis(tableName, timestampColumn))
+
   private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
     statsDateRange(tableName, columnName, partitionSpec).map(_.lastAvailablePartition)
@@ -258,6 +264,12 @@ case object Iceberg extends Format {
 
   private def fileStatsDateRange(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[(StatsDateRange, Type)] =
+    fileStatsDateRangeWithMax(tableName, columnName, partitionSpec).map { case (range, _, fieldType) =>
+      range -> fieldType
+    }
+
+  private def fileStatsDateRangeWithMax(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[(StatsDateRange, Long, Type)] =
     Try {
       val table = loadIcebergTable(tableName).getOrElse {
         throw new IllegalStateException(s"Could not load Iceberg table: $tableName")
@@ -267,7 +279,9 @@ case object Iceberg extends Format {
       }
       val fieldId = field.fieldId().asInstanceOf[java.lang.Integer]
       val fieldType = field.`type`()
-      currentDataFilesDateRange(table, fieldId, fieldType, partitionSpec).map(_ -> fieldType)
+      currentDataFilesDateRangeWithMax(table, fieldId, fieldType, partitionSpec).map { case (range, maxMillis) =>
+        (range, maxMillis, fieldType)
+      }
     } match {
       case Success(result) =>
         if (result.isDefined) {
@@ -411,8 +425,14 @@ case object Iceberg extends Format {
                                         fieldId: java.lang.Integer,
                                         fieldType: org.apache.iceberg.types.Type,
                                         partitionSpec: PartitionSpec): Option[StatsDateRange] =
+    currentDataFilesDateRangeWithMax(table, fieldId, fieldType, partitionSpec).map(_._1)
+
+  private def currentDataFilesDateRangeWithMax(table: org.apache.iceberg.Table,
+                                               fieldId: java.lang.Integer,
+                                               fieldType: org.apache.iceberg.types.Type,
+                                               partitionSpec: PartitionSpec): Option[(StatsDateRange, Long)] =
     currentDataFiles(table, includeColumnStats = true) { files =>
-      StatsDateRange.fromFileStats(
+      StatsDateRange.fromFileStatsWithMax(
         files.map(fileDateRange(_, fieldId, fieldType, partitionSpec)),
         partitionSpec,
         endMillis =>

@@ -195,6 +195,38 @@ case object BigQueryNative extends Format {
     }
   }
 
+  override def maxTimestampMillis(tableName: String, timestampColumn: String)(implicit
+      sparkSession: SparkSession): scala.Option[Long] = {
+    Try {
+      val tableIdentifier = SparkBQUtils.toTableId(tableName)
+      val providedProject = scala.Option(tableIdentifier.getProject).getOrElse(bqOptions.getProjectId)
+      val database = scala
+        .Option(tableIdentifier.getDataset)
+        .getOrElse(throw new IllegalArgumentException(s"database required for table: ${tableName}"))
+
+      val maxDf = sparkSession.read
+        .format(bqFormat)
+        .option("project", providedProject)
+        .option("viewsEnabled", true)
+        .option("materializationDataset", database)
+        .load(s"SELECT MAX(${timestampColumn}) AS max_val FROM ${tableName}")
+      val maxColumn = maxDf.columns.find(_.equalsIgnoreCase("max_val")).getOrElse("max_val")
+      val columnType = maxDf.schema(maxColumn).dataType
+
+      maxDf
+        .select(exactEpochMillisCol(col(maxColumn), columnType).as("max_millis"))
+        .collect()
+        .headOption
+        .filterNot(_.isNullAt(0))
+        .map(_.getLong(0))
+    } match {
+      case Success(result) => result
+      case Failure(e) =>
+        logger.warn(s"Failed to get max timestamp millis for $tableName.$timestampColumn: ${e.getMessage}")
+        None
+    }
+  }
+
   override def virtualPartitions(tableName: String, timestampColumn: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): List[String] = {
     Try {

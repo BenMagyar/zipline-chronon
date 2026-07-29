@@ -288,6 +288,7 @@ class ExternalSourceSensorIntegrationTest extends AnyFlatSpec with Matchers {
       "spark.default.parallelism" -> "5000",
       "spark.sql.shuffle.partitions" -> "10000",
       "spark.chronon.partition.format" -> "yyyy-MM-dd",
+      "spark.chronon.time_partitioned.readiness_coverage" -> "0.8",
       "spark.chronon.table_write.format" -> "iceberg",
       "spark.sql.catalog.spark_catalog.warehouse" -> "s3://my-bucket/warehouse/"
     ).asJava)
@@ -320,6 +321,7 @@ class ExternalSourceSensorIntegrationTest extends AnyFlatSpec with Matchers {
 
     // Non-resource configs should be preserved from downstream
     sensorConf("spark.chronon.partition.format") should equal("yyyy-MM-dd")
+    sensorConf("spark.chronon.time_partitioned.readiness_coverage") should equal("0.8")
     sensorConf("spark.chronon.table_write.format") should equal("iceberg")
     sensorConf("spark.sql.catalog.spark_catalog.warehouse") should equal("s3://my-bucket/warehouse/")
   }

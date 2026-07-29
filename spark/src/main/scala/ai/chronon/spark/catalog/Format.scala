@@ -5,7 +5,7 @@ import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.functions.{col, lit, min, max}
+import org.apache.spark.sql.functions.{col, lit, max, min, unix_date, unix_millis}
 import org.apache.spark.sql.types.{DataType, DateType, LongType, NumericType, StringType, StructType, TimestampType}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -28,6 +28,15 @@ trait Format {
     dt match {
       case _: NumericType => c.cast(LongType)
       case _              => c.cast(TimestampType).cast(LongType) * lit(1000L)
+    }
+
+  protected def exactEpochMillisCol(c: Column, dt: DataType): Column =
+    dt match {
+      case _: NumericType => c.cast(LongType)
+      // DATE is timezone-free. Casting through TIMESTAMP would apply the session timezone,
+      // so convert its epoch-day representation directly to UTC epoch millis.
+      case DateType => unix_date(c).cast(LongType) * lit(24L * 60 * 60 * 1000)
+      case _        => unix_millis(c.cast(TimestampType))
     }
 
   def createTable(tableName: String,
@@ -216,6 +225,26 @@ trait Format {
     }
   }
 
+  /** Exact MAX in epoch millis, without virtual-partition rounding. */
+  def maxTimestampMillis(tableName: String, timestampColumn: String)(implicit
+      sparkSession: SparkSession): Option[Long] = {
+    Try {
+      val df = sparkSession.read.table(tableName)
+      val columnType = df.schema(timestampColumn).dataType
+      df.select(exactEpochMillisCol(max(col(timestampColumn)), columnType).as("max_millis"))
+        .collect()
+        .headOption
+        .filterNot(_.isNullAt(0))
+        .map(_.getLong(0))
+    } match {
+      case Success(result) => result
+      case Failure(e) =>
+        logger.warn(
+          s"Failed to get max timestamp for $tableName.$timestampColumn: ${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("(no message)")}")
+        None
+    }
+  }
+
   protected def scanFirstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(
       implicit sparkSession: SparkSession): Option[String] = {
     import sparkSession.implicits._
@@ -336,6 +365,11 @@ private[catalog] object StatsDateRange {
   def fromFileStats(fileRanges: Iterator[Option[(Long, Long)]],
                     partitionSpec: PartitionSpec,
                     endPartition: Long => String): Option[StatsDateRange] =
+    fromFileStatsWithMax(fileRanges, partitionSpec, endPartition).map(_._1)
+
+  def fromFileStatsWithMax(fileRanges: Iterator[Option[(Long, Long)]],
+                           partitionSpec: PartitionSpec,
+                           endPartition: Long => String): Option[(StatsDateRange, Long)] =
     fileRanges
       .foldLeft(Some(None): Option[Option[(Long, Long)]]) {
         case (None, _) | (_, None)         => None
@@ -345,7 +379,7 @@ private[catalog] object StatsDateRange {
       }
       .flatten
       .map { case (startMillis, endMillis) =>
-        StatsDateRange(partitionSpec.at(startMillis), endPartition(endMillis))
+        StatsDateRange(partitionSpec.at(startMillis), endPartition(endMillis)) -> endMillis
       }
 }
 

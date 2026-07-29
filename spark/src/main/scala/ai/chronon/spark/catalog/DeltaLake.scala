@@ -129,6 +129,12 @@ case object DeltaLake extends Format {
       .orElse(statsLastAvailablePartition(tableName, partitionColumn, partitionSpec))
       .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
 
+  override def maxTimestampMillis(tableName: String, timestampColumn: String)(implicit
+      sparkSession: SparkSession): Option[Long] =
+    fileStatsDateRangeWithMax(tableName, timestampColumn, PartitionSpec.daily)
+      .map(_._2)
+      .orElse(super.maxTimestampMillis(tableName, timestampColumn))
+
   private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
     statsDateRange(tableName, columnName, partitionSpec).map(_.lastAvailablePartition)
@@ -150,7 +156,13 @@ case object DeltaLake extends Format {
     fileStatsDateRange(tableName, columnName, partitionSpec).map(_._1)
 
   private def fileStatsDateRange(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
-      sparkSession: SparkSession): Option[(StatsDateRange, DataType)] = {
+      sparkSession: SparkSession): Option[(StatsDateRange, DataType)] =
+    fileStatsDateRangeWithMax(tableName, columnName, partitionSpec).map { case (range, _, columnType) =>
+      range -> columnType
+    }
+
+  private def fileStatsDateRangeWithMax(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
+      sparkSession: SparkSession): Option[(StatsDateRange, Long, DataType)] = {
     Try {
       val deltaTable = tableMetadataOrThrow(tableName)
       val field = deltaTable.schema(columnName)
@@ -166,7 +178,7 @@ case object DeltaLake extends Format {
                                 field.dataType,
                                 partitionSpec)
         StatsDateRange
-          .fromFileStats(
+          .fromFileStatsWithMax(
             batches.asScala.flatMap { batch =>
               val rows = batch.getRows
               try {
@@ -191,7 +203,7 @@ case object DeltaLake extends Format {
                 case _ => partitionSpec.at(endMillis)
               }
           )
-          .map(_ -> field.dataType)
+          .map { case (range, maxMillis) => (range, maxMillis, field.dataType) }
       }
     } match {
       case Success(result) =>
