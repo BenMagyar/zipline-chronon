@@ -120,38 +120,33 @@ trait FetcherCache {
   def getCachedRequests(
       groupByRequestToKvRequest: Seq[(Fetcher.Request, Try[LambdaKvRequest])]): Map[GetRequest, CachedBatchResponse] = {
 
-    def empty = Map.empty[GetRequest, CachedBatchResponse]
+    val empty = Map.empty[GetRequest, CachedBatchResponse]
 
     if (!isCacheSizeConfigured) return empty
 
-    groupByRequestToKvRequest
-      .map {
+    val cachedRequests = Map.newBuilder[GetRequest, CachedBatchResponse]
+    groupByRequestToKvRequest.foreach {
+      case (request, Success(LambdaKvRequest(servingInfo, _, batchRequest, _, _, _)))
+          if isCachingEnabled(servingInfo.groupBy) =>
+        val batchRequestCacheKey =
+          BatchIrCache.Key(batchRequest.dataset, request.keys, servingInfo.batchEndTsMillis)
 
-        case (request, Success(LambdaKvRequest(servingInfo, _, batchRequest, _, _, _)))
-            if isCachingEnabled(servingInfo.groupBy) =>
-          val batchRequestCacheKey =
-            BatchIrCache.Key(batchRequest.dataset, request.keys, servingInfo.batchEndTsMillis)
+        // Metrics so we can get per-group-by cache metrics
+        val metricsContext =
+          request.context.getOrElse(Metrics.Context(Metrics.Environment.JoinFetching, servingInfo.groupBy))
 
-          // Metrics so we can get per-group-by cache metrics
-          val metricsContext =
-            request.context.getOrElse(Metrics.Context(Metrics.Environment.JoinFetching, servingInfo.groupBy))
-
-          maybeBatchIrCache.get.cache.getIfPresent(batchRequestCacheKey) match {
-
-            case null =>
-              metricsContext.increment(s"${batchIrCacheName}_gb_misses")
-              empty
-
-            case cachedIr: CachedBatchResponse =>
-              metricsContext.increment(s"${batchIrCacheName}_gb_hits")
-              Map(batchRequest -> cachedIr)
-
-          }
-
-        case _ => empty
-
-      }
-      .foldLeft(empty)(_ ++ _)
+        maybeBatchIrCache.get.cache.getIfPresent(batchRequestCacheKey) match {
+          case null =>
+            metricsContext.increment(s"${batchIrCacheName}_gb_misses")
+          case cachedIr: CachedBatchResponse =>
+            metricsContext.increment(s"${batchIrCacheName}_gb_hits")
+            cachedRequests += batchRequest -> cachedIr
+          case _ =>
+            metricsContext.increment(s"${batchIrCacheName}_gb_misses")
+        }
+      case _ => ()
+    }
+    cachedRequests.result()
   }
 }
 

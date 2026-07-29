@@ -6,9 +6,7 @@ import ai.chronon.online.KVStore._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
-import redis.clients.jedis.{HostAndPort, JedisCluster, DefaultJedisClientConfig, HostAndPortMapper}
-import org.testcontainers.containers.GenericContainer
-import org.testcontainers.utility.DockerImageName
+import redis.clients.jedis.JedisCluster
 import java.nio.charset.StandardCharsets
 import scala.concurrent.Await
 import scala.concurrent.duration._
@@ -21,94 +19,19 @@ import scala.jdk.CollectionConverters._
 class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers {
   import RedisKVStore._
 
-  private var redisContainer: GenericContainer[_] = _
+  private var redisFixture: RedisClusterFixture = _
   private var jedisCluster: JedisCluster = _
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    // Use grokzen/redis-cluster - minimal Redis cluster in single container
-    // Provides a 6-node cluster (3 masters, 3 replicas) with fast startup (~5-7 seconds)
-    val internalPorts = Seq(7000,7001,7002,7003,7004,7005)
-    val container = new GenericContainer(DockerImageName.parse("grokzen/redis-cluster:7.0.10"))
-    container.withExposedPorts(internalPorts.map(Integer.valueOf): _*)
-    container.withStartupTimeout(java.time.Duration.ofSeconds(60))
-    container.start()
-    println(s"\nRedis cluster container started")
-    redisContainer = container
-
-    val host = container.getHost
-    val basePort = container.getMappedPort(7000)
-    // Wait for cluster to be ready - ensure all 3 masters have slot assignments
-
-
-
-    if (!waitForClusterReady(host, basePort, 30, "Cluster Initiated")) {
-      throw new RuntimeException(s"Redis cluster failed to initialize after 30 seconds")
-    }
-
-    val configBuilder = DefaultJedisClientConfig.builder()
-      .hostAndPortMapper(new HostAndPortMapper {
-        override def getHostAndPort(hap: HostAndPort): HostAndPort = {
-          // Redis CLuster announces internal ports (7000-7005)
-          // map them to the external ports assigned by Testcontainers
-          val internalPort = hap.getPort
-          if(internalPorts.contains(internalPort)) {
-            val mappedPort = container.getMappedPort(internalPort)
-            new HostAndPort(host, mappedPort)
-          } else {
-            // if port is not in our known list, return as-is
-            hap
-          }
-        }
-      })
-
-    val poolConfig = new org.apache.commons.pool2.impl.GenericObjectPoolConfig[redis.clients.jedis.Connection]()
-    poolConfig.setMaxTotal(10)
-    poolConfig.setMaxIdle(10)
-    poolConfig.setMinIdle(2)
-    poolConfig.setTestOnBorrow(true)
-
-    // Initialize JedisCLuster with the mapped entry point and the port mapper
-    val initNode = new HostAndPort(host, basePort)
-    jedisCluster = new JedisCluster(Set(initNode).asJava, configBuilder.build(), 5, poolConfig)
-    println(s"JedisCluster connected with port mapping \n")
-
-    // Reconfigure each Redis node to announce external (mapped) ports
-    // This makes the cluster topology accessible from Spark executors!
-    println("Reconfiguring Redis cluster to announce external ports...")
-    internalPorts.foreach { internalPort =>
-      val mappedPort = container.getMappedPort(internalPort)
-      val jedis = new redis.clients.jedis.Jedis(host, mappedPort, 5000)
-
-      try {
-        // Configure Redis to announce the external host and mapped port
-        jedis.configSet("cluster-announce-ip", host)
-        jedis.configSet("cluster-announce-port", mappedPort.toString)
-        // Bus port is typically port + 5000, use mapped port for this too
-        jedis.configSet("cluster-announce-bus-port", (mappedPort + 5000).toString)
-
-        println(s"  ✓ Node $internalPort now announces $host:$mappedPort")
-      } catch {
-        case e: Exception =>
-          println(s"  ✕ Failed to reconfigure node $internalPort: ${e.getMessage}")
-          throw e
-      } finally {
-        jedis.close()
-      }
-    }
-
-    // Wait for cluster gossip protocol to propagate the new topology
-    println("Waiting for cluster topology to propagate...")
-    Thread.sleep(3000)
-    println("✓ Cluster topology reconfigured")
+    redisFixture = RedisClusterFixture.start(maxConnections = 10, minIdleConnections = 2, maxIdleConnections = 10)
+    jedisCluster = redisFixture.client
   }
 
   override def afterAll(): Unit = {
-    if (jedisCluster != null) {
-      try jedisCluster.close() catch { case _: Exception => }
-    }
-    if (redisContainer != null) {
-      try redisContainer.stop() catch { case _: Exception => }
+    if (redisFixture != null) {
+      try redisFixture.close()
+      catch { case _: Exception => }
     }
     super.afterAll()
   }
@@ -121,29 +44,6 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       case _: Exception => // Ignore cleanup errors (e.g., when Redis is stopped for failure tests)
     }
     super.withFixture(test)
-  }
-
-  private def waitForClusterReady(host: String, port: Int, maxAttempts: Int = 30, successMessage: String = "Cluster ready") : Boolean = {
-    var clusterReady = false
-    var attempts = 0
-    while (!clusterReady && attempts < maxAttempts) {
-      try {
-        val testJedis = new redis.clients.jedis.Jedis(host, port, 3000)
-        val clusterSlots = testJedis.clusterSlots()
-        testJedis.close()
-        if (clusterSlots.size() >= 3) {
-          clusterReady = true
-          println(s"\n$successMessage (${attempts + 1}s)")
-        }
-      } catch {
-        case _: Exception => // Cluster not ready yet
-      }
-      if (!clusterReady) {
-        Thread.sleep(1000)
-        attempts += 1
-      }
-    }
-    clusterReady
   }
 
   it should "create Redis dataset successfully" in {
@@ -842,8 +742,8 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     val batchDataset = s"${dataset}_BATCH"  // The actual dataset name after transformation
 
     // Get cluster connection info from the test container
-    val host = redisContainer.getHost
-    val port = redisContainer.getMappedPort(7000)
+    val host = redisFixture.container.getHost
+    val port = redisFixture.container.getMappedPort(7000)
 
     val clusterConfig = Map(
       "redis.cluster.nodes" -> s"$host:$port"

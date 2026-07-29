@@ -58,6 +58,9 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       var batchKeyBytes: Array[Byte] = null
       var streamingKeyBytes: Array[Byte] = null
+      val needsStreamingRead =
+        groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL &&
+          groupByServingInfo.groupByOps.streamingSource.isDefined
 
       try {
         // The formats of key bytes for batch requests and key bytes for streaming requests may differ based
@@ -65,9 +68,11 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
         batchKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
                                                             groupByServingInfo,
                                                             groupByServingInfo.groupByOps.batchDataset)
-        streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
-                                                                groupByServingInfo,
-                                                                groupByServingInfo.groupByOps.streamingDataset)
+        if (needsStreamingRead) {
+          streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+                                                                  groupByServingInfo,
+                                                                  groupByServingInfo.groupByOps.streamingDataset)
+        }
 
       } catch {
 
@@ -81,9 +86,11 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                                                                 groupByServingInfo,
                                                                 groupByServingInfo.groupByOps.batchDataset)
 
-            streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
-                                                                    groupByServingInfo,
-                                                                    groupByServingInfo.groupByOps.streamingDataset)
+            if (needsStreamingRead) {
+              streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
+                                                                      groupByServingInfo,
+                                                                      groupByServingInfo.groupByOps.streamingDataset)
+            }
           } catch {
             case exInner: Exception =>
               exInner.addSuppressed(ex)
@@ -94,9 +101,8 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       val batchRequest = GetRequest(batchKeyBytes, groupByServingInfo.groupByOps.batchDataset)
 
-      val streamingRequestOpt = groupByServingInfo.groupByOps.inferredAccuracy match {
-        // fetch batch(ir) and streaming(input) and aggregate
-        case Accuracy.TEMPORAL =>
+      val streamingRequestOpt =
+        if (needsStreamingRead) {
           // Build a tile key for the streaming request
           // When we build support for layering, we can expand this out into a utility that builds n tile keys for n layers
           val keyBytes = if (fetchContext.isTilingEnabled) {
@@ -117,11 +123,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             GetRequest(keyBytes,
                        groupByServingInfo.groupByOps.streamingDataset,
                        Some(groupByServingInfo.batchEndTsMillis)))
-
-        // no further aggregation is required - the value in KvStore is good as is
-        case Accuracy.SNAPSHOT => None
-
-      }
+        } else None
 
       val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
       LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)
@@ -209,15 +211,20 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             .flatMap(_.get.map(v => Option(v.bytes).map(_.length).getOrElse(0)))
             .sum
 
-        val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
-          val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>
-            val LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, _, context) =
-              requestMeta
-
+        groupByRequestToKvRequest.iterator
+          .flatMap(_._2.toOption.map(_.context))
+          .toSet
+          .foreach { context: metrics.Metrics.Context =>
             context.count("multi_get.batch.size", allRequestsToFetch.length)
             context.distribution("multi_get.bytes", totalResponseValueBytes)
             context.distribution("multi_get.response.length", kvResponses.length)
             context.distribution("multi_get.latency.millis", multiGetMillis)
+          }
+
+        val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
+          val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>
+            val LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, _, context) =
+              requestMeta
 
             // pick the batch version with highest timestamp
             val batchResponses: BatchResponses =
@@ -235,8 +242,15 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                 case Some(cachedResponse: CachedBatchResponse) => cachedResponse
               }
 
-            val streamingResponsesOpt =
-              streamingRequestOpt.map(responsesMap.getOrElse(_, Success(Seq.empty)).getOrElse(Seq.empty))
+            // Preserve the response-handler contract without issuing a streaming read: temporal batch values still
+            // need finalization when no streaming source exists, while None continues to identify snapshot values.
+            val streamingResponsesOpt: Option[Seq[TimedValue]] = streamingRequestOpt match {
+              case Some(streamingRequest) =>
+                Some(responsesMap.getOrElse(streamingRequest, Success(Seq.empty)).getOrElse(Seq.empty))
+              case None if groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL =>
+                Some(Seq.empty)
+              case None => None
+            }
 
             val queryTs = request.atMillis.getOrElse(System.currentTimeMillis())
             val requestContext = RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)

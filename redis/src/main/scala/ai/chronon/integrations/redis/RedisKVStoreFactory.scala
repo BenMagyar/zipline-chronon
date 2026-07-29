@@ -2,7 +2,7 @@ package ai.chronon.integrations.redis
 
 import ai.chronon.integrations.redis.RedisKVStoreConstants._
 import org.slf4j.LoggerFactory
-import redis.clients.jedis.{DefaultJedisClientConfig, HostAndPort, JedisCluster, JedisPoolConfig}
+import redis.clients.jedis.{ConnectionPoolConfig, DefaultJedisClientConfig, HostAndPort, JedisCluster}
 
 import scala.jdk.CollectionConverters._
 
@@ -51,10 +51,13 @@ object RedisKVStoreFactory {
     val useSsl = getOptional(EnvRedisUseSsl, conf).exists(_.toBoolean)
 
     val maxConnections = getOptional(EnvRedisMaxConnections, conf).map(_.toInt).getOrElse(DefaultMaxConnections)
-    val minIdleConnections =
-      getOptional(EnvRedisMinIdleConnections, conf).map(_.toInt).getOrElse(DefaultMinIdleConnections)
-    val maxIdleConnections =
-      getOptional(EnvRedisMaxIdleConnections, conf).map(_.toInt).getOrElse(DefaultMaxIdleConnections)
+    val configuredMinIdleConnections = getOptional(EnvRedisMinIdleConnections, conf).map(_.toInt)
+    val configuredMaxIdleConnections = getOptional(EnvRedisMaxIdleConnections, conf).map(_.toInt)
+    val poolConfig = buildConnectionPoolConfig(
+      maxConnections,
+      configuredMinIdleConnections,
+      configuredMaxIdleConnections
+    )
     val connectionTimeoutMs =
       getOptional(EnvRedisConnectionTimeoutMs, conf).map(_.toInt).getOrElse(DefaultConnectionTimeoutMs)
     val soTimeoutMs = getOptional(EnvRedisSoTimeoutMs, conf).map(_.toInt).getOrElse(DefaultSoTimeoutMs)
@@ -75,18 +78,10 @@ object RedisKVStoreFactory {
 
     logger.info(
       s"Creating Redis Cluster KVStore with nodes: ${clusterNodes.mkString(", ")}. " +
-        s"Params: ssl=$useSsl, maxConnections=$maxConnections, minIdle=$minIdleConnections, " +
-        s"maxIdle=$maxIdleConnections, connectionTimeout=$connectionTimeoutMs, " +
+        s"Params: ssl=$useSsl, maxConnections=$maxConnections, minIdle=${poolConfig.getMinIdle}, " +
+        s"maxIdle=${poolConfig.getMaxIdle}, connectionTimeout=$connectionTimeoutMs, " +
         s"soTimeout=$soTimeoutMs, maxRedirections=$maxRedirections"
     )
-
-    val poolConfig = new JedisPoolConfig()
-    poolConfig.setMaxTotal(maxConnections)
-    poolConfig.setMaxIdle(maxIdleConnections)
-    poolConfig.setMinIdle(minIdleConnections)
-    poolConfig.setTestOnBorrow(true)
-    poolConfig.setTestOnReturn(true)
-    poolConfig.setTestWhileIdle(true)
 
     val clientConfig = {
       // ElastiCache cluster mode returns node IPs (not hostnames) in the slot map.
@@ -109,7 +104,7 @@ object RedisKVStoreFactory {
       clusterNodes.asJava,
       clientConfig,
       maxRedirections,
-      poolConfig.asInstanceOf[org.apache.commons.pool2.impl.GenericObjectPoolConfig[redis.clients.jedis.Connection]]
+      poolConfig
     )
 
     val kvStore = new RedisKVStoreImpl(jedisCluster, conf)
@@ -119,6 +114,43 @@ object RedisKVStoreFactory {
 
   private def getOptional(key: String, conf: Map[String, String]): Option[String] =
     sys.env.get(key).orElse(conf.get(key))
+
+  private[redis] def buildConnectionPoolConfig(
+      maxConnections: Int,
+      minIdleConnections: Option[Int],
+      maxIdleConnections: Option[Int]
+  ): ConnectionPoolConfig = {
+    val effectiveMaxIdle = maxIdleConnections.getOrElse(math.min(DefaultMaxIdleConnections, maxConnections))
+    val effectiveMinIdle = minIdleConnections.getOrElse(math.min(DefaultMinIdleConnections, effectiveMaxIdle))
+    buildConnectionPoolConfig(maxConnections, effectiveMinIdle, effectiveMaxIdle)
+  }
+
+  private[redis] def buildConnectionPoolConfig(
+      maxConnections: Int,
+      minIdleConnections: Int,
+      maxIdleConnections: Int
+  ): ConnectionPoolConfig = {
+    require(maxConnections > 0, s"maxConnections must be positive, got $maxConnections")
+    require(minIdleConnections >= 0, s"minIdleConnections must be non-negative, got $minIdleConnections")
+    require(maxIdleConnections >= 0, s"maxIdleConnections must be non-negative, got $maxIdleConnections")
+    require(
+      minIdleConnections <= maxIdleConnections,
+      s"minIdleConnections ($minIdleConnections) must not exceed maxIdleConnections ($maxIdleConnections)"
+    )
+    require(
+      maxIdleConnections <= maxConnections,
+      s"maxIdleConnections ($maxIdleConnections) must not exceed maxConnections ($maxConnections)"
+    )
+
+    val poolConfig = new ConnectionPoolConfig()
+    poolConfig.setMaxTotal(maxConnections)
+    poolConfig.setMaxIdle(maxIdleConnections)
+    poolConfig.setMinIdle(minIdleConnections)
+    poolConfig.setTestOnBorrow(false)
+    poolConfig.setTestOnReturn(false)
+    poolConfig.setTestWhileIdle(true)
+    poolConfig
+  }
 
   private def getOrElseThrow(key: String, conf: Map[String, String]): String =
     getOptional(key, conf).getOrElse(

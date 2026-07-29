@@ -27,14 +27,21 @@ class RedisBatchPipelineLifecycleTest extends AnyFlatSpec with BeforeAndAfterAll
 
   "Redis batch multiGet" should "return pipeline connections after reading responses" in {
     val kvStore = new RedisKVStoreImpl(cluster.client)
-    val requests = (0 until 50).map(index => GetRequest(s"key-$index".getBytes, "pipeline_connections_BATCH"))
+    val requests = (0 until 50).map { index =>
+      GetRequest(s"key-$index".getBytes, f"pipeline_connections_$index%02d_BATCH")
+    }
     val puts = requests.map(request => PutRequest(request.keyBytes, "value".getBytes, request.dataset, None))
 
     Await.result(kvStore.multiPut(puts), 10.seconds) shouldBe Seq.fill(puts.size)(true)
 
-    val responses = Await.result(kvStore.multiGet(requests), 10.seconds)
-    responses should have size requests.size
-    responses.foreach(response => new String(response.values.get.head.bytes) shouldBe "value")
+    val borrowedBefore = cluster.client.getClusterNodes.values().asScala.map(_.getBorrowedCount).sum
+    (1 to 2).foreach { _ =>
+      val responses = Await.result(kvStore.multiGet(requests), 10.seconds)
+      responses.map(_.request) shouldBe requests
+      responses.foreach(response => new String(response.values.get.head.bytes) shouldBe "value")
+    }
+    val borrowedAfter = cluster.client.getClusterNodes.values().asScala.map(_.getBorrowedCount).sum
+    borrowedAfter - borrowedBefore should be <= 6L
     cluster.client.getClusterNodes.values().asScala.map(_.getNumActive).sum shouldBe 0
   }
 }

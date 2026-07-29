@@ -8,12 +8,20 @@ import ai.chronon.online.KVStore
 import ai.chronon.online.KVStore.{GetRequest, GetResponse, ListRequest, ListResponse, ListValue, PutRequest, TimedValue}
 import ai.chronon.online.metrics.Metrics
 import org.slf4j.{Logger, LoggerFactory}
-import redis.clients.jedis.{Jedis, JedisCluster, JedisPoolConfig}
+import redis.clients.jedis.exceptions.{
+  JedisAskDataException,
+  JedisConnectionException,
+  JedisException,
+  JedisRedirectionException
+}
+import redis.clients.jedis.{ClusterPipeline, Jedis, JedisCluster, Response}
 import redis.clients.jedis.params.ScanParams
-import redis.clients.jedis.resps.{ScanResult, Tuple}
+import redis.clients.jedis.resps.ScanResult
+import redis.clients.jedis.util.JedisClusterCRC16
 
 import java.nio.charset.StandardCharsets
 import scala.collection.concurrent.TrieMap
+import scala.collection.mutable
 import scala.concurrent.{Await, Future}
 import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Success, Try}
@@ -68,9 +76,14 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   @transient override lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   import RedisKVStore._
+  import RedisKVStoreImpl._
 
   // Configurable key prefix (can be empty for dedicated Redis deployments)
   private val keyPrefix: String = conf.getOrElse("redis.key.prefix", DefaultKeyPrefix)
+  private val keyHashTagMode: String =
+    conf.getOrElse("redis.key.hash.tag.mode", RedisKVStore.DatasetAndEntityHashTagMode)
+  private val recordReadMetrics: Boolean =
+    !conf.get("redis.read.metrics.enabled").exists(_.equalsIgnoreCase("false"))
 
   // TTL is now configurable via RedisKVStoreConstants or via props in create()
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("redis")
@@ -91,145 +104,341 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   override def multiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = {
     logger.debug(s"Performing multi-get for ${requests.size} requests")
 
-    // Group requests by dataset and time range
-    val requestGroups = requests.groupBy { req =>
-      val tableType = getTableType(req.dataset)
-      tableType match {
-        case StreamingTable =>
-          (req.dataset, req.startTsMillis, req.endTsMillis)
-        case _ =>
-          (req.dataset, None, None)
-      }
-    }
-
-    // Process each group separately
-    val groupFutures: Seq[Future[Seq[GetResponse]]] = requestGroups.map {
-      case ((dataset, startTs, endTs), groupRequests) =>
-        readRowsMultiGet(dataset, groupRequests, startTs, endTs)
-    }.toList
-
-    Future.sequence(groupFutures).map(_.flatten)
-  }
-
-  private def readRowsMultiGet(
-      dataset: String,
-      requests: Seq[GetRequest],
-      startTsMillis: Option[Long],
-      endTsMillis: Option[Long]
-  ): Future[Seq[GetResponse]] = {
-    val datasetMetricsContext = tableToContext.getOrElseUpdate(
-      dataset,
-      metricsContext.copy(dataset = dataset)
-    )
-    val tableType = getTableType(dataset)
-
-    Future {
-      try {
-        val startTs = System.currentTimeMillis()
-
-        val responses: Seq[GetResponse] = tableType match {
-          case BatchTable =>
-            val pipeline = jedisCluster.pipelined()
-            val pipelinedGets =
-              try {
-                val queuedGets = requests.map { request =>
-                  val redisKey = buildRedisKey(request.keyBytes, dataset, keyPrefix = keyPrefix)
-                  (request, pipeline.get(redisKey.getBytes(StandardCharsets.UTF_8)))
-                }
-                queuedGets
-              } finally {
-                // ClusterPipeline.close performs the sync and returns borrowed node connections to their pools.
-                pipeline.close()
-              }
-
-            pipelinedGets.map { case (request, response) =>
-              val timedValues = Try {
-                val storedBytes = response.get()
-                if (storedBytes != null && storedBytes.length >= 8) {
-                  val timestamp = java.nio.ByteBuffer.wrap(storedBytes.take(8)).getLong
-                  val valueBytes = storedBytes.drop(8)
-                  Seq(TimedValue(valueBytes, timestamp))
-                } else if (storedBytes != null) {
-                  logger.warn(s"Malformed data in Redis: key has ${storedBytes.length} bytes, expected >= 8")
-                  Seq.empty
-                } else {
-                  Seq.empty
-                }
-              }
-              GetResponse(request, timedValues)
-            }
-
-          case StreamingTable if startTsMillis.isDefined =>
-            val reqStartTs = startTsMillis.get
-            val endTs = endTsMillis.getOrElse(System.currentTimeMillis())
-            requests.map { request =>
-              val tileKey = TilingUtils.deserializeTileKey(request.keyBytes)
-              val tileSizeMs = tileKey.tileSizeMillis
-              val baseKeyBytes = tileKey.keyBytes.asScala.map(_.toByte).toSeq
-              val timedValues = Try(
-                getTimeSeriesData(jedisCluster, baseKeyBytes, dataset, reqStartTs, endTs, Some(tileSizeMs), keyPrefix))
-              GetResponse(request, timedValues)
-            }
-
-          case _ =>
-            // Should not happen: non-batch tables without a time range.
-            requests.map(req => GetResponse(req, Success(Seq.empty)))
+    if (requests.isEmpty) {
+      Future.successful(Seq.empty)
+    } else {
+      Future {
+        val startedAt = System.currentTimeMillis()
+        try {
+          val defaultEndTs = System.currentTimeMillis()
+          val plans = requests.map(request => planRead(request, defaultEndTs))
+          val redisPlans = plans.collect { case plan: RedisReadPlan => plan }
+          val redisResults = executeReadPipelineWithRetry(redisPlans).iterator
+          val responses = plans.map {
+            case ImmediateReadPlan(request, values) => GetResponse(request, values)
+            case plan: RedisReadPlan                => GetResponse(plan.request, redisResults.next())
+          }
+          if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
+          responses
+        } catch {
+          case e: Exception =>
+            logger.error("Error getting values from Redis Cluster", e)
+            val responses = requests.map(request => GetResponse(request, Failure(e)))
+            if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
+            responses
         }
-
-        datasetMetricsContext.distribution("multiGet.latency", System.currentTimeMillis() - startTs)
-        datasetMetricsContext.increment("multiGet.successes")
-        responses
-      } catch {
-        case e: Exception =>
-          logger.error("Error getting values from Redis Cluster", e)
-          datasetMetricsContext.increment("multiGet.redis_errors", Map("exception" -> e.getClass.getName))
-          requests.map(req => GetResponse(req, Failure(e)))
       }
     }
   }
 
-  private def getTimeSeriesData(
-      jedisCluster: JedisCluster,
-      keyBytes: Seq[Byte],
-      dataset: String,
-      startTs: Long,
-      endTs: Long,
-      maybeTileSize: Option[Long],
-      keyPrefix: String
-  ): Seq[TimedValue] = {
-    val millisPerDay = 1.day.toMillis
-    val startDay = startTs - (startTs % millisPerDay)
-    val endDay = endTs - (endTs % millisPerDay)
-
-    // Generate all day-based keys
-    val dayRange = startDay to endDay by millisPerDay
-    val allTimedValues = dayRange.flatMap { dayTs =>
-      val redisKey = maybeTileSize match {
-        case Some(tileSize) => buildTiledRedisKey(keyBytes, dataset, dayTs, tileSize, keyPrefix)
-        case None           => buildRedisKey(keyBytes, dataset, Some(dayTs), keyPrefix)
-      }
-
-      // Use ZRANGEBYSCORE to get values in the time range
-      val tuples = jedisCluster
-        .zrangeByScoreWithScores(
-          redisKey.getBytes(StandardCharsets.UTF_8),
-          startTs.toDouble,
-          endTs.toDouble
-        )
-        .asScala
-
-      tuples.map { tuple =>
-        // Extract value bytes from the member (skip first 8 bytes which contain the timestamp prefix)
-        // The prefix is needed to make members unique in Redis ZSET (same value at different timestamps)
-        // All time-series data is written with this prefix (see multiPut line 324-326)
-        val memberBytes = tuple.getBinaryElement
-        val valueBytes = memberBytes.drop(8) // Skip the 8-byte timestamp prefix
-        val timestamp = tuple.getScore.toLong
-        TimedValue(valueBytes, timestamp)
+  private def planRead(request: GetRequest, defaultEndTs: Long): PlannedRead = {
+    val planned = Try {
+      getTableType(request.dataset) match {
+        case BatchTable =>
+          val redisKey =
+            buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode)
+          BatchReadPlan(request, redisKey.getBytes(StandardCharsets.UTF_8))
+        case StreamingTable if request.startTsMillis.isDefined =>
+          val startTs = request.startTsMillis.get
+          val endTs = request.endTsMillis.getOrElse(defaultEndTs)
+          val tileKey = TilingUtils.deserializeTileKey(request.keyBytes)
+          val tileSizeMs = tileKey.tileSizeMillis
+          val baseKeyBytes = tileKey.keyBytes.asScala.map(_.toByte).toSeq
+          val millisPerDay = 1.day.toMillis
+          val startDay = startTs - (startTs % millisPerDay)
+          val endDay = endTs - (endTs % millisPerDay)
+          val redisKeys = (startDay to endDay by millisPerDay).map { dayTs =>
+            buildTiledRedisKey(baseKeyBytes,
+                               request.dataset,
+                               dayTs,
+                               tileSizeMs,
+                               keyPrefix,
+                               hashTagMode = keyHashTagMode).getBytes(StandardCharsets.UTF_8)
+          }.toVector
+          if (redisKeys.isEmpty) ImmediateReadPlan(request, Success(Seq.empty))
+          else StreamingReadPlan(request, redisKeys, startTs, endTs)
+        case StreamingTable =>
+          ImmediateReadPlan(request, Success(Seq.empty))
       }
     }
 
-    allTimedValues.toSeq
+    planned.recover { case error => ImmediateReadPlan(request, Failure(error)) }.get
+  }
+
+  private def queueRead(plan: RedisReadPlan, pipeline: ClusterPipeline): PendingRead = plan match {
+    case BatchReadPlan(request, redisKey) =>
+      val response = pipeline.get(redisKey)
+      PendingRead(request, () => Try(decodeBatchValue(response.get())))
+    case StreamingReadPlan(request, redisKeys, startTs, endTs) =>
+      val commands = redisKeys.map { redisKey =>
+        StreamingCommand(
+          redisKey,
+          startTs,
+          endTs,
+          pipeline.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble)
+        )
+      }
+      PendingRead(request, () => Try(decodeStreamingValues(commands)))
+  }
+
+  private def executeReadPipelineWithRetry(plans: Seq[RedisReadPlan]): Seq[Try[Seq[TimedValue]]] = {
+    if (plans.isEmpty) {
+      Seq.empty
+    } else {
+      val firstAttempt = executeReadPipeline(plans)
+      val attemptAfterAskRecovery = askPipelineFailure(firstAttempt, plans) match {
+        case Some((failedPlan, error)) =>
+          recordPipelineRetry(failedPlan.request.dataset, error)
+          recoverAskFailures(firstAttempt, plans)
+        case None => firstAttempt
+      }
+      val finalAttempt = retryablePipelineFailure(attemptAfterAskRecovery, plans) match {
+        case Some((_, error)) if isAskFailure(error) =>
+          attemptAfterAskRecovery
+        case Some((failedPlan, error)) =>
+          recordPipelineRetry(failedPlan.request.dataset, error)
+          Try(refreshPipelineRoute(failedPlan)) match {
+            case Success(_) =>
+              val retryAttempt = executeReadPipeline(plans)
+              retryAttempt.results match {
+                case Success(_) => mergePipelineAttempts(attemptAfterAskRecovery, retryAttempt)
+                case Failure(retryError) =>
+                  logger.error("Redis Cluster pipeline retry failed", retryError)
+                  if (attemptAfterAskRecovery.results.isSuccess) attemptAfterAskRecovery else retryAttempt
+              }
+            case Failure(refreshError) =>
+              logger.error("Redis Cluster route refresh failed", refreshError)
+              attemptAfterAskRecovery
+          }
+        case None => attemptAfterAskRecovery
+      }
+
+      finalAttempt.results.getOrElse(plans.map(_ => Failure(finalAttempt.results.failed.get)))
+    }
+  }
+
+  private def mergePipelineAttempts(firstAttempt: PipelineAttempt, retryAttempt: PipelineAttempt): PipelineAttempt = {
+    (firstAttempt.results, retryAttempt.results) match {
+      case (Success(firstResults), Success(retryResults)) if firstResults.size == retryResults.size =>
+        val mergedResults = firstResults.zip(retryResults).map {
+          case (_, retrySuccess @ Success(_))          => retrySuccess
+          case (firstSuccess @ Success(_), Failure(_)) => firstSuccess
+          case (_, retryFailure @ Failure(_))          => retryFailure
+        }
+        retryAttempt.copy(results = Success(mergedResults))
+      case _ => retryAttempt
+    }
+  }
+
+  private def executeReadPipeline(plans: Seq[RedisReadPlan]): PipelineAttempt = {
+    var activePlan = Option.empty[RedisReadPlan]
+    val results = Try {
+      val pipeline = jedisCluster.pipelined()
+      var queueError = Option.empty[Exception]
+      val pendingReads =
+        try {
+          queueJedisReads(plans, pipeline) { plan =>
+            activePlan = Some(plan)
+          }
+        } catch {
+          case error: Exception =>
+            queueError = Some(error)
+            throw error
+        } finally {
+          try {
+            // ClusterPipeline.close syncs all nodes and returns their connections to the pools.
+            pipeline.close()
+          } catch {
+            case closeError: Exception =>
+              queueError match {
+                case Some(error) => error.addSuppressed(closeError)
+                case None        => throw closeError
+              }
+          }
+        }
+      pendingReads.map(_.resolve())
+    }
+    PipelineAttempt(results, activePlan)
+  }
+
+  private def queueJedisReads(plans: Seq[RedisReadPlan], pipeline: ClusterPipeline)(
+      markActive: RedisReadPlan => Unit): Seq[PendingRead] = {
+    val pendingReads = Array.ofDim[PendingRead](plans.size)
+    val mgetGroups = new java.util.LinkedHashMap[Int, java.util.ArrayList[(Int, BatchReadPlan)]]()
+
+    plans.iterator.zipWithIndex.foreach {
+      case (plan: BatchReadPlan, index) =>
+        markActive(plan)
+        val slot = JedisClusterCRC16.getSlot(plan.redisKey)
+        var group = mgetGroups.get(slot)
+        if (group == null) {
+          group = new java.util.ArrayList[(Int, BatchReadPlan)]()
+          mgetGroups.put(slot, group)
+        }
+        group.add(index -> plan)
+      case (plan @ StreamingReadPlan(_, redisKeys, startTs, endTs), index) =>
+        markActive(plan)
+        pendingReads(index) = queueRead(plan, pipeline)
+    }
+
+    mgetGroups.values().asScala.foreach { group =>
+      if (group.size() == 1) {
+        val (index, plan) = group.get(0)
+        pendingReads(index) = queueRead(plan, pipeline)
+      } else {
+        val redisKeys = Array.ofDim[Array[Byte]](group.size())
+        var index = 0
+        while (index < group.size()) {
+          redisKeys(index) = group.get(index)._2.redisKey
+          index += 1
+        }
+        val response = pipeline.mget(redisKeys: _*)
+        lazy val values = response.get()
+        index = 0
+        while (index < group.size()) {
+          val pendingIndex = group.get(index)._1
+          val plan = group.get(index)._2
+          val responseIndex = index
+          pendingReads(pendingIndex) = PendingRead(plan.request, () => Try(decodeBatchValue(values.get(responseIndex))))
+          index += 1
+        }
+      }
+    }
+
+    pendingReads.toVector
+  }
+
+  private def retryablePipelineFailure(
+      attempt: PipelineAttempt,
+      plans: Seq[RedisReadPlan]
+  ): Option[(RedisReadPlan, Throwable)] = attempt.results match {
+    case Failure(error) if isRetryablePipelineFailure(error) =>
+      Some(attempt.failedPlan.getOrElse(plans.head) -> error)
+    case Success(results) =>
+      results.iterator.zip(plans.iterator).collectFirst {
+        case (Failure(error), plan) if isRetryablePipelineFailure(error) => plan -> error
+      }
+    case _ => None
+  }
+
+  private def askPipelineFailure(
+      attempt: PipelineAttempt,
+      plans: Seq[RedisReadPlan]
+  ): Option[(RedisReadPlan, Throwable)] = attempt.results match {
+    case Failure(error) if isAskFailure(error) =>
+      Some(attempt.failedPlan.getOrElse(plans.head) -> error)
+    case Success(results) =>
+      results.iterator.zip(plans.iterator).collectFirst {
+        case (Failure(error), plan) if isAskFailure(error) => plan -> error
+      }
+    case _ => None
+  }
+
+  private def recoverAskFailures(attempt: PipelineAttempt, plans: Seq[RedisReadPlan]): PipelineAttempt = {
+    val recoveredResults = attempt.results match {
+      case Success(results) if results.size == plans.size =>
+        Success(results.zip(plans).map {
+          case (Failure(error), plan) if isAskFailure(error) => executeDirectRead(plan)
+          case (result, _)                                   => result
+        })
+      case Failure(error) if isAskFailure(error) =>
+        Success(plans.map(executeDirectRead))
+      case other => other
+    }
+    attempt.copy(results = recoveredResults)
+  }
+
+  private def executeDirectRead(plan: RedisReadPlan): Try[Seq[TimedValue]] = Try {
+    plan match {
+      case BatchReadPlan(_, redisKey) =>
+        decodeBatchValue(jedisCluster.get(redisKey))
+      case StreamingReadPlan(_, redisKeys, startTs, endTs) =>
+        redisKeys.flatMap { redisKey =>
+          decodeStreamingMembers(jedisCluster.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble))
+        }
+    }
+  }
+
+  private def isAskFailure(error: Throwable): Boolean = error match {
+    case _: JedisAskDataException => true
+    case jedisError: JedisException =>
+      Option(jedisError.getCause).exists(isAskFailure)
+    case _ => false
+  }
+
+  private def isRetryablePipelineFailure(error: Throwable): Boolean = error match {
+    case _: JedisRedirectionException      => true
+    case _: JedisConnectionException       => true
+    case jedisError: JedisException        => Option(jedisError.getCause).exists(isRetryablePipelineFailure)
+    case stateError: IllegalStateException => stateError.getMessage == PipelineResponseUnsetMessage
+    case _                                 => false
+  }
+
+  private def refreshPipelineRoute(plan: RedisReadPlan): Unit = plan match {
+    case BatchReadPlan(_, redisKey) =>
+      jedisCluster.get(redisKey)
+      ()
+    case StreamingReadPlan(_, redisKeys, startTs, endTs) =>
+      redisKeys.headOption.foreach { redisKey =>
+        jedisCluster.zrangeByScore(redisKey, startTs.toDouble, endTs.toDouble)
+      }
+  }
+
+  private def recordPipelineRetry(dataset: String, error: Throwable): Unit = {
+    val datasetMetricsContext = tableToContext.getOrElseUpdate(dataset, metricsContext.copy(dataset = dataset))
+    datasetMetricsContext.increment("multiGet.pipeline_retries", Map("exception" -> error.getClass.getName))
+  }
+
+  private def decodeBatchValue(storedBytes: Array[Byte]): Seq[TimedValue] = {
+    if (storedBytes != null && storedBytes.length >= 8) {
+      val timestamp = java.nio.ByteBuffer.wrap(storedBytes, 0, 8).getLong
+      Seq(TimedValue(storedBytes.drop(8), timestamp))
+    } else if (storedBytes != null) {
+      logger.warn(s"Malformed data in Redis: key has ${storedBytes.length} bytes, expected >= 8")
+      Seq.empty
+    } else {
+      Seq.empty
+    }
+  }
+
+  private def decodeStreamingValues(commands: Seq[StreamingCommand]): Seq[TimedValue] = {
+    commands.flatMap { command =>
+      decodeStreamingMembers(command.response.get())
+    }
+  }
+
+  private def decodeStreamingMembers(members: java.util.List[Array[Byte]]): Seq[TimedValue] = {
+    members.asScala.flatMap { memberBytes =>
+      if (memberBytes.length >= 8) {
+        val timestamp = java.nio.ByteBuffer.wrap(memberBytes, 0, 8).getLong
+        Some(TimedValue(memberBytes.drop(8), timestamp))
+      } else {
+        logger.warn(s"Malformed streaming data in Redis: member has ${memberBytes.length} bytes, expected >= 8")
+        None
+      }
+    }
+  }
+
+  private def recordMultiGetMetrics(responses: Seq[GetResponse], latencyMillis: Long): Unit = {
+    metricsContext.distribution("multiGet.latency", latencyMillis)
+    val datasets = mutable.LinkedHashSet.empty[String]
+    val failures = mutable.HashMap.empty[String, Throwable]
+    responses.foreach { response =>
+      val dataset = response.request.dataset
+      datasets += dataset
+      if (!failures.contains(dataset)) {
+        response.values.failed.foreach(error => failures.put(dataset, error))
+      }
+    }
+    datasets.foreach { dataset =>
+      val datasetMetricsContext = tableToContext.getOrElseUpdate(dataset, metricsContext.copy(dataset = dataset))
+      failures.get(dataset) match {
+        case Some(error) =>
+          datasetMetricsContext.increment("multiGet.redis_errors", Map("exception" -> error.getClass.getName))
+        case None =>
+          datasetMetricsContext.increment("multiGet.successes")
+      }
+    }
   }
 
   override def list(request: ListRequest): Future[ListResponse] = {
@@ -353,10 +562,16 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
             case (Some(ts), StreamingTable) =>
               val tileKey = TilingUtils.deserializeTileKey(request.keyBytes)
               val baseKeyBytes = tileKey.keyBytes.asScala.map(_.toByte).toSeq
-              (buildTiledRedisKey(baseKeyBytes, request.dataset, ts, tileKey.tileSizeMillis, keyPrefix),
+              (buildTiledRedisKey(baseKeyBytes,
+                                  request.dataset,
+                                  ts,
+                                  tileKey.tileSizeMillis,
+                                  keyPrefix,
+                                  hashTagMode = keyHashTagMode),
                tileKey.tileStartTimestampMillis)
             case _ =>
-              (buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix), timestampInPutRequest)
+              (buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode),
+               timestampInPutRequest)
           }
 
           tableType match {
@@ -478,7 +693,45 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   }
 }
 
+private[redis] object RedisKVStoreImpl {
+  private val PipelineResponseUnsetMessage = "Please close pipeline or multi block before calling this method."
+
+  sealed trait PlannedRead {
+    def request: GetRequest
+  }
+
+  sealed trait RedisReadPlan extends PlannedRead
+
+  final case class ImmediateReadPlan(request: GetRequest, values: Try[Seq[TimedValue]]) extends PlannedRead
+
+  final case class BatchReadPlan(request: GetRequest, redisKey: Array[Byte]) extends RedisReadPlan
+
+  final case class StreamingReadPlan(
+      request: GetRequest,
+      redisKeys: Vector[Array[Byte]],
+      startTs: Long,
+      endTs: Long
+  ) extends RedisReadPlan
+
+  final case class StreamingCommand(
+      redisKey: Array[Byte],
+      startTs: Long,
+      endTs: Long,
+      response: Response[java.util.List[Array[Byte]]]
+  )
+
+  final case class PendingRead(request: GetRequest, resolve: () => Try[Seq[TimedValue]])
+
+  final case class PipelineAttempt(
+      results: Try[Seq[Try[Seq[TimedValue]]]],
+      failedPlan: Option[RedisReadPlan]
+  )
+}
+
 object RedisKVStore {
+  val DatasetAndEntityHashTagMode = "dataset_and_entity"
+  val EntityHashTagMode = "entity"
+
   sealed trait TableType
   case object BatchTable extends TableType
   case object StreamingTable extends TableType
@@ -497,11 +750,12 @@ object RedisKVStore {
   def buildRedisKey(baseKeyBytes: Seq[Byte],
                     dataset: String,
                     maybeTs: Option[Long] = None,
-                    keyPrefix: String = DefaultKeyPrefix): String = {
+                    keyPrefix: String = DefaultKeyPrefix,
+                    hashTagMode: String = DatasetAndEntityHashTagMode): String = {
     val base64Key = java.util.Base64.getEncoder.encodeToString(baseKeyBytes.toArray)
     val prefix = if (keyPrefix.isEmpty) "" else s"$keyPrefix$KeySeparator"
-    // Use hash tag {dataset:base64Key} to distribute load across cluster nodes
-    val baseKey = s"$prefix{$dataset$KeySeparator$base64Key}"
+    // Keep dataset in the full key for uniqueness; hashTagMode only controls the Redis Cluster hash tag.
+    val baseKey = buildBaseKey(prefix, dataset, base64Key, hashTagMode)
     maybeTs match {
       case Some(ts) =>
         // For time series data, append the day timestamp
@@ -526,12 +780,22 @@ object RedisKVStore {
                          dataset: String,
                          ts: Long,
                          tileSizeMs: Long,
-                         keyPrefix: String = DefaultKeyPrefix): String = {
+                         keyPrefix: String = DefaultKeyPrefix,
+                         hashTagMode: String = DatasetAndEntityHashTagMode): String = {
     val base64Key = java.util.Base64.getEncoder.encodeToString(baseKeyBytes.toArray)
     val dayTs = ts - (ts % 1.day.toMillis)
     val prefix = if (keyPrefix.isEmpty) "" else s"$keyPrefix$KeySeparator"
-    // Use hash tag {dataset:base64Key} to distribute load across cluster nodes
-    s"$prefix{$dataset$KeySeparator$base64Key}$KeySeparator$dayTs$KeySeparator$tileSizeMs"
+    val baseKey = buildBaseKey(prefix, dataset, base64Key, hashTagMode)
+    s"$baseKey$KeySeparator$dayTs$KeySeparator$tileSizeMs"
+  }
+
+  private def buildBaseKey(prefix: String, dataset: String, base64Key: String, hashTagMode: String): String = {
+    hashTagMode match {
+      case EntityHashTagMode           => s"$prefix$dataset$KeySeparator{$base64Key}"
+      case DatasetAndEntityHashTagMode => s"$prefix{$dataset$KeySeparator$base64Key}"
+      case null | ""                   => s"$prefix{$dataset$KeySeparator$base64Key}"
+      case other                       => throw new IllegalArgumentException(s"Unknown Redis hash tag mode: $other")
+    }
   }
 
   /** Determine table type from dataset name.
