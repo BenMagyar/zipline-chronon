@@ -34,6 +34,16 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     delegate.getItem(prefixedRequest)
   }
 
+  /** Strongly consistent GetItem sent to the underlying DynamoDB client. */
+  private[aws] def getItemStronglyConsistent(request: GetItemRequest): CompletableFuture[GetItemResponse] = {
+    val originalTableName = request.tableName()
+    val prefixedTableName = prefixTableName(originalTableName)
+    logger.debug(
+      s"getItemStronglyConsistent: original table name='$originalTableName' -> prefixed table name='$prefixedTableName'")
+    val prefixedRequest = request.toBuilder.tableName(prefixedTableName).consistentRead(true).build()
+    delegate.getItem(prefixedRequest)
+  }
+
   def query(request: QueryRequest): CompletableFuture[QueryResponse] = {
     val originalTableName = request.tableName()
     val prefixedTableName = prefixTableName(originalTableName)

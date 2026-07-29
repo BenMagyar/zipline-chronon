@@ -84,23 +84,31 @@ trait KVStore {
 
   // helper method to blocking read a string - used for fetching metadata & not in hotpath.
   def getString(key: String, dataset: String, timeoutMillis: Long): Try[String] = {
-    val bytesTry = getResponse(key, dataset, timeoutMillis)
+    val bytesTry = getResponse(key, dataset, timeoutMillis, get)
+    bytesTry.map(bytes => new String(bytes, Constants.UTF8))
+  }
+
+  /** Blocking metadata read that bypasses implementation-specific read caches when supported. */
+  def getStringFresh(key: String, dataset: String, timeoutMillis: Long): Try[String] = {
+    val bytesTry = getResponse(key, dataset, timeoutMillis, getFresh)
     bytesTry.map(bytes => new String(bytes, Constants.UTF8))
   }
 
   def getStringArray(key: String, dataset: String, timeoutMillis: Long): Try[Seq[String]] = {
-    val bytesTry = getResponse(key, dataset, timeoutMillis)
+    val bytesTry = getResponse(key, dataset, timeoutMillis, get)
     bytesTry.map(bytes => StringArrayConverter.bytesToStrings(bytes))
   }
 
-  private def getResponse(key: String, dataset: String, timeoutMillis: Long): Try[Array[Byte]] = {
+  private def getResponse(key: String,
+                          dataset: String,
+                          timeoutMillis: Long,
+                          read: GetRequest => Future[GetResponse]): Try[Array[Byte]] = {
     val fetchRequest = KVStore.GetRequest(key.getBytes(Constants.UTF8), dataset)
-    val responseFutureOpt = get(fetchRequest)
 
     def buildException(e: Throwable) =
       new RuntimeException(s"Request for key ${key} in dataset ${dataset} failed", e)
 
-    Try(Await.result(responseFutureOpt, Duration(timeoutMillis, MILLISECONDS))) match {
+    Try(Await.result(read(fetchRequest), Duration(timeoutMillis, MILLISECONDS))) match {
       case Failure(e) =>
         Failure(buildException(e))
       case Success(resp) =>
@@ -121,6 +129,9 @@ trait KVStore {
         throw e
       }
   }
+
+  /** Exact read path for callers that require implementation-specific caches to be bypassed. */
+  def getFresh(request: GetRequest): Future[GetResponse] = get(request)
 
   // Method for taking the set of keys and constructing the byte array sent to the KVStore
   def createKeyBytes(keys: Map[String, AnyRef],

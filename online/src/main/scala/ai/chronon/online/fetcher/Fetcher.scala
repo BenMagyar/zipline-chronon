@@ -191,9 +191,45 @@ object Fetcher {
 
   /** Response for a groupBy status request.
     * @param groupByName - Name of the groupBy
-    * @param batchEndDate - Date through which batch upload data is available in the KV store
+    * @param batchEndDate - Formatted partition boundary through which batch upload data is available in the KV store
+    * @param batchEndTs - Epoch millis watermark through which batch upload data is available in the KV store
     */
-  case class GroupByStatusResponse(groupByName: String, batchEndDate: String)
+  case class GroupByStatusResponse(groupByName: String, batchEndDate: String) {
+    private var batchEndTsValue: java.lang.Long = null
+
+    def this(groupByName: String, batchEndDate: String, batchEndTs: java.lang.Long) = {
+      this(groupByName, batchEndDate)
+      batchEndTsValue = batchEndTs
+    }
+
+    def batchEndTs: java.lang.Long = batchEndTsValue
+
+    def copy(groupByName: String, batchEndDate: String): GroupByStatusResponse =
+      GroupByStatusResponse(groupByName, batchEndDate, batchEndTs)
+
+    def copy(groupByName: String = this.groupByName,
+             batchEndDate: String = this.batchEndDate,
+             batchEndTs: java.lang.Long = this.batchEndTs): GroupByStatusResponse =
+      GroupByStatusResponse(groupByName, batchEndDate, batchEndTs)
+
+    override def equals(other: Any): Boolean = other match {
+      case that: GroupByStatusResponse =>
+        that.canEqual(this) &&
+        groupByName == that.groupByName &&
+        batchEndDate == that.batchEndDate &&
+        batchEndTs == that.batchEndTs
+      case _ => false
+    }
+
+    override def hashCode(): Int = (groupByName, batchEndDate, batchEndTs).hashCode()
+
+    override def toString: String = s"GroupByStatusResponse($groupByName,$batchEndDate,$batchEndTs)"
+  }
+
+  object GroupByStatusResponse {
+    def apply(groupByName: String, batchEndDate: String, batchEndTs: java.lang.Long): GroupByStatusResponse =
+      new GroupByStatusResponse(groupByName, batchEndDate, batchEndTs)
+  }
 
   private[fetcher] def codecForCurrentThread(codec: AvroCodec): AvroCodec =
     AvroCodec.ofThreaded(codec.schemaStr, codec.writerSchemaStr).get()
@@ -983,11 +1019,16 @@ class Fetcher(val kvStore: KVStore,
               s"GroupBy $groupByName is not online. Fetcher status is only available for online GroupBys. " +
                 "Enable online=True and upload the GroupBy."))
         } else {
-          metadataStore.getGroupByServingInfo(groupByName)
+          // Serving info is the authoritative upload watermark; status bypasses its long-lived read caches.
+          metadataStore.getGroupByServingInfoFresh(groupByName)
         }
       }
       .map { servingInfo =>
-        val response = GroupByStatusResponse(groupByName, servingInfo.batchEndDate)
+        val batchEndTs =
+          if (servingInfo.groupByServingInfo.isSetBatchEndTs)
+            java.lang.Long.valueOf(servingInfo.groupByServingInfo.getBatchEndTs)
+          else null
+        val response = GroupByStatusResponse(groupByName, servingInfo.batchEndDate, batchEndTs)
         ctx.distribution(Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTime)
         response
       }

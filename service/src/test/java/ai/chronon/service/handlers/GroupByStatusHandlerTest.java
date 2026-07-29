@@ -3,6 +3,7 @@ package ai.chronon.service.handlers;
 import ai.chronon.online.JTry;
 import ai.chronon.online.JavaFetcher;
 import ai.chronon.online.JavaGroupByStatusResponse;
+import ai.chronon.online.fetcher.Fetcher;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.json.JsonObject;
@@ -69,7 +70,8 @@ public class GroupByStatusHandlerTest {
         Async async = context.async();
 
         JavaGroupByStatusResponse groupByStatusResponse =
-                new JavaGroupByStatusResponse("test_group_by", "2026-05-20");
+                new JavaGroupByStatusResponse(
+                        new Fetcher.GroupByStatusResponse("test_group_by", "2026-05-20", 1779235200000L));
         JTry<JavaGroupByStatusResponse> groupByStatusResponseTry = JTry.success(groupByStatusResponse);
 
         when(mockFetcher.fetchGroupByStatus(anyString())).thenReturn(groupByStatusResponseTry);
@@ -79,6 +81,7 @@ public class GroupByStatusHandlerTest {
 
             context.assertEquals(actualResponse.getString("groupByName"), "test_group_by");
             context.assertEquals(actualResponse.getString("batchEndDate"), "2026-05-20");
+            context.assertEquals(actualResponse.getLong("batchEndTs"), 1779235200000L);
         });
 
         handler.handle(routingContext);
