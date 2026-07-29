@@ -7,6 +7,7 @@ import ai.chronon.integrations.redis.RedisBatchUpload.{BatchStatus, Delete, Oper
 import ai.chronon.integrations.redis.RedisKVStoreConstants._
 import ai.chronon.spark.catalog.TableUtils
 import org.apache.hadoop.fs.Path
+import org.apache.spark.TaskContext
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{BinaryType, IntegerType, LongType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
@@ -138,6 +139,8 @@ object Spark2RedisLoader {
                    rejected + other.rejected,
                    retries + other.retries)
   }
+
+  private[redis] case class OomRetryEvent(attempt: Int, waitMillis: Long, elapsedMillis: Long, remainingMillis: Long)
 
   case class UploadSummary(sourceRows: Long,
                            changedKeys: Long,
@@ -657,11 +660,14 @@ object Spark2RedisLoader {
       rejectedKeys == 0 || superseded,
       s"Redis generation ${manifest.status.generation} encountered $rejectedKeys newer values without a newer S3 head"
     )
-    val statusResult = RedisBatchUpload.writeStatusUntil(
+    val statusResult = writeStatusWithOomRetry(
       controlClient,
       RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix),
       manifest.status,
-      if (manifest.retired) 0L else leaseDeadlineMillis)
+      if (manifest.retired) 0L else leaseDeadlineMillis,
+      settings,
+      leaseDeadlineMillis
+    )
     val statusSuperseded = superseded ||
       (statusResult == 0L && headAdvancedPast(settings, manifest, spark, conditionalWriter))
     require(
@@ -767,10 +773,12 @@ object Spark2RedisLoader {
       rejectedKeys == 0 || superseded,
       s"Redis snapshot ${head.status.generation} encountered newer values without a newer S3 head"
     )
-    val statusResult = RedisBatchUpload.writeStatusUntil(
+    val statusResult = writeStatusWithOomRetry(
       controlClient,
       RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix),
       head.status,
+      leaseDeadlineMillis,
+      settings,
       leaseDeadlineMillis)
     val statusSuperseded = superseded ||
       (statusResult == 0L && headAdvancedPast(settings, head, spark, conditionalWriter))
@@ -1408,6 +1416,29 @@ object Spark2RedisLoader {
     Arrays.equals(currentMetadata.select(ValueColumn).head().getAs[Array[Byte]](0), previous.head.getAs[Array[Byte]](0))
   }
 
+  private def writeStatusWithOomRetry(client: JedisCluster,
+                                      statusKey: String,
+                                      status: BatchStatus,
+                                      expireAtMillis: Long,
+                                      settings: Settings,
+                                      leaseDeadlineMillis: Long): Long = {
+    val retryStartMillis = System.currentTimeMillis()
+    val retryDeadlineMillis =
+      redisOomRetryDeadline(retryStartMillis, DefaultBulkUploadOomRetryTimeoutMs, leaseDeadlineMillis)
+    withRedisOomRetry(
+      operation = () => {
+        remainingLeaseSeconds(leaseDeadlineMillis)
+        RedisBatchUpload.writeStatusUntil(client, statusKey, status, expireAtMillis)
+      },
+      retryStartMillis = retryStartMillis,
+      retryDeadlineMillis = retryDeadlineMillis,
+      retryWaitMillis = attempt => jitteredOomRetryBackoffMillis(attempt, settings.retryBackoffMs),
+      nowMillis = () => System.currentTimeMillis(),
+      sleepMillis = millis => interruptibleSleep(millis),
+      onRetry = event => logRedisOomRetry(settings.batchDataset, "status", batchSize = 1, event)
+    )
+  }
+
   private def writeToRedis(df: DataFrame,
                            mode: WriteMode,
                            settings: Settings,
@@ -1422,6 +1453,11 @@ object Spark2RedisLoader {
     val maxKeysPerSecond = settings.maxKeysPerSecond
     val maxRetries = settings.maxRetries
     val retryBackoffMs = settings.retryBackoffMs
+    // This absolute driver-created deadline is captured by every task attempt in the Spark stage. A retried task cannot
+    // start a fresh OOM window and multiply the 30-minute timeout by Spark's task retry count.
+    val oomRetryStartMillis = System.currentTimeMillis()
+    val oomRetryDeadlineMillis =
+      redisOomRetryDeadline(oomRetryStartMillis, DefaultBulkUploadOomRetryTimeoutMs, leaseDeadlineMillis)
     val effectiveTombstoneDeadline =
       if (tombstoneDeadlineMillis > 0) tombstoneDeadlineMillis else leaseDeadlineMillis
 
@@ -1447,6 +1483,8 @@ object Spark2RedisLoader {
                 maxKeysPerSecond,
                 maxRetries,
                 retryBackoffMs,
+                oomRetryStartMillis,
+                oomRetryDeadlineMillis,
                 leaseDeadlineMillis,
                 effectiveTombstoneDeadline
               )
@@ -1473,12 +1511,15 @@ object Spark2RedisLoader {
                          maxKeysPerSecond: Int,
                          maxRetries: Int,
                          retryBackoffMs: Long,
+                         oomRetryStartMillis: Long,
+                         oomRetryDeadlineMillis: Long,
                          leaseDeadlineMillis: Long,
                          tombstoneDeadlineMillis: Long): WriteSummary = {
     var attempt = 0
     var lastFailure: Throwable = null
     var directReplay = false
     var refreshClient = false
+    var oomRetries = 0L
     while (attempt <= maxRetries) {
       if (attempt > 0 && retryBackoffMs > 0) {
         val multiplier = 1L << math.min(attempt - 1, 20)
@@ -1489,34 +1530,47 @@ object Spark2RedisLoader {
       }
 
       try {
-        remainingLeaseSeconds(leaseDeadlineMillis)
-        if (refreshClient) {
-          taskClient.refresh()
-          refreshClient = false
-        }
-        acquireRate(taskClient.client, limiterKey, batch.size, maxKeysPerSecond, maxBurst, leaseDeadlineMillis)
-        remainingLeaseSeconds(leaseDeadlineMillis)
-        val results =
-          if (directReplay)
-            executeDirect(taskClient.client,
-                          batch,
-                          mode,
-                          dataset,
-                          keyPrefix,
-                          keyHashTagMode,
-                          leaseDeadlineMillis,
-                          tombstoneDeadlineMillis)
-          else
-            executePipeline(taskClient.client,
-                            batch,
-                            mode,
-                            dataset,
-                            keyPrefix,
-                            keyHashTagMode,
-                            leaseDeadlineMillis,
-                            tombstoneDeadlineMillis)
-        val counted = countResults(results, mode)
-        return counted.copy(retries = attempt)
+        val counted = withRedisOomRetry(
+          operation = () => {
+            remainingLeaseSeconds(leaseDeadlineMillis)
+            if (refreshClient) {
+              taskClient.refresh()
+              refreshClient = false
+            }
+            acquireRate(taskClient.client, limiterKey, batch.size, maxKeysPerSecond, maxBurst, leaseDeadlineMillis)
+            remainingLeaseSeconds(leaseDeadlineMillis)
+            val results =
+              if (directReplay)
+                executeDirect(taskClient.client,
+                              batch,
+                              mode,
+                              dataset,
+                              keyPrefix,
+                              keyHashTagMode,
+                              leaseDeadlineMillis,
+                              tombstoneDeadlineMillis)
+              else
+                executePipeline(taskClient.client,
+                                batch,
+                                mode,
+                                dataset,
+                                keyPrefix,
+                                keyHashTagMode,
+                                leaseDeadlineMillis,
+                                tombstoneDeadlineMillis)
+            countResults(results, mode)
+          },
+          retryStartMillis = oomRetryStartMillis,
+          retryDeadlineMillis = oomRetryDeadlineMillis,
+          retryWaitMillis = oomAttempt => jitteredOomRetryBackoffMillis(oomAttempt, retryBackoffMs),
+          nowMillis = () => System.currentTimeMillis(),
+          sleepMillis = millis => interruptibleSleep(millis),
+          onRetry = event => {
+            oomRetries += 1
+            logRedisOomRetry(dataset, writeModeName(mode), batch.size, event)
+          }
+        )
+        return counted.copy(retries = attempt + oomRetries)
       } catch {
         case error if retryableRedisFailure(error) =>
           lastFailure = error
@@ -1678,6 +1732,122 @@ object Spark2RedisLoader {
   private def redisLong(value: Any): Long = value match {
     case number: java.lang.Long => number.longValue()
     case other => throw new IllegalStateException(s"Redis command returned unexpected response: $other")
+  }
+
+  private[redis] def redisOutOfMemoryFailure(error: Throwable): Boolean = {
+    val canonicalMessage = "OOM COMMAND NOT ALLOWED WHEN USED MEMORY > 'MAXMEMORY'"
+    var current = error
+    var depth = 0
+    var redisOom = false
+    while (current != null && depth < 32) {
+      if (current.isInstanceOf[OutOfMemoryError]) return false
+      current match {
+        case dataError: JedisDataException =>
+          val message = Option(dataError.getMessage).getOrElse("").trim.toUpperCase(Locale.ROOT)
+          redisOom = redisOom || message == "OOM" || message.startsWith("OOM ") ||
+            message == "ERR OOM" || message.startsWith("ERR OOM ") || message.contains(canonicalMessage)
+        case _ =>
+      }
+      val cause = current.getCause
+      current = if (cause eq current) null else cause
+      depth += 1
+    }
+    redisOom
+  }
+
+  private[redis] def withRedisOomRetry[T](operation: () => T,
+                                          retryStartMillis: Long,
+                                          retryDeadlineMillis: Long,
+                                          retryWaitMillis: Int => Long,
+                                          nowMillis: () => Long,
+                                          sleepMillis: Long => Unit,
+                                          onRetry: OomRetryEvent => Unit): T = {
+    require(retryDeadlineMillis >= retryStartMillis,
+            s"Redis OOM retry deadline $retryDeadlineMillis precedes its start $retryStartMillis")
+    var oomAttempt = 0
+    var lastOom: Throwable = null
+    while (true) {
+      val beforeAttemptMillis = nowMillis()
+      if (lastOom != null && beforeAttemptMillis >= retryDeadlineMillis) {
+        throw redisOomRetryTimeout(retryStartMillis, beforeAttemptMillis, lastOom)
+      }
+      try {
+        return operation()
+      } catch {
+        case error if redisOutOfMemoryFailure(error) =>
+          lastOom = error
+          oomAttempt += 1
+          val retryAtMillis = nowMillis()
+          val remainingMillis = retryDeadlineMillis - retryAtMillis
+          if (remainingMillis <= 0) throw redisOomRetryTimeout(retryStartMillis, retryAtMillis, error)
+          val requestedWaitMillis = retryWaitMillis(oomAttempt)
+          require(requestedWaitMillis >= 0, s"Redis OOM retry wait must be non-negative: $requestedWaitMillis")
+          val waitMillis = math.min(requestedWaitMillis, remainingMillis)
+          onRetry(
+            OomRetryEvent(oomAttempt, waitMillis, math.max(0L, retryAtMillis - retryStartMillis), remainingMillis))
+          if (waitMillis > 0) sleepMillis(waitMillis)
+      }
+    }
+    throw new IllegalStateException("Redis OOM retry loop terminated unexpectedly")
+  }
+
+  private[redis] def redisOomRetryDeadline(startMillis: Long, timeoutMillis: Long, leaseDeadlineMillis: Long): Long = {
+    require(timeoutMillis >= 0, s"Redis OOM retry timeout must be non-negative: $timeoutMillis")
+    val timeoutDeadline =
+      if (startMillis > Long.MaxValue - timeoutMillis) Long.MaxValue else startMillis + timeoutMillis
+    math.min(timeoutDeadline, leaseDeadlineMillis)
+  }
+
+  private[redis] def cappedOomRetryBackoffMillis(attempt: Int, initialBackoffMillis: Long): Long = {
+    require(attempt > 0, s"Redis OOM retry attempt must be positive: $attempt")
+    require(initialBackoffMillis >= 0, s"Redis OOM retry backoff must be non-negative: $initialBackoffMillis")
+    var cap = math.min(math.max(1L, initialBackoffMillis), DefaultBulkUploadOomRetryMaxBackoffMs)
+    var currentAttempt = 1
+    while (currentAttempt < attempt && cap < DefaultBulkUploadOomRetryMaxBackoffMs) {
+      cap = math.min(DefaultBulkUploadOomRetryMaxBackoffMs, cap * 2L)
+      currentAttempt += 1
+    }
+    cap
+  }
+
+  private def jitteredOomRetryBackoffMillis(attempt: Int, initialBackoffMillis: Long): Long = {
+    val cap = cappedOomRetryBackoffMillis(attempt, initialBackoffMillis)
+    val lowerBound = (cap + 1L) / 2L
+    if (lowerBound == cap) cap
+    else ThreadLocalRandom.current().nextLong(lowerBound, cap + 1L)
+  }
+
+  private def redisOomRetryTimeout(startMillis: Long, nowMillis: Long, cause: Throwable): RuntimeException =
+    new RuntimeException(
+      s"Redis remained above maxmemory for ${math.max(0L, nowMillis - startMillis)} ms; " +
+        "external scaling or memory release did not complete before the OOM retry or publication lease deadline",
+      cause
+    )
+
+  private def interruptibleSleep(millis: Long): Unit =
+    try Thread.sleep(millis)
+    catch {
+      case interrupted: InterruptedException =>
+        Thread.currentThread().interrupt()
+        throw interrupted
+    }
+
+  private def logRedisOomRetry(dataset: String, operation: String, batchSize: Int, event: OomRetryEvent): Unit = {
+    val task = Option(TaskContext.get())
+      .map(context =>
+        s"stage=${context.stageId()} partition=${context.partitionId()} " +
+          s"taskAttempt=${context.attemptNumber()} taskAttemptId=${context.taskAttemptId()}")
+      .getOrElse("driver")
+    logger.warn(
+      s"Redis maxmemory OOM dataset=$dataset operation=$operation batchSize=$batchSize $task; " +
+        s"OOM retry ${event.attempt} in ${event.waitMillis} ms " +
+        s"(elapsed=${event.elapsedMillis} ms remaining=${event.remainingMillis} ms) while waiting for external " +
+        "scaling or memory release")
+  }
+
+  private def writeModeName(mode: WriteMode): String = mode match {
+    case MutationWrite => "mutation"
+    case LeaseRefresh  => "lease-refresh"
   }
 
   private[redis] def retryableRedisFailure(error: Throwable): Boolean = error match {

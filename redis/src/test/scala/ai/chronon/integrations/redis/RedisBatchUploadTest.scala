@@ -111,6 +111,8 @@ class RedisBatchUploadTest extends AnyFlatSpec with Matchers {
   "Redis batch defaults" should "count attempted key commands at the requested production rate" in {
     DefaultBulkUploadBatchSize shouldBe 1000
     DefaultBulkUploadMaxKeysPerSecond shouldBe 2500000
+    DefaultBulkUploadOomRetryTimeoutMs shouldBe 30 * 60 * 1000L
+    DefaultBulkUploadOomRetryMaxBackoffMs shouldBe 30 * 1000L
     DefaultBulkUploadTTLSeconds shouldBe 5 * 24 * 60 * 60
   }
 }

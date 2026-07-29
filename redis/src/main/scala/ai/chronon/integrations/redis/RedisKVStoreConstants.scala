@@ -33,6 +33,8 @@ object RedisKVStoreConstants {
   val DefaultBulkUploadStateBuckets = 256
   val DefaultBulkUploadMaxRetries = 3
   val DefaultBulkUploadRetryBackoffMs = 1000L
+  val DefaultBulkUploadOomRetryTimeoutMs = 30L * 60L * 1000L
+  val DefaultBulkUploadOomRetryMaxBackoffMs = 30L * 1000L
   val DefaultBulkUploadTTLSeconds = DataTTLSeconds
   val DefaultBulkUploadRequireNoEviction = true
 

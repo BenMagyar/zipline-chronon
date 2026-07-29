@@ -74,7 +74,7 @@ or as matching `-Z` properties. The node runner resolves them in that order, wit
 | `spark.chronon.kv_upload.redis.writer_partitions` | `2` | Concurrent Spark writer partitions |
 | `spark.chronon.kv_upload.redis.state_buckets` | `256` | S3 state/delta buckets chosen for a new lineage |
 | `spark.chronon.kv_upload.redis.max_retries` | `3` | Retries after a failed Redis command batch |
-| `spark.chronon.kv_upload.redis.retry_backoff_ms` | `1000` | Initial exponential retry backoff |
+| `spark.chronon.kv_upload.redis.retry_backoff_ms` | `1000` | Initial exponential retry backoff, including maxmemory OOM retries |
 | `spark.chronon.kv_upload.redis.ttl_seconds` | `432000` | Renewable value, tombstone, metadata, and status lease |
 | `spark.chronon.kv_upload.redis.require_noeviction` | `true` | Require Redis `maxmemory-policy=noeviction` before writing |
 
@@ -205,6 +205,10 @@ The TTL must exceed the maximum gap between successful uploads plus recovery tim
 Redis application, that apply/retry phase aborts rather than running past its lease deadline. Redis must use
 `maxmemory-policy=noeviction`; otherwise Redis can silently evict an earlier successful mutation while a later one is
 still applying. The uploader verifies this through `INFO memory`, so its ACL must allow `INFO`.
+
+With `noeviction`, Redis rejects writes when `maxmemory` is reached. The current failed batch (or final status write) is
+retried with exponential backoff capped at 30 seconds, logging each wait so external scaling or memory release has time
+to complete. Spark retries of one writer stage share a 30-minute deadline rather than starting a new window per attempt.
 
 ## Throughput Limits
 

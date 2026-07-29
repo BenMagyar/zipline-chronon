@@ -17,6 +17,7 @@ import redis.clients.jedis.exceptions.{
 
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.collection.mutable.ArrayBuffer
 
 class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers {
   private var spark: SparkSession = _
@@ -131,6 +132,120 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     Spark2RedisLoader.retryableRedisFailure(new IllegalStateException("application invariant failed")) shouldBe false
     Spark2RedisLoader.retryableRedisFailure(new JedisDataException("WRONGTYPE bad input")) shouldBe false
     Spark2RedisLoader.retryableRedisFailure(new IllegalArgumentException("invalid mutation")) shouldBe false
+  }
+
+  "Redis OOM retries" should "recognize only Redis maxmemory failures" in {
+    val reported = new JedisDataException(
+      "OOM command not allowed when used memory > 'maxmemory'. script: abc, on @user_script:22.")
+    val wrapped = new RuntimeException(
+      "pipeline failed",
+      new JedisDataException(
+        "ERR Error running script (call to f_abc): @user_script:22: -OOM command not allowed when used memory > 'maxmemory'."))
+
+    Spark2RedisLoader.redisOutOfMemoryFailure(reported) shouldBe true
+    Spark2RedisLoader.redisOutOfMemoryFailure(wrapped) shouldBe true
+    Spark2RedisLoader.redisOutOfMemoryFailure(new JedisDataException("ERR OOM maxmemory reached")) shouldBe true
+    Spark2RedisLoader.redisOutOfMemoryFailure(new JedisDataException("WRONGTYPE bad input")) shouldBe false
+    Spark2RedisLoader.redisOutOfMemoryFailure(new OutOfMemoryError("Java heap space")) shouldBe false
+    Spark2RedisLoader.retryableRedisFailure(reported) shouldBe false
+  }
+
+  it should "back off until Redis has capacity" in {
+    var nowMillis = 1000L
+    var attempts = 0
+    val sleeps = ArrayBuffer.empty[Long]
+    val events = ArrayBuffer.empty[Spark2RedisLoader.OomRetryEvent]
+
+    val result = Spark2RedisLoader.withRedisOomRetry(
+      operation = () => {
+        attempts += 1
+        if (attempts <= 2) throw new JedisDataException("OOM command not allowed when used memory > 'maxmemory'.")
+        "written"
+      },
+      retryStartMillis = nowMillis,
+      retryDeadlineMillis = nowMillis + 10000L,
+      retryWaitMillis = attempt => attempt * 100L,
+      nowMillis = () => nowMillis,
+      sleepMillis = millis => {
+        sleeps += millis
+        nowMillis += millis
+      },
+      onRetry = event => {
+        events += event
+        ()
+      }
+    )
+
+    result shouldBe "written"
+    attempts shouldBe 3
+    sleeps shouldBe Seq(100L, 200L)
+    events.map(_.attempt) shouldBe Seq(1, 2)
+    events.map(_.elapsedMillis) shouldBe Seq(0L, 100L)
+  }
+
+  it should "stop at the shared thirty-minute deadline" in {
+    val oom = new JedisDataException("OOM command not allowed when used memory > 'maxmemory'.")
+    val sevenMinutes = 7.minutes.toMillis
+    val thirtyMinutes = 30.minutes.toMillis
+    var nowMillis = 0L
+    var attempts = 0
+    val sleeps = ArrayBuffer.empty[Long]
+
+    val failure = the[RuntimeException] thrownBy {
+      Spark2RedisLoader.withRedisOomRetry(
+        operation = () => {
+          attempts += 1
+          throw oom
+        },
+        retryStartMillis = 0L,
+        retryDeadlineMillis = thirtyMinutes,
+        retryWaitMillis = _ => sevenMinutes,
+        nowMillis = () => nowMillis,
+        sleepMillis = millis => {
+          sleeps += millis
+          nowMillis += millis
+        },
+        onRetry = _ => ()
+      )
+    }
+
+    attempts shouldBe 5
+    sleeps shouldBe Seq(sevenMinutes, sevenMinutes, sevenMinutes, sevenMinutes, 2.minutes.toMillis)
+    failure.getMessage should include("external scaling or memory release")
+    failure.getCause shouldBe oom
+  }
+
+  it should "propagate non-OOM data errors without waiting" in {
+    val wrongType = new JedisDataException("WRONGTYPE bad input")
+    var attempts = 0
+    var sleeps = 0
+
+    val failure = the[JedisDataException] thrownBy {
+      Spark2RedisLoader.withRedisOomRetry(
+        operation = () => {
+          attempts += 1
+          throw wrongType
+        },
+        retryStartMillis = 0L,
+        retryDeadlineMillis = 1000L,
+        retryWaitMillis = _ => 10L,
+        nowMillis = () => 0L,
+        sleepMillis = _ => sleeps += 1,
+        onRetry = _ => ()
+      )
+    }
+
+    failure shouldBe wrongType
+    attempts shouldBe 1
+    sleeps shouldBe 0
+  }
+
+  it should "use capped exponential backoff and honor the publication lease" in {
+    (1 to 8).map(Spark2RedisLoader.cappedOomRetryBackoffMillis(_, 1000L)) shouldBe
+      Seq(1000L, 2000L, 4000L, 8000L, 16000L, 30000L, 30000L, 30000L)
+    Spark2RedisLoader.redisOomRetryDeadline(startMillis = 1000L,
+                                            timeoutMillis = 30.minutes.toMillis,
+                                            leaseDeadlineMillis = 5000L) shouldBe 5000L
   }
 
   "Redis recovery diffing" should "force every current value into a rebuild without inventing deletes" in {
