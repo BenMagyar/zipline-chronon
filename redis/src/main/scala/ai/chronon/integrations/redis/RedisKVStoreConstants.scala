@@ -23,6 +23,7 @@ object RedisKVStoreConstants {
   // Redis Cluster configuration
   val DefaultMaxRedirections = 5 // Matches Jedis default, protects against redirect loops during rebalancing
   val DefaultSoTimeoutMs = 2000 // Socket timeout for Redis commands (typical P99 < 10ms, 2s allows for network jitter)
+  val DefaultPipelineSyncThreads = 12 // Set REDIS_PIPELINE_SYNC_THREADS=0 to restore Jedis' per-pipeline executors
 
   // Environment variable keys for Redis Cluster
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
@@ -35,6 +36,10 @@ object RedisKVStoreConstants {
   val EnvRedisConnectionTimeoutMs = "REDIS_CONNECTION_TIMEOUT_MS"
   val EnvRedisSoTimeoutMs = "REDIS_SO_TIMEOUT_MS"
   val EnvRedisMaxRedirections = "REDIS_MAX_REDIRECTIONS"
+  val EnvRedisPipelineSyncThreads = "REDIS_PIPELINE_SYNC_THREADS"
+
+  // RedisKVStoreImpl configuration keys
+  val ConfigPipelineSyncThreads = "redis.pipeline.sync.threads"
 
   // Prop keys for create()
   val PropTTLSeconds = "ttl-seconds"

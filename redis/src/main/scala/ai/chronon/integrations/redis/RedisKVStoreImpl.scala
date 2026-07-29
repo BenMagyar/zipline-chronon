@@ -20,6 +20,8 @@ import redis.clients.jedis.resps.ScanResult
 import redis.clients.jedis.util.JedisClusterCRC16
 
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{LinkedBlockingQueue, ThreadFactory, ThreadPoolExecutor, TimeUnit}
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
 import scala.concurrent.{Await, Future}
@@ -84,6 +86,17 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
     conf.getOrElse("redis.key.hash.tag.mode", RedisKVStore.DatasetAndEntityHashTagMode)
   private val recordReadMetrics: Boolean =
     !conf.get("redis.read.metrics.enabled").exists(_.equalsIgnoreCase("false"))
+  private[redis] val pipelineSyncThreads: Int = conf
+    .get(ConfigPipelineSyncThreads)
+    .map { value =>
+      Try(value.toInt).getOrElse(
+        throw new IllegalArgumentException(s"$ConfigPipelineSyncThreads must be an integer, got '$value'"))
+    }
+    .getOrElse(DefaultPipelineSyncThreads)
+  require(pipelineSyncThreads >= 0, s"$ConfigPipelineSyncThreads must be non-negative, got $pipelineSyncThreads")
+
+  private[redis] val pipelineSyncExecutor: Option[ThreadPoolExecutor] =
+    if (pipelineSyncThreads > 0) Some(buildPipelineSyncExecutor(pipelineSyncThreads)) else None
 
   // TTL is now configurable via RedisKVStoreConstants or via props in create()
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("redis")
@@ -233,7 +246,10 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   private def executeReadPipeline(plans: Seq[RedisReadPlan]): PipelineAttempt = {
     var activePlan = Option.empty[RedisReadPlan]
     val results = Try {
-      val pipeline = jedisCluster.pipelined()
+      val pipeline = pipelineSyncExecutor match {
+        case Some(executor) => jedisCluster.pipelined(executor)
+        case None           => jedisCluster.pipelined()
+      }
       var queueError = Option.empty[Exception]
       val pendingReads =
         try {
@@ -408,7 +424,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
   }
 
   private def decodeStreamingMembers(members: java.util.List[Array[Byte]]): Seq[TimedValue] = {
-    members.asScala.flatMap { memberBytes =>
+    members.asScala.iterator.flatMap { memberBytes =>
       if (memberBytes.length >= 8) {
         val timestamp = java.nio.ByteBuffer.wrap(memberBytes, 0, 8).getLong
         Some(TimedValue(memberBytes.drop(8), timestamp))
@@ -416,7 +432,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         logger.warn(s"Malformed streaming data in Redis: member has ${memberBytes.length} bytes, expected >= 8")
         None
       }
-    }
+    }.toSeq
   }
 
   private def recordMultiGetMetrics(responses: Seq[GetResponse], latencyMillis: Long): Unit = {
@@ -691,10 +707,51 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         logger.warn("Warm-up operations failed", e)
     }
   }
+
+  private[redis] def shutdownPipelineSyncExecutor(): Unit = {
+    pipelineSyncExecutor.foreach { executor =>
+      executor.shutdown()
+      try {
+        if (!executor.awaitTermination(PipelineExecutorShutdownTimeoutSeconds, TimeUnit.SECONDS)) {
+          executor.shutdownNow()
+          executor.awaitTermination(PipelineExecutorShutdownTimeoutSeconds, TimeUnit.SECONDS)
+        }
+      } catch {
+        case _: InterruptedException =>
+          executor.shutdownNow()
+          Thread.currentThread().interrupt()
+      }
+    }
+  }
 }
 
 private[redis] object RedisKVStoreImpl {
   private val PipelineResponseUnsetMessage = "Please close pipeline or multi block before calling this method."
+  private val PipelineExecutorShutdownTimeoutSeconds = 5L
+  private val PipelineExecutorIds = new AtomicInteger()
+
+  private def buildPipelineSyncExecutor(threads: Int): ThreadPoolExecutor = {
+    val executorId = PipelineExecutorIds.incrementAndGet()
+    val threadIds = new AtomicInteger()
+    val threadFactory = new ThreadFactory {
+      override def newThread(runnable: Runnable): Thread = {
+        val thread = new Thread(runnable, s"chronon-redis-pipeline-$executorId-${threadIds.incrementAndGet()}")
+        thread.setDaemon(true)
+        if (thread.getContextClassLoader == null) thread.setContextClassLoader(getClass.getClassLoader)
+        thread
+      }
+    }
+    val executor = new ThreadPoolExecutor(
+      threads,
+      threads,
+      0L,
+      TimeUnit.MILLISECONDS,
+      new LinkedBlockingQueue[Runnable](),
+      threadFactory
+    )
+    executor.prestartAllCoreThreads()
+    executor
+  }
 
   sealed trait PlannedRead {
     def request: GetRequest

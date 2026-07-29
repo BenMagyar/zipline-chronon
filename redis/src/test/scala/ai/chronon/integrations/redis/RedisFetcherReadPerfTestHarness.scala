@@ -1,7 +1,9 @@
 package ai.chronon.integrations.redis
 
 import ai.chronon.integrations.redis.RedisKVStoreConstants.{
+  ConfigPipelineSyncThreads,
   DefaultMinIdleConnections,
+  DefaultPipelineSyncThreads,
   EnvRedisClusterNodes,
   EnvRedisMaxConnections,
   EnvRedisMaxIdleConnections,
@@ -29,6 +31,7 @@ import scala.jdk.CollectionConverters._
   * apply the named hit percentage to candidate keys; they do not instantiate Caffeine or measure fetcher cache work.
   * Set PERF_REDIS_PRIMARY_COUNT and PERF_REDIS_REPLICAS_PER_PRIMARY to measure shard-topology tradeoffs. Set
   * PERF_REDIS_CPU_LIMIT to constrain the local Redis container for fixed-resource comparisons. Set
+  * PERF_REDIS_PIPELINE_SYNC_THREAD_COUNTS to compare Jedis' per-pipeline executors (0) with shared executor sizes. Set
   * PERF_REDIS_USE_NATIVE_LOCAL=false for the legacy amd64 fixture, or PERF_REDIS_USE_EXTERNAL=true with
   * REDIS_CLUSTER_NODES for one isolated external-cluster configuration.
   *
@@ -56,6 +59,8 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     Seq(32, 48, 64, 96)
   )
   private val workerThreadCounts = envInts("PERF_REDIS_THREAD_COUNTS", Seq(16, 32, 48, 64))
+  private val pipelineSyncThreadCounts =
+    envInts("PERF_REDIS_PIPELINE_SYNC_THREAD_COUNTS", Seq(DefaultPipelineSyncThreads))
   private val queueCapacities = envInts("PERF_REDIS_QUEUE_CAPACITIES", Seq(10000))
   private val candidates = envInt("PERF_CANDIDATES", RedisFetcherReadWorkload.Config().candidates)
   private val loadBatchSize = envInt("PERF_LOAD_BATCH_SIZE", 100)
@@ -96,6 +101,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
   require(measurementIterations > 0)
   require(batchConcurrencies.nonEmpty && batchConcurrencies.forall(_ > 0))
   require(workerThreadCounts.nonEmpty && workerThreadCounts.forall(_ > 0))
+  require(pipelineSyncThreadCounts.nonEmpty && pipelineSyncThreadCounts.forall(_ >= 0))
   require(queueCapacities.nonEmpty && queueCapacities.forall(_ > 0))
   require(candidates > 0)
   require(loadBatchSize > 0)
@@ -109,6 +115,8 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     require(localCpuLimit.isEmpty, "PERF_REDIS_CPU_LIMIT only applies to the local Redis fixture")
     require(poolConfigs.size == 1,
             "External Redis runs require one worker/queue configuration per JVM for an isolated executor measurement")
+    require(pipelineSyncThreadCounts.size == 1,
+            "External Redis runs require one pipeline-sync thread configuration per JVM")
   }
 
   @volatile private var resultSink: AnyRef = _
@@ -143,7 +151,8 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
             EnvRedisMaxIdleConnections -> maxIdleConnections.toString,
             "redis.key.prefix" -> keyPrefix,
             "redis.key.hash.tag.mode" -> keyHashTagMode,
-            "redis.read.metrics.enabled" -> readMetricsEnabled.toString
+            "redis.read.metrics.enabled" -> readMetricsEnabled.toString,
+            ConfigPipelineSyncThreads -> pipelineSyncThreadCounts.head.toString
           ))
       } else {
         localCluster =
@@ -164,6 +173,7 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
 
   override def afterAll(): Unit = {
     try {
+      if (externalKvStore != null) externalKvStore.shutdownPipelineSyncExecutor()
       if (localCluster != null) localCluster.close()
     } finally {
       super.afterAll()
@@ -216,35 +226,38 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
       s"redis_io_threads=${Option(localCluster).map(_.ioThreads.toString).getOrElse("external")} " +
       s"redis_io_threads_do_reads=${Option(localCluster).map(_.ioThreadsDoReads.toString).getOrElse("external")} " +
       s"pool_sample_interval_ms=$PoolSampleIntervalMillis " +
-      s"jedis_pipeline_sync_workers_per_pipeline=" +
+      s"jedis_dedicated_pipeline_sync_workers_per_pipeline=" +
       s"${redis.clients.jedis.MultiNodePipelineBase.MULTI_NODE_PIPELINE_SYNC_WORKERS} " +
+      s"pipeline_sync_thread_counts=${pipelineSyncThreadCounts.mkString(",")} " +
       s"worker_threads=${workerThreadCounts.mkString(",")} queue_capacities=${queueCapacities.mkString(",")}")
 
-    withRedisStore(poolConfigs.maxBy(_.threads), loader = true) { (loaderStore, _, _) =>
+    withRedisStore(poolConfigs.maxBy(_.threads), pipelineSyncThreads = 0, loader = true) { (loaderStore, _, _) =>
       load(loaderStore, workload)
     }
 
     poolConfigs.foreach { poolConfig =>
-      withRedisStore(poolConfig, loader = false) { (kvStore, redisExecutor, jedisCluster) =>
-        selectedProfiles.foreach(profile => validateProfile(kvStore, profile))
-        batchConcurrencies.foreach { batchConcurrency =>
-          selectedProfiles.foreach { profile =>
-            if (warmupIterations > 0) {
-              val warmup = execute(kvStore, redisExecutor, jedisCluster, profile, warmupIterations, batchConcurrency)
-              requireSuccessful(profile.name, "warmup", warmup)
-            }
+      pipelineSyncThreadCounts.foreach { pipelineSyncThreads =>
+        withRedisStore(poolConfig, pipelineSyncThreads, loader = false) { (kvStore, redisExecutor, jedisCluster) =>
+          selectedProfiles.foreach(profile => validateProfile(kvStore, profile))
+          batchConcurrencies.foreach { batchConcurrency =>
+            selectedProfiles.foreach { profile =>
+              if (warmupIterations > 0) {
+                val warmup = execute(kvStore, redisExecutor, jedisCluster, profile, warmupIterations, batchConcurrency)
+                requireSuccessful(profile.name, "warmup", warmup)
+              }
 
-            val measurement =
-              execute(kvStore, redisExecutor, jedisCluster, profile, measurementIterations, batchConcurrency)
-            printResult(workload, profile, poolConfig, measurement, batchConcurrency)
-            requireSuccessful(profile.name, "measurement", measurement)
+              val measurement =
+                execute(kvStore, redisExecutor, jedisCluster, profile, measurementIterations, batchConcurrency)
+              printResult(workload, profile, poolConfig, measurement, batchConcurrency)
+              requireSuccessful(profile.name, "measurement", measurement)
+            }
           }
         }
       }
     }
   }
 
-  private def withRedisStore(poolConfig: PoolConfig, loader: Boolean)(
+  private def withRedisStore(poolConfig: PoolConfig, pipelineSyncThreads: Int, loader: Boolean)(
       run: (RedisKVStoreImpl, ThreadPoolExecutor, Option[JedisCluster]) => Unit): Unit = {
     if (useExternalCluster) {
       val executor = FlexibleExecutionContext.buildExecutor
@@ -260,14 +273,19 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
         Map(
           "redis.key.prefix" -> keyPrefix,
           "redis.key.hash.tag.mode" -> keyHashTagMode,
-          "redis.read.metrics.enabled" -> readMetricsEnabled.toString
+          "redis.read.metrics.enabled" -> readMetricsEnabled.toString,
+          ConfigPipelineSyncThreads -> pipelineSyncThreads.toString
         ),
         ExecutionContext.fromExecutor(executor)
       )
       try run(kvStore, executor, Some(localCluster.client))
       finally {
-        executor.shutdownNow()
-        executor.awaitTermination(5, TimeUnit.SECONDS)
+        executor.shutdown()
+        if (!executor.awaitTermination(readTimeout.toMillis, TimeUnit.MILLISECONDS)) {
+          executor.shutdownNow()
+          require(executor.awaitTermination(5, TimeUnit.SECONDS), "Redis benchmark executor did not terminate")
+        }
+        kvStore.shutdownPipelineSyncExecutor()
       }
     }
   }
@@ -337,10 +355,15 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
     val peakActive = new AtomicInteger()
     val peakJedisActive = new AtomicInteger()
     val peakJedisWaiters = new AtomicInteger()
+    val peakPipelineActive = new AtomicInteger()
+    val peakPipelineQueue = new AtomicInteger()
     val sampling = new AtomicBoolean(true)
     val latenciesNanos = Array.fill(iterations)(0L)
     val submittedBefore = redisExecutor.getTaskCount
     val completedBefore = redisExecutor.getCompletedTaskCount
+    val pipelineExecutor = kvStore.pipelineSyncExecutor
+    val pipelineSubmittedBefore = pipelineExecutor.map(_.getTaskCount).getOrElse(0L)
+    val pipelineCompletedBefore = pipelineExecutor.map(_.getCompletedTaskCount).getOrElse(0L)
     val sampler = new Thread(
       () => {
         while (sampling.get()) {
@@ -350,6 +373,10 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
             val pools = client.getClusterNodes.values().asScala
             peakJedisActive.accumulateAndGet(pools.iterator.map(_.getNumActive).sum, Math.max)
             peakJedisWaiters.accumulateAndGet(pools.iterator.map(_.getNumWaiters).sum, Math.max)
+          }
+          pipelineExecutor.foreach { executor =>
+            peakPipelineActive.accumulateAndGet(executor.getActiveCount, Math.max)
+            peakPipelineQueue.accumulateAndGet(executor.getQueue.size(), Math.max)
           }
           Thread.sleep(PoolSampleIntervalMillis)
         }
@@ -403,7 +430,14 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
           redisExecutor.getCompletedTaskCount - completedBefore,
           jedisCluster.isDefined,
           peakJedisActive.get(),
-          peakJedisWaiters.get()
+          peakJedisWaiters.get(),
+          kvStore.pipelineSyncThreads,
+          pipelineExecutor.isDefined,
+          pipelineExecutor.map(_ => peakPipelineActive.get()).getOrElse(-1),
+          pipelineExecutor.map(_ => peakPipelineQueue.get()).getOrElse(-1),
+          pipelineExecutor.map(_.getTaskCount - pipelineSubmittedBefore).getOrElse(-1L),
+          pipelineExecutor.map(_.getCompletedTaskCount - pipelineCompletedBefore).getOrElse(-1L),
+          pipelineExecutor.map(_.getLargestPoolSize).getOrElse(-1)
         )
       )
     } finally {
@@ -476,8 +510,16 @@ class RedisFetcherReadPerfTestHarness extends AnyFlatSpec with BeforeAndAfterAll
         f"jedis_pool_metrics=${measurement.pool.jedisMetricsAvailable}%s " +
         f"jedis_sampled_peak_active_sum=${measurement.pool.peakJedisActive}%d " +
         f"jedis_sampled_peak_waiters_sum=${measurement.pool.peakJedisWaiters}%d " +
-        f"jedis_pipeline_sync_workers_per_pipeline=" +
+        f"jedis_pipeline_executor_mode=" +
+        (if (measurement.pool.pipelineExecutorAvailable) "shared " else "dedicated_per_pipeline ") +
+        f"jedis_pipeline_shared_threads=${measurement.pool.pipelineSyncThreads}%d " +
+        f"jedis_pipeline_dedicated_workers_per_pipeline=" +
         f"${redis.clients.jedis.MultiNodePipelineBase.MULTI_NODE_PIPELINE_SYNC_WORKERS}%d " +
+        f"jedis_pipeline_sampled_peak_active=${measurement.pool.peakPipelineActive}%d " +
+        f"jedis_pipeline_sampled_peak_queue=${measurement.pool.peakPipelineQueue}%d " +
+        f"jedis_pipeline_tasks=${measurement.pool.pipelineSubmittedTasks}%d " +
+        f"jedis_pipeline_completed=${measurement.pool.pipelineCompletedTasks}%d " +
+        f"jedis_pipeline_prestarted_threads=${measurement.pool.pipelineLargestPoolSize}%d " +
         f"batch_get_commands_per_batch=$effectiveBatchReadCommands%d " +
         f"zrange_commands_per_batch=$effectiveStreamingCommands%d " +
         f"redis_commands_per_batch=$effectiveRedisCommands%d kv_responses_per_batch=${profile.requests.size}%d " +
@@ -552,7 +594,14 @@ private object RedisFetcherReadPerfTestHarness {
       completedTasks: Long,
       jedisMetricsAvailable: Boolean,
       peakJedisActive: Int,
-      peakJedisWaiters: Int
+      peakJedisWaiters: Int,
+      pipelineSyncThreads: Int,
+      pipelineExecutorAvailable: Boolean,
+      peakPipelineActive: Int,
+      peakPipelineQueue: Int,
+      pipelineSubmittedTasks: Long,
+      pipelineCompletedTasks: Long,
+      pipelineLargestPoolSize: Int
   )
 
   final case class Measurement(

@@ -21,6 +21,7 @@ import scala.jdk.CollectionConverters._
   *  - REDIS_CONNECTION_TIMEOUT_MS: Connection timeout in milliseconds (default: 5000)
   *  - REDIS_SO_TIMEOUT_MS: Socket timeout in milliseconds (default: 2000)
   *  - REDIS_MAX_REDIRECTIONS: Maximum cluster redirections (default: 5)
+  *  - REDIS_PIPELINE_SYNC_THREADS: Shared cluster-pipeline drain threads (default: 12; set 0 for Jedis-managed pools)
   *
   * Example usage:
   * {{{
@@ -62,6 +63,12 @@ object RedisKVStoreFactory {
       getOptional(EnvRedisConnectionTimeoutMs, conf).map(_.toInt).getOrElse(DefaultConnectionTimeoutMs)
     val soTimeoutMs = getOptional(EnvRedisSoTimeoutMs, conf).map(_.toInt).getOrElse(DefaultSoTimeoutMs)
     val maxRedirections = getOptional(EnvRedisMaxRedirections, conf).map(_.toInt).getOrElse(DefaultMaxRedirections)
+    val pipelineSyncThreads = getOptional(EnvRedisPipelineSyncThreads, conf)
+      .orElse(conf.get(ConfigPipelineSyncThreads))
+      .map(_.toInt)
+      .getOrElse(DefaultPipelineSyncThreads)
+    require(pipelineSyncThreads >= 0,
+            s"$ConfigPipelineSyncThreads must be non-negative, got $pipelineSyncThreads")
 
     // Parse cluster nodes: "node1:6379,node2:6379,node3:6379"
     val clusterNodes = nodesStr
@@ -80,7 +87,7 @@ object RedisKVStoreFactory {
       s"Creating Redis Cluster KVStore with nodes: ${clusterNodes.mkString(", ")}. " +
         s"Params: ssl=$useSsl, maxConnections=$maxConnections, minIdle=${poolConfig.getMinIdle}, " +
         s"maxIdle=${poolConfig.getMaxIdle}, connectionTimeout=$connectionTimeoutMs, " +
-        s"soTimeout=$soTimeoutMs, maxRedirections=$maxRedirections"
+        s"soTimeout=$soTimeoutMs, maxRedirections=$maxRedirections, pipelineSyncThreads=$pipelineSyncThreads"
     )
 
     val clientConfig = {
@@ -107,7 +114,8 @@ object RedisKVStoreFactory {
       poolConfig
     )
 
-    val kvStore = new RedisKVStoreImpl(jedisCluster, conf)
+    val kvStore =
+      new RedisKVStoreImpl(jedisCluster, conf.updated(ConfigPipelineSyncThreads, pipelineSyncThreads.toString))
     kvStore.init()
     kvStore
   }

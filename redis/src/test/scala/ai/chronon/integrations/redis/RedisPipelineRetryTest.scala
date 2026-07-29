@@ -1,5 +1,6 @@
 package ai.chronon.integrations.redis
 
+import ai.chronon.integrations.redis.RedisKVStoreConstants.ConfigPipelineSyncThreads
 import ai.chronon.online.KVStore.GetRequest
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{mock, times, verify, when}
@@ -116,7 +117,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
   }
 
   private def readTwoBatchKeys(cluster: JedisCluster) = {
-    val kvStore = new RedisKVStoreImpl(cluster)
+    val kvStore = new RedisKVStoreImpl(cluster, Map(ConfigPipelineSyncThreads -> "0"))
     val requests = Seq(
       GetRequest("key-a".getBytes(StandardCharsets.UTF_8), "RETRY_A_BATCH"),
       GetRequest("key-b".getBytes(StandardCharsets.UTF_8), "RETRY_B_BATCH")

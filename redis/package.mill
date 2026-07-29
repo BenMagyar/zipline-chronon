@@ -20,8 +20,8 @@ trait RedisModule extends Cross.Module[String] with build.BaseModule {
     build.Constants.loggingApiDeps ++
     build.Constants.utilityDeps ++
     Seq(
-      mvn"redis.clients:jedis:5.1.0",
-      mvn"org.apache.commons:commons-pool2:2.12.0"
+      mvn"redis.clients:jedis:7.5.2",
+      mvn"org.apache.commons:commons-pool2:2.12.1"
       // RedisLabs' spark-redis only supports Jedis 3.x (unmaintained since 2021)
       // We use direct Jedis API with foreachPartition in Spark2RedisLoader instead
     )
@@ -41,4 +41,3 @@ trait RedisModule extends Cross.Module[String] with build.BaseModule {
     def forkArgs = build.Constants.commonTestForkArgs
   }
 }
-
