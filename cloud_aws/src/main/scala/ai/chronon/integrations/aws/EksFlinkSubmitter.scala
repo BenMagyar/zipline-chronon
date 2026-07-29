@@ -23,8 +23,11 @@ object EksFlinkSubmitter {
   val DefaultS3FlinkJarsBasePath = "s3://zipline-spark-libs/spark-3.5.3/libs/"
 
   // Jars required on EKS that other engines like Dataproc provide via their pre-installed Hadoop/YARN host classpath.
+  // hadoop-client-runtime must match hadoop-aws (3.4.1) so S3AFileSystem doesn't hit missing
+  // Configuration methods (e.g. getEnumSet added in 3.4.x). hadoop-aws:3.4.1 also requires
+  // hadoop-client-api:3.4.1 to avoid S3AUtils duration-string parse errors with "60s" format.
   val EksOnlyAdditionalJarNames: Array[String] = Array(
-    "hadoop-client-runtime-3.3.6.jar",
+    "hadoop-client-runtime-3.4.1.jar",
     "jakarta.servlet-api-4.0.3.jar"
   )
 

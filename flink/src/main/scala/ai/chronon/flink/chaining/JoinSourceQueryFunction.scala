@@ -120,7 +120,8 @@ object JoinSourceQueryFunction {
     val wheres = Option(joinSource.query.wheres).map(_.asScala.toSeq).getOrElse(Seq.empty)
 
     // Create CatalystUtil instance
-    val catalystUtil = new CatalystUtil(joinSchema, selectsWithTimeColumn, wheres)
+    val setups = Option(joinSource.query.setups).map(_.asScala.toSeq).getOrElse(Seq.empty)
+    val catalystUtil = new CatalystUtil(joinSchema, selectsWithTimeColumn, wheres, setups)
 
     // Get the output schema from Catalyst and convert to Chronon format
     val outputSparkSchema = catalystUtil.getOutputSparkSchema

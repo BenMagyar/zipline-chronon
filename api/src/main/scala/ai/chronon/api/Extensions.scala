@@ -1244,7 +1244,9 @@ object Extensions {
     }
 
     def setups: Seq[String] =
-      (join.left.query.setupsSeq ++ join.joinParts.toScala
+      (join.left.query.setupsSeq ++ Option(join.joinParts)
+        .getOrElse(new util.ArrayList[JoinPart]())
+        .toScala
         .flatMap(_.groupBy.setups)).distinct
 
     lazy val joinPartOps: Seq[JoinPartOps] =

@@ -238,7 +238,10 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
     val valueFields = if (!servingInfo.groupBy.hasDerivations) {
       baseValueSchema.fields
     } else {
-      buildDerivedFields(servingInfo.groupBy.derivationsScala, keySchema, baseValueSchema).toArray
+      buildDerivedFields(servingInfo.groupBy.derivationsScala,
+                         keySchema,
+                         baseValueSchema,
+                         servingInfo.groupBy.setups).toArray
     }
     val joinValueFields = valueFields.map(joinPart.constructJoinPartSchema)
 

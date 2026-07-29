@@ -107,6 +107,27 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     response.selectedSchema shouldBe servingInfo.selectedAvroSchema
   }
 
+  it should "fetch schema for a groupBy whose derivations use a Hive UDF" in {
+    val kvStore = InMemoryKvStore.build(s"FetcherSchemaTest_udf_${System.nanoTime()}")
+    kvStore.create(Constants.MetadataDataset)
+
+    val servingInfo = GroupByDerivationsTest.makeUdfGroupByServingInfoParsed().groupByServingInfo
+    servingInfo.groupBy.metaData.setOnline(true)
+    val groupByName = servingInfo.groupBy.metaData.name
+    val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
+    kvStore.create(batchDataset)
+
+    putString(kvStore, servingInfo.groupBy.keyNameForKvStore, ThriftJsonCodec.toJsonStr(servingInfo.groupBy), Constants.MetadataDataset)
+    putString(kvStore, Constants.GroupByServingInfoKey, ThriftJsonCodec.toJsonStr(servingInfo), batchDataset)
+
+    val fetcher = new Fetcher(kvStore, Constants.MetadataDataset)
+    val response = fetcher.fetchGroupBySchema(groupByName).get
+
+    val valueCodec = AvroCodec.of(response.valueSchema)
+    valueCodec.fieldNames.toSet should contain("int_val_minus_two")
+    valueCodec.fieldNames.toSet should contain("int_val_last_1d")
+  }
+
   it should "fail schema fetch when the groupBy has no batch upload" in {
     val kvStore = InMemoryKvStore.build(s"FetcherSchemaTest_no_upload_${System.nanoTime()}")
     kvStore.create(Constants.MetadataDataset)

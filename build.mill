@@ -149,6 +149,23 @@ object Constants {
   // GCS publishing configuration
   val defaultGcsBucket = "gs://zipline-artifacts-canary"
   val defaultGcsBasePath = "release"
+
+  // spark-hive + hive-common shade hive-exec and other artifacts but leave their original pom
+  // metadata, which grype flags as vulnerable. Strip it since the code is shaded.
+  def hiveAssemblyRules = Seq(
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.hive/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.hive\\.shims/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.datanucleus/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.jline/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/jline/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/log4j/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.avro/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.hadoop/hadoop-yarn-.*/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/com\\.nimbusds/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/commons-beanutils/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.commons/commons-configuration2/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.eclipse\\.jetty/jetty-http/.*"),
+  )
 }
 
 // Custom PublishModule trait that adds GCS publishing capabilities

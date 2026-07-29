@@ -86,6 +86,12 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
     build.Constants.utilityDeps ++
     Seq(
       mvn"com.google.cloud:google-cloud-storage:2.49.0",
+      // gcs-connector enables gs:// filesystem resolution for ADD JAR in CatalystUtil setups.
+      // 3.x is required for APPLICATION_DEFAULT credential support (2.x only supports service account keys).
+      mvn"com.google.cloud.bigdataoss:gcs-connector:3.0.3",
+      mvn"com.google.cloud.bigdataoss:gcsio:3.0.3",
+      mvn"com.google.cloud.bigdataoss:util-hadoop:3.0.0",
+      mvn"com.google.cloud.bigdataoss:util:3.0.0",
       mvn"com.google.cloud:google-cloud-dataproc:4.52.0",
       mvn"com.google.cloud:google-cloud-pubsub:1.134.2",
       mvn"com.google.cloud.hosted.kafka:managed-kafka-auth-login-handler:1.0.6",

@@ -52,9 +52,18 @@ object CatalystUtil {
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config(SQLConf.DATETIME_JAVA8API_ENABLED.key, true)
       .config(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, false)
-      // disable Hive support as this requires spark-hive as a hard dep and that fails grype tests
-//      .enableHiveSupport() // needed to support registering Hive UDFs via CREATE FUNCTION.. calls
+      // required for Hive UDF support
+      .enableHiveSupport()
       .getOrCreate()
+    // Allow callers to override the S3A credential provider via AWS_CREDENTIALS_PROVIDER.
+    // core-default.xml (bundled in hadoop-client-runtime) defaults to a narrow chain that
+    // excludes file-based credentials (~/.aws/credentials). Setting this on hadoopConf before
+    // any s3a:// filesystem is accessed (e.g. ADD JAR setup statements) overrides that default.
+    // Example: AWS_CREDENTIALS_PROVIDER=software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+    // for local fetcher runs with ~/.aws/credentials.
+    sys.env.get("AWS_CREDENTIALS_PROVIDER").foreach { provider =>
+      spark.sparkContext.hadoopConfiguration.set("fs.s3a.aws.credentials.provider", provider)
+    }
     assert(spark.sessionState.conf.wholeStageEnabled)
     spark
   }
@@ -168,20 +177,7 @@ class CatalystUtil(inputSchema: StructType,
 
   private def initialize(): (InternalRow => Seq[InternalRow], types.StructType) = {
     val session = CatalystUtil.session
-
-    // run through and execute the setup statements
-    setups.foreach { statement =>
-      try {
-        session.sql(statement)
-        logger.info(s"Executed setup statement: $statement")
-      } catch {
-        case _: FunctionAlreadyExistsException =>
-        // ignore - this crops up in unit tests on occasion
-        case e: Exception =>
-          logger.warn(s"Failed to execute setup statement: $statement", e)
-          throw new RuntimeException(s"Error executing setup statement: $statement", e)
-      }
-    }
+    executeSetups()
 
     // create dummy df with sql query and schema
     val emptyRowRdd = session.emptyDataFrame.rdd
@@ -200,5 +196,63 @@ class CatalystUtil(inputSchema: StructType,
     val transformer = CatalystTransformBuilder.buildTransformChain(execPlan)
 
     (transformer, df.schema)
+  }
+
+  // Executes setup statements (ADD JAR and CREATE FUNCTION). The thread context classloader is
+  // switched to jarClassLoader so that SessionCatalog.makeFunctionBuilder can resolve UDF classes
+  // via Utils.classForName (which reads the thread context CL). jarClassLoader delegates to
+  // Spark's driver classloader which has the full application classpath, so CREATE FUNCTION can
+  // find UDF classes without needing an ADD JAR.
+  private def executeSetups(): Unit = {
+    if (setups.isEmpty) return
+    val session = CatalystUtil.session
+    val addJarPattern = """(?i)^\s*ADD\s+JAR\s+['"]?([^\s'"]+)['"]?\s*;?\s*$""".r
+    val originalCL = Thread.currentThread().getContextClassLoader
+    Thread.currentThread().setContextClassLoader(session.sharedState.jarClassLoader)
+    try {
+      setups.foreach { statement =>
+        try {
+          statement.trim match {
+            case addJarPattern(jarPath) =>
+              val localFile = localizeJar(jarPath)
+              logger.info(s"Executed setup statement via localizeJar (${localFile.length()} bytes): $statement")
+            case _ =>
+              session.sql(statement)
+              logger.info(s"Executed setup statement: $statement")
+          }
+        } catch {
+          case _: FunctionAlreadyExistsException =>
+          // ignore - this crops up in unit tests on occasion
+          case e: Exception =>
+            logger.warn(s"Failed to execute setup statement: $statement", e)
+            throw new RuntimeException(s"Error executing setup statement: $statement", e)
+        }
+      }
+    } finally {
+      Thread.currentThread().setContextClassLoader(originalCL)
+    }
+  }
+
+  // Downloads a remote jar (s3a://, gs://, or local path) to a temp file, registers it with
+  // SparkContext for executor distribution, and adds it to jarClassLoader so the driver can
+  // resolve UDF classes loaded from it. Returns the local temp file.
+  //
+  // We bypass session.sql("ADD JAR") because that routes through HiveSessionResourceLoader, which
+  // lazily initializes HiveExternalCatalog → Derby metastore → DataNucleus. DataNucleus requires
+  // its three jars (core, api-jdo, rdbms) as separate classpath entries so each jar's plugin.xml
+  // is discoverable; in an uber-jar only one plugin.xml survives the merge and the JDO adapter
+  // registration is lost, causing a fatal startup error.
+  private def localizeJar(jarPath: String): java.io.File = {
+    val sc = CatalystUtil.session.sparkContext
+    // s3:// has no registered Hadoop FileSystem; rewrite to s3a:// which does.
+    val normalizedPath = if (jarPath.startsWith("s3://")) "s3a://" + jarPath.stripPrefix("s3://") else jarPath
+    val srcPath = new org.apache.hadoop.fs.Path(new java.net.URI(normalizedPath))
+    val fs = srcPath.getFileSystem(sc.hadoopConfiguration)
+    val localFile = java.io.File.createTempFile(srcPath.getName.stripSuffix(".jar") + "-", ".jar")
+    localFile.deleteOnExit()
+    fs.copyToLocalFile(srcPath, new org.apache.hadoop.fs.Path(localFile.toURI))
+    sc.addJar(localFile.getAbsolutePath)
+    CatalystUtil.session.sharedState.jarClassLoader.addURL(localFile.toURI.toURL)
+    localFile
   }
 }

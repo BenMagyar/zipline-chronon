@@ -58,6 +58,12 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
     mvn"software.amazon.awssdk:identity-spi:2.30.13",
     mvn"software.amazon.msk:aws-msk-iam-auth:2.3.5",
     mvn"org.apache.hadoop:hadoop-client-api:3.4.1",
+    // hadoop-aws enables s3a:// filesystem resolution for ADD JAR setup statements
+    // Must match the hadoop-client-api version (3.4.1) to avoid S3AUtils duration-string parse errors.
+    // Exclude the awssdk bundle fat-jar (brings in cloudfront with grype vulnerabilities)
+    mvn"org.apache.hadoop:hadoop-aws:3.4.1"
+      .exclude("software.amazon.awssdk" -> "bundle"),
+    mvn"software.amazon.awssdk:s3-transfer-manager:2.30.13",
     mvn"org.apache.iceberg::iceberg-spark-runtime-3.5:1.10.0",
     // delta-storage is delta-spark's runtime LogStore layer — a separate,
     // unpatched artifact. The bundled delta-spark jar (deltaSparkJarFile) is

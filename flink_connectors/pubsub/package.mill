@@ -32,6 +32,8 @@ trait PubSubConnectorModule extends Cross.Module[String] with build.BaseModule {
     mvn"io.netty:netty-codec-http:${build.Constants.nettyVersion}",
   ).map(_.forceVersion())
 
+  override def assemblyRules = super.assemblyRules ++ build.Constants.hiveAssemblyRules
+
   object test extends build.BaseTestModule {
     def scalaVersion = crossValue
     def moduleDeps = Seq(build.flink_connectors.pubsub(crossValue))

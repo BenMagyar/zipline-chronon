@@ -171,4 +171,22 @@ class JoinRequestKeysTest extends AnyFlatSpec {
       JoinRequestKeys.deriveLeftKeys(request, queryJoin, joinPart, keyServingInfo)
     )
   }
+
+  // Hive UDFs registered via setups on the left source should be available when evaluating
+  // left key select expressions
+  it should "evaluate a Hive UDF registered via setups when deriving left keys" in {
+    val udfJoin = join(
+      selectExpr = "MINUS_TWO(CAST(query_id AS INT))",
+      setups = Seq("CREATE FUNCTION MINUS_TWO AS 'ai.chronon.online.test.Minus_Two'")
+    )
+    val joinPart = udfJoin.joinPartOps.head
+    val request = Request(udfJoin.metaData.name, Map("query_id" -> java.lang.Integer.valueOf(10)))
+    val keyServingInfo = servingInfo(StructType("Input", Array(StructField("query_id", IntType))))
+
+    assertEquals(true, JoinRequestKeys.needsDerivation(request, udfJoin, joinPart))
+    assertEquals(
+      Map("query_normalized" -> java.lang.Integer.valueOf(8)),
+      JoinRequestKeys.deriveLeftKeys(request, udfJoin, joinPart, keyServingInfo)
+    )
+  }
 }
