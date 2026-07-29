@@ -247,7 +247,7 @@ class Fetcher(val kvStore: KVStore,
         joinName => Some(cachedJoinCodecsByName.getOrElseUpdate(joinName, joinCodecCache(joinName)))
     }
     val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecForName)
-    val externalResponsesF = fetchExternal(requests)
+    val externalResponsesF = fetchExternal(requests, joinConf)
     val combinedResponsesF =
       internalResponsesF.zip(externalResponsesF).map { case (internalResponses, externalResponses) =>
         val zipped = if (externalResponses == null) {
@@ -680,9 +680,47 @@ class Fetcher(val kvStore: KVStore,
   }
 
   // Pulling external features in a batched fashion across services in-parallel
-  private def fetchExternal(joinRequests: Seq[Request]): Future[Seq[Response]] = {
+  private def fetchExternal(joinRequests: Seq[Request], joinConf: Option[api.Join]): Future[Seq[Response]] = {
 
     val startTime = System.currentTimeMillis()
+    val overrideJoinOps = joinConf.map(join => Success(JoinOps(join)))
+    val joinOpsByName = mutable.HashMap.empty[String, Try[JoinOps]]
+    def resolveJoinOps(joinName: String): Try[JoinOps] = overrideJoinOps.getOrElse {
+      joinOpsByName.getOrElseUpdate(
+        joinName, {
+          val joinOpsTry = metadataStore.getJoinConf(joinName)
+          if (joinOpsTry.isFailure) metadataStore.getJoinConf.refresh(joinName)
+          joinOpsTry
+        }
+      )
+    }
+
+    // The common path has no online external parts. Resolve each join name once and return before
+    // allocating per-request result maps when there is no external work to schedule.
+    val joinIterator = joinRequests.iterator
+    var hasExternalParts = false
+    var contextualOnly = true
+    while (joinIterator.hasNext && contextualOnly) {
+      resolveJoinOps(joinIterator.next().name) match {
+        case Failure(_) =>
+          // Preserve the existing failure response path below.
+          hasExternalParts = true
+          contextualOnly = false
+        case Success(joinOps) =>
+          Option(joinOps.join.onlineExternalParts).foreach { parts =>
+            val partIterator = parts.iterator()
+            while (partIterator.hasNext && contextualOnly) {
+              hasExternalParts = true
+              contextualOnly = partIterator.next().isContextual
+            }
+          }
+      }
+    }
+    if (!hasExternalParts) return Future.successful(null)
+    if (contextualOnly) {
+      return Future.successful(fetchContextualExternal(joinRequests, resolveJoinOps, startTime))
+    }
+
     val resultMap = new mutable.LinkedHashMap[Request, Try[mutable.HashMap[String, Any]]]
     var invalidCount = 0
     val validRequests = new ListBuffer[Request]
@@ -690,9 +728,8 @@ class Fetcher(val kvStore: KVStore,
     // step-1 handle invalid requests and collect valid ones
     joinRequests.foreach { request =>
       val joinName = request.name
-      val joinConfTry: Try[JoinOps] = metadataStore.getJoinConf(request.name)
+      val joinConfTry = resolveJoinOps(joinName)
       if (joinConfTry.isFailure) {
-        metadataStore.getJoinConf.refresh(request.name)
         resultMap.update(
           request,
           Failure(
@@ -714,16 +751,7 @@ class Fetcher(val kvStore: KVStore,
 
     // step-2 dedup external requests across joins
     val externalToJoinRequests: Seq[ExternalToJoinRequest] = validRequests.flatMap { joinRequest =>
-      val joinConf = metadataStore.getJoinConf(joinRequest.name)
-      if (joinConf.isFailure) {
-        metadataStore.getJoinConf.refresh(joinRequest.name)
-      }
-      val parts =
-        metadataStore
-          .getJoinConf(joinRequest.name)
-          .get
-          .join
-          .onlineExternalParts // cheap since it is cached, valid since step-1
+      val parts = resolveJoinOps(joinRequest.name).get.join.onlineExternalParts
 
       parts.iterator().asScala.map { part =>
         // Selected left-key derivation is currently scoped to internal GroupBy join parts. External parts retain the
@@ -798,6 +826,49 @@ class Fetcher(val kvStore: KVStore,
         Response(req, resultMap(req).map(_.mapValues(_.asInstanceOf[AnyRef]).toMap))
       }
     }
+  }
+
+  /** Contextual sources only project mapped request keys. Handle an all-contextual batch inline instead of building the
+    * external request fanout graph and scheduling it through [[ExternalSourceRegistry]].
+    */
+  private def fetchContextualExternal(joinRequests: Seq[Request],
+                                      resolveJoinOps: String => Try[JoinOps],
+                                      startTime: Long): Seq[Response] = {
+    val uniqueExternalRequests = mutable.HashSet.empty[Request]
+
+    val responses = joinRequests.map { joinRequest =>
+      val resultValues = mutable.HashMap.empty[String, AnyRef]
+      Option(resolveJoinOps(joinRequest.name).get.join.onlineExternalParts).foreach { parts =>
+        parts.iterator().asScala.foreach { part =>
+          val mappedKeys = part.applyMapping(joinRequest.keys)
+          uniqueExternalRequests.add(Request(part.source.metadata.name, mappedKeys))
+
+          val prefix = part.fullName + "_"
+          mappedKeys.foreach { case (name, value) => resultValues.update(prefix + name, value) }
+          Metrics
+            .Context(Metrics.Environment.JoinFetching, join = joinRequest.name, groupBy = part.fullName)
+            .count("response.value_count", mappedKeys.size)
+        }
+      }
+
+      Metrics
+        .Context(Metrics.Environment.JoinFetching, join = joinRequest.name)
+        .distribution("external.latency.millis", System.currentTimeMillis() - startTime)
+      Response(joinRequest, Success(resultValues.toMap))
+    }
+
+    val context = Metrics.Context(
+      environment = Metrics.Environment.JoinFetching,
+      join = joinRequests.iterator.map(_.name.sanitize).toSeq.distinct.mkString(",")
+    )
+    context.distribution("response.external_pre_processing.latency", System.currentTimeMillis() - startTime)
+    context.count("response.external_invalid_joins.count", 0)
+
+    val externalContext = context.copy(groupBy = s"${Constants.ExternalPrefix}_${Constants.ContextualSourceName}")
+    externalContext.distribution("response.latency", System.currentTimeMillis() - startTime)
+    externalContext.count("response.failures", 0)
+    externalContext.count("response.successes", uniqueExternalRequests.size)
+    responses
   }
 
   def fetchJoinSchema(joinName: String): Try[JoinSchemaResponse] = {

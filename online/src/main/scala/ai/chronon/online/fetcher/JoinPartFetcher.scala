@@ -59,19 +59,26 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
                  joinConf: Option[Join] = None,
                  joinCodecForName: String => Option[Try[JoinCodec]] = _ => None): Future[Seq[Response]] = {
     val startTimeMs = System.currentTimeMillis()
+    val overrideJoinOps = joinConf.map { join =>
+      logger.debug(s"Using passed in join configuration: ${join.metaData.getName}")
+      Success(JoinOps(join))
+    }
+    val joinOpsByName = mutable.HashMap.empty[String, Try[JoinOps]]
+
     // convert join requests to groupBy requests
     val joinDecomposed: Seq[(Request, Try[Seq[Either[PrefixedRequest, KeyMissingException]]])] =
       requests.map { request =>
         // use passed-in join or fetch one
-        val joinTry: Try[JoinOps] = if (joinConf.isEmpty) {
-          val joinConfTry = metadataStore.getJoinConf(request.name)
-          if (joinConfTry.isFailure) {
-            metadataStore.getJoinConf.refresh(request.name)
-          }
-          joinConfTry
-        } else {
-          logger.debug(s"Using passed in join configuration: ${joinConf.get.metaData.getName}")
-          Success(JoinOps(joinConf.get))
+        val joinTry: Try[JoinOps] = overrideJoinOps.getOrElse {
+          joinOpsByName.getOrElseUpdate(
+            request.name, {
+              val joinConfTry = metadataStore.getJoinConf(request.name)
+              if (joinConfTry.isFailure) {
+                metadataStore.getJoinConf.refresh(request.name)
+              }
+              joinConfTry
+            }
+          )
         }
 
         var joinContext: Option[metrics.Metrics.Context] = None

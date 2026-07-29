@@ -16,10 +16,12 @@
 
 package ai.chronon.online.test
 
+import ai.chronon.api.Extensions.JoinOps
 import ai.chronon.api.{Accuracy, Builders}
 import ai.chronon.online.fetcher.Fetcher.{Request, Response}
 import ai.chronon.online.fetcher.{FetchContext, JoinPartFetcher, MetadataStore}
 import ai.chronon.online.KVStore
+import ai.chronon.online.metrics.TTLCache
 import org.mockito.{Answers, Mockito}
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.any
@@ -35,7 +37,7 @@ import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
-import scala.util.Success
+import scala.util.{Success, Try}
 
 /** Tests that fetchJoins deduplicates GroupBy requests with identical (name, keys) across a bulk batch,
   * avoiding redundant KV lookups for contextual (e.g. user-level) GroupBys shared across all product rows.
@@ -115,6 +117,24 @@ class JoinPartFetcherDeduplicationTest
     val captor = ArgumentCaptor.forClass(classOf[Seq[_]])
     verify(joinPartFetcher, times(1)).fetchGroupBys(captor.capture().asInstanceOf[Seq[Request]])
     captor.getValue.asInstanceOf[Seq[Request]].length shouldBe 6
+  }
+
+  it should "resolve one join configuration per name for a request batch" in {
+    stubFetchGroupBys()
+    val joinConfCache = mock[TTLCache[String, Try[JoinOps]]]
+    when(joinConfCache.apply(testJoin.metaData.name)).thenReturn(Success(new JoinOps(testJoin)))
+    doReturn(joinConfCache).when(metadataStore).getJoinConf
+    val joinRequests = (1 to 5).map { i =>
+      Request(
+        testJoin.metaData.name,
+        Map("user_id" -> "u42".asInstanceOf[AnyRef], "product_id" -> s"p$i".asInstanceOf[AnyRef])
+      )
+    }
+
+    val responses = Await.result(joinPartFetcher.fetchJoins(joinRequests), 1.second)
+
+    responses should have size 5
+    verify(joinConfCache, times(1)).apply(testJoin.metaData.name)
   }
 
   it should "dedup contextual GroupBy requests when user_id is repeated across bulk product rows" in {
