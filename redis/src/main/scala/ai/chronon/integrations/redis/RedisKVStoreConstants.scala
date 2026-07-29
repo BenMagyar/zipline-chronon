@@ -26,6 +26,7 @@ object RedisKVStoreConstants {
 
   // Environment variable keys for Redis Cluster
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
+  val EnvRedisUseSsl = "REDIS_USE_SSL"
   val EnvRedisPassword = "REDIS_PASSWORD"
   val EnvRedisKeyPrefix = "REDIS_KEY_PREFIX"
   val EnvRedisMaxConnections = "REDIS_MAX_CONNECTIONS"

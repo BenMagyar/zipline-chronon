@@ -1,5 +1,6 @@
 package ai.chronon.integrations.aws
 
+import ai.chronon.integrations.redis.RedisKVStoreFactory
 import ai.chronon.online._
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
@@ -10,13 +11,25 @@ import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient
 import java.net.URI
 import java.time.Duration
 import java.util
+import java.util.concurrent.atomic.AtomicReference
 
-/** Implementation of Chronon's API interface for AWS. This is a work in progress and currently just covers the
-  * DynamoDB based KV store implementation.
+/** Implementation of Chronon's API interface for AWS.
+  *
+  * Supports multiple KV store backends based on configuration:
+  *   - DynamoDB (default): Set KV_STORE_TYPE=dynamodb (or omit)
+  *   - Redis: Set KV_STORE_TYPE=redis
+  *
+  * Redis Configuration:
+  *   - REDIS_CLUSTER_NODES: Comma-separated cluster nodes (e.g., "node1:6379,node2:6379") [required]
+  *   - REDIS_PASSWORD: Redis password (optional)
+  *   - See RedisKVStoreFactory for additional configuration options.
   */
 class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
 
   import AwsApiImpl._
+
+  @transient private lazy val sharedKvStore = new AtomicReference[KVStore]()
+  @transient private lazy val kvStoreLock = new Object()
 
   // For now similar to GcpApiImpl, we have a flag store that relies on some hardcoded values.
   // SAM lambda for FlagStore fails deserialization under Java 17 (LambdaMetafactory rejects
@@ -102,7 +115,32 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
 
   }
 
-  override def genKvStore: KVStore = new DynamoDBKVStoreImpl(ddbClient, conf)
+  override def genKvStore: KVStore = {
+    Option(sharedKvStore.get()) match {
+      case Some(store) => store
+      case None =>
+        kvStoreLock.synchronized {
+          Option(sharedKvStore.get()) match {
+            case Some(store) => store
+            case None =>
+              val kvStoreType = getOptional("KV_STORE_TYPE", conf).getOrElse("dynamodb")
+              val newStore = kvStoreType.toLowerCase match {
+                case "redis" =>
+                  logger.info("Initializing Redis KV store")
+                  RedisKVStoreFactory.create(conf)
+                case "dynamodb" =>
+                  logger.info("Initializing DynamoDB KV store")
+                  new DynamoDBKVStoreImpl(ddbClient, conf)
+                case other =>
+                  throw new IllegalArgumentException(
+                    s"Unsupported KV store type: $other. Supported types: dynamodb, redis")
+              }
+              sharedKvStore.set(newStore)
+              newStore
+          }
+        }
+    }
+  }
 
   /** The stream decoder method in the AwsApi is currently unimplemented. This needs to be implemented before
     * we can spin up the Aws streaming Chronon stack
