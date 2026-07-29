@@ -40,6 +40,8 @@ trait KinesisConnectorModule extends Cross.Module[String] with build.BaseModule 
   ) ++ Seq(
     mvn"io.netty:netty-codec-http2:${build.Constants.nettyVersion}",
     mvn"io.netty:netty-codec-http:${build.Constants.nettyVersion}",
+    // GHSA-xx22-p4ch-683r: pulled in transitively via schema-registry-serde; force the patched release.
+    mvn"at.yawk.lz4:lz4-java:1.11.1",
   ).map(_.forceVersion())
 
   object test extends build.BaseTestModule {
