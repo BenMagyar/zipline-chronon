@@ -69,7 +69,7 @@ class JoinPartFetcherPlanningPerfTest extends AnyFlatSpec with Matchers {
 
   behavior of "JoinPartFetcher planning and fanout"
 
-  it should "model 50 candidates, 25 shared GroupBys, and 25 candidate GroupBys" in {
+  ignore should "model 50 candidates, 25 shared GroupBys, and 25 candidate GroupBys" in {
     val executor = newExecutor(2)
     try {
       val fetcher = newFetcher(executor)

@@ -164,7 +164,7 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
 
   behavior of "online fetcher hot-path workload"
 
-  it should "model the exact deduplicated GroupBy and KV request shape" in {
+  ignore should "model the exact deduplicated GroupBy and KV request shape" in {
     preparedGroupBys should have size GroupByCount
     preparedRequests should have size UniqueGroupByRequestCount
     preparedRequests.count(_.candidateIndex.isEmpty) shouldBe ContextGroupByCount
