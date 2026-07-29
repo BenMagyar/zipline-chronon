@@ -10,7 +10,7 @@ import ai.chronon.planner._
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.batch.iceberg.IcebergPartitionStatsExtractor
 import ai.chronon.spark.batch.{StagingQuery => StagingQueryUtil}
-import ai.chronon.spark.catalog.{Format, TableUtils}
+import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.join.UnionJoin
 import ai.chronon.spark.submission.{NodeConfReader, SparkSessionBuilder}
 import ai.chronon.spark.utils.SemanticUtils
@@ -126,26 +126,24 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
 
     // A partitioned input is ready after its last partition covers the required range.
     if (hasPartitionColumn) {
-      val readinessCoverage = BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils)
-      val coverageApplies =
-        BatchNodeRunner.readinessCoverageApplies(tableName, tableInfo, tableUtils, readinessCoverage)
+      val readinessCoverage = BatchNodeRunner
+        .timePartitionedReadinessCoverage(tableUtils)
+        .filter(_ => BatchNodeRunner.readinessCoverageApplies(tableName, tableInfo, tableUtils))
       @tailrec
       def retry(attempt: Long): Try[Unit] = {
         Try {
-          val (observedWatermark, requiredWatermark, appliedCoverage) =
-            if (coverageApplies)
+          val (observedWatermark, requiredWatermark) = readinessCoverage match {
+            case Some(coverage) =>
               (tableUtils.maxTimestampMillis(tableName, tableInfo.partitionColumn),
-               BatchNodeRunner.requiredWatermarkMillis(requiredRange, readinessCoverage),
-               readinessCoverage)
-            else
-              (tableUtils.dataWatermarkMillis(tableName, Some(requiredRange.partitionSpec)),
-               requiredRange.endMillis,
-               0.0)
+               BatchNodeRunner.requiredWatermarkMillis(requiredRange, coverage))
+            case None =>
+              (tableUtils.dataWatermarkMillis(tableName, Some(requiredRange.partitionSpec)), requiredRange.endMillis)
+          }
           val watermark = observedWatermark
             .getOrElse(throw new RuntimeException(s"Could not determine data watermark for ${tableName}"))
           logger.info(
             s"Data watermark: ${TsUtils.toStr(watermark)}, required watermark: ${TsUtils.toStr(requiredWatermark)}, " +
-              s"readiness coverage: $appliedCoverage")
+              s"readiness coverage: ${readinessCoverage.map(_.toString).getOrElse("legacy")}")
 
           if (watermark >= requiredWatermark) {
             logger.info(s"Sensor succeeded for $tableName")
@@ -646,7 +644,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
       range: PartitionRange,
       tableUtils: TableUtils
   ): Iterable[TablePartitionStatus] = {
-    val readinessCoverage = BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils)
+    val configuredReadinessCoverage = BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils)
     val inputTableDependencies: Map[String, Array[TableDependency]] =
       Option(metadata.executionInfo.getTableDependencies)
         .map(_.asScala.toArray)
@@ -666,16 +664,18 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
         } else {
           val tableInfo = deps.head.tableInfo
           val inputPartitionSpec = tableInfo.partitionSpec(tableUtils.partitionSpec)
-          val coverageApplies =
-            BatchNodeRunner.readinessCoverageApplies(table, tableInfo, tableUtils, readinessCoverage)
-          val (watermark, requiredEndMillis) =
-            if (coverageApplies)
+          val readinessCoverage = configuredReadinessCoverage
+            .filter(_ => BatchNodeRunner.readinessCoverageApplies(table, tableInfo, tableUtils))
+          val (watermark, requiredEndMillis) = readinessCoverage match {
+            case Some(coverage) =>
               (tableUtils
                  .maxTimestampMillis(table, tableInfo.partitionColumn)
-                 .map(maximum => Format.readinessPartition(maximum, inputPartitionSpec) -> maximum),
-               requiredRanges.map(BatchNodeRunner.requiredWatermarkMillis(_, readinessCoverage)).max)
-            else
+                 .map(maximum =>
+                   BatchNodeRunner.coverageWatermarkPartition(maximum, inputPartitionSpec, coverage) -> maximum),
+               requiredRanges.map(BatchNodeRunner.requiredWatermarkMillis(_, coverage)).max)
+            case None =>
               (tableUtils.dataWatermark(table, Some(inputPartitionSpec)), requiredRanges.map(_.endMillis).max)
+          }
 
           val firstPartition =
             tableUtils.firstAvailablePartition(table, partitionSpec = inputPartitionSpec)
@@ -817,36 +817,34 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
 
 object BatchNodeRunner {
 
-  val TimePartitionedReadinessCoverageConf = "spark.chronon.time_partitioned.readiness_coverage"
-  val DefaultTimePartitionedReadinessCoverage = 0.0
+  val TimePartitionedReadinessCoverageConf = "spark.chronon.experimental.time_partitioned.readiness_coverage"
 
-  private[batch] def timePartitionedReadinessCoverage(tableUtils: TableUtils): Double = {
-    val raw = tableUtils.sparkSession.conf.get(
-      TimePartitionedReadinessCoverageConf,
-      DefaultTimePartitionedReadinessCoverage.toString
-    )
-    Try(raw.toDouble)
-      .filter(value => !value.isNaN && !value.isInfinite && value >= 0.0 && value <= 1.0)
-      .getOrElse(throw new IllegalArgumentException(
-        s"$TimePartitionedReadinessCoverageConf must be a number from 0.0 through 1.0, got '$raw'"))
-  }
+  private[batch] def timePartitionedReadinessCoverage(tableUtils: TableUtils): Option[Double] =
+    tableUtils.sparkSession.conf.getOption(TimePartitionedReadinessCoverageConf).map { raw =>
+      Try(raw.toDouble)
+        .filter(value => !value.isNaN && !value.isInfinite && value >= 0.0 && value <= 1.0)
+        .getOrElse(throw new IllegalArgumentException(
+          s"$TimePartitionedReadinessCoverageConf must be a number from 0.0 through 1.0, got '$raw'"))
+    }
+
+  private[batch] def coverageOffsetMillis(partitionSpec: PartitionSpec, coverage: Double): Long =
+    (BigDecimal(partitionSpec.spanMillis) * BigDecimal(coverage.toString))
+      .setScale(0, BigDecimal.RoundingMode.CEILING)
+      .toLong
 
   private[batch] def requiredWatermarkMillis(requiredRange: PartitionRange, coverage: Double): Long = {
     val partitionStartMillis = requiredRange.partitionSpec.partitionStartMillis(requiredRange.end)
-    val coveredMillis =
-      (BigDecimal(requiredRange.partitionSpec.spanMillis) * BigDecimal(coverage.toString))
-        .setScale(0, BigDecimal.RoundingMode.CEILING)
-        .toLong
-    partitionStartMillis + coveredMillis
+    partitionStartMillis + coverageOffsetMillis(requiredRange.partitionSpec, coverage)
   }
+
+  private[batch] def coverageWatermarkPartition(maximum: Long, partitionSpec: PartitionSpec, coverage: Double): String =
+    partitionSpec.at(maximum - coverageOffsetMillis(partitionSpec, coverage))
 
   private[batch] def readinessCoverageApplies(tableName: String,
                                               tableInfo: TableInfo,
-                                              tableUtils: TableUtils,
-                                              coverage: Double): Boolean =
-    coverage > 0.0 &&
-      ((tableInfo.isSetTimePartitioned && tableInfo.timePartitioned) ||
-        tableUtils.partitionColumnType(tableName, tableInfo.partitionColumn) != StringType)
+                                              tableUtils: TableUtils): Boolean =
+    (tableInfo.isSetTimePartitioned && tableInfo.timePartitioned) ||
+      tableUtils.partitionColumnType(tableName, tableInfo.partitionColumn) != StringType
 
   def main(args: Array[String]): Unit = {
     val batchArgs = new BatchNodeRunnerArgs(args)

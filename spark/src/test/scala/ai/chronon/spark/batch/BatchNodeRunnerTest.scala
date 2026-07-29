@@ -265,9 +265,7 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
   }
 
   override def beforeEach(): Unit = {
-    spark.conf.set(
-      BatchNodeRunner.TimePartitionedReadinessCoverageConf,
-      BatchNodeRunner.DefaultTimePartitionedReadinessCoverage.toString)
+    spark.conf.unset(BatchNodeRunner.TimePartitionedReadinessCoverageConf)
 
     // Drop all test tables to ensure fresh start
     spark.sql("DROP TABLE IF EXISTS test_db.input_table")
@@ -1652,17 +1650,38 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     }
   }
 
+  it should "treat configured zero coverage as inclusive at the partition start" in {
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0")
+    BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe Some(0.0)
+    createCoverageWatermark("2024-01-01 05:59:59.999")
+
+    val dep = TableDependencies.fromTable("test_db.coverage_watermark", subDailyQuery("created_at"))
+    val runner = defaultRunner()
+    val sixOClockFire = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
+
+    runner.checkPartitions(sensorFor(dep), sixOClockFire).isFailure shouldBe true
+
+    spark.sql(
+      "INSERT INTO test_db.coverage_watermark VALUES (2, TIMESTAMP '2024-01-01 06:00:00')")
+    runner.checkPartitions(sensorFor(dep), sixOClockFire).isSuccess shouldBe true
+  }
+
   it should "require the configured fraction of the final dependency partition" in {
-    BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe 0.0
+    BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe None
     spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "1.1")
     intercept[IllegalArgumentException](BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils))
     spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0.8")
+    BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe Some(0.8)
     createCoverageWatermark("2024-01-01 08:23:59.999")
 
     // Deliberately omit timePartitioned: runtime column-type detection must still apply the knob.
     val dep = TableDependencies.fromTable("test_db.coverage_watermark", subDailyQuery("created_at"))
     val runner = defaultRunner()
     val sixOClockFire = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
+    val partitionEndMillis = threeHourSpec.partitionEndMillis("2024-01-01-06-00")
+    BatchNodeRunner.requiredWatermarkMillis(sixOClockFire, 1.0) shouldBe partitionEndMillis
+    BatchNodeRunner.coverageWatermarkPartition(partitionEndMillis, threeHourSpec, 1.0) shouldBe
+      "2024-01-01-06-00"
 
     runner.checkPartitions(sensorFor(dep), sixOClockFire).isFailure shouldBe true
 
@@ -1704,6 +1723,17 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     spark.sql(
       "INSERT INTO test_db.coverage_watermark VALUES (2, TIMESTAMP '2024-01-01 08:24:00')")
     runner.computeInputTablePartitionStatuses(metadata, range, tableUtils).toSeq.head.ready shouldBe true
+
+    spark.sql("DROP TABLE test_db.coverage_watermark")
+    createCoverageWatermark("2024-01-01 06:00:00")
+    spark.conf.unset(BatchNodeRunner.TimePartitionedReadinessCoverageConf)
+    runner.computeInputTablePartitionStatuses(metadata, range, tableUtils).toSeq.head.ready shouldBe false
+
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0")
+    val inclusiveStart = runner.computeInputTablePartitionStatuses(metadata, range, tableUtils).toSeq.head
+    inclusiveStart.ready shouldBe true
+    inclusiveStart.requiredEndMillis shouldBe threeHourSpec.partitionStartMillis("2024-01-01-06-00")
+    inclusiveStart.lastAvailablePartition shouldBe Some("2024-01-01-06-00")
 
     val physicalMetadata = createTestMetadata("test_db.input_table", "test_db.output_table")
     val physicalRange = PartitionRange(yesterday, yesterday)(tableUtils.partitionSpec)
