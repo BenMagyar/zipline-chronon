@@ -1,7 +1,7 @@
 package ai.chronon.online
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.codegen.CodeGenerator
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodeGenerator, GeneratedClass}
 import org.apache.spark.sql.catalyst.expressions.{
   Attribute,
   AttributeSet,
@@ -27,12 +27,90 @@ import org.apache.spark.sql.execution.{
 import org.apache.spark.sql.internal.SQLConf
 import org.slf4j.LoggerFactory
 
+import java.io.{
+  ByteArrayInputStream,
+  ByteArrayOutputStream,
+  InputStream,
+  ObjectInputStream,
+  ObjectOutputStream,
+  ObjectStreamClass
+}
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
 
 object CatalystTransformBuilder {
 
   @transient private lazy val logger = LoggerFactory.getLogger(this.getClass)
+
+  type Transform = InternalRow => Seq[InternalRow]
+
+  /** A Transform is not thread safe - generated iterators, projections and predicates all carry mutable row
+    * buffers. A TransformFactory is: plan traversal, java source generation and compilation happen once when
+    * the factory is built, and each invocation only allocates the mutable per-instance state.
+    */
+  type TransformFactory = () => Transform
+
+  private class ClassLoaderObjectInputStream(in: InputStream, loader: ClassLoader) extends ObjectInputStream(in) {
+    override def resolveClass(desc: ObjectStreamClass): Class[_] =
+      try Class.forName(desc.getName, false, loader)
+      catch { case _: ClassNotFoundException => super.resolveClass(desc) }
+  }
+
+  /** Both codegen paths end the same way: a compiled GeneratedClass plus a references array mints instances.
+    * The class is shareable, the references are not - objects codegen puts in there are not required to be
+    * thread safe (LegacySimpleTimestampFormatter wraps a SimpleDateFormat). Spark gets away with sharing
+    * because every task deserializes its own copy of the plan closure, so each instance here does the same.
+    * `rebuild` covers the case where references cannot be serialized.
+    */
+  private def generatedInstances[T](clazz: GeneratedClass, references: Array[Any], rebuild: () => T): () => T =
+    if (references.isEmpty) { () =>
+      clazz.generate(references).asInstanceOf[T] // nothing shared, nothing to race on
+    } else {
+      Try {
+        val bytes = new ByteArrayOutputStream()
+        val out = new ObjectOutputStream(bytes)
+        out.writeObject(references)
+        out.close()
+        val serialized = bytes.toByteArray
+        val loader = Option(Thread.currentThread().getContextClassLoader).getOrElse(getClass.getClassLoader)
+
+        def copyReferences(): Array[Any] = {
+          val in = new ClassLoaderObjectInputStream(new ByteArrayInputStream(serialized), loader)
+          try in.readObject().asInstanceOf[Array[Any]]
+          finally in.close()
+        }
+
+        copyReferences() // fail here rather than at request time
+        () => clazz.generate(copyReferences()).asInstanceOf[T]
+      }.getOrElse {
+        logger.warn(
+          "References are not serializable, rebuilding this stage per instance: " +
+            references.map(r => if (r == null) "null" else r.getClass.getName).mkString(", "))
+        rebuild
+      }
+    }
+
+  /** Copies field by field into a fresh row so a downstream stage cannot observe the generated code
+    * reusing its output buffer for the next row.
+    */
+  private def copyRow(row: InternalRow, output: Seq[Attribute]): InternalRow = {
+    val safeRow = new GenericInternalRow(output.size)
+    output.indices.foreach { i =>
+      try safeRow.update(i, row.get(i, output(i).dataType))
+      catch {
+        case e: Exception => logger.error(s"Error copying field ${output(i).name}: ${e.getMessage}")
+      }
+    }
+    safeRow
+  }
+
+  private def chain(childFactory: TransformFactory, stageFactory: TransformFactory): TransformFactory =
+    () => {
+      val childTransformer = childFactory()
+      val stageTransformer = stageFactory()
+      row => childTransformer(row).flatMap(stageTransformer)
+    }
 
   private class IteratorWrapper[T] extends Iterator[T] {
     def put(elem: T): Unit = elemArr.enqueue(elem)
@@ -44,9 +122,9 @@ object CatalystTransformBuilder {
     private val elemArr: mutable.Queue[T] = mutable.Queue.empty[T]
   }
 
-  /** Recursively builds a chain of transformation functions from a SparkPlan
+  /** Recursively builds a factory of transformation chains from a SparkPlan
     */
-  def buildTransformChain(plan: org.apache.spark.sql.execution.SparkPlan): InternalRow => Seq[InternalRow] = {
+  def buildTransformFactory(plan: org.apache.spark.sql.execution.SparkPlan): TransformFactory = {
     logger.info(s"Building transform chain for plan: ${plan.getClass.getSimpleName}")
 
     // Helper function to inspect plan structures
@@ -78,17 +156,17 @@ object CatalystTransformBuilder {
 
           // Process the child plan, which will handle the InputAdapter recursively
           // This is the critical step that implements proper cascading codegen
-          val childTransformer = buildTransformChain(whc.child)
+          val childFactory = buildTransformFactory(whc.child)
 
           // Return the child transformer directly - the cascading will happen
           // through the InputAdapter case which will process the next stage
-          childTransformer
+          childFactory
         } else {
           // If no InputAdapter is found, this is a single WholeStageCodegenExec
           // that we can process with the extracted code
           try {
             logger.info("Processing WholeStageCodegenExec as a single stage")
-            extractCodegenStageTransformer(whc)
+            codegenStageFactory(whc)
           } catch {
             case e: Exception =>
               // If codegen fails, fall back to processing the child plans without codegen
@@ -96,7 +174,7 @@ object CatalystTransformBuilder {
               logger.info("Building transform chain for child plan instead")
 
               // Recursively build a transform chain from the child plans
-              buildTransformChain(whc.child)
+              buildTransformFactory(whc.child)
           }
         }
 
@@ -107,56 +185,28 @@ object CatalystTransformBuilder {
           // Special handling for direct RDD scans - no need to process through child
           case _: RDDScanExec | _: LocalTableScanExec =>
             // When the child is a simple scan, we can directly apply the projection
-            extractProjectTransformer(project)
+            projectFactory(project)
 
           // Special handling when child is InputAdapter
-          case inputAdapter: InputAdapter =>
+          case _: InputAdapter =>
             logger.info("ProjectExec has an InputAdapter child - using special handling")
 
-            // Get the child transformer
-            val childTransformer = buildTransformChain(project.child)
-            val proj = UnsafeProjection.create(project.projectList, project.child.output)
-            // Apply the project to each generated row independently
-            row => {
-              // Get rows from the generate transformer
-              val childRows = childTransformer(row)
+            val childFactory = buildTransformFactory(project.child)
+            val projectionFactory =
+              generatedInstanceFactory(() => UnsafeProjection.create(project.projectList, project.child.output))
 
-              // Apply the projection to each row individually with memory isolation
-              val safeRows = childRows.zipWithIndex.map { case (childRow, idx) =>
-                // Create a specialized projection for each row
-
-                val projected = proj(childRow)
-
-                // Create a deep copy of the projected row
-                val safeRow = new GenericInternalRow(project.output.size)
-                for (i <- project.output.indices) {
-                  try {
-                    val dataType = project.output(i).dataType
-                    val value = projected.get(i, dataType)
-                    safeRow.update(i, value)
-                  } catch {
-                    case e: Exception =>
-                      logger.error(s"Error copying field ${project.output(i).name}: ${e.getMessage}")
-                  }
-                }
-
-                safeRow
-              }
-
-              safeRows
+            () => {
+              val childTransformer = childFactory()
+              val proj = projectionFactory()
+              // project each generated row independently, copying it out of the projection's reused buffer
+              row => childTransformer(row).map(childRow => copyRow(proj(childRow), project.output))
             }
 
           // Special handling for WholeStageCodegenExec child - we need to be careful about schema alignment
           case whc: WholeStageCodegenExec =>
             try {
               // Try to use both the WholeStageCodegenExec and then the projection
-              val codegenTransformer = buildTransformChain(whc)
-              val projectTransformer = extractProjectTransformer(project)
-
-              row => {
-                val intermediateRows = codegenTransformer(row)
-                intermediateRows.flatMap(projectTransformer)
-              }
+              chain(buildTransformFactory(whc), projectFactory(project))
             } catch {
               case e: Exception =>
                 logger.error(s"Error processing ProjectExec with WholeStageCodegenExec child: ", e)
@@ -165,23 +215,14 @@ object CatalystTransformBuilder {
 
           case _ =>
             // For complex children, we need to chain the transformations
-            val childTransformer = buildTransformChain(project.child)
-            val projectTransformer = extractProjectTransformer(project)
-
-            row => {
-              val intermediateRows = childTransformer(row)
-              intermediateRows.flatMap(projectTransformer)
-            }
+            chain(buildTransformFactory(project.child), projectFactory(project))
         }
 
       case filter: FilterExec =>
         logger.info(s"Processing FilterExec with condition: ${filter.condition}")
 
         // For a filter, first process the child and then apply filter
-        val childTransformer = buildTransformChain(filter.child)
-        val filterTransformer = extractFilterTransformer(filter)
-
-        row => childTransformer(row).flatMap(filterTransformer)
+        chain(buildTransformFactory(filter.child), predicateFactory(filter))
 
       case input: InputAdapter =>
         logger.info(
@@ -190,107 +231,49 @@ object CatalystTransformBuilder {
 
         // InputAdapter is a boundary between codegen regions
         // We need to recursively process its child, which might be another WholeStageCodegenExec
-        val childTransformer = buildTransformChain(input.child)
+        val childFactory = buildTransformFactory(input.child)
 
         // Special handling when the child is a GenerateExec
         if (input.child.isInstanceOf[GenerateExec]) {
           logger.info("InputAdapter has a GenerateExec child - using special handling to ensure row memory isolation")
 
-          // Return a function that carefully preserves the independence of rows
-          row => {
-            // Get rows from the child transformer
-            val childRows = childTransformer(row)
-
-            // Create deep copies of each row to ensure memory isolation
-            val safeRows = childRows.zipWithIndex.map { case (childRow, idx) =>
-              // Create a new row with copied values
-              val safeRow = new GenericInternalRow(input.output.size)
-
-              // Copy all fields from the child row
-              for (i <- input.output.indices) {
-                try {
-                  val dataType = input.output(i).dataType
-                  val value = childRow.get(i, dataType)
-                  safeRow.update(i, value)
-                } catch {
-                  case e: Exception =>
-                    logger.error(s"Error copying field ${input.output(i).name}: ${e.getMessage}")
-                }
-              }
-
-              safeRow
-            }
-
-            safeRows
+          () => {
+            val childTransformer = childFactory()
+            row => childTransformer(row).map(copyRow(_, input.output))
           }
         } else {
           // Standard handling for other cases
-          row =>
-            {
-              val childRows = childTransformer(row)
-              childRows
-            }
+          childFactory
         }
 
       case ltse: LocalTableScanExec =>
         logger.info(s"Processing LocalTableScanExec with schema: ${ltse.schema}")
 
         // Input row is unused for LocalTableScanExec
-        _ => ArrayBuffer(ltse.executeCollect(): _*).toSeq
+        () => _ => ArrayBuffer(ltse.executeCollect(): _*).toSeq
 
       case rddse: RDDScanExec =>
         logger.info(s"Processing RDDScanExec with schema: ${rddse.schema}")
 
-        val unsafeProjection = UnsafeProjection.create(rddse.schema)
-        row => Seq(unsafeProjection.apply(row))
+        val scanProjectionFactory = generatedInstanceFactory(() => UnsafeProjection.create(rddse.schema))
+
+        () => {
+          val unsafeProjection = scanProjectionFactory()
+          row => Seq(unsafeProjection.apply(row))
+        }
 
       case generateExec: GenerateExec =>
         logger.info(s"Processing GenerateExec with generator: ${generateExec.generator}")
-        // Get transformer for the child plan
-        val childTransformer = buildTransformChain(generateExec.child)
 
-        // Get transformer for the generate operation
-        val generateTransformer = extractGenerateTransformer(generateExec)
+        val childFactory = buildTransformFactory(generateExec.child)
+        val genFactory = generateFactory(generateExec)
         val generateOutput = generateExec.output
-        // Chain them together
-        row => {
-          val intermediateRows = childTransformer(row)
 
-          val results = intermediateRows.flatMap { ir =>
-            // Get the generated rows
-            val genRows = generateTransformer(ir)
-
-            // Create deep copies of each row to prevent memory reuse
-            val safeRows = genRows.zipWithIndex.map { case (genRow, idx) =>
-              // Create a new row with copied values
-              val safeRow = new GenericInternalRow(generateOutput.size)
-
-              // Copy all fields from the generator row
-              for (i <- generateOutput.indices) {
-                try {
-                  val dataType = generateOutput(i).dataType
-                  val value = genRow.get(i, dataType)
-                  safeRow.update(i, value)
-                } catch {
-                  case e: Exception =>
-                    logger.error(s"Error copying field ${generateOutput(i).name}: ${e.getMessage}")
-                }
-              }
-
-              // Create an UnsafeRow copy to ensure memory isolation
-              val finalRow = new GenericInternalRow(safeRow.numFields)
-              for (i <- 0 until safeRow.numFields) {
-                val dataType = generateOutput(i).dataType
-                val value = safeRow.get(i, dataType)
-                finalRow.update(i, value)
-              }
-
-              finalRow
-            }
-
-            safeRows
-          }
-          results
+        () => {
+          val childTransformer = childFactory()
+          val generateTransformer = genFactory()
+          // the generator reuses its row objects across calls, so each generated row is copied out
+          row => childTransformer(row).flatMap(generateTransformer(_).map(copyRow(_, generateOutput)))
         }
 
       case unsupported =>
@@ -301,9 +284,13 @@ object CatalystTransformBuilder {
 
   /** Extracts a transformation function from WholeStageCodegenExec
     * This method only handles the code generation part - the fallback to
-    * child plans is handled in buildTransformChain
+    * child plans is handled in buildTransformFactory
+    *
+    * Source generation and janino compilation happen once here. Per instance we only pay `clazz.generate`,
+    * which mirrors what spark itself does across the tasks of a stage - the compiled class and the references
+    * array are shared, the BufferedRowIterator is not.
     */
-  private def extractCodegenStageTransformer(whc: WholeStageCodegenExec): InternalRow => Seq[InternalRow] = {
+  private def codegenStageFactory(whc: WholeStageCodegenExec): TransformFactory = {
     logger.info(s"Extracting codegen stage transformer for: ${whc}")
 
     // Generate and compile the code
@@ -316,80 +303,133 @@ object CatalystTransformBuilder {
     val (clazz, compilationTime) = CodeGenerator.compile(cleanedSource)
     logger.info(s"Compiled code in ${compilationTime}ms")
 
-    val references = ctx.references.toArray
-    val buffer = clazz.generate(references).asInstanceOf[BufferedRowIterator]
-    val iteratorWrapper: IteratorWrapper[InternalRow] = new IteratorWrapper[InternalRow]
-    buffer.init(0, Array(iteratorWrapper))
-
-    def codegenFunc(row: InternalRow): Seq[InternalRow] = {
-      iteratorWrapper.put(row)
-      val result = ArrayBuffer.empty[InternalRow]
-      while (buffer.hasNext) {
-        result.append(buffer.next())
+    val newBuffer = generatedInstances[BufferedRowIterator](
+      clazz,
+      ctx.references.toArray,
+      () => {
+        val (freshCtx, freshSource) = whc.doCodeGen()
+        CodeGenerator.compile(freshSource)._1.generate(freshCtx.references.toArray).asInstanceOf[BufferedRowIterator]
       }
-      result.toSeq
-    }
+    )
 
-    codegenFunc
+    () => {
+      val buffer = newBuffer()
+      val iteratorWrapper: IteratorWrapper[InternalRow] = new IteratorWrapper[InternalRow]
+      buffer.init(0, Array(iteratorWrapper))
+
+      def codegenFunc(row: InternalRow): Seq[InternalRow] = {
+        iteratorWrapper.put(row)
+        val result = ArrayBuffer.empty[InternalRow]
+        while (buffer.hasNext) {
+          result.append(buffer.next())
+        }
+        result.toSeq
+      }
+
+      codegenFunc
+    }
   }
 
-  private def extractProjectTransformer(project: ProjectExec): InternalRow => Seq[InternalRow] = {
+  /** Spark's generated projections and predicates are inner classes of a GeneratedClass whose public
+    * generate(references) mints a fresh instance - the same primitive whole stage codegen uses. Reusing it
+    * skips the java source generation that UnsafeProjection.create/Predicate.create would redo per instance
+    * (6ms vs 0.7us for a 30 expression projection). Falls back to rebuilding when the object is not codegen
+    * backed, which happens on spark's interpreted fallback path.
+    */
+  private def generatedInstanceFactory[T <: AnyRef](build: () => T): () => T = {
+    val prototype = build()
+
+    val cloner = Try {
+      def readField(name: String): Any = {
+        val field = prototype.getClass.getDeclaredField(name)
+        field.setAccessible(true)
+        field.get(prototype)
+      }
+
+      val outer = readField("this$0").asInstanceOf[GeneratedClass]
+      val references = readField("references").asInstanceOf[Array[Any]]
+      val factory = generatedInstances[T](outer, references, build)
+      require(factory().getClass == prototype.getClass, "clone produced a different class")
+
+      factory
+    }
+
+    cloner.getOrElse {
+      logger.info(s"${prototype.getClass.getName} is not codegen backed, rebuilding it per instance")
+      build
+    }
+  }
+
+  private def projectFactory(project: ProjectExec): TransformFactory = {
     // Use project.child.output as input schema instead of project.output
     // This ensures expressions like int32s#8 can be properly resolved
-    val unsafeProjection = UnsafeProjection.create(project.projectList, project.child.output)
+    val projectionFactory =
+      generatedInstanceFactory(() => UnsafeProjection.create(project.projectList, project.child.output))
 
-    row => Seq(unsafeProjection.apply(row))
-  }
-
-  private def extractFilterTransformer(filter: FilterExec): InternalRow => Seq[InternalRow] = {
-    val predicate = Predicate.create(filter.condition, filter.child.output)
-    predicate.initialize(0)
-    val func = { row: InternalRow =>
-      val passed = predicate.eval(row)
-      if (passed) Seq(row) else Seq.empty
+    () => {
+      val unsafeProjection = projectionFactory()
+      row => Seq(unsafeProjection.apply(row))
     }
-    func
   }
 
-  private def extractGenerateTransformer(generate: GenerateExec): InternalRow => Seq[InternalRow] = {
+  private def predicateFactory(filter: FilterExec): TransformFactory = {
+    val builtPredicateFactory = generatedInstanceFactory(() => Predicate.create(filter.condition, filter.child.output))
+
+    () => {
+      val predicate = builtPredicateFactory()
+      predicate.initialize(0)
+      val func = { row: InternalRow =>
+        val passed = predicate.eval(row)
+        if (passed) Seq(row) else Seq.empty
+      }
+      func
+    }
+  }
+
+  private def generateFactory(generate: GenerateExec): TransformFactory = {
     logger.info(s"Extracting transformer for GenerateExec with generator: ${generate.generator}")
 
-    // Create a bound generator
-    val boundGenerator = BindReferences
-      .bindReference(
-        generate.generator.asInstanceOf[Expression],
-        generate.child.output
-      )
-      .asInstanceOf[Generator]
-
-    // Initialize any nondeterministic expressions
-    boundGenerator match {
-      case n: Nondeterministic => n.initialize(0)
-      case _                   => // No initialization needed
-    }
-
-    // Create a null row for outer join case
-    val generatorNullRow = new GenericInternalRow(boundGenerator.elementSchema.length)
-
     val needsPruning = generate.child.outputSet != AttributeSet(generate.requiredChildOutput)
-    lazy val pruneChildForResult: InternalRow => InternalRow = if (needsPruning) {
-      UnsafeProjection.create(generate.requiredChildOutput, generate.child.output)
-    } else {
-      identity
-    }
 
-    // Return the transformer function
-    row => {
-      try {
-        if (generate.requiredChildOutput.nonEmpty) {
-          extractGenerateNonEmptyChildren(generate, boundGenerator, generatorNullRow, row, pruneChildForResult)
-        } else {
-          extractGenerateEmptyChildren(generate, boundGenerator, generatorNullRow, row)
+    // bound generators can be Nondeterministic - their rng state cannot be shared across instances. Binding
+    // is cheap, no codegen is involved.
+    () => {
+      // Create a bound generator
+      val boundGenerator = BindReferences
+        .bindReference(
+          generate.generator.asInstanceOf[Expression],
+          generate.child.output
+        )
+        .asInstanceOf[Generator]
+
+      // Initialize any nondeterministic expressions
+      boundGenerator match {
+        case n: Nondeterministic => n.initialize(0)
+        case _                   => // No initialization needed
+      }
+
+      // Create a null row for outer join case
+      val generatorNullRow = new GenericInternalRow(boundGenerator.elementSchema.length)
+
+      lazy val pruneChildForResult: InternalRow => InternalRow = if (needsPruning) {
+        UnsafeProjection.create(generate.requiredChildOutput, generate.child.output)
+      } else {
+        identity
+      }
+
+      // Return the transformer function
+      row => {
+        try {
+          if (generate.requiredChildOutput.nonEmpty) {
+            extractGenerateNonEmptyChildren(generate, boundGenerator, generatorNullRow, row, pruneChildForResult)
+          } else {
+            extractGenerateEmptyChildren(generate, boundGenerator, generatorNullRow, row)
+          }
+        } catch {
+          case e: Exception =>
+            logger.error(s"Error evaluating generator: ${e.getMessage}", e)
+            throw e
         }
-      } catch {
-        case e: Exception =>
-          logger.error(s"Error evaluating generator: ${e.getMessage}", e)
-          throw e
       }
     }
   }

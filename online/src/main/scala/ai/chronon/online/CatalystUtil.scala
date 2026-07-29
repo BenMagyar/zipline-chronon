@@ -17,7 +17,6 @@
 package ai.chronon.online
 
 import ai.chronon.api.{DataType, StructType}
-import ai.chronon.online.CatalystUtil.{PoolKey, poolMap}
 import ai.chronon.online.Extensions.StructTypeOps
 import ai.chronon.online.serde._
 import org.apache.spark.sql.catalyst.InternalRow
@@ -26,7 +25,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.{DataFrame, SparkSession, functions, types}
 import org.slf4j.LoggerFactory
 
-import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap}
+import java.util.concurrent.ConcurrentHashMap
 import java.util.function
 
 object CatalystUtil {
@@ -59,84 +58,149 @@ object CatalystUtil {
     spark
   }
 
-  case class PoolKey(expressions: Seq[(String, String)], inputSchema: StructType, setups: Seq[String])
-  val poolMap: PoolMap[PoolKey, CatalystUtil] = new PoolMap[PoolKey, CatalystUtil](pi =>
-    new CatalystUtil(pi.inputSchema, pi.expressions, setups = pi.setups))
-}
+  case class BlueprintKey(inputSchema: StructType,
+                          selects: Seq[(String, String)],
+                          wheres: Seq[String],
+                          setups: Seq[String],
+                          timestampMillisOutputColumns: Set[String])
 
-class PoolMap[Key, Value](createFunc: Key => Value, maxSize: Int = 100, initialSize: Int = 2) {
-  val map: ConcurrentHashMap[Key, ArrayBlockingQueue[Value]] = new ConcurrentHashMap[Key, ArrayBlockingQueue[Value]]()
-  def getPool(input: Key): ArrayBlockingQueue[Value] =
-    map.computeIfAbsent(
-      input,
-      new function.Function[Key, ArrayBlockingQueue[Value]] {
-        override def apply(t: Key): ArrayBlockingQueue[Value] = {
-          val result = new ArrayBlockingQueue[Value](maxSize)
-          var i = 0
-          while (i < initialSize) {
-            result.add(createFunc(t))
-            i += 1
-          }
-          result
+  // the memo holder keeps planning outside of computeIfAbsent - otherwise the map bin stays locked for the
+  // ~100ms to 1s that a cold plan takes, blocking unrelated keys that hash to the same bin
+  private class Memo[T](thunk: => T) { lazy val get: T = thunk }
+
+  private val blueprints: ConcurrentHashMap[BlueprintKey, Memo[CatalystUtilBlueprint]] =
+    new ConcurrentHashMap[BlueprintKey, Memo[CatalystUtilBlueprint]]()
+
+  /** Spark planning (parse -> analyze -> optimize -> physical plan -> java source generation) dominates the
+    * cost of constructing a CatalystUtil and depends only on the query and the input schema. Cache it so that
+    * every CatalystUtil for a given query after the first is close to free.
+    */
+  def blueprintOf(inputSchema: StructType,
+                  selects: Seq[(String, String)],
+                  wheres: Seq[String],
+                  setups: Seq[String],
+                  timestampMillisOutputColumns: Set[String]): CatalystUtilBlueprint =
+    blueprints
+      .computeIfAbsent(
+        BlueprintKey(inputSchema, selects, wheres, setups, timestampMillisOutputColumns),
+        new function.Function[BlueprintKey, Memo[CatalystUtilBlueprint]] {
+          override def apply(k: BlueprintKey): Memo[CatalystUtilBlueprint] =
+            new Memo(new CatalystUtilBlueprint(k))
         }
-      }
-    )
-
-  def performWithValue[Output](key: Key, pool: ArrayBlockingQueue[Value])(func: Value => Output): Output = {
-    var value = pool.poll()
-    if (value == null) {
-      value = createFunc(key)
-    }
-    try {
-      func(value)
-    } catch {
-      case e: Exception => throw e
-    } finally {
-      pool.offer(value)
-    }
-  }
+      )
+      .get
 }
 
+/** One CatalystUtil per thread. Instances are cheap now that the plan and the compiled class live on the
+  * blueprint, so a thread local beats a shared pool - it drops the single lock that every call used to
+  * serialize on. The tradeoff is that a thread which never ran this query before builds its own instance.
+  */
 class PooledCatalystUtil(expressions: Seq[(String, String)], inputSchema: StructType, setups: Seq[String] = Seq.empty) {
-  private val poolKey = PoolKey(expressions, inputSchema, setups)
-  private val cuPool = poolMap.getPool(poolKey)
-  def performSql(values: Map[String, Any]): Seq[Map[String, Any]] =
-    poolMap.performWithValue(poolKey, cuPool) { _.performSql(values) }
-  def outputChrononSchema: Array[(String, DataType)] =
-    poolMap.performWithValue(poolKey, cuPool) { _.outputChrononSchema }
+  private val blueprint = CatalystUtil.blueprintOf(inputSchema, expressions, Seq.empty, setups, Set.empty)
+  private val threadLocalUtil: ThreadLocal[CatalystUtil] = ThreadLocal.withInitial(() => blueprint.newInstance())
+
+  def performSql(values: Map[String, Any]): Seq[Map[String, Any]] = threadLocalUtil.get().performSql(values)
+  def outputChrononSchema: Array[(String, DataType)] = blueprint.outputChrononSchema
 }
 
-class CatalystUtil(inputSchema: StructType,
-                   selects: Seq[(String, String)],
-                   wheres: Seq[String] = Seq.empty,
-                   setups: Seq[String] = Seq.empty,
-                   timestampMillisOutputColumns: Set[String] = Set.empty) {
-
-  def this(inputSchema: StructType, selects: Seq[(String, String)], wheres: Seq[String], setups: Seq[String]) =
-    this(inputSchema, selects, wheres, setups, Set.empty)
+/** Everything about a (schema, query) pair that is immutable and therefore shareable across threads: the
+  * physical plan, the compiled whole stage class, the schemas and the row conversion functions. The only
+  * per-instance state is what `transformFactory()` allocates.
+  */
+class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
 
   @transient private lazy val logger = LoggerFactory.getLogger(this.getClass)
 
-  val selectClauses: Seq[String] = selects.map { case (name, expr) => s"$expr as $name" }
-  private val sessionTable =
-    s"q${math.abs(selectClauses.mkString(", ").hashCode)}_f${math.abs(inputSparkSchema.pretty.hashCode)}"
-  val whereClauseOpt: Option[String] = Option(wheres)
+  val selectClauses: Seq[String] = key.selects.map { case (name, expr) => s"$expr as $name" }
+
+  val whereClauseOpt: Option[String] = Option(key.wheres)
     .filter(_.nonEmpty)
     .map { w =>
       // wrap each clause in parens
       w.map(c => s"( $c )").mkString(" AND ")
     }
 
-  @transient lazy val inputSparkSchema: types.StructType = SparkConversions.fromChrononSchema(inputSchema)
-  private val inputEncoder = SparkInternalRowConversions.to(inputSparkSchema)
+  val inputSparkSchema: types.StructType = SparkConversions.fromChrononSchema(key.inputSchema)
+
+  private val sessionTable =
+    s"q${math.abs(selectClauses.mkString(", ").hashCode)}_f${math.abs(inputSparkSchema.pretty.hashCode)}"
+
+  val inputEncoder: Any => Any = SparkInternalRowConversions.to(inputSparkSchema)
   val inputArrEncoder: Any => Any = SparkInternalRowConversions.to(inputSparkSchema, false)
 
-  private val (transformFunc: (InternalRow => Seq[InternalRow]), outputSparkSchema: types.StructType) = initialize()
+  val (transformFactory: CatalystTransformBuilder.TransformFactory, outputSparkSchema: types.StructType) =
+    initialize()
 
-  private lazy val outputArrDecoder = SparkInternalRowConversions.from(outputSparkSchema, false)
-  @transient lazy val outputChrononSchema: Array[(String, DataType)] =
-    SparkConversions.toChrononSchema(outputSparkSchema)
-  private val outputDecoder = SparkInternalRowConversions.from(outputSparkSchema)
+  val outputDecoder: Any => Any = SparkInternalRowConversions.from(outputSparkSchema)
+  val outputArrDecoder: Any => Any = SparkInternalRowConversions.from(outputSparkSchema, false)
+  val outputChrononSchema: Array[(String, DataType)] = SparkConversions.toChrononSchema(outputSparkSchema)
+
+  def newInstance(): CatalystUtil = new CatalystUtil(this)
+
+  private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame =
+    df.schema.fields
+      .filter(field => key.timestampMillisOutputColumns.contains(field.name) && field.dataType == types.TimestampType)
+      .foldLeft(df) { case (currentDf, field) =>
+        val quotedColumn = s"`${field.name.replace("`", "``")}`"
+        currentDf.withColumn(field.name, functions.expr(s"unix_millis($quotedColumn)"))
+      }
+
+  private def initialize(): (CatalystTransformBuilder.TransformFactory, types.StructType) = {
+    val session = CatalystUtil.session
+
+    // run through and execute the setup statements
+    key.setups.foreach { statement =>
+      try {
+        session.sql(statement)
+        logger.info(s"Executed setup statement: $statement")
+      } catch {
+        case _: FunctionAlreadyExistsException =>
+        // ignore - this crops up in unit tests on occasion
+        case e: Exception =>
+          logger.warn(s"Failed to execute setup statement: $statement", e)
+          throw new RuntimeException(s"Error executing setup statement: $statement", e)
+      }
+    }
+
+    // create dummy df with sql query and schema
+    val emptyRowRdd = session.emptyDataFrame.rdd
+    val emptyDf = session.createDataFrame(emptyRowRdd, inputSparkSchema)
+    emptyDf.createOrReplaceTempView(sessionTable)
+    val projectedDf = session.sqlContext.table(sessionTable).selectExpr(selectClauses.toSeq: _*)
+    val normalizedDf = normalizeTimestampOutputs(projectedDf)
+    val df = whereClauseOpt.map(normalizedDf.where(_)).getOrElse(normalizedDf)
+
+    // extract transform function from the df spark plan
+    val execPlan = df.queryExecution.executedPlan
+    logger.info(s"Catalyst Execution Plan - ${execPlan}")
+
+    (CatalystTransformBuilder.buildTransformFactory(execPlan), df.schema)
+  }
+}
+
+class CatalystUtil(blueprint: CatalystUtilBlueprint) {
+
+  def this(inputSchema: StructType,
+           selects: Seq[(String, String)],
+           wheres: Seq[String] = Seq.empty,
+           setups: Seq[String] = Seq.empty,
+           timestampMillisOutputColumns: Set[String] = Set.empty) =
+    this(CatalystUtil.blueprintOf(inputSchema, selects, wheres, setups, timestampMillisOutputColumns))
+
+  val selectClauses: Seq[String] = blueprint.selectClauses
+  val whereClauseOpt: Option[String] = blueprint.whereClauseOpt
+  def inputSparkSchema: types.StructType = blueprint.inputSparkSchema
+
+  private val inputEncoder = blueprint.inputEncoder
+  val inputArrEncoder: Any => Any = blueprint.inputArrEncoder
+
+  // the only per-instance state - generated iterators and projections carry mutable row buffers
+  private val transformFunc: InternalRow => Seq[InternalRow] = blueprint.transformFactory()
+
+  private val outputSparkSchema: types.StructType = blueprint.outputSparkSchema
+  private val outputArrDecoder = blueprint.outputArrDecoder
+  private val outputDecoder = blueprint.outputDecoder
+  def outputChrononSchema: Array[(String, DataType)] = blueprint.outputChrononSchema
 
   def performSql(values: Array[Any]): Seq[Array[Any]] = {
     val internalRow = inputArrEncoder(values).asInstanceOf[InternalRow]
@@ -158,47 +222,5 @@ class CatalystUtil(inputSchema: StructType,
 
   def getOutputSparkSchema: types.StructType = outputSparkSchema
 
-  private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame =
-    df.schema.fields
-      .filter(field => timestampMillisOutputColumns.contains(field.name) && field.dataType == types.TimestampType)
-      .foldLeft(df) { case (currentDf, field) =>
-        val quotedColumn = s"`${field.name.replace("`", "``")}`"
-        currentDf.withColumn(field.name, functions.expr(s"unix_millis($quotedColumn)"))
-      }
-
-  private def initialize(): (InternalRow => Seq[InternalRow], types.StructType) = {
-    val session = CatalystUtil.session
-
-    // run through and execute the setup statements
-    setups.foreach { statement =>
-      try {
-        session.sql(statement)
-        logger.info(s"Executed setup statement: $statement")
-      } catch {
-        case _: FunctionAlreadyExistsException =>
-        // ignore - this crops up in unit tests on occasion
-        case e: Exception =>
-          logger.warn(s"Failed to execute setup statement: $statement", e)
-          throw new RuntimeException(s"Error executing setup statement: $statement", e)
-      }
-    }
-
-    // create dummy df with sql query and schema
-    val emptyRowRdd = session.emptyDataFrame.rdd
-    val inputSparkSchema = SparkConversions.fromChrononSchema(inputSchema)
-    val emptyDf = session.createDataFrame(emptyRowRdd, inputSparkSchema)
-    emptyDf.createOrReplaceTempView(sessionTable)
-    val projectedDf = session.sqlContext.table(sessionTable).selectExpr(selectClauses.toSeq: _*)
-    val normalizedDf = normalizeTimestampOutputs(projectedDf)
-    val df = whereClauseOpt.map(normalizedDf.where(_)).getOrElse(normalizedDf)
-
-    // extract transform function from the df spark plan
-    val execPlan = df.queryExecution.executedPlan
-    logger.info(s"Catalyst Execution Plan - ${execPlan}")
-
-    // Use the new recursive approach to build a transformation chain
-    val transformer = CatalystTransformBuilder.buildTransformChain(execPlan)
-
-    (transformer, df.schema)
-  }
+  private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame = blueprint.normalizeTimestampOutputs(df)
 }
