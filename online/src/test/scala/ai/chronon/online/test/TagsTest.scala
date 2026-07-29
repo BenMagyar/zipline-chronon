@@ -23,6 +23,8 @@ import io.opentelemetry.api.OpenTelemetry
 import org.junit.Assert.assertEquals
 import org.scalatest.flatspec.AnyFlatSpec
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, ObjectInputStream, ObjectOutputStream}
+
 class TagsTest extends AnyFlatSpec {
   // test that ttlCache of context is creates non duplicated entries
 
@@ -61,6 +63,26 @@ class TagsTest extends AnyFlatSpec {
     val slowTags = otelMetricsClient.tagCache(context)
     val fastTags = otelMetricsClient.tagCache(copyCorrect)
     assertEquals(slowTags, fastTags)
+  }
+
+  it should "preserve context equality and hashes after serialization" in {
+    val context = Metrics.Context(Environment.JoinFetching,
+                                  join = "team.join",
+                                  groupBy = "team.group_by",
+                                  production = true,
+                                  team = "team")
+    val bytes = new ByteArrayOutputStream()
+    val output = new ObjectOutputStream(bytes)
+    output.writeObject(context)
+    output.close()
+
+    val input = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray))
+    val restored = input.readObject().asInstanceOf[Metrics.Context]
+    input.close()
+
+    assertEquals(context, restored)
+    assertEquals(context.hashCode(), restored.hashCode())
+    assertEquals("value", Map(context -> "value")(restored))
   }
 
 }

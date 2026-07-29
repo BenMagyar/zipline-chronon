@@ -135,6 +135,38 @@ object Fetcher {
     }
   }
 
+  // Feature count metrics are additive; aggregate them without changing per-response histogram observations.
+  private[online] final class FeatureMetricsAccumulator(
+      emit: (metrics.Metrics.Context, String, Long, Map[String, String]) => Unit = (context, metric, value, tags) =>
+        context.count(metric, value, tags)) {
+    private final class Counts(var total: Long = 0L, var nulls: Long = 0L)
+
+    private val countsByContext =
+      mutable.LinkedHashMap.empty[metrics.Metrics.Context, mutable.LinkedHashMap[String, Counts]]
+
+    def add(responseMap: Map[String, AnyRef], context: metrics.Metrics.Context): Unit = {
+      val countsByFeature = countsByContext.getOrElseUpdate(context, mutable.LinkedHashMap.empty)
+      responseMap.foreach { case (featureName, value) =>
+        if (!featureName.endsWith(FetcherUtil.FeatureExceptionSuffix)) {
+          val counts = countsByFeature.getOrElseUpdate(featureName, new Counts)
+          counts.total += 1L
+          if (value == null) counts.nulls += 1L
+        }
+      }
+    }
+
+    def flush(): Unit = {
+      countsByContext.foreach { case (context, countsByFeature) =>
+        countsByFeature.foreach { case (featureName, counts) =>
+          val tags = Map(metrics.Metrics.Tag.Feature -> featureName)
+          if (counts.nulls > 0L) emit(context, metrics.Metrics.Name.FeatureNulls, counts.nulls, tags)
+          emit(context, metrics.Metrics.Name.FeatureCount, counts.total, tags)
+        }
+      }
+      countsByContext.clear()
+    }
+  }
+
   /** Response for a join schema request
     * @param joinName - Name of the join
     * @param keySchema - Avro schema string for the key

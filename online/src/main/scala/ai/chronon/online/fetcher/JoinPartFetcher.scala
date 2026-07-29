@@ -164,6 +164,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
         // Key the response map by (name, keys, atMillis) so the fan-out lookup ignores context.
         val responseMap: Map[GroupByKey, Try[Map[String, AnyRef]]] =
           groupByResponses.iterator.map { response => groupByKey(response.request) -> response.values }.toMap
+        val featureMetrics = new Fetcher.FeatureMetricsAccumulator
         val responses = joinDecomposed.iterator.map { case (joinRequest, decomposedRequestsTry) =>
           val joinValuesTry = decomposedRequestsTry.map { groupByRequestsWithPrefix =>
             groupByRequestsWithPrefix.iterator.flatMap {
@@ -182,7 +183,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
             case Success(responseMap) =>
               joinRequest.context.foreach { ctx =>
                 ctx.distribution("response.keys.count", responseMap.size)
-                Fetcher.logFeatureNullRates(responseMap, ctx)
+                featureMetrics.add(responseMap, ctx)
               }
           }
           joinRequest.context.foreach { ctx =>
@@ -191,6 +192,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           }
           Response(joinRequest, joinValuesTry)
         }.toSeq
+        featureMetrics.flush()
         responses
       }
   }

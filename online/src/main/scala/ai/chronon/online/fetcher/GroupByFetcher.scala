@@ -9,6 +9,7 @@ import ai.chronon.online.fetcher.FetcherCache.{BatchResponses, CachedBatchRespon
 import ai.chronon.online._
 import org.slf4j.{Logger, LoggerFactory}
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
@@ -38,97 +39,99 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
   /** Convert a groupBy request into a batch kv request and optionally a streaming kv request
     */
-  private def toLambdaKvRequest(request: Fetcher.Request): Try[LambdaKvRequest] = metadataStore
-    .getGroupByServingInfo(request.name)
-    .recover { case ex: Throwable =>
-      metadataStore.getGroupByServingInfo.refresh(request.name)
-      logThrottled(ERROR,
-                   s"missing_serving_info_${request.name}",
-                   s"Couldn't fetch GroupByServingInfo for ${request.name}",
-                   ex)
-      request.context.foreach(_.incrementException(ex))
-      throw ex
-
-    }
-    .map { groupByServingInfo =>
-      val context =
-        request.context.getOrElse(
-          metrics.Metrics.Context(metrics.Metrics.Environment.GroupByFetching, groupByServingInfo.groupBy))
-      context.increment("group_by_request.count")
-
-      var batchKeyBytes: Array[Byte] = null
-      var streamingKeyBytes: Array[Byte] = null
-      val needsStreamingRead =
-        groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL &&
-          groupByServingInfo.groupByOps.streamingSource.isDefined
-
-      try {
-        // The formats of key bytes for batch requests and key bytes for streaming requests may differ based
-        // on the KVStore implementation, so we encode each distinctly.
-        batchKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
-                                                            groupByServingInfo,
-                                                            groupByServingInfo.groupByOps.batchDataset)
-        if (needsStreamingRead) {
-          streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
-                                                                  groupByServingInfo,
-                                                                  groupByServingInfo.groupByOps.streamingDataset)
-        }
-
-      } catch {
-
-        // TODO: only gets hit in cli path - make this code path just use avro schema to decode keys directly in cli
-        // TODO: Remove this code block
-        case ex: Exception =>
-          val castedKeys = groupByServingInfo.keyChrononSchema.cast(request.keys)
-
-          try {
-            batchKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
-                                                                groupByServingInfo,
-                                                                groupByServingInfo.groupByOps.batchDataset)
-
-            if (needsStreamingRead) {
-              streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
-                                                                      groupByServingInfo,
-                                                                      groupByServingInfo.groupByOps.streamingDataset)
-            }
-          } catch {
-            case exInner: Exception =>
-              exInner.addSuppressed(ex)
-              throw new RuntimeException("Couldn't encode request keys or casted keys", exInner)
-          }
+  private def toLambdaKvRequest(request: Fetcher.Request,
+                                recordRequestContext: metrics.Metrics.Context => Unit): Try[LambdaKvRequest] =
+    metadataStore
+      .getGroupByServingInfo(request.name)
+      .recover { case ex: Throwable =>
+        metadataStore.getGroupByServingInfo.refresh(request.name)
+        logThrottled(ERROR,
+                     s"missing_serving_info_${request.name}",
+                     s"Couldn't fetch GroupByServingInfo for ${request.name}",
+                     ex)
+        request.context.foreach(_.incrementException(ex))
+        throw ex
 
       }
+      .map { groupByServingInfo =>
+        val context =
+          request.context.getOrElse(
+            metrics.Metrics.Context(metrics.Metrics.Environment.GroupByFetching, groupByServingInfo.groupBy))
+        recordRequestContext(context)
 
-      val batchRequest = GetRequest(batchKeyBytes, groupByServingInfo.groupByOps.batchDataset)
+        var batchKeyBytes: Array[Byte] = null
+        var streamingKeyBytes: Array[Byte] = null
+        val needsStreamingRead =
+          groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL &&
+            groupByServingInfo.groupByOps.streamingSource.isDefined
 
-      val streamingRequestOpt =
-        if (needsStreamingRead) {
-          // Build a tile key for the streaming request
-          // When we build support for layering, we can expand this out into a utility that builds n tile keys for n layers
-          val keyBytes = if (fetchContext.isTilingEnabled) {
-
-            val tileKey = TilingUtils.buildTileKey(
-              groupByServingInfo.groupByOps.streamingDataset,
-              streamingKeyBytes,
-              Some(groupByServingInfo.smallestTailHopMillis),
-              None
-            )
-
-            TilingUtils.serializeTileKey(tileKey)
-          } else {
-            streamingKeyBytes
+        try {
+          // The formats of key bytes for batch requests and key bytes for streaming requests may differ based
+          // on the KVStore implementation, so we encode each distinctly.
+          batchKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+                                                              groupByServingInfo,
+                                                              groupByServingInfo.groupByOps.batchDataset)
+          if (needsStreamingRead) {
+            streamingKeyBytes = fetchContext.kvStore.createKeyBytes(request.keys,
+                                                                    groupByServingInfo,
+                                                                    groupByServingInfo.groupByOps.streamingDataset)
           }
 
-          Some(
-            GetRequest(keyBytes,
-                       groupByServingInfo.groupByOps.streamingDataset,
-                       Some(groupByServingInfo.batchEndTsMillis)))
-        } else None
+        } catch {
 
-      val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
-      LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)
+          // TODO: only gets hit in cli path - make this code path just use avro schema to decode keys directly in cli
+          // TODO: Remove this code block
+          case ex: Exception =>
+            val castedKeys = groupByServingInfo.keyChrononSchema.cast(request.keys)
 
-    }
+            try {
+              batchKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
+                                                                  groupByServingInfo,
+                                                                  groupByServingInfo.groupByOps.batchDataset)
+
+              if (needsStreamingRead) {
+                streamingKeyBytes = fetchContext.kvStore.createKeyBytes(castedKeys,
+                                                                        groupByServingInfo,
+                                                                        groupByServingInfo.groupByOps.streamingDataset)
+              }
+            } catch {
+              case exInner: Exception =>
+                exInner.addSuppressed(ex)
+                throw new RuntimeException("Couldn't encode request keys or casted keys", exInner)
+            }
+
+        }
+
+        val batchRequest = GetRequest(batchKeyBytes, groupByServingInfo.groupByOps.batchDataset)
+
+        val streamingRequestOpt =
+          if (needsStreamingRead) {
+            // Build a tile key for the streaming request
+            // When we build support for layering, we can expand this out into a utility that builds n tile keys for n layers
+            val keyBytes = if (fetchContext.isTilingEnabled) {
+
+              val tileKey = TilingUtils.buildTileKey(
+                groupByServingInfo.groupByOps.streamingDataset,
+                streamingKeyBytes,
+                Some(groupByServingInfo.smallestTailHopMillis),
+                None
+              )
+
+              TilingUtils.serializeTileKey(tileKey)
+            } else {
+              streamingKeyBytes
+            }
+
+            Some(
+              GetRequest(keyBytes,
+                         groupByServingInfo.groupByOps.streamingDataset,
+                         Some(groupByServingInfo.batchEndTsMillis)))
+          } else None
+
+        val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
+        LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)
+
+      }
 
   private def attemptDerivations(request: Fetcher.Request,
                                  responseMap: Map[String, AnyRef],
@@ -157,18 +160,30 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
   // 4. Finally converted to outputSchema
   def fetchGroupBys(requests: Seq[Fetcher.Request]): Future[Seq[Fetcher.Response]] = {
 
+    // Counters are additive, so equal metric contexts can share one reporter call without changing the emitted sum.
+    val requestCountByContext = mutable.LinkedHashMap.empty[metrics.Metrics.Context, Long]
+    val multiGetMetricContexts = mutable.LinkedHashSet.empty[metrics.Metrics.Context]
+    def recordRequestContext(context: metrics.Metrics.Context): Unit =
+      requestCountByContext.update(context, requestCountByContext.getOrElse(context, 0L) + 1L)
+
     // split a groupBy level request into its kvStore level requests
-    val groupByRequestToKvRequest: Seq[(Fetcher.Request, Try[LambdaKvRequest])] = requests.iterator
+    val groupByRequestToKvRequest: Vector[(Fetcher.Request, Try[LambdaKvRequest])] = requests.iterator
       .filter(r => r.keys == null || r.keys.values == null || r.keys.values.exists(_ != null))
       .map { request =>
-        val groupByRequestMetaTry: Try[LambdaKvRequest] = toLambdaKvRequest(request)
+        val groupByRequestMetaTry: Try[LambdaKvRequest] = toLambdaKvRequest(request, recordRequestContext)
 
         if (groupByRequestMetaTry.isFailure)
           request.context.foreach(_.increment("group_by_serving_info_failure.count"))
+        else
+          multiGetMetricContexts.add(groupByRequestMetaTry.get.context)
 
         request -> groupByRequestMetaTry
       }
-      .toSeq
+      .toVector
+
+    requestCountByContext.foreach { case (context, count) =>
+      context.count("group_by_request.count", count)
+    }
 
     // If caching is enabled, we check if any of the GetRequests are already cached. If so, we store them in a Map
     // and avoid the work of re-fetching them. It is mainly for batch data requests.
@@ -177,13 +192,13 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
     maybeBatchIrCache.foreach(cache =>
       LRUCache.collectCaffeineCacheMetrics(caffeineMetricsContext, cache.cache, cache.cacheName))
 
-    val allRequestsToFetch: Seq[GetRequest] = groupByRequestToKvRequest.flatMap {
+    val allRequestsToFetch: Vector[GetRequest] = groupByRequestToKvRequest.iterator.flatMap {
       case (_, Success(LambdaKvRequest(_, _, batchRequest, streamingRequestOpt, _, _))) =>
         // If a batch request is cached, don't include it in the list of requests to fetch because the batch IRs already cached
         if (cachedRequests.contains(batchRequest)) streamingRequestOpt else Some(batchRequest) ++ streamingRequestOpt
 
-      case _ => Seq.empty
-    }
+      case _ => Iterator.empty
+    }.toVector
 
     val startTimeMs = System.currentTimeMillis()
     val kvResponseFuture: Future[Seq[GetResponse]] = if (allRequestsToFetch.nonEmpty) {
@@ -210,16 +225,15 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             .filter(v => v.isSuccess && v.get != null)
             .flatMap(_.get.map(v => Option(v.bytes).map(_.length).getOrElse(0)))
             .sum
+        val requestCount = allRequestsToFetch.length
+        val responseCount = kvResponses.length
 
-        groupByRequestToKvRequest.iterator
-          .flatMap(_._2.toOption.map(_.context))
-          .toSet
-          .foreach { context: metrics.Metrics.Context =>
-            context.count("multi_get.batch.size", allRequestsToFetch.length)
-            context.distribution("multi_get.bytes", totalResponseValueBytes)
-            context.distribution("multi_get.response.length", kvResponses.length)
-            context.distribution("multi_get.latency.millis", multiGetMillis)
-          }
+        multiGetMetricContexts.foreach { context: metrics.Metrics.Context =>
+          context.count("multi_get.batch.size", requestCount)
+          context.distribution("multi_get.bytes", totalResponseValueBytes)
+          context.distribution("multi_get.response.length", responseCount)
+          context.distribution("multi_get.latency.millis", multiGetMillis)
+        }
 
         val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
           val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>

@@ -180,6 +180,12 @@ object Metrics {
                      modelTransforms: String = null)
       extends Serializable {
 
+    // Contexts are immutable and are repeatedly used as keys by the metrics tag cache. Cache the
+    // product hash so a batch does not traverse every context field for each metric emission.
+    @transient private lazy val cachedHashCode: Int = scala.util.hashing.MurmurHash3.productHash(this)
+
+    override def hashCode(): Int = cachedHashCode
+
     def withSuffix(suffixN: String): Context = copy(suffix = (Option(suffix) ++ Seq(suffixN)).mkString("."))
 
     private val prefixString =
@@ -250,6 +256,9 @@ object Metrics {
       Context.client.distribution(prefix(metric), value, additionalTags)
 
     def count(metric: String, value: Long): Unit = Context.client.count(prefix(metric), value)
+
+    def count(metric: String, value: Long, additionalTags: Map[String, String]): Unit =
+      Context.client.count(prefix(metric), value, additionalTags)
 
     def gauge(metric: String, value: Long): Unit = Context.client.longGauge(prefix(metric), value)
 

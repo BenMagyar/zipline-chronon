@@ -59,32 +59,33 @@ class OtelMetricsReporter(openTelemetry: OpenTelemetry) extends MetricsReporter 
     builder.build()
   }
 
+  private def metricAttributes(tags: Map[String, String])(implicit context: Context): Attributes = {
+    val contextAttributes = tagCache(context)
+    if (tags.isEmpty) contextAttributes else mergeAttributes(contextAttributes, tags)
+  }
+
   override def count(metric: String, value: Long, tags: Map[String, String] = Map.empty)(implicit
       context: Context): Unit = {
     val counter = counters.getOrElseUpdate(metric, meter.counterBuilder(metric).build())
-    val mergedAttributes = mergeAttributes(tagCache(context), tags)
-    counter.add(value, mergedAttributes)
+    counter.add(value, metricAttributes(tags))
   }
 
   override def longGauge(metric: String, value: Long, tags: Map[String, String] = Map.empty)(implicit
       context: Context): Unit = {
     val gauge = longGauges.getOrElseUpdate(metric, meter.gaugeBuilder(metric).ofLongs().build())
-    val mergedAttributes = mergeAttributes(tagCache(context), tags)
-    gauge.set(value, mergedAttributes)
+    gauge.set(value, metricAttributes(tags))
   }
 
   override def doubleGauge(metric: String, value: Double, tags: Map[String, String] = Map.empty)(implicit
       context: Context): Unit = {
     val gauge = doubleGauges.getOrElseUpdate(metric, meter.gaugeBuilder(metric).build())
-    val mergedAttributes = mergeAttributes(tagCache(context), tags)
-    gauge.set(value, mergedAttributes)
+    gauge.set(value, metricAttributes(tags))
   }
 
   override def distribution(metric: String, value: Long, tags: Map[String, String] = Map.empty)(implicit
       context: Context): Unit = {
     val histogram = histograms.getOrElseUpdate(metric, meter.histogramBuilder(metric).ofLongs().build())
-    val mergedAttributes = mergeAttributes(tagCache(context), tags)
-    histogram.record(value, mergedAttributes)
+    histogram.record(value, metricAttributes(tags))
   }
 
   override def flush(timeoutMillis: Long): Unit = sdkMeterProvider.foreach { provider =>
