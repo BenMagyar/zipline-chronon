@@ -242,8 +242,15 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                 case Some(cachedResponse: CachedBatchResponse) => cachedResponse
               }
 
-            val streamingResponsesOpt =
-              streamingRequestOpt.map(responsesMap.getOrElse(_, Success(Seq.empty)).getOrElse(Seq.empty))
+            // Preserve the response-handler contract without issuing a streaming read: temporal batch values still
+            // need finalization when no streaming source exists, while None continues to identify snapshot values.
+            val streamingResponsesOpt: Option[Seq[TimedValue]] = streamingRequestOpt match {
+              case Some(streamingRequest) =>
+                Some(responsesMap.getOrElse(streamingRequest, Success(Seq.empty)).getOrElse(Seq.empty))
+              case None if groupByServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL =>
+                Some(Seq.empty)
+              case None => None
+            }
 
             val queryTs = request.atMillis.getOrElse(System.currentTimeMillis())
             val requestContext = RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)

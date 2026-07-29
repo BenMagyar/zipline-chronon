@@ -3,7 +3,7 @@ import ai.chronon.aggregator.windowing
 import ai.chronon.aggregator.windowing.{FinalBatchIr, SawtoothOnlineAggregator, TiledIr}
 import ai.chronon.api.Extensions.WindowOps
 import ai.chronon.api.ScalaJavaConversions.{IteratorOps, JMapOps}
-import ai.chronon.api.{Accuracy, DataModel, Row, Window}
+import ai.chronon.api.{DataModel, Row, Window}
 import ai.chronon.online.serde.AvroConversions
 import ai.chronon.online.GroupByServingInfoParsed
 import ai.chronon.online.KVStore.TimedValue
@@ -49,12 +49,8 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     // The bulk upload may not have removed an older batch values. We manually discard all but the latest one.
     val batchBytes: Array[Byte] = batchResponses.getBatchBytes(newServingInfo.batchEndTsMillis)
 
-    val requiresTemporalMerge =
-      newServingInfo.groupBy.aggregations != null &&
-        newServingInfo.groupByOps.inferredAccuracy == Accuracy.TEMPORAL
-
     val responseMap: Map[String, AnyRef] =
-      if (!requiresTemporalMerge) { // no-agg or snapshot
+      if (newServingInfo.groupBy.aggregations == null || streamingResponsesOpt.isEmpty) { // no-agg
 
         val batchResponseDecodeStartTime = System.currentTimeMillis()
         val response = getMapResponseFromBatchResponse(batchResponses,
@@ -68,8 +64,7 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
 
       } else { // temporal accurate
 
-        // A temporal GroupBy without a streaming source still stores batch aggregation IRs that must be finalized.
-        val streamingResponses = streamingResponsesOpt.getOrElse(Seq.empty)
+        val streamingResponses = streamingResponsesOpt.get
         val output: Array[Any] = mergeWithStreaming(batchResponses,
                                                     streamingResponses,
                                                     batchBytes,

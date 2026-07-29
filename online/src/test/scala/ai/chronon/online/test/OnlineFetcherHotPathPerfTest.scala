@@ -13,7 +13,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import scala.collection.JavaConverters._
 import scala.concurrent.duration.DurationInt
@@ -191,7 +191,7 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
         s"legacy_metric_writes=$LegacyMultiGetMetricWrites deduplicated_metric_writes=$DeduplicatedMultiGetMetricWrites")
   }
 
-  it should "skip streaming reads for temporal GroupBys without a topic" in {
+  it should "skip streaming reads and preserve temporal finalization for GroupBys without a topic" in {
     val name = "benchmark.batch_only_temporal"
     val groupBy = Builders.GroupBy(
       sources = Seq(Builders.Source.events(query = Builders.Query(), table = s"$name.events")),
@@ -206,16 +206,21 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
         .setBatchEndTs(BenchmarkAtMillis))
     val fixture = newGroupByFixture(
       executorThreads = 1,
-      failAfterPlanning = true,
+      failAfterPlanning = false,
       countKeyEncodes = true,
       servingInfos = Map(name -> servingInfo)
     )
     try {
-      awaitPlanningComplete(
+      val responses = Await.result(
         fixture.fetcher.fetchGroupBys(
-          Seq(Request(name, Map(KeyColumn -> "batch-only".asInstanceOf[AnyRef]), Some(BenchmarkAtMillis)))))
+          Seq(Request(name, Map(KeyColumn -> "batch-only".asInstanceOf[AnyRef]), Some(BenchmarkAtMillis)))),
+        30.seconds
+      )
+      responses should have size 1
+      responses.head.values.isSuccess shouldBe true
       fixture.store.keyEncodeCount.get() shouldBe 1L
       fixture.store.lastMultiGetSize.get() shouldBe 1
+      fixture.fetcher.lastStreamingResponsesOpt.get() shouldBe Some(Seq.empty)
     } finally {
       closeExecutor(fixture.executor)
     }
@@ -430,9 +435,14 @@ class OnlineFetcherHotPathPerfTest extends AnyFlatSpec with Matchers {
 
   private final class BenchmarkGroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
       extends GroupByFetcher(fetchContext, metadataStore) {
+    val lastStreamingResponsesOpt = new AtomicReference[Option[Seq[TimedValue]]]()
+
     override def decodeAndMerge(batchResponses: BatchResponses,
                                 streamingResponsesOpt: Option[Seq[TimedValue]],
-                                requestContext: RequestContext): Map[String, AnyRef] = Map.empty
+                                requestContext: RequestContext): Map[String, AnyRef] = {
+      lastStreamingResponsesOpt.set(streamingResponsesOpt)
+      Map.empty
+    }
   }
 
   private final case class GroupByFixture(fetcher: BenchmarkGroupByFetcher,
