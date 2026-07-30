@@ -278,6 +278,11 @@ abstract class Api(userConf: Map[String, String]) extends Serializable {
     */
   def logResponse(resp: LoggableResponse): Unit
 
+  /** Whether this API implementation has a response-log sink. Implementations without one can disable response
+    * encoding while retaining debug logging in the fetcher.
+    */
+  protected def responseLoggingEnabled: Boolean = true
+
   // not sure if thread safe - TODO: double check
 
   // helper functions
@@ -289,7 +294,7 @@ abstract class Api(userConf: Map[String, String]) extends Serializable {
     new Fetcher(
       genKvStore,
       MetadataDataset,
-      logFunc = responseConsumer,
+      logFunc = responseConsumerOrNull,
       debug = debug,
       externalSourceRegistry = externalRegistry,
       modelPlatformProvider = generateModelPlatformProvider,
@@ -309,7 +314,7 @@ abstract class Api(userConf: Map[String, String]) extends Serializable {
       genKvStore,
       MetadataDataset,
       timeoutMillis,
-      responseConsumer,
+      responseConsumerOrNull,
       externalRegistry
     ).modelPlatformProvider(generateModelPlatformProvider)
       .callerName(callerName)
@@ -322,10 +327,12 @@ abstract class Api(userConf: Map[String, String]) extends Serializable {
 
   final def buildJavaFetcher(): JavaFetcher = buildJavaFetcher(null)
 
-  private def responseConsumer: Consumer[LoggableResponse] =
-    new Consumer[LoggableResponse] {
-      override def accept(t: LoggableResponse): Unit = logResponse(t)
-    }
+  private[online] final def responseConsumerOrNull: Consumer[LoggableResponse] =
+    if (responseLoggingEnabled) {
+      new Consumer[LoggableResponse] {
+        override def accept(t: LoggableResponse): Unit = logResponse(t)
+      }
+    } else null
 }
 
 case class PredictRequest(model: Model, inputRequests: Seq[Map[String, AnyRef]])

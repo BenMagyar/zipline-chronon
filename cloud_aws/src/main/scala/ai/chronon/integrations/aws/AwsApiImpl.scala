@@ -149,6 +149,8 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
     */
   override def logResponse(resp: LoggableResponse): Unit = ()
 
+  override protected def responseLoggingEnabled: Boolean = false
+
   override def genMetricsKvStore(tableBaseName: String): KVStore = {
     val store = new DynamoDBMetricsKVStoreImpl(new DynamoDBStatsKVStoreImpl(ddbClient, conf), tableBaseName)
     store.create(tableBaseName)

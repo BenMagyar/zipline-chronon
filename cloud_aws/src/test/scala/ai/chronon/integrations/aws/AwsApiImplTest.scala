@@ -16,6 +16,14 @@ import software.amazon.awssdk.services.s3.S3Client
 import software.amazon.awssdk.services.s3.model.{GetObjectRequest, GetObjectResponse, PutObjectRequest, S3Exception}
 
 class AwsApiImplTest extends AnyFlatSpec with Matchers with MockitoSugar {
+  "response logging" should "remain disabled while the AWS sink is unimplemented" in {
+    val api = new AwsApiImpl(Map.empty) {
+      def isResponseLoggingEnabled: Boolean = responseLoggingEnabled
+    }
+
+    api.isResponseLoggingEnabled shouldBe false
+  }
+
   "configuredKvStoreType" should "default to DynamoDB" in {
     AwsApiImpl.configuredKvStoreType(Map.empty, Map.empty) shouldBe AwsApiImpl.DynamoDbKvStoreType
   }

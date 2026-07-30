@@ -59,6 +59,11 @@ object Fetcher {
 
   import ai.chronon.online.metrics
 
+  private[online] def shouldEncodeResponseLog(logFunc: Consumer[LoggableResponse],
+                                              debug: Boolean,
+                                              samplePercent: Double): Boolean =
+    samplePercent > 0 && (logFunc != null || debug)
+
   case class Request(name: String,
                      keys: Map[String, AnyRef],
                      atMillis: Option[Long] = None,
@@ -662,7 +667,7 @@ class Fetcher(val kvStore: KVStore,
         val metaData = codec.conf.join.metaData
         val samplePercent = if (metaData.isSetSamplePercent) metaData.getSamplePercent else 0
 
-        if (samplePercent > 0)
+        if (Fetcher.shouldEncodeResponseLog(logFunc, debug, samplePercent))
           encodeAndPublishLog(resp, ts, codec, samplePercent)
 
       })
