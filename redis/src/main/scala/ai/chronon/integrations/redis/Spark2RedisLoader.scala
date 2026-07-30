@@ -8,10 +8,18 @@ import ai.chronon.integrations.redis.RedisKVStoreConstants._
 import ai.chronon.spark.catalog.TableUtils
 import org.apache.hadoop.fs.Path
 import org.apache.spark.TaskContext
+import org.apache.spark.scheduler.{
+  AccumulableInfo,
+  SparkListener,
+  SparkListenerExecutorMetricsUpdate,
+  SparkListenerTaskEnd,
+  SparkListenerTaskStart
+}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{BinaryType, IntegerType, LongType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.LongAccumulator
 import org.slf4j.LoggerFactory
 import redis.clients.jedis.{ClusterPipeline, JedisCluster, Protocol, Response}
 import redis.clients.jedis.exceptions.{
@@ -27,7 +35,9 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, Da
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.{Arrays, Locale, UUID}
-import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{Executors, ThreadFactory, ThreadLocalRandom, TimeUnit}
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 import scala.util.control.NonFatal
@@ -48,6 +58,7 @@ import scala.util.control.NonFatal
 object Spark2RedisLoader {
   private val logger = LoggerFactory.getLogger(getClass)
   private val UnsetPipelineResponseMessage = "Please close pipeline or multi block before calling this method."
+  private val UploadProgressLogIntervalSeconds = 30L
 
   private[redis] val PartitionColumnProp = "spark.chronon.partition.column"
   private[redis] val PartitionFormatProp = "spark.chronon.partition.format"
@@ -143,6 +154,129 @@ object Spark2RedisLoader {
                    replayed + other.replayed,
                    rejected + other.rejected,
                    retries + other.retries)
+  }
+
+  private case class WriteProgress(generation: String, phase: String, totalKeys: Option[Long]) {
+    require(generation.nonEmpty, "Redis upload progress generation must be non-empty")
+    require(phase.nonEmpty, "Redis upload progress phase must be non-empty")
+    require(totalKeys.forall(_ >= 0), s"Redis upload progress total must be non-negative: $totalKeys")
+  }
+
+  private[redis] final class UploadProgressTracker {
+    private val taskPartitions = mutable.Map.empty[Long, Int]
+    private val partitionHighWater = mutable.Map.empty[Int, Long]
+
+    def taskStarted(taskId: Long, partition: Int): Unit = synchronized {
+      require(taskId >= 0, s"Spark task ID must be non-negative: $taskId")
+      require(partition >= 0, s"Spark partition must be non-negative: $partition")
+      taskPartitions.update(taskId, partition)
+    }
+
+    def taskProgress(taskId: Long, completed: Long): Unit = synchronized {
+      require(completed >= 0, s"Redis task progress must be non-negative: $completed")
+      taskPartitions.get(taskId).foreach { partition =>
+        partitionHighWater.update(partition, math.max(partitionHighWater.getOrElse(partition, 0L), completed))
+      }
+    }
+
+    def completed: Long = synchronized {
+      partitionHighWater.valuesIterator.foldLeft(0L)(_ + _)
+    }
+  }
+
+  private final class UploadProgressReporter(dataset: String,
+                                             operation: String,
+                                             progress: WriteProgress,
+                                             accumulatorId: Long,
+                                             writerPartitions: Int,
+                                             batchSize: Int)
+      extends SparkListener
+      with AutoCloseable {
+    private val tracker = new UploadProgressTracker
+    private val startedAtMillis = System.currentTimeMillis()
+    private val closed = new AtomicBoolean(false)
+    private val scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory {
+      override def newThread(runnable: Runnable): Thread = {
+        val thread = new Thread(runnable, "redis-upload-progress")
+        thread.setDaemon(true)
+        thread
+      }
+    })
+
+    def start(): Unit = {
+      logger.info(s"Redis upload started dataset=$dataset generation=${progress.generation} phase=${progress.phase} " +
+        s"operation=$operation ${totalText(progress.totalKeys)} writerPartitions=$writerPartitions batchSize=$batchSize")
+      scheduler.scheduleAtFixedRate(
+        new Runnable {
+          override def run(): Unit =
+            try logProgress()
+            catch {
+              case NonFatal(error) => logger.warn("Could not report Redis upload progress", error)
+            }
+        },
+        UploadProgressLogIntervalSeconds,
+        UploadProgressLogIntervalSeconds,
+        TimeUnit.SECONDS
+      )
+    }
+
+    override def onTaskStart(event: SparkListenerTaskStart): Unit =
+      tracker.taskStarted(event.taskInfo.taskId, event.taskInfo.index)
+
+    override def onExecutorMetricsUpdate(event: SparkListenerExecutorMetricsUpdate): Unit =
+      event.accumUpdates.foreach { case (taskId, _, _, updates) =>
+        accumulatorValue(updates).foreach(value => tracker.taskProgress(taskId, value))
+      }
+
+    override def onTaskEnd(event: SparkListenerTaskEnd): Unit =
+      accumulatorValue(event.taskInfo.accumulables).foreach(value => tracker.taskProgress(event.taskInfo.taskId, value))
+
+    def complete(completed: Long, retries: Long): Unit = {
+      if (closed.compareAndSet(false, true)) {
+        scheduler.shutdownNow()
+        val elapsedMillis = math.max(1L, System.currentTimeMillis() - startedAtMillis)
+        logger.info(
+          s"Redis upload completed dataset=$dataset generation=${progress.generation} phase=${progress.phase} " +
+            s"operation=$operation completed=$completed ${completedTotalText(progress.totalKeys)}" +
+            s"elapsedMs=$elapsedMillis rate=${keysPerSecond(completed, elapsedMillis)} keys/s retries=$retries")
+      }
+    }
+
+    override def close(): Unit = {
+      if (closed.compareAndSet(false, true)) scheduler.shutdownNow()
+    }
+
+    private def logProgress(): Unit = {
+      if (!closed.get()) {
+        val elapsedMillis = math.max(1L, System.currentTimeMillis() - startedAtMillis)
+        val completed = progress.totalKeys.fold(tracker.completed)(total => math.min(total, tracker.completed))
+        logger.info(
+          s"Redis upload progress dataset=$dataset generation=${progress.generation} phase=${progress.phase} " +
+            s"operation=$operation completed=$completed ${progressTotalText(completed, progress.totalKeys)}" +
+            s"elapsedMs=$elapsedMillis rate=${keysPerSecond(completed, elapsedMillis)} keys/s")
+      }
+    }
+
+    private def accumulatorValue(updates: scala.collection.Seq[AccumulableInfo]): Option[Long] =
+      updates.iterator
+        .find(_.id == accumulatorId)
+        .flatMap(info => info.update.orElse(info.value))
+        .collect { case number: java.lang.Number => number.longValue() }
+
+    private def totalText(totalKeys: Option[Long]): String =
+      totalKeys.fold("total=unknown")(total => s"total=$total")
+
+    private def progressTotalText(completed: Long, totalKeys: Option[Long]): String =
+      totalKeys.fold("") { total =>
+        val percent = if (total == 0) 99 else math.min(99, (completed.toDouble * 100.0 / total).toInt)
+        s"total=$total percent=$percent "
+      }
+
+    private def completedTotalText(totalKeys: Option[Long]): String =
+      totalKeys.fold("")(total => s"total=$total percent=100 ")
+
+    private def keysPerSecond(completed: Long, elapsedMillis: Long): Long =
+      math.round(completed.toDouble * 1000.0 / elapsedMillis)
   }
 
   private[redis] case class OomRetryEvent(attempt: Int, waitMillis: Long, elapsedMillis: Long, remainingMillis: Long)
@@ -630,7 +764,14 @@ object Spark2RedisLoader {
       if (manifest.retired) leaseDeadlineMillis
       else generationLeaseDeadline(leaseDeadlineMillis, currentLeaseDeadline, parentLeaseDeadline)
 
-    val dataSummary = writeToRedis(dataDelta, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
+    val dataSummary = writeToRedis(
+      dataDelta,
+      MutationWrite,
+      settings,
+      limiterKey,
+      activeLeaseDeadlineMillis,
+      progress = Some(WriteProgress(manifest.status.generation, "delta-mutations", Some(manifest.deltaRows - 1)))
+    )
     require(
       dataSummary.attempted == manifest.deltaRows - 1,
       s"Redis generation ${manifest.status.generation} attempted ${dataSummary.attempted} data mutations; " +
@@ -647,8 +788,14 @@ object Spark2RedisLoader {
         .select(KeyColumn, ValueTimestampColumn, ValueWriteEpochColumn, BucketColumn)
       val expectedDeadline =
         if (settings.clientSettings.clientNoTouch) inheritedLeaseDeadline else None
-      refreshSummary =
-        writeToRedis(unchangedState, LeaseRefresh(expectedDeadline), settings, limiterKey, activeLeaseDeadlineMillis)
+      refreshSummary = writeToRedis(
+        unchangedState,
+        LeaseRefresh(expectedDeadline),
+        settings,
+        limiterKey,
+        activeLeaseDeadlineMillis,
+        progress = Some(WriteProgress(manifest.status.generation, "lease-refresh", Some(unchangedKeys)))
+      )
       require(
         refreshSummary.attempted == unchangedKeys,
         s"Redis generation ${manifest.status.generation} checked ${refreshSummary.attempted} unchanged keys; " +
@@ -670,7 +817,14 @@ object Spark2RedisLoader {
         val replayCount = replay.count()
         require(replayCount == manifest.dataRows,
                 s"Redis full replay contains $replayCount data keys; manifest records ${manifest.dataRows}")
-        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
+        val replaySummary = writeToRedis(
+          replay,
+          MutationWrite,
+          settings,
+          limiterKey,
+          activeLeaseDeadlineMillis,
+          progress = Some(WriteProgress(manifest.status.generation, "full-replay", Some(manifest.dataRows)))
+        )
         require(replaySummary.attempted == manifest.dataRows,
                 s"Redis full replay attempted ${replaySummary.attempted} keys; expected ${manifest.dataRows}")
         rejectedKeys += replaySummary.rejected
@@ -690,7 +844,8 @@ object Spark2RedisLoader {
         MutationWrite,
         settings,
         limiterKey,
-        activeLeaseDeadlineMillis
+        activeLeaseDeadlineMillis,
+        progress = Some(WriteProgress(manifest.status.generation, "tombstone-replay", None))
       )
       rejectedKeys += tombstoneSummary.rejected
     }
@@ -808,7 +963,14 @@ object Spark2RedisLoader {
           .select(KeyColumn, ValueTimestampColumn, ValueWriteEpochColumn, BucketColumn)
         val expectedDeadline =
           if (useExpiryFence) committedLease.map(_.record.minimumActiveDeadlineMillis) else None
-        writeToRedis(state, LeaseRefresh(expectedDeadline), settings, limiterKey, intendedLeaseDeadlineMillis)
+        writeToRedis(
+          state,
+          LeaseRefresh(expectedDeadline),
+          settings,
+          limiterKey,
+          intendedLeaseDeadlineMillis,
+          progress = Some(WriteProgress(head.status.generation, "snapshot-lease-check", Some(head.dataRows)))
+        )
       }
     if (forceReplay) {
       logger.info(
@@ -831,7 +993,14 @@ object Spark2RedisLoader {
           s"forceReplay=$forceReplay missingOrRolledBackKeys=${refreshed.rejected}")
       val replay = buildFullReplay(settings, head, spark).persist(StorageLevel.DISK_ONLY)
       try {
-        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
+        val replaySummary = writeToRedis(
+          replay,
+          MutationWrite,
+          settings,
+          limiterKey,
+          activeLeaseDeadlineMillis,
+          progress = Some(WriteProgress(head.status.generation, "snapshot-repair", Some(head.dataRows)))
+        )
         require(replaySummary.attempted == head.dataRows,
                 s"Redis full snapshot repair attempted ${replaySummary.attempted} keys; expected ${head.dataRows}")
         replayRejected = replaySummary.rejected
@@ -842,12 +1011,15 @@ object Spark2RedisLoader {
     if (head.tombstoneRows > 0) {
       val tombstoneDeadlineMillis = committedApplied(settings, head, spark, conditionalWriter)
         .tombstoneRetainUntilMillis(head.liveTTLSeconds)
-      tombstoneRejected = writeToRedis(buildTombstoneReplay(settings, head, spark, tombstoneDeadlineMillis),
-                                       MutationWrite,
-                                       settings,
-                                       limiterKey,
-                                       activeLeaseDeadlineMillis,
-                                       tombstoneDeadlineMillis).rejected
+      tombstoneRejected = writeToRedis(
+        buildTombstoneReplay(settings, head, spark, tombstoneDeadlineMillis),
+        MutationWrite,
+        settings,
+        limiterKey,
+        activeLeaseDeadlineMillis,
+        tombstoneDeadlineMillis,
+        progress = Some(WriteProgress(head.status.generation, "tombstone-replay", None))
+      ).rejected
     }
 
     val metadata = loadDelta(settings, head.status.generation, spark)
@@ -1604,7 +1776,8 @@ object Spark2RedisLoader {
                            settings: Settings,
                            limiterKey: String,
                            leaseDeadlineMillis: Long,
-                           tombstoneDeadlineMillis: Long = 0L): WriteSummary = {
+                           tombstoneDeadlineMillis: Long = 0L,
+                           progress: Option[WriteProgress] = None): WriteSummary = {
     val clientSettings = settings.clientSettings.bulkWriter
     val batchDataset = settings.batchDataset
     val keyPrefix = settings.keyPrefix
@@ -1621,43 +1794,76 @@ object Spark2RedisLoader {
     val effectiveTombstoneDeadline =
       if (tombstoneDeadlineMillis > 0) tombstoneDeadlineMillis else leaseDeadlineMillis
 
-    val summaries = df
-      .repartition(settings.writerPartitions, col(BucketColumn))
-      .rdd
-      .mapPartitions { rows =>
-        if (!rows.hasNext) Iterator.empty
-        else {
-          val taskClient = new TaskClient(clientSettings)
-          var total = WriteSummary(0, 0, 0, 0, 0)
-          try {
-            rows.grouped(batchSize).foreach { batch =>
-              total = total + writeBatch(
-                taskClient,
-                batch,
-                mode,
-                batchDataset,
-                keyPrefix,
-                keyHashTagMode,
-                limiterKey,
-                batchSize,
-                maxKeysPerSecond,
-                maxRetries,
-                retryBackoffMs,
-                oomRetryStartMillis,
-                oomRetryDeadlineMillis,
-                leaseDeadlineMillis,
-                effectiveTombstoneDeadline
-              )
+    val sparkContext = df.sparkSession.sparkContext
+    val activeProgress = progress.filter(_.totalKeys.forall(_ > 0))
+    val progressAccumulator = activeProgress.map { spec =>
+      sparkContext.longAccumulator(s"redis-upload-${spec.generation}-${spec.phase}")
+    }
+    val progressReporter = activeProgress.zip(progressAccumulator).map { case (spec, accumulator) =>
+      new UploadProgressReporter(batchDataset,
+                                 writeModeName(mode),
+                                 spec,
+                                 accumulator.id,
+                                 settings.writerPartitions,
+                                 batchSize)
+    }
+    progressReporter.foreach(sparkContext.addSparkListener)
+
+    try {
+      progressReporter.foreach(_.start())
+      val summaries = df
+        .repartition(settings.writerPartitions, col(BucketColumn))
+        .rdd
+        .mapPartitions { rows =>
+          if (!rows.hasNext) Iterator.empty
+          else {
+            val taskClient = new TaskClient(clientSettings)
+            var total = WriteSummary(0, 0, 0, 0, 0)
+            try {
+              rows.grouped(batchSize).foreach { batch =>
+                val batchSummary = writeBatch(
+                  taskClient,
+                  batch,
+                  mode,
+                  batchDataset,
+                  keyPrefix,
+                  keyHashTagMode,
+                  limiterKey,
+                  batchSize,
+                  maxKeysPerSecond,
+                  maxRetries,
+                  retryBackoffMs,
+                  oomRetryStartMillis,
+                  oomRetryDeadlineMillis,
+                  leaseDeadlineMillis,
+                  effectiveTombstoneDeadline
+                )
+                total = total + batchSummary
+                progressAccumulator.foreach(_.add(batchSummary.attempted))
+              }
+              Iterator.single(total)
+            } finally {
+              taskClient.close()
             }
-            Iterator.single(total)
-          } finally {
-            taskClient.close()
           }
         }
-      }
-      .collect()
+        .collect()
 
-    summaries.foldLeft(WriteSummary(0, 0, 0, 0, 0))(_ + _)
+      val summary = summaries.foldLeft(WriteSummary(0, 0, 0, 0, 0))(_ + _)
+      activeProgress.foreach { spec =>
+        spec.totalKeys.foreach { expected =>
+          require(summary.attempted == expected,
+                  s"Redis upload phase ${spec.phase} attempted ${summary.attempted} keys; expected $expected")
+        }
+      }
+      progressReporter.foreach(_.complete(summary.attempted, summary.retries))
+      summary
+    } finally {
+      progressReporter.foreach { reporter =>
+        sparkContext.removeSparkListener(reporter)
+        reporter.close()
+      }
+    }
   }
 
   private def writeBatch(taskClient: TaskClient,

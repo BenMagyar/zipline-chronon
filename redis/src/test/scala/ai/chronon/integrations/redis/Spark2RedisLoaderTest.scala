@@ -201,6 +201,23 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     Spark2RedisLoader.pipelineResponseDirectReplayRequired(new JedisDataException("WRONGTYPE bad input")) shouldBe false
   }
 
+  "Redis upload progress" should "deduplicate retries and speculative attempts by partition" in {
+    val tracker = new Spark2RedisLoader.UploadProgressTracker
+    tracker.taskStarted(taskId = 1L, partition = 0)
+    tracker.taskStarted(taskId = 2L, partition = 1)
+    tracker.taskProgress(taskId = 1L, completed = 400L)
+    tracker.taskProgress(taskId = 2L, completed = 300L)
+    tracker.completed shouldBe 700L
+
+    tracker.taskStarted(taskId = 3L, partition = 0)
+    tracker.taskProgress(taskId = 3L, completed = 200L)
+    tracker.completed shouldBe 700L
+
+    tracker.taskProgress(taskId = 3L, completed = 600L)
+    tracker.taskProgress(taskId = 1L, completed = 500L)
+    tracker.completed shouldBe 900L
+  }
+
   "Redis OOM retries" should "recognize only Redis maxmemory failures" in {
     val reported = new JedisDataException(
       "OOM command not allowed when used memory > 'maxmemory'. script: abc, on @user_script:22.")
