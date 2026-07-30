@@ -64,6 +64,15 @@ object Fetcher {
                                               samplePercent: Double): Boolean =
     samplePercent > 0 && (logFunc != null || debug)
 
+  private[fetcher] def renameOnlyFallback(areDerivationsRenameOnly: Boolean,
+                                          fallback: => Map[String, AnyRef]): Try[Map[String, AnyRef]] = {
+    if (!areDerivationsRenameOnly) {
+      Success(Map.empty)
+    } else {
+      Try(fallback)
+    }
+  }
+
   case class Request(name: String,
                      keys: Map[String, AnyRef],
                      atMillis: Option[Long] = None,
@@ -578,12 +587,13 @@ class Fetcher(val kvStore: KVStore,
           case Failure(exception) =>
             ctx.incrementException(exception)
 
-            val renameOnlyDerivedMapTry: Try[Map[String, AnyRef]] = Try {
+            val renameOnlyDerivedMapTry = Fetcher.renameOnlyFallback(
+              joinCodec.conf.areDerivationsRenameOnly,
               joinCodec
                 .renameOnlyDeriveFunc(request.keys, baseMap)
                 .mapValues(_.asInstanceOf[AnyRef])
                 .toMap
-            }
+            )
 
             val renameOnlyDerivedMap: Map[String, AnyRef] =
               renameOnlyDerivedMapTry match {
