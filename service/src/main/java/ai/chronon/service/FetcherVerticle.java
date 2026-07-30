@@ -13,6 +13,7 @@ import ai.chronon.service.handlers.StatsHandler;
 import ai.chronon.service.handlers.StatsTrailingDriftHandler;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Promise;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.core.http.Http2Settings;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
@@ -27,8 +28,12 @@ import org.slf4j.LoggerFactory;
  */
 public class FetcherVerticle extends AbstractVerticle {
     private static final Logger logger = LoggerFactory.getLogger(FetcherVerticle.class);
+    private static final String FETCH_WORKER_POOL_SIZE_PROPERTY = "ai.chronon.fetcher.worker.pool.size";
+    private static final String FETCH_WORKER_POOL_SIZE_ENV = "FETCHER_WORKER_POOL_SIZE";
+    private static final int DEFAULT_FETCH_WORKER_POOL_SIZE = 20;
 
     private HttpServer server;
+    private WorkerExecutor fetchWorkerExecutor;
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
@@ -47,6 +52,7 @@ public class FetcherVerticle extends AbstractVerticle {
                 // This code runs back on the event loop when the blocking operation completes
                 startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
             } catch (Exception e) {
+                closeFetchWorkerExecutor();
                 startPromise.fail(e);
             }
         })
@@ -55,12 +61,15 @@ public class FetcherVerticle extends AbstractVerticle {
 
     protected void startHttpServer(int port, String configJsonString, Api api, JavaFetcher fetcher, Promise<Void> startPromise) throws Exception {
         Router router = Router.router(vertx);
+        int fetchWorkerPoolSize = fetchWorkerPoolSize();
+        fetchWorkerExecutor = vertx.createSharedWorkerExecutor("chronon-fetch-init", fetchWorkerPoolSize);
+        logger.info("Fetcher initiation worker pool size: {}", fetchWorkerPoolSize);
 
         // Define routes
 
         // Set up sub-routes for the various feature retrieval apis
-        router.route("/v1/fetch/*").subRouter(FetchRouter.createFetchRoutes(vertx, fetcher));
-        router.route("/v2/fetch/*").subRouter(FetchRouterV2.createFetchRoutes(vertx, fetcher));
+        router.route("/v1/fetch/*").subRouter(FetchRouter.createFetchRoutes(vertx, fetcher, fetchWorkerExecutor));
+        router.route("/v2/fetch/*").subRouter(FetchRouterV2.createFetchRoutes(vertx, fetcher, fetchWorkerExecutor));
 
         // Set up route for list of online joins
         router.get("/v1/joins").handler(new JoinListHandler(fetcher));
@@ -116,8 +125,36 @@ public class FetcherVerticle extends AbstractVerticle {
                 })
                 .onFailure(err -> {
                     logger.error("Failed to start HTTP server", err);
+                    closeFetchWorkerExecutor();
                     startPromise.fail(err);
                 });
+    }
+
+    private static int fetchWorkerPoolSize() {
+        String configured = System.getProperty(FETCH_WORKER_POOL_SIZE_PROPERTY);
+        if (configured == null || configured.trim().isEmpty()) {
+            configured = System.getenv(FETCH_WORKER_POOL_SIZE_ENV);
+        }
+        if (configured == null || configured.trim().isEmpty()) {
+            return DEFAULT_FETCH_WORKER_POOL_SIZE;
+        }
+
+        try {
+            int poolSize = Integer.parseInt(configured.trim());
+            if (poolSize <= 0) {
+                throw new IllegalArgumentException("Fetcher worker pool size must be positive");
+            }
+            return poolSize;
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("Invalid fetcher worker pool size: " + configured, exception);
+        }
+    }
+
+    private void closeFetchWorkerExecutor() {
+        if (fetchWorkerExecutor != null) {
+            fetchWorkerExecutor.close();
+            fetchWorkerExecutor = null;
+        }
     }
 
     @Override
@@ -127,13 +164,16 @@ public class FetcherVerticle extends AbstractVerticle {
             server.close()
                     .onSuccess(v -> {
                         logger.info("HTTP server stopped successfully");
+                        closeFetchWorkerExecutor();
                         stopPromise.complete();
                     })
                     .onFailure(err -> {
                         logger.error("Failed to stop HTTP server", err);
+                        closeFetchWorkerExecutor();
                         stopPromise.fail(err);
                     });
         } else {
+            closeFetchWorkerExecutor();
             stopPromise.complete();
         }
     }

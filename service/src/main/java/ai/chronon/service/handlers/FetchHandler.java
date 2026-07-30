@@ -9,6 +9,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RequestBody;
 import io.vertx.ext.web.RoutingContext;
@@ -44,10 +45,19 @@ public class FetchHandler implements Handler<RoutingContext> {
 
     private final JavaFetcher fetcher;
     private final BiFunction<JavaFetcher, List<JavaRequest>, CompletableFuture<List<JavaResponse>>> fetchFunction;
+    private final WorkerExecutor workerExecutor;
 
     public FetchHandler(JavaFetcher fetcher, BiFunction<JavaFetcher, List<JavaRequest>, CompletableFuture<List<JavaResponse>>> fetchFunction) {
+        this(fetcher, fetchFunction, null);
+    }
+
+    public FetchHandler(
+            JavaFetcher fetcher,
+            BiFunction<JavaFetcher, List<JavaRequest>, CompletableFuture<List<JavaResponse>>> fetchFunction,
+            WorkerExecutor workerExecutor) {
         this.fetcher = fetcher;
         this.fetchFunction = fetchFunction;
+        this.workerExecutor = workerExecutor;
     }
 
     @Override
@@ -75,11 +85,15 @@ public class FetchHandler implements Handler<RoutingContext> {
         }
 
         List<JavaRequest> requests = maybeRequest.getValue();
-        CompletableFuture<List<JavaResponse>> resultsJavaFuture = fetchFunction.apply(fetcher, requests);
 
-        // wrap the Java future we get in a Vert.x Future to not block the worker thread
+        // Fetch initiation performs synchronous metadata, codec, and Future-graph construction. Keep it off the
+        // event loop, but release the worker as soon as the asynchronous fetch has been started.
+        Future<CompletableFuture<List<JavaResponse>>> fetchInitiation = workerExecutor == null
+                ? ctx.vertx().executeBlocking(() -> fetchFunction.apply(fetcher, requests), false)
+                : workerExecutor.executeBlocking(() -> fetchFunction.apply(fetcher, requests), false);
         Future<List<GetFeaturesResponse.Result>> maybeFeatureResponses =
-                Future.fromCompletionStage(resultsJavaFuture)
+                fetchInitiation
+                      .compose(Future::fromCompletionStage)
                       .map(result ->
                               result.stream()
                                       .map(FetchHandler::responseToPoJo)

@@ -3,6 +3,7 @@ package ai.chronon.service.handlers;
 import ai.chronon.online.*;
 import ai.chronon.service.model.GetFeaturesResponse;
 import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -39,11 +40,19 @@ public class FetchRouterV2 {
     }
 
     public static Router createFetchRoutes(Vertx vertx, JavaFetcher fetcher) {
+        return createFetchRoutes(vertx, fetcher, null);
+    }
+
+    public static Router createFetchRoutes(Vertx vertx, JavaFetcher fetcher, WorkerExecutor workerExecutor) {
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
 
         // TODO: can add a query param in future to specify avro binary response instead of base64 string
-        router.post("/join/:name").handler(new FetchHandlerV2(fetcher, new JoinFetcherAvroStringFunction(), new AvroStringOnSuccessFunction()));
+        router.post("/join/:name").handler(new FetchHandlerV2(
+                fetcher,
+                new JoinFetcherAvroStringFunction(),
+                new AvroStringOnSuccessFunction(),
+                workerExecutor));
 
         return router;
     }

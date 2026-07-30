@@ -2,6 +2,7 @@ package ai.chronon.service.handlers;
 
 import ai.chronon.online.*;
 import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.handler.BodyHandler;
 
@@ -35,12 +36,19 @@ public class FetchRouter {
     }
 
     public static Router createFetchRoutes(Vertx vertx, JavaFetcher fetcher) {
+        return createFetchRoutes(vertx, fetcher, null);
+    }
+
+    public static Router createFetchRoutes(Vertx vertx, JavaFetcher fetcher, WorkerExecutor workerExecutor) {
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
 
-        router.post("/groupby/:name").handler(new FetchHandler(fetcher, new GroupByFetcherFunction()));
-        router.post("/join/:name").handler(new FetchHandler(fetcher, new JoinFetcherFunction()));
-        router.post("/modeltransforms/:name").handler(new FetchHandler(fetcher, new ModelTransformsFetcherFunction()));
+        router.post("/groupby/:name")
+                .handler(new FetchHandler(fetcher, new GroupByFetcherFunction(), workerExecutor));
+        router.post("/join/:name")
+                .handler(new FetchHandler(fetcher, new JoinFetcherFunction(), workerExecutor));
+        router.post("/modeltransforms/:name")
+                .handler(new FetchHandler(fetcher, new ModelTransformsFetcherFunction(), workerExecutor));
 
         return router;
     }
