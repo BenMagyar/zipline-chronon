@@ -25,6 +25,9 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.{DataFrame, SparkSession, functions, types}
 import org.slf4j.LoggerFactory
 
+import java.io.File
+import java.net.URI
+import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
 import java.util.function
 
@@ -63,6 +66,12 @@ object CatalystUtil {
     sys.env.get("AWS_CREDENTIALS_PROVIDER").foreach { provider =>
       spark.sparkContext.hadoopConfiguration.set("fs.s3a.aws.credentials.provider", provider)
     }
+    // Set fs.s3a.endpoint.region from the standard AWS env vars so ADD JAR s3a:// paths resolve
+    // to the correct region. S3A defaults to us-east-1 and returns a redirect for other regions.
+    val awsRegion = sys.env.getOrElse("AWS_DEFAULT_REGION", sys.env.getOrElse("AWS_REGION", ""))
+    if (awsRegion.nonEmpty && spark.sparkContext.hadoopConfiguration.get("fs.s3a.endpoint.region", "").isEmpty) {
+      spark.sparkContext.hadoopConfiguration.set("fs.s3a.endpoint.region", awsRegion)
+    }
     assert(spark.sessionState.conf.wholeStageEnabled)
     spark
   }
@@ -80,6 +89,79 @@ object CatalystUtil {
   private val blueprints: ConcurrentHashMap[BlueprintKey, Memo[CatalystUtilBlueprint]] =
     new ConcurrentHashMap[BlueprintKey, Memo[CatalystUtilBlueprint]]()
 
+  // s3:// and s3a:// identify the same source for setup purposes. Normalize before building the key so they share
+  // both the compiled blueprint and the localized jar.
+  private def normalizeSetups(setups: Seq[String]): Seq[String] =
+    setups.map(_.replace("s3://", "s3a://"))
+
+  // A setup is part of the blueprint key, so the same UDF jar can otherwise be copied to a new temp file for
+  // every distinct query that uses it. Spark's session and jar classloader live for the process lifetime, so cache
+  // the complete successful localization and registration operation by source URI.
+  private val localizedJars = new ConcurrentHashMap[URI, File]()
+
+  private[online] def normalizeJarUri(jarPath: String): URI = {
+    val uri = new URI(jarPath)
+    // Preserve existing setup contracts while routing legacy S3 URIs through Hadoop's supported filesystem.
+    if (Option(uri.getScheme).exists(_.equalsIgnoreCase("s3"))) {
+      new URI("s3a", uri.getRawSchemeSpecificPart, uri.getRawFragment)
+    } else {
+      uri
+    }
+  }
+
+  private[online] def localizeJar(jarPath: String): File = {
+    val normalizedUri = normalizeJarUri(jarPath)
+    // Loading a changed implementation at the same URI cannot safely replace classes already defined by Spark's
+    // process-wide classloader. Publishers must use immutable, versioned paths. computeIfAbsent also means a failed
+    // copy is not inserted, so the next request can retry it.
+    localizedJars.computeIfAbsent(
+      normalizedUri,
+      new function.Function[URI, File] {
+        override def apply(uri: URI): File = copyAndRegisterJar(uri)
+      }
+    )
+  }
+
+  private[online] def localizedJarCount: Int = localizedJars.size()
+
+  private[online] def isJarLocalized(jarPath: String): Boolean =
+    localizedJars.containsKey(normalizeJarUri(jarPath))
+
+  private def copyAndRegisterJar(uri: URI): File = {
+    val sparkContext = session.sparkContext
+    val sourcePath = new org.apache.hadoop.fs.Path(uri)
+    val fileSystem = sourcePath.getFileSystem(sparkContext.hadoopConfiguration)
+    val tempDir = Files.createTempDirectory("chronon-udf-").toFile
+    tempDir.deleteOnExit()
+    // SparkContext indexes added jars by basename, so two different URIs ending in the same common build name
+    // (for example, out.jar) must still receive distinct local names.
+    val sourceName = Option(sourcePath.getName).filter(_.nonEmpty).getOrElse("udf.jar")
+    val localFile = new File(tempDir, s"${tempDir.getName}-$sourceName")
+    localFile.deleteOnExit()
+
+    try {
+      fileSystem.copyToLocalFile(sourcePath, new org.apache.hadoop.fs.Path(localFile.toURI))
+      sparkContext.addJar(localFile.getAbsolutePath)
+      session.sharedState.jarClassLoader.addURL(localFile.toURI.toURL)
+      localFile
+    } catch {
+      case exception: Exception =>
+        Files.deleteIfExists(localFile.toPath)
+        Files.deleteIfExists(tempDir.toPath)
+        throw exception
+    }
+  }
+
+  private[online] def evictLocalizedJarForTest(jarPath: String): Unit = {
+    val localizedFile = localizedJars.remove(normalizeJarUri(jarPath))
+    Option(localizedFile).foreach { file =>
+      val directory = file.getParentFile
+      // LocalFileSystem may put a hidden checksum beside the copied jar.
+      Option(directory.listFiles()).getOrElse(Array.empty[File]).foreach(child => Files.deleteIfExists(child.toPath))
+      Files.deleteIfExists(directory.toPath)
+    }
+  }
+
   /** Spark planning (parse -> analyze -> optimize -> physical plan -> java source generation) dominates the
     * cost of constructing a CatalystUtil and depends only on the query and the input schema. Cache it so that
     * every CatalystUtil for a given query after the first is close to free.
@@ -91,7 +173,7 @@ object CatalystUtil {
                   timestampMillisOutputColumns: Set[String]): CatalystUtilBlueprint =
     blueprints
       .computeIfAbsent(
-        BlueprintKey(inputSchema, selects, wheres, setups, timestampMillisOutputColumns),
+        BlueprintKey(inputSchema, selects, wheres, normalizeSetups(setups), timestampMillisOutputColumns),
         new function.Function[BlueprintKey, Memo[CatalystUtilBlueprint]] {
           override def apply(k: BlueprintKey): Memo[CatalystUtilBlueprint] =
             new Memo(new CatalystUtilBlueprint(k))
@@ -144,6 +226,8 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
   val outputArrDecoder: Any => Any = SparkInternalRowConversions.from(outputSparkSchema, false)
   val outputChrononSchema: Array[(String, DataType)] = SparkConversions.toChrononSchema(outputSparkSchema)
 
+  val hasSetups: Boolean = key.setups.nonEmpty
+
   def newInstance(): CatalystUtil = new CatalystUtil(this)
 
   private[chronon] def normalizeTimestampOutputs(df: DataFrame): DataFrame =
@@ -187,7 +271,7 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
         try {
           statement.trim match {
             case addJarPattern(jarPath) =>
-              val localFile = localizeJar(jarPath)
+              val localFile = CatalystUtil.localizeJar(jarPath)
               logger.info(s"Executed setup statement via localizeJar (${localFile.length()} bytes): $statement")
             case _ =>
               session.sql(statement)
@@ -205,22 +289,15 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
     }
   }
 
-  private def localizeJar(jarPath: String): java.io.File = {
-    val session = CatalystUtil.session
-    val sparkContext = session.sparkContext
-    val normalizedPath = if (jarPath.startsWith("s3://")) "s3a://" + jarPath.stripPrefix("s3://") else jarPath
-    val sourcePath = new org.apache.hadoop.fs.Path(new java.net.URI(normalizedPath))
-    val fileSystem = sourcePath.getFileSystem(sparkContext.hadoopConfiguration)
-    val localFile = java.io.File.createTempFile(sourcePath.getName.stripSuffix(".jar") + "-", ".jar")
-    localFile.deleteOnExit()
-    fileSystem.copyToLocalFile(sourcePath, new org.apache.hadoop.fs.Path(localFile.toURI))
-    sparkContext.addJar(localFile.getAbsolutePath)
-    session.sharedState.jarClassLoader.addURL(localFile.toURI.toURL)
-    localFile
-  }
 }
 
 class CatalystUtil(blueprint: CatalystUtilBlueprint) {
+
+  // Hive resolves externally loaded UDF classes through the calling thread's context classloader at evaluation time.
+  // Blueprint setup happens once, so each thread-local instance also needs the shared jar classloader.
+  if (blueprint.hasSetups) {
+    Thread.currentThread().setContextClassLoader(CatalystUtil.session.sharedState.jarClassLoader)
+  }
 
   def this(inputSchema: StructType,
            selects: Seq[(String, String)],

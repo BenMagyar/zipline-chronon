@@ -160,4 +160,54 @@ class CatalystUtilSharingTest extends AnyFlatSpec with Matchers {
       failures shouldBe empty
     }
   }
+
+  it should "produce correct results concurrently when a UDF is registered via setups" in {
+    val udfSetups = Seq(
+      "CREATE FUNCTION MINUS_TWO AS 'ai.chronon.online.test.Minus_Two'"
+    )
+    val udfSelects = Seq(
+      "user_id" -> "user_id",
+      "amount_cents" -> "CAST(amount * 100 AS LONG)",
+      "adjusted_qty" -> "MINUS_TWO(CAST(quantity AS INT))"
+    )
+    val pooled = new PooledCatalystUtil(udfSelects, schema, setups = udfSetups)
+    val expected = (0 until 100).map(i => i -> pooled.performSql(rowFor(i)).head).toMap
+
+    val threads = 16
+    val failures = new ConcurrentLinkedQueue[String]()
+    val executor = Executors.newFixedThreadPool(threads)
+    val ready = new CountDownLatch(threads)
+    val go = new CountDownLatch(1)
+    val done = new CountDownLatch(threads)
+
+    (0 until threads).foreach { thread =>
+      executor.submit(new Runnable {
+        override def run(): Unit = {
+          ready.countDown()
+          go.await()
+          try {
+            (0 until 100).foreach { row =>
+              val got = pooled.performSql(rowFor(row)).head
+              expected(row).foreach { case (field, want) =>
+                if (got(field) != want)
+                  failures.add(s"thread $thread row $row field $field: got ${got(field)} want $want")
+              }
+            }
+          } catch {
+            case exception: Throwable => failures.add(s"thread $thread threw: $exception")
+          } finally done.countDown()
+        }
+      })
+    }
+
+    ready.await()
+    go.countDown()
+    val finished = done.await(2, TimeUnit.MINUTES)
+    executor.shutdownNow()
+
+    finished shouldBe true
+    withClue(s"${failures.size} mismatches, first few: ${failures.toArray.take(5).mkString("; ")} ") {
+      failures shouldBe empty
+    }
+  }
 }
