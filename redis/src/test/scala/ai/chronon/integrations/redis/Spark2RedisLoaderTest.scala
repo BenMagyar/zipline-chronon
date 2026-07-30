@@ -5,9 +5,12 @@ import java.nio.file.Files
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.mockito.Mockito.{never, times, verify, when}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import org.scalatestplus.mockito.MockitoSugar
+import redis.clients.jedis.{ClusterPipeline, Response}
 import redis.clients.jedis.exceptions.{
   JedisClusterException,
   JedisConnectionException,
@@ -19,7 +22,7 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.collection.mutable.ArrayBuffer
 
-class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers {
+class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers with MockitoSugar {
   private var spark: SparkSession = _
 
   override def beforeAll(): Unit = {
@@ -132,6 +135,31 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     Spark2RedisLoader.retryableRedisFailure(new IllegalStateException("application invariant failed")) shouldBe false
     Spark2RedisLoader.retryableRedisFailure(new JedisDataException("WRONGTYPE bad input")) shouldBe false
     Spark2RedisLoader.retryableRedisFailure(new IllegalArgumentException("invalid mutation")) shouldBe false
+  }
+
+  it should "close a write pipeline once before surfacing an unset response" in {
+    val pipeline = mock[ClusterPipeline]
+    val response = mock[Response[Any]]
+    val unsetResponse =
+      new IllegalStateException("Please close pipeline or multi block before calling this method.")
+    when(response.get()).thenThrow(unsetResponse)
+
+    val failure = the[IllegalStateException] thrownBy {
+      Spark2RedisLoader.completePipeline(pipeline)(Seq(response))
+    }
+
+    failure shouldBe unsetResponse
+    verify(pipeline, times(1)).close()
+    verify(pipeline, never()).sync()
+  }
+
+  it should "use direct replay after an unset pipeline response" in {
+    val unsetResponse =
+      new IllegalStateException("Please close pipeline or multi block before calling this method.")
+
+    Spark2RedisLoader.directReplayRequired(unsetResponse) shouldBe true
+    Spark2RedisLoader.directReplayRequired(new JedisNoScriptException("NOSCRIPT missing")) shouldBe true
+    Spark2RedisLoader.directReplayRequired(new JedisConnectionException("connection reset")) shouldBe false
   }
 
   "Redis OOM retries" should "recognize only Redis maxmemory failures" in {

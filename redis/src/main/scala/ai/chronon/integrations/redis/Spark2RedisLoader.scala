@@ -1574,8 +1574,7 @@ object Spark2RedisLoader {
       } catch {
         case error if retryableRedisFailure(error) =>
           lastFailure = error
-          directReplay =
-            directReplay || error.isInstanceOf[JedisRedirectionException] || error.isInstanceOf[JedisNoScriptException]
+          directReplay = directReplay || directReplayRequired(error)
           refreshClient = refreshClient || refreshRequired(error)
           attempt += 1
           logger.warn(s"Redis command batch failed; attempt $attempt of ${maxRetries + 1}", error)
@@ -1592,24 +1591,29 @@ object Spark2RedisLoader {
                               keyHashTagMode: String,
                               leaseDeadlineMillis: Long,
                               tombstoneDeadlineMillis: Long): Seq[Any] = {
-    var pipeline: ClusterPipeline = null
-    try {
-      pipeline = client.pipelined()
-      val responses =
-        batch.map(row =>
-          enqueueCommand(pipeline,
-                         row,
-                         mode,
-                         dataset,
-                         keyPrefix,
-                         keyHashTagMode,
-                         leaseDeadlineMillis,
-                         tombstoneDeadlineMillis))
-      pipeline.sync()
-      responses.map(_.get())
-    } finally {
-      if (pipeline != null) Try(pipeline.close())
+    val pipeline = client.pipelined()
+    completePipeline(pipeline) {
+      batch.map(row =>
+        enqueueCommand(pipeline,
+                       row,
+                       mode,
+                       dataset,
+                       keyPrefix,
+                       keyHashTagMode,
+                       leaseDeadlineMillis,
+                       tombstoneDeadlineMillis))
     }
+  }
+
+  private[redis] def completePipeline(pipeline: ClusterPipeline)(enqueue: => Seq[Response[_]]): Seq[Any] = {
+    val responses =
+      try enqueue
+      finally {
+        // close is both the sync and the connection-release step. A second sync after a failed one can make Jedis
+        // revisit response queues whose node connections it already removed and fail on its executor thread.
+        pipeline.close()
+      }
+    responses.map(_.get())
   }
 
   private def executeDirect(client: JedisCluster,
@@ -1856,7 +1860,14 @@ object Spark2RedisLoader {
     case _: JedisRedirectionException      => true
     case _: JedisNoScriptException         => true
     case dataError: JedisDataException     => retryableDataError(dataError)
-    case stateError: IllegalStateException => Option(stateError.getMessage).contains(UnsetPipelineResponseMessage)
+    case stateError: IllegalStateException => unsetPipelineResponse(stateError)
+    case _                                 => false
+  }
+
+  private[redis] def directReplayRequired(error: Throwable): Boolean = error match {
+    case _: JedisRedirectionException      => true
+    case _: JedisNoScriptException         => true
+    case stateError: IllegalStateException => unsetPipelineResponse(stateError)
     case _                                 => false
   }
 
@@ -1867,9 +1878,12 @@ object Spark2RedisLoader {
     case dataError: JedisDataException =>
       val message = Option(dataError.getMessage).getOrElse("").toUpperCase(Locale.ROOT)
       Seq("CLUSTERDOWN", "MASTERDOWN", "READONLY").exists(message.startsWith)
-    case stateError: IllegalStateException => Option(stateError.getMessage).contains(UnsetPipelineResponseMessage)
+    case stateError: IllegalStateException => unsetPipelineResponse(stateError)
     case _                                 => false
   }
+
+  private def unsetPipelineResponse(error: IllegalStateException): Boolean =
+    Option(error.getMessage).contains(UnsetPipelineResponseMessage)
 
   private def retryableDataError(error: JedisDataException): Boolean = {
     val message = Option(error.getMessage).getOrElse("").toUpperCase(Locale.ROOT)
