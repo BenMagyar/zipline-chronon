@@ -78,7 +78,8 @@ import scala.concurrent.duration._
   * Writing to the same timestamp twice deletes the first value via ZREMRANGEBYSCORE before ZADD.
   * This matches BigTable's deleteCells + setCell pattern.
   *
-  * Data is stored with a default TTL of 5 days (matching BigTable implementation).
+  * Direct KV writes use a default TTL of 5 days (matching BigTable). Managed batch publication configures its lease
+  * independently.
   */
 class RedisKVStoreImpl(jedisCluster: JedisCluster,
                        conf: Map[String, String] = Map.empty,

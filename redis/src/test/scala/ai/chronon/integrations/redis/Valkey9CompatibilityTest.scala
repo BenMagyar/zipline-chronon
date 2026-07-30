@@ -15,6 +15,8 @@ import scala.jdk.CollectionConverters._
 class Valkey9CompatibilityTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers {
   private var container: GenericContainer[_] = _
   private var client: JedisCluster = _
+  private var host: String = _
+  private var mappedPort: Int = _
 
   private def leaseDeadlineBytes(seconds: Int = 300): Array[Byte] =
     (System.currentTimeMillis() + seconds * 1000L).toString.getBytes(StandardCharsets.UTF_8)
@@ -51,8 +53,8 @@ class Valkey9CompatibilityTest extends AnyFlatSpec with BeforeAndAfterAll with M
     }
     require(clusterReady, "Valkey 9 single-node cluster did not reach cluster_state:ok")
 
-    val host = container.getHost
-    val mappedPort = container.getMappedPort(6379)
+    host = container.getHost
+    mappedPort = container.getMappedPort(6379)
     val config = DefaultJedisClientConfig
       .builder()
       .hostAndPortMapper(new HostAndPortMapper {
@@ -132,5 +134,68 @@ class Valkey9CompatibilityTest extends AnyFlatSpec with BeforeAndAfterAll with M
     val status = RedisBatchUpload.BatchStatus("valkey9-generation", "2026-07-27", 2000L, 2L)
     RedisBatchUpload.writeStatus(client, statusKey, status) shouldBe 1L
     RedisBatchUpload.readStatus(client, statusKey) shouldBe Some(status)
+  }
+
+  it should "set no-touch mode on direct and pipeline connections without changing control clients" in {
+    RedisKVStoreFactory.supportsClientNoTouch(client) shouldBe true
+    val settings = RedisKVStoreFactory
+      .settings(Map("redis.cluster.nodes" -> s"$host:$mappedPort"), env = Map.empty)
+      .copy(
+        maxConnections = 2,
+        minIdleConnections = 0,
+        maxIdleConnections = 1,
+        advertisedPortMappings = Map(6379 -> RedisKVStoreFactory.RedisEndpoint(host, mappedPort)),
+        clientNoTouch = true
+      )
+    val noTouchClient = RedisKVStoreFactory.createClient(settings)
+    val key = "chronon:{NO_TOUCH_BATCH:entity-1}".getBytes(StandardCharsets.UTF_8)
+    val timestamp = 2000L
+    val writeEpoch = 2L
+    val encodedValue = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      timestamp,
+      "cold-value".getBytes(StandardCharsets.UTF_8),
+      writeEpoch)
+    try {
+      client.configSet("maxmemory-policy", "allkeys-lru") shouldBe "OK"
+      client.set(key, encodedValue) shouldBe "OK"
+      val initialDeadline = System.currentTimeMillis() + 300000L
+      client.pexpireAt(key, initialDeadline) shouldBe 1L
+      Thread.sleep(2200L)
+      val idleBefore = client.objectIdletime(key).longValue()
+      idleBefore should be >= 2L
+
+      new String(RedisBatchUpload.decodeValue(noTouchClient.get(key)).get.payload,
+                 StandardCharsets.UTF_8) shouldBe "cold-value"
+      noTouchClient.pexpireTime(key) should be > System.currentTimeMillis()
+      RedisBatchUpload
+        .validateExpiryAndAdvance(
+          noTouchClient,
+          key,
+          Seq(initialDeadline, initialDeadline + 30000L, timestamp, writeEpoch)
+            .map(_.toString.getBytes(StandardCharsets.UTF_8)))
+        .asInstanceOf[java.lang.Long]
+        .longValue() shouldBe 1L
+      val pipeline = noTouchClient.pipelined()
+      val pipelinedValue = pipeline.get(key)
+      val expiration = pipeline.evalsha(
+        RedisBatchUpload.validateExpiryAndAdvanceSha,
+        List(key).asJava,
+        Seq(initialDeadline, initialDeadline + 60000L, timestamp, writeEpoch)
+          .map(_.toString.getBytes(StandardCharsets.UTF_8))
+          .asJava
+      )
+      pipeline.close()
+      new String(RedisBatchUpload.decodeValue(pipelinedValue.get()).get.payload,
+                 StandardCharsets.UTF_8) shouldBe "cold-value"
+      expiration.get().asInstanceOf[java.lang.Long].longValue() shouldBe 1L
+      client.objectIdletime(key).longValue() should be >= idleBefore
+
+      client.get(key) should not be null
+      client.objectIdletime(key).longValue() should be <= 1L
+    } finally {
+      noTouchClient.close()
+      client.configSet("maxmemory-policy", "noeviction")
+    }
   }
 }

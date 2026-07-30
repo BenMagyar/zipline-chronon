@@ -3,14 +3,21 @@ package ai.chronon.integrations.redis
 import ai.chronon.integrations.redis.RedisKVStoreConstants._
 import org.slf4j.LoggerFactory
 import redis.clients.jedis.{
+  Connection,
   ConnectionPoolConfig,
   DefaultJedisClientConfig,
   HostAndPort,
   HostAndPortMapper,
-  JedisCluster
+  JedisCluster,
+  Protocol
 }
+import redis.clients.jedis.exceptions.JedisDataException
+import redis.clients.jedis.providers.ClusterConnectionProvider
 
+import java.time.Duration
+import java.util.Locale
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 /** Factory for creating Redis KVStore instances.
   *
@@ -55,7 +62,8 @@ object RedisKVStoreFactory {
                             maxRedirections: Int,
                             pipelineSyncThreads: Int = DefaultPipelineSyncThreads,
                             validateConnections: Boolean = false,
-                            advertisedPortMappings: Map[Int, RedisEndpoint] = Map.empty)
+                            advertisedPortMappings: Map[Int, RedisEndpoint] = Map.empty,
+                            clientNoTouch: Boolean = false)
       extends Serializable {
 
     /** Spark tasks issue one pipeline at a time. Keep their per-node pools deliberately small. */
@@ -104,7 +112,7 @@ object RedisKVStoreFactory {
         s"maxConnections=${settings.maxConnections}, minIdle=${settings.minIdleConnections}, " +
         s"maxIdle=${settings.maxIdleConnections}, connectionTimeout=${settings.connectionTimeoutMs}, " +
         s"soTimeout=${settings.soTimeoutMs}, maxRedirections=${settings.maxRedirections}, " +
-        s"pipelineSyncThreads=${settings.pipelineSyncThreads}"
+        s"pipelineSyncThreads=${settings.pipelineSyncThreads}, clientNoTouch=${settings.clientNoTouch}"
     )
 
     val poolConfig =
@@ -130,12 +138,83 @@ object RedisKVStoreFactory {
       })
     }
 
-    new JedisCluster(
-      clusterNodes.asJava,
-      clientConfigBuilder.build(),
-      settings.maxRedirections,
-      poolConfig
-    )
+    val clientConfig = clientConfigBuilder.build()
+    if (settings.clientNoTouch) {
+      val provider = new NoTouchClusterConnectionProvider(clusterNodes.asJava, clientConfig, poolConfig)
+      val retriesDuration =
+        Duration.ofMillis(java.lang.Math.multiplyExact(settings.soTimeoutMs.toLong, settings.maxRedirections.toLong))
+      new JedisCluster(provider, settings.maxRedirections, retriesDuration)
+    } else {
+      new JedisCluster(clusterNodes.asJava, clientConfig, settings.maxRedirections, poolConfig)
+    }
+  }
+
+  /** Checks the current cluster for CLIENT NO-TOUCH without leaving the shared control pool in no-touch mode. */
+  private[redis] def supportsClientNoTouch(client: JedisCluster): Boolean = {
+    val pools = client.getClusterNodes.values().asScala.toSeq
+    require(pools.nonEmpty, "Redis cluster has no node pools for CLIENT NO-TOUCH capability detection")
+    pools.forall { pool =>
+      val connection = pool.getResource
+      var enabled = false
+      var reusable = true
+      try {
+        setClientNoTouch(connection, enabled = true)
+        enabled = true
+        setClientNoTouch(connection, enabled = false)
+        enabled = false
+        true
+      } catch {
+        case error: JedisDataException if unavailableClientNoTouch(error) => false
+        case error: Throwable =>
+          reusable = false
+          throw error
+      } finally {
+        if (enabled) {
+          try setClientNoTouch(connection, enabled = false)
+          catch {
+            case _: Throwable => reusable = false
+          }
+        }
+        if (!reusable) connection.setBroken()
+        connection.close()
+      }
+    }
+  }
+
+  private[redis] def setClientNoTouch(connection: Connection, enabled: Boolean): Unit = {
+    connection.sendCommand(Protocol.Command.CLIENT, "NO-TOUCH", if (enabled) "ON" else "OFF")
+    val response = connection.getStatusCodeReply
+    require(response == "OK", s"Redis CLIENT NO-TOUCH returned an unexpected response: $response")
+  }
+
+  private def unavailableClientNoTouch(error: JedisDataException): Boolean = {
+    val message = Option(error.getMessage).getOrElse("").toUpperCase(Locale.ROOT)
+    message.contains("UNKNOWN SUBCOMMAND") || message.contains("UNKNOWN COMMAND") || message.startsWith("NOPERM")
+  }
+
+  private final class NoTouchClusterConnectionProvider(
+      nodes: java.util.Set[HostAndPort],
+      clientConfig: redis.clients.jedis.JedisClientConfig,
+      poolConfig: org.apache.commons.pool2.impl.GenericObjectPoolConfig[Connection]
+  ) extends ClusterConnectionProvider(nodes, clientConfig, poolConfig) {
+
+    override def getConnection(node: HostAndPort): Connection = enableNoTouch(super.getConnection(node))
+
+    override def getConnection(): Connection = enableNoTouch(super.getConnection())
+
+    override def getConnectionFromSlot(slot: Int): Connection = enableNoTouch(super.getConnectionFromSlot(slot))
+
+    private def enableNoTouch(connection: Connection): Connection = {
+      try {
+        setClientNoTouch(connection, enabled = true)
+        connection
+      } catch {
+        case error: Throwable =>
+          connection.setBroken()
+          Try(connection.close())
+          throw error
+      }
+    }
   }
 
   private[redis] def parseEndpoint(node: String): HostAndPort = {

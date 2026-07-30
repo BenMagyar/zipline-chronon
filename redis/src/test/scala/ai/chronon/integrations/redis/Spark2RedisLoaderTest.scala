@@ -276,6 +276,79 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
                                             leaseDeadlineMillis = 5000L) shouldBe 5000L
   }
 
+  "Redis lease renewal" should "renew missing and half-spent leases while leaving fresh leases untouched" in {
+    val nowMillis = 1000000L
+    val ttlSeconds = 5 * 24 * 60 * 60
+    val halfTtlMillis = ttlSeconds.toLong * 1000L / 2L
+
+    Spark2RedisLoader.leaseRefreshRequired(None, ttlSeconds, nowMillis) shouldBe true
+    Spark2RedisLoader.leaseRefreshRequired(Some(nowMillis + halfTtlMillis + 1L), ttlSeconds, nowMillis) shouldBe false
+    Spark2RedisLoader.leaseRefreshRequired(Some(nowMillis + halfTtlMillis), ttlSeconds, nowMillis) shouldBe true
+    Spark2RedisLoader.leaseRefreshRequired(Some(nowMillis), ttlSeconds, nowMillis) shouldBe true
+  }
+
+  it should "advance generation and renewal deadlines monotonically" in {
+    Spark2RedisLoader.generationLeaseDeadline(2000L, None, None) shouldBe 2000L
+    Spark2RedisLoader.generationLeaseDeadline(2000L, Some(3000L), Some(2500L)) shouldBe 3000L
+    Spark2RedisLoader.generationLeaseDeadline(2000L, None, Some(3000L)) shouldBe 3001L
+    Spark2RedisLoader.renewedLeaseDeadline(2000L, None) shouldBe 2000L
+    Spark2RedisLoader.renewedLeaseDeadline(2000L, Some(3000L)) shouldBe 3001L
+  }
+
+  it should "round-trip the generation-bound lease checkpoint" in {
+    val status = RedisBatchUpload.BatchStatus("generation-a", "2024-07-27", 1000L, 2L)
+    val digest = Array.tabulate[Byte](32)(_.toByte)
+    val lease = Spark2RedisLoader.LeaseRecord(status, digest, minimumActiveDeadlineMillis = 2000000L)
+
+    val decoded = Spark2RedisLoader.decodeLease(Spark2RedisLoader.encodeLease(lease))
+
+    decoded.status shouldBe status
+    decoded.readyDigest.toSeq shouldBe digest.toSeq
+    decoded.minimumActiveDeadlineMillis shouldBe 2000000L
+  }
+
+  it should "advance a lease checkpoint monotonically" in {
+    val status = RedisBatchUpload.BatchStatus("generation-a", "2024-07-27", 1000L, 2L)
+    val digest = Array.tabulate[Byte](32)(_.toByte)
+    val manifest = Spark2RedisLoader.ReadyManifest(
+      status = status,
+      parentGeneration = None,
+      stateGeneration = status.generation,
+      sourceTable = "source",
+      batchDataset = "dataset_BATCH",
+      keyPrefix = "chronon",
+      keyHashTagMode = RedisKVStore.DatasetAndEntityHashTagMode,
+      stateBuckets = 4,
+      sourceRows = 2L,
+      dataRows = 1L,
+      changedKeys = 1L,
+      deletedKeys = 0L,
+      deltaRows = 2L,
+      tombstoneRows = 0L,
+      liveTTLSeconds = 3600,
+      fullRebuild = true,
+      retired = false
+    )
+    val path = new org.apache.hadoop.fs.Path(Files.createTempDirectory("redis-lease").resolve("_LEASE").toUri)
+
+    def advance(deadlineMillis: Long): Spark2RedisLoader.LeaseRecord =
+      Spark2RedisLoader.advanceLease(
+        path,
+        Spark2RedisLoader.LeaseRecord(status, digest, deadlineMillis),
+        manifest,
+        digest,
+        spark,
+        HadoopConditionalObjectWriter
+      )
+
+    advance(2000L).minimumActiveDeadlineMillis shouldBe 2000L
+    advance(1000L).minimumActiveDeadlineMillis shouldBe 2000L
+    advance(3000L).minimumActiveDeadlineMillis shouldBe 3000L
+    Spark2RedisLoader
+      .decodeLease(HadoopConditionalObjectWriter.read(path, spark.sparkContext.hadoopConfiguration).get.bytes)
+      .minimumActiveDeadlineMillis shouldBe 3000L
+  }
+
   "Redis recovery diffing" should "force every current value into a rebuild without inventing deletes" in {
     val previousRows = frame("a" -> "a-1", "b" -> "b-1")
     val previousState = Spark2RedisLoader

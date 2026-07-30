@@ -98,6 +98,7 @@ flowchart TD
     delta["delta: changed value or tombstone + batch tuple + bucket"]
     tombstones["tombstones: TTL-bounded deletes retained for older-snapshot recovery"]
     records["_CANDIDATE -> _READY -> _APPLIED"]
+    lease["mutable _LEASE minimum entity deadline"]
     head["Durable _HEAD"]
     redis["Pipelined, fenced Redis mutations"]
     metadata["serving metadata"]
@@ -108,10 +109,11 @@ flowchart TD
     generation --> delta
     generation --> tombstones
     generation --> records
+    generation --> lease
     generation -- S3 If-Match CAS --> head
     head --> redis
     redis --> metadata
-    metadata --> status
+    metadata --> lease --> status
 ```
 
 The S3 layout is:
@@ -127,6 +129,7 @@ The S3 layout is:
     tombstones/redis_bucket=<n>/part-*.parquet
     _READY
     _APPLIED
+    _LEASE
 ```
 
 `_HEAD` is the durable publication pointer. It contains a monotonic revision, the admitted generation, its parent, and
@@ -137,9 +140,10 @@ not lose the durable pointer or recovery values.
 The first publication must use a fresh Redis key prefix or an otherwise empty serving namespace. With no prior S3
 state, the loader cannot discover and tombstone unknown legacy keys that are absent from the source snapshot.
 
-`_CANDIDATE`, `_READY`, `_APPLIED`, `_HEAD`, and `claims/<uuid>` are binary protocol records. Candidate claims fence
-cleanup against active admission; an expired unclaimed candidate is marked abandoned before deletion, so a late writer
-must rebuild under a new UUID.
+`_CANDIDATE`, `_READY`, `_APPLIED`, `_LEASE`, `_HEAD`, and `claims/<uuid>` are binary protocol records. `_LEASE` is a
+small monotonic checkpoint containing the earliest guaranteed expiry among active entity keys. The other generation
+records remain unchanged and immutable. Candidate claims fence cleanup against active admission; an expired unclaimed
+candidate is marked abandoned before deletion, so a late writer must rebuild under a new UUID.
 
 Cleanup re-reads `_HEAD` before deletion. It keeps the current generation and any state generation it references, gives
 the previous head a reader grace period, and removes expired failed or losing candidates. On a versioned S3 bucket,
@@ -157,15 +161,20 @@ Every Redis value and tombstone carries `(source timestamp, write epoch)`. Times
 partition cannot overwrite a later partition. Equal timestamps use the S3 lineage epoch, making corrected same-partition
 uploads deterministic. Older jobs repair and renew the current head instead of moving it backward.
 
-Unchanged values are not blindly expired. A Lua command reads and checks only the ordering header before renewing the
-TTL, avoiding a full payload read and hash for tiered values. Missing or older values trigger a full replay from the
-immutable value-bearing S3 state. Retained tombstones remove keys resurrected by an older Redis snapshot. A newer value
-is only accepted as supersession when S3 proves that a strictly newer head exists.
+On servers that support `CLIENT NO-TOUCH`, each publication checks the absolute expiration of every unchanged active key
+against the parent generation's `_LEASE` deadline. The Lua command uses `PEXPIRETIME` and, when needed, `PEXPIREAT`; it
+does not read the value payload when the deadline matches. An anomalously later deadline validates the 22-byte ordering
+header before accepting it, covering a concurrent older writer without making header reads the normal path. Dedicated
+bulk-writer connections enable `CLIENT NO-TOUCH` on every checkout so those commands do not update eviction recency. A
+missing key, persistent key, older expiration, or mismatched ordering tuple triggers a full replay from the immutable
+value-bearing S3 state. Retained tombstones remove keys resurrected by an older Redis snapshot. A newer value is only
+accepted as supersession when S3 proves that a strictly newer head exists.
 
-Serving metadata is written after entity mutations. The Redis status mirror is written only after mutation validation,
-and `_APPLIED` is written last. Managed fetchers require status, hide tombstones, and treat a value whose tuple is ahead
-of the published status as unavailable. This prevents a half-written generation from being decoded with metadata that
-has not been published yet.
+Serving metadata is written after entity mutations. The generation's `_LEASE` checkpoint is advanced only after its
+active-key guarantee is established, the Redis status mirror is written only after mutation validation, and `_APPLIED`
+is written last. Managed fetchers require status, hide tombstones, and treat a value whose tuple is ahead of the
+published status as unavailable. This prevents a half-written generation from being decoded with metadata that has not
+been published yet.
 
 Direct writes to stable entity keys do not provide an atomic whole-GroupBy cutover. During an upload, different keys can
 temporarily reflect different applied generations. Retries are idempotent, interrupted generations are resumed, and S3
@@ -189,9 +198,20 @@ DELETE: payload is empty and the value is a tombstone
 
 ## TTL and Removal
 
-Changed values and tombstones are written with the configured lease. Unchanged active values are validated and renewed;
-serving metadata and the active status mirror receive a lease that expires no later than the earliest entity lease.
-The default is five days.
+Changed values and tombstones are written with the configured lease. Each newly admitted generation advances unchanged
+active keys to a fresh absolute deadline after validating their prior deadline. An exact rerun checks the expiry fence
+but only advances it once half the configured lease has elapsed. Serving metadata and the active status mirror receive a
+lease that expires no later than the earliest entity lease. The batch default is five days, so a missed daily upload
+still leaves roughly four days after the last successful publication.
+
+The deadline recorded in `_LEASE` never decreases, and each child generation requires a deadline strictly later than
+its parent's. Restoring an older Redis snapshot therefore restores older expiration metadata that the next publication
+can detect without loading an unchanged value from the tiered data store.
+
+Generations created by older loaders have no `_LEASE` checkpoint. The first new-loader publication that depends on one
+uses the existing 22-byte ordering-header validation once, then creates the checkpoint. Servers without `CLIENT
+NO-TOUCH` continue using that legacy validation path. `_READY`, `_APPLIED`, and Redis value bytes retain their existing
+wire versions, and an older loader safely ignores `_LEASE`.
 
 Removed entity keys become fenced tombstones for the same lease period. If uploads for a GroupBy stop, its values,
 metadata, and active status age out. Marking a GroupBy `online=false` does not itself stop uploads because offline
@@ -216,7 +236,7 @@ The rate is measured in attempted Redis key commands, not source records or pipe
 
 - one changed key is one fenced Lua mutation;
 - one removed key is one fenced Lua tombstone;
-- one unchanged key is one validate-and-expire command;
+- one unchanged key is one expiration-fence command per newly admitted generation;
 - one retained, unexpired tombstone is replayed once per upload;
 - serving metadata is one final fenced mutation;
 - commands are grouped into `batch_size` pipeline flushes (`1000` by default);
@@ -228,26 +248,31 @@ serving/streaming `multiPut` traffic or its own control commands. A different ra
 idle; concurrent jobs with mismatched rates fail clearly instead of silently creating independent limits or ratcheting
 the cluster to the lowest value.
 
-Value payload traffic is incremental, but every successful upload still scans the complete source and durable state,
-refreshes every active key, and writes one complete immutable active-state snapshot plus unexpired tombstones before
-obsolete generations are cleaned.
+Value payload traffic is incremental. Every successful upload still scans the complete source and durable state, issues
+one metadata-only expiration command for each unchanged entity key, and writes one complete immutable active-state
+snapshot plus unexpired tombstones before obsolete generations are cleaned.
 Spark scans, joins, shuffles, S3 Parquet writes, Redis CPU, tiered-value latency, retries, and replication determine the
 achieved rate.
 
 ## Valkey 9 and Tiered Storage
 
-Valkey 9 does not change the protocol. The path uses RESP-compatible Jedis operations, pipelined `EVALSHA`, Lua script
-reload, TTL, and Redis Cluster hash slots. Tiered storage also needs no alternate value format. Ordering and lease
-validation read only the 22-byte header; an exact mutation replay reads the full value to verify byte equality.
+Valkey 9 does not change the value protocol. The path uses RESP-compatible Jedis operations, pipelined `EVALSHA`, Lua
+script reload, expiration metadata, and Redis Cluster hash slots. Tiered storage also needs no alternate value format.
+The loader probes `CLIENT NO-TOUCH` support and enables it on every physical connection borrowed by its dedicated bulk
+client. Probe connections are restored to normal mode, and serving/control clients are not changed. Once a generation
+has `_LEASE`, normal unchanged-key validation reads only expiration metadata; a later-than-checkpoint expiration reads
+the ordering header, and an exact mutation replay reads the full value to verify byte equality.
 
-Keys and Redis metadata still consume memory even when values are placed on SSD. Run with `noeviction`, leave memory
-headroom, and canary the configured rate while monitoring per-node CPU, command latency, replication lag, OOM errors,
-connections, and memory/SSD item counts.
+Keys and Redis metadata still consume memory even when values are placed on SSD. Expiration checks and renewals do not
+load unchanged payloads or refresh their eviction recency, allowing tiered values to remain cold. They still consume
+Redis command, replication, and expiration-metadata write capacity. Run with `noeviction`, leave memory headroom, and
+canary the configured rate while monitoring per-node CPU, command latency, replication lag, OOM errors, connections, and
+memory/SSD item counts.
 
-The protocol repairs missing or rolled-back keys on the next upload, but it cannot make an acknowledged Redis shard
-write survive a cluster failover. If the status slot survives while a data slot rolls back, reads can return an older
-value or a miss until that repair runs. Configure Redis/Valkey replication durability for the serving requirement and
-treat S3 as the upload recovery source.
+The protocol repairs missing or rolled-back keys on a forced status recovery or the next publication, but it cannot make
+an acknowledged Redis shard write survive a cluster failover. If the status slot survives while a data slot rolls back,
+reads can return an older value or a miss until that repair runs. Configure Redis/Valkey replication durability for the
+serving requirement and treat S3 as the upload recovery source.
 
 ## Tests
 

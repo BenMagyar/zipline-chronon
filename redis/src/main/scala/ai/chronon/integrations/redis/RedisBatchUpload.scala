@@ -27,6 +27,7 @@ import scala.util.Try
   *       delta["delta: changed value or tombstone + batch tuple + bucket"]
   *       tombstones["tombstones: TTL-bounded deletes retained for older-snapshot recovery"]
   *       records["_CANDIDATE -> _READY -> _APPLIED"]
+  *       lease["mutable _LEASE minimum entity deadline"]
   *       head["Durable _HEAD"]
   *       redis["Pipelined, fenced Redis mutations"]
   *       metadata["serving metadata"]
@@ -37,10 +38,11 @@ import scala.util.Try
   *       generation --> delta
   *       generation --> tombstones
   *       generation --> records
+  *       generation --> lease
   *       generation -- S3 If-Match CAS --> head
   *       head --> redis
   *       redis --> metadata
-  *       metadata --> status
+  *       metadata --> lease --> status
   * }}}
   *
   * Redis stores serving values and a recoverable status mirror. S3 remains the durable authority for generation
@@ -80,7 +82,7 @@ import scala.util.Try
   * {{{
   *   changed key   -> 1 Lua mutation command
   *   removed key   -> 1 Lua tombstone command
-  *   unchanged key -> 1 header-validation/EXPIRE command from the loader
+  *   unchanged key -> 1 expiration-fence check, or one legacy header-validation command during migration
   *   retained delete -> 1 Lua tombstone replay command
   *   serving metadata -> 1 final Lua mutation command
   *
@@ -252,6 +254,54 @@ object RedisBatchUpload {
       |return 1
       |""".stripMargin.getBytes(StandardCharsets.UTF_8)
 
+  // Once a generation has a durable lease checkpoint, its absolute expiration is also a per-key rollback fence.
+  // Checking and advancing that metadata avoids reading a tiered value on the normal path. A later-than-checkpoint
+  // expiration is validated against the ordering header before it is accepted, covering concurrent older writers.
+  private val ValidateExpiryAndAdvanceScript: Array[Byte] =
+    """
+      |local function numberAt(value, startIndex)
+      |  local result = 0
+      |  for i = startIndex, startIndex + 7 do result = result * 256 + string.byte(value, i) end
+      |  return result
+      |end
+      |local expectedMinimum = tonumber(ARGV[1])
+      |local desired = tonumber(ARGV[2])
+      |local expectedTimestamp = tonumber(ARGV[3])
+      |local expectedEpoch = tonumber(ARGV[4])
+      |if not expectedMinimum or expectedMinimum <= 0 then
+      |  return redis.error_reply('Chronon expected lease deadline must be positive')
+      |end
+      |if not desired or desired < expectedMinimum then
+      |  return redis.error_reply('Chronon desired lease deadline precedes its expected deadline')
+      |end
+      |if not expectedTimestamp or expectedTimestamp < 0 or not expectedEpoch or expectedEpoch < 0 then
+      |  return redis.error_reply('Chronon expected ordering tuple must be non-negative')
+      |end
+      |local parts = redis.call('TIME')
+      |local now = tonumber(parts[1]) * 1000 + math.floor(tonumber(parts[2]) / 1000)
+      |if desired <= now then return redis.error_reply('Chronon mutation lease expired') end
+      |local observed = redis.call('PEXPIRETIME', KEYS[1])
+      |if observed < expectedMinimum then return 0 end
+      |if observed > expectedMinimum then
+      |  local current = redis.call('GETRANGE', KEYS[1], 0, 21)
+      |  if string.len(current) < 8 then return 0 end
+      |  local currentTimestamp = numberAt(current, 1)
+      |  local currentEpoch = 0
+      |  local operation = string.byte(current, 14)
+      |  local versioned = string.len(current) >= 22 and string.sub(current, 9, 12) == 'CRB2' and string.byte(current, 13) == 1 and (operation == 1 or operation == 2)
+      |  if versioned then currentEpoch = numberAt(current, 15) end
+      |  if currentTimestamp > expectedTimestamp then return 2 end
+      |  if currentTimestamp < expectedTimestamp then return 0 end
+      |  if currentEpoch > expectedEpoch then return 2 end
+      |  if currentEpoch < expectedEpoch then return 0 end
+      |  if not versioned or operation ~= 1 then
+      |    return redis.error_reply('Chronon active value has an unexpected wire format')
+      |  end
+      |end
+      |if desired > observed then redis.call('PEXPIREAT', KEYS[1], desired) end
+      |return 1
+      |""".stripMargin.getBytes(StandardCharsets.UTF_8)
+
   private val SetStatusIfNewerScript: Array[Byte] =
     """
       |local function numberAt(value, startIndex)
@@ -337,6 +387,7 @@ object RedisBatchUpload {
 
   private val PutBaseIfNewerSha = scriptSha(PutBaseIfNewerScript)
   private val ValidateAndExpireSha = scriptSha(ValidateAndExpireScript)
+  private val ValidateExpiryAndAdvanceSha = scriptSha(ValidateExpiryAndAdvanceScript)
   private val SetStatusIfNewerSha = scriptSha(SetStatusIfNewerScript)
   private val ReserveRateSha = scriptSha(ReserveRateScript)
 
@@ -465,6 +516,13 @@ object RedisBatchUpload {
 
   private[redis] def validateAndExpire(jedisCluster: JedisCluster, key: Array[Byte], args: Seq[Array[Byte]]): Any =
     evalScript(jedisCluster, ValidateAndExpireScript, ValidateAndExpireSha, List(key), args)
+
+  private[redis] def validateExpiryAndAdvanceSha: Array[Byte] = ValidateExpiryAndAdvanceSha
+
+  private[redis] def validateExpiryAndAdvance(jedisCluster: JedisCluster,
+                                              key: Array[Byte],
+                                              args: Seq[Array[Byte]]): Any =
+    evalScript(jedisCluster, ValidateExpiryAndAdvanceScript, ValidateExpiryAndAdvanceSha, List(key), args)
 
   /** Reserves cluster-wide write capacity and returns how long the caller must wait before using it. */
   def reserveRate(jedisCluster: JedisCluster,

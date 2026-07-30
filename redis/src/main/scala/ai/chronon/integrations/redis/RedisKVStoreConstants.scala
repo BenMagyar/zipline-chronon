@@ -25,8 +25,8 @@ object RedisKVStoreConstants {
   val DefaultSoTimeoutMs = 2000 // Socket timeout for Redis commands (typical P99 < 10ms, 2s allows for network jitter)
   val DefaultPipelineSyncThreads = 12 // Set REDIS_PIPELINE_SYNC_THREADS=0 to restore Jedis' per-pipeline executors
 
-  // Incremental batch upload defaults. Every full snapshot refreshes this lease for active keys while value payloads
-  // are only rewritten when their digest changes.
+  // Incremental batch upload defaults. Absolute expirations fence rollback without reading unchanged value payloads;
+  // the five-day lease leaves several missed daily uploads of recovery margin.
   val DefaultBulkUploadBatchSize = 1000
   val DefaultBulkUploadMaxKeysPerSecond = 2500000
   val DefaultBulkUploadWriterPartitions = 2

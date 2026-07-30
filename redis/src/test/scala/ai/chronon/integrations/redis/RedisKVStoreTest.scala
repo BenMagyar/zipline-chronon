@@ -975,6 +975,81 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     jedisCluster.pttl(statusKey.getBytes(StandardCharsets.UTF_8)) should be > 250000L
   }
 
+  it should "compare an absolute expiration before advancing its lease fence" in {
+    val key = "chronon:{EXPIRY_FENCE_BATCH:entity-1}".getBytes(StandardCharsets.UTF_8)
+    val timestamp = 2000L
+    val writeEpoch = 2L
+    val previousDeadline = System.currentTimeMillis() + 180000L
+    val nextDeadline = previousDeadline + 120000L
+    val currentValue = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      timestamp,
+      "value".getBytes(StandardCharsets.UTF_8),
+      writeEpoch)
+    val olderValue = RedisBatchUpload.encodeValue(
+      RedisBatchUpload.Upsert,
+      timestamp - 1L,
+      "older".getBytes(StandardCharsets.UTF_8),
+      writeEpoch - 1L)
+    def args(expectedDeadline: Long, desiredDeadline: Long): Seq[Array[Byte]] =
+      Seq(expectedDeadline, desiredDeadline, timestamp, writeEpoch)
+        .map(_.toString.getBytes(StandardCharsets.UTF_8))
+
+    jedisCluster.set(key, currentValue) shouldBe "OK"
+    jedisCluster.pexpireAt(key, previousDeadline) shouldBe 1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(previousDeadline, nextDeadline)) shouldBe 1L
+    jedisCluster.pexpireTime(key) shouldBe nextDeadline
+
+    val aheadDeadline = nextDeadline + 60000L
+    val advancedDeadline = aheadDeadline + 60000L
+    jedisCluster.pexpireAt(key, aheadDeadline) shouldBe 1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(nextDeadline, advancedDeadline)) shouldBe 1L
+    jedisCluster.pexpireTime(key) shouldBe advancedDeadline
+
+    val mismatchedDeadline = advancedDeadline + 60000L
+    jedisCluster.set(key, olderValue) shouldBe "OK"
+    jedisCluster.pexpireAt(key, mismatchedDeadline) shouldBe 1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(advancedDeadline, mismatchedDeadline + 60000L)) shouldBe 0L
+    jedisCluster.pexpireTime(key) shouldBe mismatchedDeadline
+
+    val rolledBackDeadline = advancedDeadline - 60000L
+    jedisCluster.set(key, currentValue) shouldBe "OK"
+    jedisCluster.pexpireAt(key, rolledBackDeadline) shouldBe 1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(advancedDeadline, advancedDeadline + 120000L)) shouldBe 0L
+    jedisCluster.pexpireTime(key) shouldBe rolledBackDeadline
+
+    jedisCluster.set(key, currentValue) shouldBe "OK"
+    jedisCluster.pexpireTime(key) shouldBe -1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(advancedDeadline, advancedDeadline + 120000L)) shouldBe 0L
+    jedisCluster.pexpireTime(key) shouldBe -1L
+
+    jedisCluster.del(key) shouldBe 1L
+    RedisBatchUpload.validateExpiryAndAdvance(
+      jedisCluster,
+      key,
+      args(advancedDeadline, advancedDeadline + 120000L)) shouldBe 0L
+  }
+
+  it should "fall back when Redis does not support client no-touch mode" in {
+    RedisKVStoreFactory.supportsClientNoTouch(jedisCluster) shouldBe false
+    jedisCluster.ping() shouldBe "PONG"
+  }
+
   it should "decode a versioned direct batch value" in {
     val dataset = "BOOTSTRAP_BATCH"
     val key = "bootstrap-key".getBytes(StandardCharsets.UTF_8)
@@ -1143,7 +1218,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       maxKeysPerSecond = 100000,
       writerPartitions = 1,
       stateBuckets = 4,
-      liveTTLSeconds = 300
+      liveTTLSeconds = 3600
     )
     val batchDataset = settings.batchDataset
     val statusKey = RedisBatchUpload.buildStatusKey(batchDataset, settings.keyPrefix)
@@ -1178,6 +1253,11 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       }
     }
 
+    def deleteLease(generation: String): Unit = {
+      val path = Spark2RedisLoader.leaseCheckpointPath(settings, generation)
+      path.getFileSystem(spark.sparkContext.hadoopConfiguration).delete(path, false) shouldBe true
+    }
+
     try {
       rows("2024-07-27", "a" -> "a-1", "b" -> "b-1", "d" -> "d-1")
         .write
@@ -1206,28 +1286,39 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
         .readStatus(jedisCluster, statusKey)
         .get
       initialStatus.generation shouldBe initial.generation.get
-      jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 300L)
+      jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
 
       val ttlDecrease = the[IllegalArgumentException] thrownBy {
-        Spark2RedisLoader.run(settings.copy(liveTTLSeconds = 299), spark, jedisCluster)
+        Spark2RedisLoader.run(settings.copy(liveTTLSeconds = 3599), spark, jedisCluster)
       }
       ttlDecrease.getMessage should include("Redis TTL cannot decrease within an active lineage")
 
       val aRedisKey = RedisKVStore.buildRedisKey("a".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
       jedisCluster.expire(aRedisKey.getBytes(StandardCharsets.UTF_8), 30L) shouldBe 1L
 
+      val checkedInitial = Spark2RedisLoader.run(settings, spark, jedisCluster)
+      checkedInitial.generation shouldBe initial.generation
+      checkedInitial.refreshedKeys shouldBe 3L
+      jedisCluster.ttl(aRedisKey.getBytes(StandardCharsets.UTF_8)) should be > 3500L
+
+      // Existing generations have no _LEASE record. Removing it simulates one and must trigger one conservative
+      // validation pass before the generation adopts checkpoint-based renewal.
+      deleteLease(initial.generation.get)
       val refreshedInitial = Spark2RedisLoader.run(settings, spark, jedisCluster)
       refreshedInitial.generation shouldBe initial.generation
       refreshedInitial.refreshedKeys shouldBe 3L
-      jedisCluster.ttl(aRedisKey.getBytes(StandardCharsets.UTF_8)) should be > 250L
+      jedisCluster.ttl(aRedisKey.getBytes(StandardCharsets.UTF_8)) should be > 3500L
 
       rows("2024-07-28", "a" -> "a-1", "b" -> "b-2", "c" -> "c-1")
         .write
         .mode("append")
         .insertInto(sourceTable)
+      // A new loader must also build a child directly from an older parent with no lease checkpoint.
+      deleteLease(initial.generation.get)
       val second = Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
       second.changedKeys shouldBe 2L
       second.deletedKeys shouldBe 1L
+      second.refreshedKeys shouldBe 1L
 
       val secondValues = read("a", "b", "c", "d")
       new String(secondValues("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
@@ -1243,6 +1334,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
           settings.batchTimestamp,
           "b-1".getBytes(StandardCharsets.UTF_8),
           writeEpoch = 1L))
+      deleteLease(second.generation.get)
       val staleValueRepair =
         Spark2RedisLoader.run(settings.copy(sourcePartition = "2024-07-28"), spark, jedisCluster)
       staleValueRepair.fullRebuild shouldBe true
@@ -1260,7 +1352,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
         .decodeValue(jedisCluster.get(dRedisKey.getBytes(StandardCharsets.UTF_8)))
         .get
         .operation shouldBe RedisBatchUpload.Delete
-      jedisCluster.ttl(dRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 300L)
+      jedisCluster.ttl(dRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
 
       // Simulate restoring Redis to a snapshot from before d was deleted. Recovery from the current S3 head must
       // replay retained tombstones, not just the current active values, and must not need the mutable source table.
@@ -1271,6 +1363,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
           settings.batchTimestamp,
           "d-1".getBytes(StandardCharsets.UTF_8),
           writeEpoch = 1L))
+      deleteLease(samePartitionCorrection.generation.get)
       jedisCluster.unlink(statusKey.getBytes(StandardCharsets.UTF_8)) shouldBe 1L
       spark.sql(s"DROP TABLE $sourceTable")
       val statusLossRepair =
@@ -1292,10 +1385,12 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
         .partitionBy("ds")
         .saveAsTable(sourceTable)
 
+      deleteLease(samePartitionCorrection.generation.get)
       jedisCluster.unlink(aRedisKey.getBytes(StandardCharsets.UTF_8))
       Spark2RedisLoader.run(settings, spark, jedisCluster)
       new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
 
+      deleteLease(samePartitionCorrection.generation.get)
       jedisCluster.unlink(bRedisKey.getBytes(StandardCharsets.UTF_8))
       val repairedLatest = Spark2RedisLoader.run(settings, spark, jedisCluster)
       repairedLatest.fullRebuild shouldBe true
@@ -1375,6 +1470,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       emptySnapshot.getMessage should include("contains no data keys")
       new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
 
+      deleteLease(third.generation.get)
       jedisCluster.unlink(aRedisKey.getBytes(StandardCharsets.UTF_8)) shouldBe 1L
       val olderAfterEmpty = Spark2RedisLoader.run(
         settings.copy(sourcePartition = "2024-07-29"),

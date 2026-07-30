@@ -39,9 +39,10 @@ import scala.util.control.NonFatal
   * before advancing. Redis receives direct, timestamp-fenced mutations, so reads do not depend on a volatile Redis
   * generation pointer.
   *
-  * Live values use a renewable lease. Changed values are written with the lease TTL and unchanged active keys receive
-  * an EXPIRE refresh from the reconstructed state set. The lease must exceed the maximum expected gap between
-  * successful uploads plus recovery margin. Direct publication is intentionally not an atomic whole-dataset cutover.
+  * Live values use a renewable lease. Changed values are written with an absolute deadline; unchanged active keys use
+  * that expiration as a rollback fence, allowing the loader to verify and advance metadata without reading tiered
+  * payloads. The lease must exceed the maximum expected gap between successful uploads plus recovery margin. Direct
+  * publication is intentionally not an atomic whole-dataset cutover.
   */
 object Spark2RedisLoader {
   private val logger = LoggerFactory.getLogger(getClass)
@@ -67,6 +68,7 @@ object Spark2RedisLoader {
 
   private val ReadyFile = "_READY"
   private val AppliedFile = "_APPLIED"
+  private val LeaseFile = "_LEASE"
   private val HeadFile = "_HEAD"
   private val CandidateFile = "_CANDIDATE"
   private val DeltaDirectory = "delta"
@@ -83,6 +85,8 @@ object Spark2RedisLoader {
   private val HeadVersion = 1
   private val AppliedMagic = 0x43524241 // CRBA
   private val AppliedVersion = 1
+  private val LeaseMagic = 0x43524245 // CRBE
+  private val LeaseVersion = 1
   private val ClaimMagic = 0x4352424c // CRBL
   private val ClaimVersion = 1
   private val MaxAdmissionAttempts = 64
@@ -189,14 +193,22 @@ object Spark2RedisLoader {
     def tombstoneRetainUntilMillis(liveTTLSeconds: Int): Long =
       java.lang.Math.addExact(lastModifiedMillis, java.lang.Math.multiplyExact(liveTTLSeconds.toLong, 1000L))
   }
-  private case class ApplyResult(mutationKeys: Long, refreshedKeys: Long, recovered: Boolean)
+  private[redis] case class LeaseRecord(status: BatchStatus,
+                                        readyDigest: Array[Byte],
+                                        minimumActiveDeadlineMillis: Long)
+  private case class VersionedLease(record: LeaseRecord, version: String)
+  private case class ApplyResult(mutationKeys: Long,
+                                 refreshedKeys: Long,
+                                 recovered: Boolean,
+                                 minimumActiveDeadlineMillis: Long)
   private case class GenerationPaths(root: Path,
                                      candidate: Path,
                                      delta: Path,
                                      state: Path,
                                      tombstones: Path,
                                      ready: Path,
-                                     applied: Path)
+                                     applied: Path,
+                                     lease: Path)
 
   private final class TaskClient(settings: RedisKVStoreFactory.ClientSettings) {
     private var current = RedisKVStoreFactory.createClient(settings)
@@ -215,7 +227,7 @@ object Spark2RedisLoader {
 
   private sealed trait WriteMode extends Product with Serializable
   private case object MutationWrite extends WriteMode
-  private case object LeaseRefresh extends WriteMode
+  private case class LeaseRefresh(expectedMinimumDeadlineMillis: Option[Long]) extends WriteMode
 
   def run(settings: Settings,
           spark: SparkSession,
@@ -230,12 +242,19 @@ object Spark2RedisLoader {
     else
       logger.warn(
         "Skipping Redis maxmemory-policy=noeviction validation; eviction can silently lose published feature values")
+    val clientNoTouch = RedisKVStoreFactory.supportsClientNoTouch(controlClient)
+    val effectiveSettings = settings.copy(clientSettings = settings.clientSettings.copy(clientNoTouch = clientNoTouch))
+    if (clientNoTouch)
+      logger.info("Redis bulk-writer connections will require CLIENT NO-TOUCH")
+    else
+      logger.warn(
+        "Redis does not support or permit CLIENT NO-TOUCH; retaining header-based lease validation for compatibility")
 
     var attempts = 0
     while (attempts < MaxAdmissionAttempts) {
       try {
-        val summary = runAttempt(settings, spark, controlClient, conditionalWriter)
-        cleanupObsoleteGenerations(settings, spark, conditionalWriter)
+        val summary = runAttempt(effectiveSettings, spark, controlClient, conditionalWriter)
+        cleanupObsoleteGenerations(effectiveSettings, spark, conditionalWriter)
         return summary
       } catch {
         case HeadAdvanced(generation) =>
@@ -547,6 +566,7 @@ object Spark2RedisLoader {
           val recoverFull = requiresFullRecovery(manifest, currentStatus)
           val result = applyGeneration(settings,
                                        manifest,
+                                       head.record.readyDigest,
                                        spark,
                                        controlClient,
                                        conditionalWriter,
@@ -558,11 +578,13 @@ object Spark2RedisLoader {
                                       refreshedKeys = result.refreshedKeys,
                                       recovered = result.recovered)
           remainingLeaseSeconds(leaseDeadlineMillis)
+          if (!manifest.retired) remainingLeaseSeconds(result.minimumActiveDeadlineMillis)
           conditionalWriter.putIfAbsent(paths.applied, encodeApplied(applied), spark.sparkContext.hadoopConfiguration)
           validateApplied(readCommittedApplied(paths.applied, spark, conditionalWriter).record,
                           manifest,
                           head.record.readyDigest)
           remainingLeaseSeconds(leaseDeadlineMillis)
+          if (!manifest.retired) remainingLeaseSeconds(result.minimumActiveDeadlineMillis)
           val publishedStatus =
             RedisBatchUpload.readStatus(controlClient,
                                         RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix))
@@ -578,6 +600,7 @@ object Spark2RedisLoader {
 
   private def applyGeneration(settings: Settings,
                               manifest: ReadyManifest,
+                              readyDigest: Array[Byte],
                               spark: SparkSession,
                               controlClient: JedisCluster,
                               conditionalWriter: ConditionalObjectWriter,
@@ -590,8 +613,23 @@ object Spark2RedisLoader {
     val persistedDelta = loadDelta(settings, manifest.status.generation, spark)
     val dataDelta = persistedDelta.where(not(isServingInfo(col(KeyColumn))))
     val metadataDelta = persistedDelta.where(isServingInfo(col(KeyColumn)))
+    val unchangedKeys = manifest.dataRows - manifest.changedKeys
+    val currentLeaseDeadline =
+      readLease(generationPaths(settings, manifest.status.generation).lease,
+                manifest,
+                readyDigest,
+                spark,
+                conditionalWriter).map(_.record.minimumActiveDeadlineMillis)
+    val parentLeaseDeadline =
+      if (manifest.retired) None
+      else manifest.parentGeneration.flatMap(readGenerationLease(settings, _, spark, conditionalWriter))
+    val inheritedLeaseDeadline =
+      (currentLeaseDeadline.toSeq ++ parentLeaseDeadline.toSeq).reduceOption((left, right) => math.max(left, right))
+    val activeLeaseDeadlineMillis =
+      if (manifest.retired) leaseDeadlineMillis
+      else generationLeaseDeadline(leaseDeadlineMillis, currentLeaseDeadline, parentLeaseDeadline)
 
-    val dataSummary = writeToRedis(dataDelta, MutationWrite, settings, limiterKey, leaseDeadlineMillis)
+    val dataSummary = writeToRedis(dataDelta, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
     require(
       dataSummary.attempted == manifest.deltaRows - 1,
       s"Redis generation ${manifest.status.generation} attempted ${dataSummary.attempted} data mutations; " +
@@ -602,21 +640,23 @@ object Spark2RedisLoader {
     var recovered = recoverFull || manifest.fullRebuild
     var replayRequired = recoverFull && !manifest.fullRebuild
     var refreshSummary = WriteSummary(0, 0, 0, 0, 0)
-    if (!manifest.retired && !manifest.fullRebuild && !recoverFull) {
+    if (!manifest.retired && !manifest.fullRebuild && !recoverFull && unchangedKeys > 0) {
       val unchangedState = loadStateIndex(settings, manifest.stateGeneration, spark)
         .where(col(ValueWriteEpochColumn) < lit(manifest.status.writeEpoch))
         .select(KeyColumn, ValueTimestampColumn, ValueWriteEpochColumn, BucketColumn)
-      refreshSummary = writeToRedis(unchangedState, LeaseRefresh, settings, limiterKey, leaseDeadlineMillis)
-      val unchangedKeys = manifest.dataRows - manifest.changedKeys
+      val expectedDeadline =
+        if (settings.clientSettings.clientNoTouch) inheritedLeaseDeadline else None
+      refreshSummary =
+        writeToRedis(unchangedState, LeaseRefresh(expectedDeadline), settings, limiterKey, activeLeaseDeadlineMillis)
       require(
         refreshSummary.attempted == unchangedKeys,
-        s"Redis generation ${manifest.status.generation} refreshed ${refreshSummary.attempted} keys; " +
-          s"expected $unchangedKeys unchanged keys"
+        s"Redis generation ${manifest.status.generation} checked ${refreshSummary.attempted} unchanged keys; " +
+          s"expected $unchangedKeys"
       )
       if (refreshSummary.rejected > 0) {
         logger.warn(
-          s"Redis generation ${manifest.status.generation} found ${refreshSummary.rejected} missing active keys; " +
-            "promoting the apply to a full source replay")
+          s"Redis generation ${manifest.status.generation} found ${refreshSummary.rejected} missing or rolled-back " +
+            "active keys; promoting the apply to a full source replay")
         recovered = true
         replayRequired = true
       }
@@ -629,7 +669,7 @@ object Spark2RedisLoader {
         val replayCount = replay.count()
         require(replayCount == manifest.dataRows,
                 s"Redis full replay contains $replayCount data keys; manifest records ${manifest.dataRows}")
-        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, leaseDeadlineMillis)
+        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
         require(replaySummary.attempted == manifest.dataRows,
                 s"Redis full replay attempted ${replaySummary.attempted} keys; expected ${manifest.dataRows}")
         rejectedKeys += replaySummary.rejected
@@ -641,16 +681,20 @@ object Spark2RedisLoader {
     var tombstoneSummary = WriteSummary(0, 0, 0, 0, 0)
     if (manifest.tombstoneRows > 0) {
       tombstoneSummary = writeToRedis(
-        buildTombstoneReplay(settings, manifest, spark, leaseDeadlineMillis, excludeStatus = Some(manifest.status)),
+        buildTombstoneReplay(settings,
+                             manifest,
+                             spark,
+                             activeLeaseDeadlineMillis,
+                             excludeStatus = Some(manifest.status)),
         MutationWrite,
         settings,
         limiterKey,
-        leaseDeadlineMillis
+        activeLeaseDeadlineMillis
       )
       rejectedKeys += tombstoneSummary.rejected
     }
 
-    val metadataSummary = writeToRedis(metadataDelta, MutationWrite, settings, limiterKey, leaseDeadlineMillis)
+    val metadataSummary = writeToRedis(metadataDelta, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
     require(metadataSummary.attempted == 1,
             s"Redis generation ${manifest.status.generation} must apply exactly one serving-info mutation")
     rejectedKeys += metadataSummary.rejected
@@ -660,13 +704,29 @@ object Spark2RedisLoader {
       rejectedKeys == 0 || superseded,
       s"Redis generation ${manifest.status.generation} encountered $rejectedKeys newer values without a newer S3 head"
     )
+    val intendedActiveDeadlineMillis =
+      if (manifest.retired) 0L
+      else activeLeaseDeadlineMillis
+    val minimumActiveDeadlineMillis =
+      if (manifest.retired || superseded) intendedActiveDeadlineMillis
+      else
+        advanceLease(
+          generationPaths(settings, manifest.status.generation).lease,
+          LeaseRecord(manifest.status, readyDigest, intendedActiveDeadlineMillis),
+          manifest,
+          readyDigest,
+          spark,
+          conditionalWriter
+        ).minimumActiveDeadlineMillis
+    val statusOperationDeadlineMillis =
+      if (manifest.retired) leaseDeadlineMillis else math.min(leaseDeadlineMillis, minimumActiveDeadlineMillis)
     val statusResult = writeStatusWithOomRetry(
       controlClient,
       RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix),
       manifest.status,
-      if (manifest.retired) 0L else leaseDeadlineMillis,
+      if (manifest.retired) 0L else minimumActiveDeadlineMillis,
       settings,
-      leaseDeadlineMillis
+      statusOperationDeadlineMillis
     )
     val statusSuperseded = superseded ||
       (statusResult == 0L && headAdvancedPast(settings, manifest, spark, conditionalWriter))
@@ -677,7 +737,7 @@ object Spark2RedisLoader {
     val mutationKeys =
       dataSummary.attempted + metadataSummary.attempted + tombstoneSummary.attempted +
         (if (replayRequired) manifest.dataRows else 0L)
-    ApplyResult(mutationKeys, refreshSummary.attempted, recovered)
+    ApplyResult(mutationKeys, refreshSummary.attempted, recovered, minimumActiveDeadlineMillis)
   }
 
   private def requiresFullRecovery(child: ReadyManifest, currentStatus: Option[BatchStatus]): Boolean = {
@@ -706,7 +766,7 @@ object Spark2RedisLoader {
       refreshCommittedSnapshot(latestSettings, head, spark, controlClient, conditionalWriter, forceReplay)
     logger.info(
       s"Redis older partition ${settings.sourcePartition} did not move S3 head ${head.status.generation}; " +
-        s"the latest partition ${head.status.sourcePartition} was lease-refreshed instead")
+        s"the latest partition ${head.status.sourcePartition} was checked for lease renewal instead")
     refreshed.copy(superseded = true)
   }
 
@@ -725,25 +785,52 @@ object Spark2RedisLoader {
                            superseded = true,
                            fullRebuild = false)
     }
-    val leaseDeadlineMillis = uploadDeadlineMillis(head.liveTTLSeconds)
+    val paths = generationPaths(settings, head.status.generation)
+    val readyDigest = sha256(readBytes(paths.ready, spark))
+    val committedLease = readLease(paths.lease, head, readyDigest, spark, conditionalWriter)
+    val renewLease =
+      forceReplay || leaseRefreshRequired(committedLease.map(_.record.minimumActiveDeadlineMillis),
+                                          head.liveTTLSeconds,
+                                          System.currentTimeMillis())
+    val candidateLeaseDeadlineMillis = uploadDeadlineMillis(head.liveTTLSeconds)
+    val intendedLeaseDeadlineMillis =
+      if (renewLease)
+        renewedLeaseDeadline(candidateLeaseDeadlineMillis, committedLease.map(_.record.minimumActiveDeadlineMillis))
+      else committedLease.get.record.minimumActiveDeadlineMillis
     val limiterKey = RedisBatchUpload.RateLimiterKey
+    val useExpiryFence = settings.clientSettings.clientNoTouch && committedLease.isDefined
+    val checkLease = !forceReplay
     val refreshed =
-      if (forceReplay) WriteSummary(0, 0, 0, 0, 0)
+      if (!checkLease) WriteSummary(0, 0, 0, 0, 0)
       else {
         val state = loadStateIndex(settings, head.stateGeneration, spark)
           .select(KeyColumn, ValueTimestampColumn, ValueWriteEpochColumn, BucketColumn)
-        writeToRedis(state, LeaseRefresh, settings, limiterKey, leaseDeadlineMillis)
+        val expectedDeadline =
+          if (useExpiryFence) committedLease.map(_.record.minimumActiveDeadlineMillis) else None
+        writeToRedis(state, LeaseRefresh(expectedDeadline), settings, limiterKey, intendedLeaseDeadlineMillis)
       }
+    if (forceReplay) {
+      logger.info(
+        s"Skipping Redis lease validation for committed generation ${head.status.generation}; a full replay is required")
+    } else if (!renewLease) {
+      logger.info(
+        s"Checked Redis expiration fences for committed generation ${head.status.generation} without advancing " +
+          s"deadline ${committedLease.get.record.minimumActiveDeadlineMillis}")
+    }
     val replayRequired = forceReplay || refreshed.rejected > 0
+    val activeLeaseDeadlineMillis =
+      if (replayRequired && !renewLease)
+        renewedLeaseDeadline(candidateLeaseDeadlineMillis, committedLease.map(_.record.minimumActiveDeadlineMillis))
+      else intendedLeaseDeadlineMillis
     var replayRejected = 0L
     var tombstoneRejected = 0L
     if (replayRequired) {
       logger.warn(
         s"Redis lease refresh for ${head.status.generation} requires a full replay: " +
-          s"forceReplay=$forceReplay missingKeys=${refreshed.rejected}")
+          s"forceReplay=$forceReplay missingOrRolledBackKeys=${refreshed.rejected}")
       val replay = buildFullReplay(settings, head, spark).persist(StorageLevel.DISK_ONLY)
       try {
-        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, leaseDeadlineMillis)
+        val replaySummary = writeToRedis(replay, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
         require(replaySummary.attempted == head.dataRows,
                 s"Redis full snapshot repair attempted ${replaySummary.attempted} keys; expected ${head.dataRows}")
         replayRejected = replaySummary.rejected
@@ -758,14 +845,14 @@ object Spark2RedisLoader {
                                        MutationWrite,
                                        settings,
                                        limiterKey,
-                                       leaseDeadlineMillis,
+                                       activeLeaseDeadlineMillis,
                                        tombstoneDeadlineMillis).rejected
     }
 
     val metadata = loadDelta(settings, head.status.generation, spark)
       .where(isServingInfo(col(KeyColumn)))
     require(metadata.count() == 1, "Redis committed snapshot refresh requires exactly one serving-info row")
-    val metadataSummary = writeToRedis(metadata, MutationWrite, settings, limiterKey, leaseDeadlineMillis)
+    val metadataSummary = writeToRedis(metadata, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
     require(metadataSummary.attempted == 1, "Redis committed snapshot refresh must attempt one serving-info row")
     val superseded = headAdvancedPast(settings, head, spark, conditionalWriter)
     val rejectedKeys = refreshed.replayed + replayRejected + tombstoneRejected + metadataSummary.rejected
@@ -773,13 +860,30 @@ object Spark2RedisLoader {
       rejectedKeys == 0 || superseded,
       s"Redis snapshot ${head.status.generation} encountered newer values without a newer S3 head"
     )
+    val intendedActiveDeadlineMillis =
+      if (renewLease || replayRequired) activeLeaseDeadlineMillis
+      else committedLease.get.record.minimumActiveDeadlineMillis
+    val minimumActiveDeadlineMillis =
+      if (superseded) intendedActiveDeadlineMillis
+      else if (renewLease || replayRequired)
+        advanceLease(
+          paths.lease,
+          LeaseRecord(head.status, readyDigest, intendedActiveDeadlineMillis),
+          head,
+          readyDigest,
+          spark,
+          conditionalWriter
+        ).minimumActiveDeadlineMillis
+      else committedLease.get.record.minimumActiveDeadlineMillis
+    val statusOperationDeadlineMillis = math.min(candidateLeaseDeadlineMillis, minimumActiveDeadlineMillis)
     val statusResult = writeStatusWithOomRetry(
       controlClient,
       RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix),
       head.status,
-      leaseDeadlineMillis,
+      minimumActiveDeadlineMillis,
       settings,
-      leaseDeadlineMillis)
+      statusOperationDeadlineMillis
+    )
     val statusSuperseded = superseded ||
       (statusResult == 0L && headAdvancedPast(settings, head, spark, conditionalWriter))
     require(
@@ -1039,9 +1143,13 @@ object Spark2RedisLoader {
       new Path(root, StateDirectory),
       new Path(root, TombstoneDirectory),
       new Path(root, ReadyFile),
-      new Path(root, AppliedFile)
+      new Path(root, AppliedFile),
+      new Path(root, LeaseFile)
     )
   }
+
+  private[redis] def leaseCheckpointPath(settings: Settings, generation: String): Path =
+    generationPaths(settings, generation).lease
 
   private def headPath(settings: Settings): Path = new Path(datasetRoot(settings), HeadFile)
 
@@ -1215,6 +1323,57 @@ object Spark2RedisLoader {
     conditionalWriter
       .read(headPath(settings), spark.sparkContext.hadoopConfiguration)
       .map(value => VersionedHead(decodeHead(value.bytes), value.version, value.lastModifiedMillis))
+
+  private def readGenerationLease(settings: Settings,
+                                  generation: String,
+                                  spark: SparkSession,
+                                  conditionalWriter: ConditionalObjectWriter): Option[Long] = {
+    val (manifest, readyBytes) = validateReady(settings, generation, spark)
+    readLease(generationPaths(settings, generation).lease, manifest, sha256(readyBytes), spark, conditionalWriter)
+      .map(_.record.minimumActiveDeadlineMillis)
+  }
+
+  private def readLease(path: Path,
+                        manifest: ReadyManifest,
+                        readyDigest: Array[Byte],
+                        spark: SparkSession,
+                        conditionalWriter: ConditionalObjectWriter): Option[VersionedLease] =
+    conditionalWriter
+      .read(path, spark.sparkContext.hadoopConfiguration)
+      .map { value =>
+        val record = decodeLease(value.bytes)
+        validateLease(record, manifest, readyDigest)
+        VersionedLease(record, value.version)
+      }
+
+  private[redis] def advanceLease(path: Path,
+                                  desired: LeaseRecord,
+                                  manifest: ReadyManifest,
+                                  readyDigest: Array[Byte],
+                                  spark: SparkSession,
+                                  conditionalWriter: ConditionalObjectWriter): LeaseRecord = {
+    validateLease(desired, manifest, readyDigest)
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    var current = conditionalWriter.read(path, hadoopConf)
+    var attempts = 0
+    while (attempts < MaxAdmissionAttempts) {
+      attempts += 1
+      val winner = current match {
+        case None => conditionalWriter.putIfAbsent(path, encodeLease(desired), hadoopConf)
+        case Some(existing) =>
+          val existingRecord = decodeLease(existing.bytes)
+          validateLease(existingRecord, manifest, readyDigest)
+          if (existingRecord.minimumActiveDeadlineMillis >= desired.minimumActiveDeadlineMillis) return existingRecord
+          conditionalWriter.compareAndSet(path, existing.version, encodeLease(desired), hadoopConf)
+      }
+      val winnerRecord = decodeLease(winner.bytes)
+      validateLease(winnerRecord, manifest, readyDigest)
+      if (winnerRecord.minimumActiveDeadlineMillis >= desired.minimumActiveDeadlineMillis) return winnerRecord
+      current = Some(winner)
+    }
+    throw new IllegalStateException(
+      s"Redis lease for generation ${manifest.status.generation} could not advance after $MaxAdmissionAttempts attempts")
+  }
 
   private def headAdvancedPast(settings: Settings,
                                manifest: ReadyManifest,
@@ -1650,7 +1809,13 @@ object Spark2RedisLoader {
         pipeline.evalsha(RedisBatchUpload.putBaseIfNewerSha,
                          List(key).asJava,
                          List(timestamp, writeEpoch, encoded, expireAt, allowExpired).asJava)
-      case LeaseRefresh =>
+      case LeaseRefresh(Some(expectedDeadline)) =>
+        pipeline.evalsha(
+          RedisBatchUpload.validateExpiryAndAdvanceSha,
+          List(key).asJava,
+          expiryValidationArgs(row, expectedDeadline, leaseDeadlineMillis).asJava
+        )
+      case LeaseRefresh(None) =>
         pipeline.evalsha(RedisBatchUpload.validateAndExpireSha,
                          List(key).asJava,
                          leaseValidationArgs(row, leaseDeadlineMillis).asJava)
@@ -1671,7 +1836,11 @@ object Spark2RedisLoader {
         val (timestamp, writeEpoch, encoded, expireAt, allowExpired) =
           encodedMutation(row, leaseDeadlineMillis, tombstoneDeadlineMillis)
         RedisBatchUpload.putBaseIfNewer(client, key, List(timestamp, writeEpoch, encoded, expireAt, allowExpired))
-      case LeaseRefresh =>
+      case LeaseRefresh(Some(expectedDeadline)) =>
+        RedisBatchUpload.validateExpiryAndAdvance(client,
+                                                  key,
+                                                  expiryValidationArgs(row, expectedDeadline, leaseDeadlineMillis))
+      case LeaseRefresh(None) =>
         RedisBatchUpload.validateAndExpire(client, key, leaseValidationArgs(row, leaseDeadlineMillis))
     }
   }
@@ -1722,12 +1891,21 @@ object Spark2RedisLoader {
       leaseDeadlineMillis.toString.getBytes(StandardCharsets.UTF_8)
     )
 
+  private def expiryValidationArgs(row: Row,
+                                   expectedDeadlineMillis: Long,
+                                   desiredDeadlineMillis: Long): Seq[Array[Byte]] =
+    Seq(expectedDeadlineMillis,
+        desiredDeadlineMillis,
+        row.getAs[Long](ValueTimestampColumn),
+        row.getAs[Long](ValueWriteEpochColumn))
+      .map(_.toString.getBytes(StandardCharsets.UTF_8))
+
   private def countResults(results: Seq[Any], mode: WriteMode): WriteSummary = {
     mode match {
       case MutationWrite =>
         val codes = results.map(redisLong)
         WriteSummary(codes.size, codes.count(_ == 1L), codes.count(_ == 2L), codes.count(_ == 0L), retries = 0)
-      case LeaseRefresh =>
+      case _: LeaseRefresh =>
         val codes = results.map(redisLong)
         WriteSummary(codes.size, codes.count(_ == 1L), codes.count(_ == 2L), codes.count(_ == 0L), retries = 0)
     }
@@ -1850,8 +2028,8 @@ object Spark2RedisLoader {
   }
 
   private def writeModeName(mode: WriteMode): String = mode match {
-    case MutationWrite => "mutation"
-    case LeaseRefresh  => "lease-refresh"
+    case MutationWrite   => "mutation"
+    case _: LeaseRefresh => "lease-refresh"
   }
 
   private[redis] def retryableRedisFailure(error: Throwable): Boolean = error match {
@@ -1913,6 +2091,35 @@ object Spark2RedisLoader {
   private def uploadDeadlineMillis(ttlSeconds: Int): Long =
     java.lang.Math.addExact(System.currentTimeMillis(), java.lang.Math.multiplyExact(ttlSeconds.toLong, 1000L))
 
+  private[redis] def generationLeaseDeadline(candidateDeadlineMillis: Long,
+                                             currentDeadlineMillis: Option[Long],
+                                             parentDeadlineMillis: Option[Long]): Long = {
+    require(candidateDeadlineMillis > 0, s"Redis candidate lease deadline must be positive: $candidateDeadlineMillis")
+    val parentFloor = parentDeadlineMillis.map(deadline => java.lang.Math.addExact(deadline, 1L)).getOrElse(0L)
+    math.max(candidateDeadlineMillis, math.max(currentDeadlineMillis.getOrElse(0L), parentFloor))
+  }
+
+  private[redis] def renewedLeaseDeadline(candidateDeadlineMillis: Long, currentDeadlineMillis: Option[Long]): Long = {
+    require(candidateDeadlineMillis > 0, s"Redis candidate lease deadline must be positive: $candidateDeadlineMillis")
+    currentDeadlineMillis
+      .map(current => math.max(candidateDeadlineMillis, java.lang.Math.addExact(current, 1L)))
+      .getOrElse(candidateDeadlineMillis)
+  }
+
+  private[redis] def leaseRefreshRequired(minimumActiveDeadlineMillis: Option[Long],
+                                          ttlSeconds: Int,
+                                          nowMillis: Long): Boolean = {
+    require(ttlSeconds > 0, s"Redis live-key TTL must be positive: $ttlSeconds")
+    require(nowMillis >= 0, s"Redis lease check time must be non-negative: $nowMillis")
+    val renewalWindowMillis = java.lang.Math.multiplyExact(ttlSeconds.toLong, 1000L) / 2L
+    minimumActiveDeadlineMillis match {
+      case None => true
+      case Some(deadlineMillis) =>
+        require(deadlineMillis > 0, s"Redis active lease deadline must be positive: $deadlineMillis")
+        deadlineMillis <= nowMillis || deadlineMillis - nowMillis <= renewalWindowMillis
+    }
+  }
+
   private def remainingLeaseSeconds(deadlineMillis: Long): Int = {
     val remainingMillis = deadlineMillis - System.currentTimeMillis()
     require(remainingMillis > 0, "Redis upload exceeded its configured TTL")
@@ -1942,6 +2149,20 @@ object Spark2RedisLoader {
             s"Redis applied record contains too few mutations for generation ${manifest.status.generation}")
     require(record.refreshedKeys >= 0,
             s"Redis applied record contains a negative refresh count for generation ${manifest.status.generation}")
+  }
+
+  private def validateLease(record: LeaseRecord, manifest: ReadyManifest, digest: Array[Byte]): Unit = {
+    require(record.status == manifest.status,
+            s"Redis lease record does not match generation ${manifest.status.generation}")
+    require(Arrays.equals(record.readyDigest, digest),
+            s"Redis lease record digest does not match generation ${manifest.status.generation}")
+    if (manifest.retired) {
+      require(record.minimumActiveDeadlineMillis == 0L,
+              s"Retired Redis generation ${manifest.status.generation} has an active lease deadline")
+    } else {
+      require(record.minimumActiveDeadlineMillis > 0L,
+              s"Redis generation ${manifest.status.generation} has an invalid active lease deadline")
+    }
   }
 
   private def encodeCandidate(candidate: CandidateRecord): Array[Byte] = binaryRecord { out =>
@@ -2085,6 +2306,32 @@ object Spark2RedisLoader {
     out.writeBoolean(applied.recovered)
   }
 
+  private[redis] def encodeLease(lease: LeaseRecord): Array[Byte] = binaryRecord { out =>
+    val status = RedisBatchUpload.encodeStatus(lease.status)
+    out.writeInt(LeaseMagic)
+    out.writeInt(LeaseVersion)
+    out.writeInt(status.length)
+    out.write(status)
+    out.writeInt(lease.readyDigest.length)
+    out.write(lease.readyDigest)
+    out.writeLong(lease.minimumActiveDeadlineMillis)
+  }
+
+  private[redis] def decodeLease(bytes: Array[Byte]): LeaseRecord =
+    readRecord(bytes) { in =>
+      require(in.readInt() == LeaseMagic, "Redis LEASE record has an invalid magic header")
+      require(in.readInt() == LeaseVersion, "Redis LEASE record has an unsupported version")
+      val statusLength = in.readInt()
+      require(statusLength > 0 && statusLength <= 1024 * 1024, s"Redis LEASE status length is invalid: $statusLength")
+      val statusBytes = new Array[Byte](statusLength)
+      in.readFully(statusBytes)
+      val digestLength = in.readInt()
+      require(digestLength == 32, s"Redis LEASE digest length is invalid: $digestLength")
+      val digest = new Array[Byte](digestLength)
+      in.readFully(digest)
+      LeaseRecord(RedisBatchUpload.decodeStatus(statusBytes).get, digest, in.readLong())
+    }
+
   private def readCommittedApplied(path: Path,
                                    spark: SparkSession,
                                    conditionalWriter: ConditionalObjectWriter): CommittedApplied = {
@@ -2190,15 +2437,12 @@ object Spark2RedisLoader {
     val rows = df.collect()
     rows.grouped(batchSize).foreach { batch =>
       val pipeline = jedisCluster.pipelined()
-      try {
-        batch.foreach { row =>
+      completePipeline(pipeline) {
+        batch.toSeq.map { row =>
           pipeline.setex(row.getAs[String]("redis_key").getBytes(StandardCharsets.UTF_8),
                          ttl.toLong,
                          row.getAs[Array[Byte]]("redis_value"))
         }
-        pipeline.sync()
-      } finally {
-        pipeline.close()
       }
     }
   }
