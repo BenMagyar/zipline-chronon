@@ -1,5 +1,6 @@
 package ai.chronon.integrations.redis
 
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -343,10 +344,10 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     Spark2RedisLoader.leaseRefreshRequired(Some(nowMillis), ttlSeconds, nowMillis) shouldBe true
   }
 
-  it should "advance generation and renewal deadlines monotonically" in {
-    Spark2RedisLoader.generationLeaseDeadline(2000L, None, None) shouldBe 2000L
-    Spark2RedisLoader.generationLeaseDeadline(2000L, Some(3000L), Some(2500L)) shouldBe 3000L
-    Spark2RedisLoader.generationLeaseDeadline(2000L, None, Some(3000L)) shouldBe 3001L
+  it should "advance one generation monotonically without inheriting its parent's longer lease" in {
+    Spark2RedisLoader.generationLeaseDeadline(2000L, None) shouldBe 2000L
+    Spark2RedisLoader.generationLeaseDeadline(2000L, Some(3000L)) shouldBe 3000L
+    Spark2RedisLoader.generationLeaseDeadline(4000L, Some(3000L)) shouldBe 4000L
     Spark2RedisLoader.renewedLeaseDeadline(2000L, None) shouldBe 2000L
     Spark2RedisLoader.renewedLeaseDeadline(2000L, Some(3000L)) shouldBe 3001L
   }
@@ -361,6 +362,49 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     decoded.status shouldBe status
     decoded.readyDigest.toSeq shouldBe digest.toSeq
     decoded.minimumActiveDeadlineMillis shouldBe 2000000L
+  }
+
+  it should "read legacy READY records and retain the historical delete-fence TTL in new records" in {
+    val status = RedisBatchUpload.BatchStatus("generation-a", "2024-07-27", 1000L, 2L)
+    val manifest = Spark2RedisLoader.ReadyManifest(
+      status = status,
+      parentGeneration = None,
+      stateGeneration = status.generation,
+      sourceTable = "source",
+      batchDataset = "dataset_BATCH",
+      keyPrefix = "chronon",
+      keyHashTagMode = RedisKVStore.EntityHashTagMode,
+      stateBuckets = 4,
+      sourceRows = 2L,
+      dataRows = 1L,
+      changedKeys = 1L,
+      deletedKeys = 0L,
+      deltaRows = 2L,
+      tombstoneRows = 0L,
+      liveTTLSeconds = 1800,
+      deleteFenceTTLSeconds = 3600,
+      fullRebuild = true,
+      retired = false
+    )
+
+    val encoded = Spark2RedisLoader.encodeReady(manifest)
+    Spark2RedisLoader.decodeReady(encoded) shouldBe manifest
+
+    val version5 = encoded.take(encoded.length - 6) ++ encoded.takeRight(2)
+    ByteBuffer.wrap(version5, 4, 4).putInt(5)
+    val decodedVersion5 = Spark2RedisLoader.decodeReady(version5)
+    decodedVersion5.keyHashTagMode shouldBe RedisKVStore.EntityHashTagMode
+    decodedVersion5.deleteFenceTTLSeconds shouldBe 1800
+
+    val hashTagBytes = manifest.keyHashTagMode.getBytes(StandardCharsets.UTF_8)
+    val hashTagValueOffset = version5.indexOfSlice(hashTagBytes)
+    hashTagValueOffset should be > 2
+    val version4 =
+      version5.take(hashTagValueOffset - 2) ++ version5.drop(hashTagValueOffset + hashTagBytes.length)
+    ByteBuffer.wrap(version4, 4, 4).putInt(4)
+    val decodedVersion4 = Spark2RedisLoader.decodeReady(version4)
+    decodedVersion4.keyHashTagMode shouldBe RedisKVStore.DatasetAndEntityHashTagMode
+    decodedVersion4.deleteFenceTTLSeconds shouldBe 1800
   }
 
   it should "advance a lease checkpoint monotonically" in {
@@ -382,6 +426,7 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
       deltaRows = 2L,
       tombstoneRows = 0L,
       liveTTLSeconds = 3600,
+      deleteFenceTTLSeconds = 3600,
       fullRebuild = true,
       retired = false
     )

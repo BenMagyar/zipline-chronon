@@ -89,8 +89,9 @@ object Spark2RedisLoader {
   private val GenerationsDirectory = "generations"
   private val ClaimsDirectory = "claims"
   private val ReadyMagic = 0x43524252 // CRBR
-  private val ReadyVersion = 5
   private val LegacyReadyVersion = 4
+  private val HashTagReadyVersion = 5
+  private val ReadyVersion = 6
   private val CandidateMagic = 0x43524243 // CRBC
   private val CandidateVersion = 2
   private val HeadMagic = 0x43524248 // CRBH
@@ -304,6 +305,7 @@ object Spark2RedisLoader {
                                           deltaRows: Long,
                                           tombstoneRows: Long,
                                           liveTTLSeconds: Int,
+                                          deleteFenceTTLSeconds: Int,
                                           fullRebuild: Boolean,
                                           retired: Boolean)
 
@@ -446,10 +448,11 @@ object Spark2RedisLoader {
                                    conditionalWriter,
                                    !redisStatus.contains(committed.status))
       }
-      require(
-        settings.liveTTLSeconds >= committed.liveTTLSeconds,
-        s"Redis TTL cannot decrease within an active lineage: ${settings.liveTTLSeconds} < ${committed.liveTTLSeconds}"
-      )
+      if (settings.liveTTLSeconds < committed.liveTTLSeconds) {
+        logger.info(
+          s"Redis live-value TTL is decreasing from ${committed.liveTTLSeconds} to ${settings.liveTTLSeconds} seconds; " +
+            s"retaining delete fences for ${committed.deleteFenceTTLSeconds} seconds")
+      }
 
       // APPLIED makes the value-bearing S3 generation authoritative even if Redis loses its status marker or is
       // restored to an older snapshot. Repair that committed generation before consulting the mutable source table.
@@ -609,6 +612,8 @@ object Spark2RedisLoader {
             deltaRows = deltaRows,
             tombstoneRows = tombstoneRows,
             liveTTLSeconds = settings.liveTTLSeconds,
+            deleteFenceTTLSeconds =
+              math.max(settings.liveTTLSeconds, head.map(_.deleteFenceTTLSeconds).getOrElse(settings.liveTTLSeconds)),
             fullRebuild = needsFullRebuild || head.isEmpty,
             retired = false
           )
@@ -762,7 +767,8 @@ object Spark2RedisLoader {
       (currentLeaseDeadline.toSeq ++ parentLeaseDeadline.toSeq).reduceOption((left, right) => math.max(left, right))
     val activeLeaseDeadlineMillis =
       if (manifest.retired) leaseDeadlineMillis
-      else generationLeaseDeadline(leaseDeadlineMillis, currentLeaseDeadline, parentLeaseDeadline)
+      else generationLeaseDeadline(leaseDeadlineMillis, currentLeaseDeadline)
+    val deleteFenceDeadlineMillis = uploadDeadlineMillis(manifest.deleteFenceTTLSeconds)
 
     val dataSummary = writeToRedis(
       dataDelta,
@@ -770,6 +776,7 @@ object Spark2RedisLoader {
       settings,
       limiterKey,
       activeLeaseDeadlineMillis,
+      deleteFenceDeadlineMillis,
       progress = Some(WriteProgress(manifest.status.generation, "delta-mutations", Some(manifest.deltaRows - 1)))
     )
     require(
@@ -788,12 +795,13 @@ object Spark2RedisLoader {
         .select(KeyColumn, ValueTimestampColumn, ValueWriteEpochColumn, BucketColumn)
       val expectedDeadline =
         if (settings.clientSettings.clientNoTouch) inheritedLeaseDeadline else None
+      val unchangedLeaseDeadlineMillis = math.max(activeLeaseDeadlineMillis, inheritedLeaseDeadline.getOrElse(0L))
       refreshSummary = writeToRedis(
         unchangedState,
         LeaseRefresh(expectedDeadline),
         settings,
         limiterKey,
-        activeLeaseDeadlineMillis,
+        unchangedLeaseDeadlineMillis,
         progress = Some(WriteProgress(manifest.status.generation, "lease-refresh", Some(unchangedKeys)))
       )
       require(
@@ -839,12 +847,13 @@ object Spark2RedisLoader {
         buildTombstoneReplay(settings,
                              manifest,
                              spark,
-                             activeLeaseDeadlineMillis,
+                             deleteFenceDeadlineMillis,
                              excludeStatus = Some(manifest.status)),
         MutationWrite,
         settings,
         limiterKey,
         activeLeaseDeadlineMillis,
+        deleteFenceDeadlineMillis,
         progress = Some(WriteProgress(manifest.status.generation, "tombstone-replay", None))
       )
       rejectedKeys += tombstoneSummary.rejected
@@ -1010,7 +1019,7 @@ object Spark2RedisLoader {
     }
     if (head.tombstoneRows > 0) {
       val tombstoneDeadlineMillis = committedApplied(settings, head, spark, conditionalWriter)
-        .tombstoneRetainUntilMillis(head.liveTTLSeconds)
+        .tombstoneRetainUntilMillis(head.deleteFenceTTLSeconds)
       tombstoneRejected = writeToRedis(
         buildTombstoneReplay(settings, head, spark, tombstoneDeadlineMillis),
         MutationWrite,
@@ -1642,6 +1651,8 @@ object Spark2RedisLoader {
     )
     require(manifest.stateBuckets > 0, s"Redis generation $generation has no state buckets")
     require(manifest.liveTTLSeconds > 0, s"Redis generation $generation has an invalid TTL")
+    require(manifest.deleteFenceTTLSeconds >= manifest.liveTTLSeconds,
+            s"Redis generation $generation has a delete-fence TTL shorter than its live-value TTL")
     require(manifest.retired == manifest.status.retired, s"Redis generation $generation has inconsistent retired state")
     require(
       Seq(manifest.sourceRows,
@@ -1703,7 +1714,7 @@ object Spark2RedisLoader {
       .withColumn(
         TombstoneExpiresAtColumn,
         when(col(TombstoneExpiresAtColumn) === lit(PendingTombstoneExpiry),
-             lit(applied.tombstoneRetainUntilMillis(manifest.liveTTLSeconds)))
+             lit(applied.tombstoneRetainUntilMillis(manifest.deleteFenceTTLSeconds)))
           .otherwise(col(TombstoneExpiresAtColumn))
       )
   }
@@ -2124,9 +2135,9 @@ object Spark2RedisLoader {
     val expireAtMillis =
       if (operation == Delete) {
         explicitTombstoneDeadline match {
-          case Some(PendingTombstoneExpiry) => math.min(leaseDeadlineMillis, tombstoneDeadlineMillis)
-          case Some(deadline)               => math.min(leaseDeadlineMillis, deadline)
-          case None                         => leaseDeadlineMillis
+          case Some(PendingTombstoneExpiry) => tombstoneDeadlineMillis
+          case Some(deadline)               => deadline
+          case None                         => tombstoneDeadlineMillis
         }
       } else leaseDeadlineMillis
     require(expireAtMillis > 0, s"Redis mutation deadline must be positive: $expireAtMillis")
@@ -2361,11 +2372,9 @@ object Spark2RedisLoader {
     java.lang.Math.addExact(System.currentTimeMillis(), java.lang.Math.multiplyExact(ttlSeconds.toLong, 1000L))
 
   private[redis] def generationLeaseDeadline(candidateDeadlineMillis: Long,
-                                             currentDeadlineMillis: Option[Long],
-                                             parentDeadlineMillis: Option[Long]): Long = {
+                                             currentDeadlineMillis: Option[Long]): Long = {
     require(candidateDeadlineMillis > 0, s"Redis candidate lease deadline must be positive: $candidateDeadlineMillis")
-    val parentFloor = parentDeadlineMillis.map(deadline => java.lang.Math.addExact(deadline, 1L)).getOrElse(0L)
-    math.max(candidateDeadlineMillis, math.max(currentDeadlineMillis.getOrElse(0L), parentFloor))
+    math.max(candidateDeadlineMillis, currentDeadlineMillis.getOrElse(0L))
   }
 
   private[redis] def renewedLeaseDeadline(candidateDeadlineMillis: Long, currentDeadlineMillis: Option[Long]): Long = {
@@ -2473,7 +2482,7 @@ object Spark2RedisLoader {
     CandidateClaim(generation, in.readBoolean())
   }
 
-  private def encodeReady(manifest: ReadyManifest): Array[Byte] = binaryRecord { out =>
+  private[redis] def encodeReady(manifest: ReadyManifest): Array[Byte] = binaryRecord { out =>
     val status = RedisBatchUpload.encodeStatus(manifest.status)
     out.writeInt(ReadyMagic)
     out.writeInt(ReadyVersion)
@@ -2493,14 +2502,15 @@ object Spark2RedisLoader {
     out.writeLong(manifest.deltaRows)
     out.writeLong(manifest.tombstoneRows)
     out.writeInt(manifest.liveTTLSeconds)
+    out.writeInt(manifest.deleteFenceTTLSeconds)
     out.writeBoolean(manifest.fullRebuild)
     out.writeBoolean(manifest.retired)
   }
 
-  private def decodeReady(bytes: Array[Byte]): ReadyManifest = readRecord(bytes) { in =>
+  private[redis] def decodeReady(bytes: Array[Byte]): ReadyManifest = readRecord(bytes) { in =>
     require(in.readInt() == ReadyMagic, "Redis READY record has an invalid magic header")
     val version = in.readInt()
-    require(version == LegacyReadyVersion || version == ReadyVersion,
+    require(version == LegacyReadyVersion || version == HashTagReadyVersion || version == ReadyVersion,
             s"Redis READY record has an unsupported version: $version")
     val statusLength = in.readInt()
     require(statusLength > 0 && statusLength <= 1024 * 1024, s"Redis READY status length is invalid: $statusLength")
@@ -2513,23 +2523,33 @@ object Spark2RedisLoader {
     val batchDataset = in.readUTF()
     val keyPrefix = in.readUTF()
     val keyHashTagMode =
-      if (version >= ReadyVersion) in.readUTF() else RedisKVStore.DatasetAndEntityHashTagMode
+      if (version >= HashTagReadyVersion) in.readUTF() else RedisKVStore.DatasetAndEntityHashTagMode
+    val stateBuckets = in.readInt()
+    val sourceRows = in.readLong()
+    val dataRows = in.readLong()
+    val changedKeys = in.readLong()
+    val deletedKeys = in.readLong()
+    val deltaRows = in.readLong()
+    val tombstoneRows = in.readLong()
+    val liveTTLSeconds = in.readInt()
+    val deleteFenceTTLSeconds = if (version == ReadyVersion) in.readInt() else liveTTLSeconds
     ReadyManifest(
-      status = status,
-      parentGeneration = parentGeneration,
-      stateGeneration = stateGeneration,
-      sourceTable = sourceTable,
-      batchDataset = batchDataset,
-      keyPrefix = keyPrefix,
-      keyHashTagMode = keyHashTagMode,
-      stateBuckets = in.readInt(),
-      sourceRows = in.readLong(),
-      dataRows = in.readLong(),
-      changedKeys = in.readLong(),
-      deletedKeys = in.readLong(),
-      deltaRows = in.readLong(),
-      tombstoneRows = in.readLong(),
-      liveTTLSeconds = in.readInt(),
+      status,
+      parentGeneration,
+      stateGeneration,
+      sourceTable,
+      batchDataset,
+      keyPrefix,
+      keyHashTagMode,
+      stateBuckets,
+      sourceRows,
+      dataRows,
+      changedKeys,
+      deletedKeys,
+      deltaRows,
+      tombstoneRows,
+      liveTTLSeconds,
+      deleteFenceTTLSeconds,
       fullRebuild = in.readBoolean(),
       retired = in.readBoolean()
     )

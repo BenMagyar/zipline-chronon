@@ -75,14 +75,15 @@ or as matching `-Z` properties. The node runner resolves them in that order, wit
 | `spark.chronon.kv_upload.redis.state_buckets` | `256` | S3 state/delta buckets chosen for a new lineage |
 | `spark.chronon.kv_upload.redis.max_retries` | `3` | Retries after a failed Redis command batch |
 | `spark.chronon.kv_upload.redis.retry_backoff_ms` | `1000` | Initial exponential retry backoff, including maxmemory OOM retries |
-| `spark.chronon.kv_upload.redis.ttl_seconds` | `432000` | Renewable value, tombstone, metadata, and status lease |
+| `spark.chronon.kv_upload.redis.ttl_seconds` | `432000` | Renewable value, metadata, and status lease |
 | `spark.chronon.kv_upload.redis.require_noeviction` | `true` | Require Redis `maxmemory-policy=noeviction` before writing |
 
 A state root is the durable identity of one Redis serving target and must not be shared across Redis clusters. A dataset
 lineage must keep the same key prefix. The first admitted generation fixes `state_buckets` for that lineage. A TTL change
 publishes a new generation; a refresh of an existing generation uses the TTL recorded with that generation. TTL may
-increase but cannot decrease inside an active lineage because delete fences must cover every prior value lease.
-Concurrent jobs sharing a cluster must use the same rate while the shared queue is active.
+increase or decrease in place. The lineage separately retains its largest historical TTL for delete fences, so a shorter
+live-value lease cannot expose a value written by an older generation. Concurrent jobs sharing a cluster must use the
+same rate while the shared queue is active.
 
 ## Publication Protocol
 
@@ -198,24 +199,27 @@ DELETE: payload is empty and the value is a tombstone
 
 ## TTL and Removal
 
-Changed values and tombstones are written with the configured lease. Each newly admitted generation advances unchanged
-active keys to a fresh absolute deadline after validating their prior deadline. An exact rerun checks the expiry fence
-but only advances it once half the configured lease has elapsed. Serving metadata and the active status mirror receive a
-lease that expires no later than the earliest entity lease. The batch default is five days, so a missed daily upload
-still leaves roughly four days after the last successful publication.
+Changed values are written with the configured lease. Each newly admitted generation validates unchanged active keys
+against the parent deadline and advances them when the new deadline is later; a TTL decrease never shortens an existing
+key in place. An exact rerun checks the expiry fence but only advances it once half the configured lease has elapsed.
+Serving metadata and the active status mirror receive a lease that expires no later than the earliest entity lease. The
+batch default is five days, so a missed daily upload still leaves roughly four days after the last successful publication.
 
-The deadline recorded in `_LEASE` never decreases, and each child generation requires a deadline strictly later than
-its parent's. Restoring an older Redis snapshot therefore restores older expiration metadata that the next publication
-can detect without loading an unchanged value from the tiered data store.
+The deadline recorded in one generation's `_LEASE` never decreases. A child generation may start with a shorter lease,
+while its unchanged keys retain any later parent expiration until the configured lease catches up. Restoring an older
+Redis snapshot therefore restores expiration metadata that the next publication can validate before advancing.
 
 Generations created by older loaders have no `_LEASE` checkpoint. The first new-loader publication that depends on one
 uses the existing 22-byte ordering-header validation once, then creates the checkpoint. Servers without `CLIENT
-NO-TOUCH` continue using that legacy validation path. `_READY`, `_APPLIED`, and Redis value bytes retain their existing
-wire versions, and an older loader safely ignores `_LEASE`.
+NO-TOUCH` continue using that legacy validation path. The loader reads existing `_READY` versions 4 and 5 and writes
+version 6 records containing both the key hash-tag mode and the separate delete-fence TTL. `_APPLIED`, `_LEASE`, and
+Redis value bytes retain their existing wire versions. Older loaders reject version 6 `_READY` records rather than
+losing the transition fence.
 
-Removed entity keys become fenced tombstones for the same lease period. If uploads for a GroupBy stop, its values,
-metadata, and active status age out. Marking a GroupBy `online=false` does not itself stop uploads because offline
-GroupBys can still be join inputs; the scheduler determines whether publication continues.
+Removed entity keys become tombstones for the lineage's largest historical TTL. This can retain tombstones longer than
+live values after a TTL decrease, but guarantees they outlive every value lease issued before the transition. If uploads
+for a GroupBy stop, its values, metadata, and active status age out. Marking a GroupBy `online=false` does not itself stop
+uploads because offline GroupBys can still be join inputs; the scheduler determines whether publication continues.
 
 A GroupBy upload must contain at least one entity row; a zero-row computation fails before publishing so a missing
 source partition cannot become a delete-all. Ordinary snapshots tombstone keys absent from the new state. To retire an

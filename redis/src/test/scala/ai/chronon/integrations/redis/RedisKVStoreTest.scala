@@ -1288,11 +1288,6 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       initialStatus.generation shouldBe initial.generation.get
       jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
 
-      val ttlDecrease = the[IllegalArgumentException] thrownBy {
-        Spark2RedisLoader.run(settings.copy(liveTTLSeconds = 3599), spark, jedisCluster)
-      }
-      ttlDecrease.getMessage should include("Redis TTL cannot decrease within an active lineage")
-
       val aRedisKey = RedisKVStore.buildRedisKey("a".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
       jedisCluster.expire(aRedisKey.getBytes(StandardCharsets.UTF_8), 30L) shouldBe 1L
 
@@ -1481,6 +1476,27 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       RedisBatchUpload.decodeValue(jedisCluster.get(aRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
         RedisBatchUpload.Upsert
       new String(read("a")("a").head.bytes, StandardCharsets.UTF_8) shouldBe "a-1"
+
+      val shortSettings = settings.copy(sourcePartition = "2024-07-29", liveTTLSeconds = 1800)
+      val transition = Spark2RedisLoader.run(shortSettings, spark, jedisCluster)
+      transition.generation should not equal olderAfterEmpty.generation
+      transition.changedKeys shouldBe 0L
+      transition.deletedKeys shouldBe 0L
+      transition.refreshedKeys shouldBe 3L
+      jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
+      jedisCluster.ttl(aRedisKey.getBytes(StandardCharsets.UTF_8)) should be > 3000L
+
+      replaceRows("2024-07-29", "a" -> "a-1", "b" -> "b-short")
+      val shortDelta = Spark2RedisLoader.run(shortSettings, spark, jedisCluster)
+      shortDelta.changedKeys shouldBe 1L
+      shortDelta.deletedKeys shouldBe 1L
+      shortDelta.refreshedKeys shouldBe 1L
+      val cRedisKey = RedisKVStore.buildRedisKey("c".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      jedisCluster.ttl(bRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
+      jedisCluster.ttl(cRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 3000L and be <= 3600L)
+      RedisBatchUpload.decodeValue(jedisCluster.get(cRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
+        RedisBatchUpload.Delete
+      read("c")("c") shouldBe empty
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $sourceTable")
       RedisSparkSessionTestHelper.release()
