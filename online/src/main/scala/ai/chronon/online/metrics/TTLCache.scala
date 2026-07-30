@@ -18,13 +18,40 @@ package ai.chronon.online.metrics
 
 import org.slf4j.{Logger, LoggerFactory}
 
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap, RejectedExecutionException, ThreadFactory, TimeUnit}
 import java.util.function
 
 object TTLCache {
   val DefaultTtlMillis: Long = 2 * 60 * 60 * 1000 // 2 hours
-  private[TTLCache] val executor = FlexibleExecutionContext.buildExecutor
+
+  private val RefreshThreadCount = 4
+  private val RefreshQueueCapacity = 1000
+  private val instanceId = java.util.UUID.randomUUID().toString.take(8)
+  private val threadFactory = new ThreadFactory {
+    private val counter = new AtomicInteger(0)
+
+    override def newThread(runnable: Runnable): Thread = {
+      val thread = new Thread(runnable, s"chronon-ttl-cache-refresh-$instanceId-${counter.incrementAndGet()}")
+      thread.setDaemon(true)
+      if (thread.getContextClassLoader == null) thread.setContextClassLoader(getClass.getClassLoader)
+      thread
+    }
+  }
+
+  // Cache creators can synchronously wait for Futures that run on FlexibleExecutionContext. Running refresh creators on
+  // that same executor can therefore starve the Futures they are awaiting. Keep refresh work isolated and bounded; when
+  // the queue is full, callers continue serving stale data and retry the refresh on a later read.
+  private[TTLCache] val executor = new InstrumentedThreadPoolExecutor(
+    RefreshThreadCount,
+    RefreshThreadCount,
+    0L,
+    TimeUnit.MILLISECONDS,
+    new ArrayBlockingQueue[Runnable](RefreshQueueCapacity),
+    threadFactory,
+    metricsContext = Metrics.Context(Metrics.Environment.Fetcher).withSuffix("ttl_cache_refresh_threadpool")
+  )
 }
 // can continuously grow, only used for schemas
 // has two methods apply & refresh. Apply uses a longer ttl before updating than refresh
@@ -109,28 +136,36 @@ class TTLCache[I, O](f: I => O,
         entry.markedForUpdate.compareAndSet(false, true)
       ) {
         // enqueue async update and return old value
-        TTLCache.executor.execute(new Runnable {
-          override def run(): Unit = {
-            try {
-              val updated = wrappedCreator(i)
-              if (isValid(updated)) {
-                cMap.put(i, Entry(updated, nowFunc()))
-                contextBuilder(i).increment("cache.update")
-              } else {
-                // refresh produced an invalid value (e.g. a Failure): keep the last-known-good entry and let a
-                // later read re-enqueue the refresh once the interval elapses again.
-                cMap.get(i).markedForUpdate.compareAndSet(true, false)
-                contextBuilder(i).increment("cache.refresh_failure")
+        try {
+          TTLCache.executor.execute(new Runnable {
+            override def run(): Unit = {
+              try {
+                val updated = wrappedCreator(i)
+                if (isValid(updated)) {
+                  cMap.put(i, Entry(updated, nowFunc()))
+                  contextBuilder(i).increment("cache.update")
+                } else {
+                  // refresh produced an invalid value (e.g. a Failure): keep the last-known-good entry and let a
+                  // later read re-enqueue the refresh once the interval elapses again.
+                  cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                  contextBuilder(i).increment("cache.refresh_failure")
+                }
+              } catch {
+                case ex: Exception =>
+                  // creator threw: keep serving the stale value, reset the mark so another read can retry
+                  cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                  contextBuilder(i).increment("cache.refresh_failure")
+                  contextBuilder(i).incrementException(ex)
               }
-            } catch {
-              case ex: Exception =>
-                // creator threw: keep serving the stale value, reset the mark so another read can retry
-                cMap.get(i).markedForUpdate.compareAndSet(true, false)
-                contextBuilder(i).increment("cache.refresh_failure")
-                contextBuilder(i).incrementException(ex)
             }
-          }
-        })
+          })
+        } catch {
+          case _: RejectedExecutionException =>
+            // Never move refresh back onto the calling request thread. Keep serving stale and allow a later read to
+            // retry once the bounded refresh queue has capacity.
+            entry.markedForUpdate.compareAndSet(true, false)
+            contextBuilder(i).increment("cache.refresh_rejected")
+        }
       }
       entry.value
     }
