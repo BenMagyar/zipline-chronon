@@ -293,10 +293,22 @@ class CatalystUtilBlueprint(key: CatalystUtil.BlueprintKey) {
 
 class CatalystUtil(blueprint: CatalystUtilBlueprint) {
 
-  // Hive resolves externally loaded UDF classes through the calling thread's context classloader at evaluation time.
-  // Blueprint setup happens once, so each thread-local instance also needs the shared jar classloader.
-  if (blueprint.hasSetups) {
-    Thread.currentThread().setContextClassLoader(CatalystUtil.session.sharedState.jarClassLoader)
+  // Hive resolves externally loaded UDF classes through the calling thread's context classloader. Fetcher worker
+  // threads are reused and their context loader can change between requests, so scope Spark's jar loader to every
+  // instance creation/evaluation and restore the worker's loader afterwards.
+  private def withUdfClassLoader[T](operation: => T): T = {
+    if (!blueprint.hasSetups) return operation
+
+    val thread = Thread.currentThread()
+    val originalClassLoader = thread.getContextClassLoader
+    val udfClassLoader = CatalystUtil.session.sharedState.jarClassLoader
+    if (originalClassLoader eq udfClassLoader) {
+      operation
+    } else {
+      thread.setContextClassLoader(udfClassLoader)
+      try operation
+      finally thread.setContextClassLoader(originalClassLoader)
+    }
   }
 
   def this(inputSchema: StructType,
@@ -314,26 +326,28 @@ class CatalystUtil(blueprint: CatalystUtilBlueprint) {
   val inputArrEncoder: Any => Any = blueprint.inputArrEncoder
 
   // the only per-instance state - generated iterators and projections carry mutable row buffers
-  private val transformFunc: InternalRow => Seq[InternalRow] = blueprint.transformFactory()
+  private val transformFunc: InternalRow => Seq[InternalRow] = withUdfClassLoader(blueprint.transformFactory())
 
   private val outputSparkSchema: types.StructType = blueprint.outputSparkSchema
   private val outputArrDecoder = blueprint.outputArrDecoder
   private val outputDecoder = blueprint.outputDecoder
   def outputChrononSchema: Array[(String, DataType)] = blueprint.outputChrononSchema
 
-  def performSql(values: Array[Any]): Seq[Array[Any]] = {
+  def performSql(values: Array[Any]): Seq[Array[Any]] = withUdfClassLoader {
     val internalRow = inputArrEncoder(values).asInstanceOf[InternalRow]
     val resultRowSeq = transformFunc(internalRow)
     val outputVal = resultRowSeq.map(resultRow => outputArrDecoder(resultRow))
     outputVal.map(_.asInstanceOf[Array[Any]])
   }
 
-  def performSql(values: Map[String, Any]): Seq[Map[String, Any]] = {
+  def performSql(values: Map[String, Any]): Seq[Map[String, Any]] = withUdfClassLoader {
     val internalRow = inputEncoder(values).asInstanceOf[InternalRow]
-    performSql(internalRow)
+    performSqlInternal(internalRow)
   }
 
-  def performSql(row: InternalRow): Seq[Map[String, Any]] = {
+  def performSql(row: InternalRow): Seq[Map[String, Any]] = withUdfClassLoader(performSqlInternal(row))
+
+  private def performSqlInternal(row: InternalRow): Seq[Map[String, Any]] = {
     val resultRowMaybe = transformFunc(row)
     val outputVal = resultRowMaybe.map(resultRow => outputDecoder(resultRow))
     outputVal.map(_.asInstanceOf[Map[String, Any]])

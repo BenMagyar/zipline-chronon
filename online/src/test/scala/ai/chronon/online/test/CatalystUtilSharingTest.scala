@@ -5,6 +5,7 @@ import ai.chronon.online.{CatalystUtil, PooledCatalystUtil}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
 
 /** CatalystUtil instances for one query share a blueprint: the physical plan, the compiled whole stage class
@@ -209,5 +210,42 @@ class CatalystUtilSharingTest extends AnyFlatSpec with Matchers {
     withClue(s"${failures.size} mismatches, first few: ${failures.toArray.take(5).mkString("; ")} ") {
       failures shouldBe empty
     }
+  }
+
+  it should "scope the UDF classloader around every evaluation on a reused worker" in {
+    val pooled = new PooledCatalystUtil(
+      Seq("value" -> "REQUIRE_CONTEXT_CLASS_LOADER(currency)"),
+      schema,
+      setups = Seq(
+        "CREATE FUNCTION REQUIRE_CONTEXT_CLASS_LOADER AS 'ai.chronon.online.test.Require_Context_Class_Loader'"))
+    val executor = Executors.newSingleThreadExecutor()
+    val done = new CountDownLatch(1)
+    val failure = new AtomicReference[Throwable]()
+    val contextAfterSecondEvaluation = new AtomicReference[ClassLoader]()
+    val resetLoader = new ClassLoader(null) {}
+
+    try {
+      executor.submit(new Runnable {
+        override def run(): Unit = {
+          try {
+            // Initialize the thread-local evaluator on this worker, then model the server resetting
+            // its context loader before assigning another request to the same thread.
+            pooled.performSql(rowFor(0)).head("value") shouldBe "usd"
+            Thread.currentThread().setContextClassLoader(resetLoader)
+
+            pooled.performSql(rowFor(1)).head("value") shouldBe "usd"
+            contextAfterSecondEvaluation.set(Thread.currentThread().getContextClassLoader)
+          } catch {
+            case throwable: Throwable => failure.set(throwable)
+          } finally done.countDown()
+        }
+      })
+
+      done.await(60, TimeUnit.SECONDS) shouldBe true
+      withClue(Option(failure.get()).map(_.toString).getOrElse("")) {
+        failure.get() shouldBe null
+      }
+      contextAfterSecondEvaluation.get() should be theSameInstanceAs resetLoader
+    } finally executor.shutdownNow()
   }
 }

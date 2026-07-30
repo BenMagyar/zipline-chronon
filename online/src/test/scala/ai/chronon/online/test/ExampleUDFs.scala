@@ -12,3 +12,12 @@ class Cat_Str extends org.apache.hadoop.hive.ql.exec.UDF {
     x + "123"
   }
 }
+
+// Mirrors the runtime class lookup performed by externally loaded Hive UDFs. Keeping the
+// lookup inside evaluate makes a reused worker's context-classloader lifecycle deterministic.
+class Require_Context_Class_Loader extends org.apache.hadoop.hive.ql.exec.UDF {
+  def evaluate(x: String): String = {
+    Class.forName(getClass.getName, false, Thread.currentThread().getContextClassLoader)
+    x
+  }
+}
