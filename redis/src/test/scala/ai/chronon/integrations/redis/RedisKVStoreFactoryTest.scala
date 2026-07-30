@@ -2,6 +2,9 @@ package ai.chronon.integrations.redis
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import redis.clients.jedis.Connection
+
+import scala.collection.mutable.ArrayBuffer
 
 class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
 
@@ -86,5 +89,35 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
       Map("redis.key.prefix" -> "property"),
       env = Map("REDIS_KEY_PREFIX" -> "environment")
     ) shouldBe "environment"
+  }
+
+  "ClientNoTouchInitializer" should "initialize each physical connection only once" in {
+    val first = new Connection()
+    val second = new Connection()
+    val initialized = ArrayBuffer.empty[Connection]
+    val initializer = new RedisKVStoreFactory.ClientNoTouchInitializer(initialized += _)
+
+    initializer.initialize(first)
+    initializer.initialize(first)
+    initializer.initialize(second)
+    initializer.initialize(first)
+    initializer.initialize(second)
+
+    initialized.toSeq shouldBe Seq(first, second)
+  }
+
+  it should "retry initialization after a failed attempt" in {
+    val connection = new Connection()
+    var attempts = 0
+    val initializer = new RedisKVStoreFactory.ClientNoTouchInitializer(_ => {
+      attempts += 1
+      if (attempts == 1) throw new RuntimeException("initialization failed")
+    })
+
+    an[RuntimeException] should be thrownBy initializer.initialize(connection)
+    initializer.initialize(connection)
+    initializer.initialize(connection)
+
+    attempts shouldBe 2
   }
 }

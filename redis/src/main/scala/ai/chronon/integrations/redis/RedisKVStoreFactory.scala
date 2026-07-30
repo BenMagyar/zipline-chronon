@@ -15,7 +15,7 @@ import redis.clients.jedis.exceptions.JedisDataException
 import redis.clients.jedis.providers.ClusterConnectionProvider
 
 import java.time.Duration
-import java.util.Locale
+import java.util.{Locale, WeakHashMap}
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 
@@ -198,6 +198,9 @@ object RedisKVStoreFactory {
       poolConfig: org.apache.commons.pool2.impl.GenericObjectPoolConfig[Connection]
   ) extends ClusterConnectionProvider(nodes, clientConfig, poolConfig) {
 
+    private val noTouchInitializer =
+      new ClientNoTouchInitializer(connection => setClientNoTouch(connection, enabled = true))
+
     override def getConnection(node: HostAndPort): Connection = enableNoTouch(super.getConnection(node))
 
     override def getConnection(): Connection = enableNoTouch(super.getConnection())
@@ -206,13 +209,30 @@ object RedisKVStoreFactory {
 
     private def enableNoTouch(connection: Connection): Connection = {
       try {
-        setClientNoTouch(connection, enabled = true)
+        noTouchInitializer.initialize(connection)
         connection
       } catch {
         case error: Throwable =>
           connection.setBroken()
           Try(connection.close())
           throw error
+      }
+    }
+  }
+
+  private[redis] final class ClientNoTouchInitializer(initializeConnection: Connection => Unit) {
+    // CLIENT state survives pool returns for the socket lifetime; weak keys do not retain removed or broken sockets.
+    private val initializedConnections = new WeakHashMap[Connection, java.lang.Boolean]()
+
+    def initialize(connection: Connection): Unit = connection.synchronized {
+      val initialized = initializedConnections.synchronized {
+        initializedConnections.containsKey(connection)
+      }
+      if (!initialized) {
+        initializeConnection(connection)
+        initializedConnections.synchronized {
+          initializedConnections.put(connection, java.lang.Boolean.TRUE)
+        }
       }
     }
   }

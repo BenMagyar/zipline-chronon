@@ -18,6 +18,7 @@ import redis.clients.jedis.exceptions.{
   JedisClusterOperationException,
   JedisConnectionException,
   JedisDataException,
+  JedisMovedDataException,
   JedisNoScriptException,
   JedisRedirectionException
 }
@@ -1678,6 +1679,7 @@ object Spark2RedisLoader {
     var lastFailure: Throwable = null
     var directReplay = false
     var refreshClient = false
+    var pipelineMovedFailures = 0
     var oomRetries = 0L
     while (attempt <= maxRetries) {
       if (attempt > 0 && retryBackoffMs > 0) {
@@ -1733,10 +1735,19 @@ object Spark2RedisLoader {
       } catch {
         case error if retryableRedisFailure(error) =>
           lastFailure = error
-          directReplay = directReplay || directReplayRequired(error)
-          refreshClient = refreshClient || refreshRequired(error)
+          val failedMode = if (directReplay) "direct" else "pipeline"
+          if (!directReplay && error.isInstanceOf[JedisMovedDataException]) pipelineMovedFailures += 1
           attempt += 1
-          logger.warn(s"Redis command batch failed; attempt $attempt of ${maxRetries + 1}", error)
+          val attemptsRemaining = maxRetries + 1 - attempt
+          directReplay = directReplay || directReplayRequired(error, pipelineMovedFailures, attemptsRemaining)
+          refreshClient = refreshClient || refreshRequired(error)
+          val nextMode = if (attemptsRemaining == 0) "none" else if (directReplay) "direct" else "pipeline"
+          logger.warn(
+            s"Redis command batch failed dataset=$dataset operation=${writeModeName(mode)} batchSize=${batch.size} " +
+              s"failedMode=$failedMode; attempt $attempt of ${maxRetries + 1}, attemptsRemaining=$attemptsRemaining " +
+              s"nextMode=$nextMode refreshClient=$refreshClient",
+            error
+          )
       }
     }
     throw new RuntimeException(s"Redis command batch failed after ${maxRetries + 1} attempts", lastFailure)
@@ -1751,7 +1762,7 @@ object Spark2RedisLoader {
                               leaseDeadlineMillis: Long,
                               tombstoneDeadlineMillis: Long): Seq[Any] = {
     val pipeline = client.pipelined()
-    completePipeline(pipeline) {
+    val responses = completePipeline(pipeline) {
       batch.map(row =>
         enqueueCommand(pipeline,
                        row,
@@ -1762,17 +1773,56 @@ object Spark2RedisLoader {
                        leaseDeadlineMillis,
                        tombstoneDeadlineMillis))
     }
+    val (results, replayedFailures) = resolvePipelineResponses(batch, responses) { row =>
+      executeCommand(client,
+                     row,
+                     mode,
+                     dataset,
+                     keyPrefix,
+                     keyHashTagMode,
+                     leaseDeadlineMillis,
+                     tombstoneDeadlineMillis)
+    }
+    if (replayedFailures.nonEmpty) {
+      val causes = replayedFailures
+        .groupBy(_.getClass.getSimpleName)
+        .toSeq
+        .sortBy(_._1)
+        .map { case (name, failures) => s"$name:${failures.size}" }
+        .mkString(",")
+      logger.warn(
+        s"Redis pipeline replayed affected commands directly dataset=$dataset operation=${writeModeName(mode)} " +
+          s"batchSize=${batch.size} replayCount=${replayedFailures.size} causes=$causes")
+    }
+    results
   }
 
-  private[redis] def completePipeline(pipeline: ClusterPipeline)(enqueue: => Seq[Response[_]]): Seq[Any] = {
-    val responses =
-      try enqueue
-      finally {
-        // close is both the sync and the connection-release step. A second sync after a failed one can make Jedis
-        // revisit response queues whose node connections it already removed and fail on its executor thread.
-        pipeline.close()
+  private[redis] def completePipeline(pipeline: ClusterPipeline)(enqueue: => Seq[Response[_]]): Seq[Response[_]] =
+    try enqueue
+    finally {
+      // close is both the sync and the connection-release step. A second sync after a failed one can make Jedis
+      // revisit response queues whose node connections it already removed and fail on its executor thread.
+      pipeline.close()
+    }
+
+  private[redis] def resolvePipelineResponses[T](items: Seq[T], responses: Seq[Response[_]])(
+      directReplay: T => Any): (Seq[Any], Seq[Throwable]) = {
+    require(items.size == responses.size,
+            s"Redis pipeline returned ${responses.size} responses for ${items.size} commands")
+    val results = Array.fill[Any](items.size)(null)
+    val replayBuilder = Vector.newBuilder[(Int, T, Throwable)]
+
+    items.iterator.zip(responses.iterator).zipWithIndex.foreach { case ((item, response), index) =>
+      try results(index) = response.get()
+      catch {
+        case error if pipelineResponseDirectReplayRequired(error) =>
+          replayBuilder += ((index, item, error))
       }
-    responses.map(_.get())
+    }
+
+    val replays = replayBuilder.result()
+    replays.foreach { case (index, item, _) => results(index) = directReplay(item) }
+    (results.toIndexedSeq, replays.map(_._3))
   }
 
   private def executeDirect(client: JedisCluster,
@@ -2042,7 +2092,20 @@ object Spark2RedisLoader {
     case _                                 => false
   }
 
-  private[redis] def directReplayRequired(error: Throwable): Boolean = error match {
+  private[redis] def directReplayRequired(error: Throwable,
+                                          pipelineMovedFailures: Int,
+                                          attemptsRemaining: Int): Boolean = {
+    require(pipelineMovedFailures >= 0, s"Pipeline MOVED failures must be non-negative: $pipelineMovedFailures")
+    require(attemptsRemaining >= 0, s"Redis attempts remaining must be non-negative: $attemptsRemaining")
+    error match {
+      // Response-level MOVED failures are normally replayed selectively. If one escapes that recovery, refresh
+      // topology and re-pipeline once while preserving a final redirect-aware direct attempt.
+      case _: JedisMovedDataException => pipelineMovedFailures > 1 || attemptsRemaining <= 1
+      case _                          => pipelineResponseDirectReplayRequired(error)
+    }
+  }
+
+  private[redis] def pipelineResponseDirectReplayRequired(error: Throwable): Boolean = error match {
     case _: JedisRedirectionException      => true
     case _: JedisNoScriptException         => true
     case stateError: IllegalStateException => unsetPipelineResponse(stateError)

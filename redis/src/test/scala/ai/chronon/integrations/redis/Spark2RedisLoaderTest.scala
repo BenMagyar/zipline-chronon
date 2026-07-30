@@ -10,11 +10,13 @@ import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
-import redis.clients.jedis.{ClusterPipeline, Response}
+import redis.clients.jedis.{ClusterPipeline, HostAndPort, Response}
 import redis.clients.jedis.exceptions.{
+  JedisAskDataException,
   JedisClusterException,
   JedisConnectionException,
   JedisDataException,
+  JedisMovedDataException,
   JedisNoScriptException
 }
 
@@ -137,29 +139,66 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     Spark2RedisLoader.retryableRedisFailure(new IllegalArgumentException("invalid mutation")) shouldBe false
   }
 
-  it should "close a write pipeline once before surfacing an unset response" in {
+  it should "close a write pipeline once before resolving its responses" in {
     val pipeline = mock[ClusterPipeline]
     val response = mock[Response[Any]]
     val unsetResponse =
       new IllegalStateException("Please close pipeline or multi block before calling this method.")
     when(response.get()).thenThrow(unsetResponse)
 
-    val failure = the[IllegalStateException] thrownBy {
-      Spark2RedisLoader.completePipeline(pipeline)(Seq(response))
-    }
+    val responses = Spark2RedisLoader.completePipeline(pipeline)(Seq(response))
 
-    failure shouldBe unsetResponse
+    responses shouldBe Seq(response)
     verify(pipeline, times(1)).close()
     verify(pipeline, never()).sync()
+    val failure = the[IllegalStateException] thrownBy {
+      responses.head.get()
+    }
+    failure shouldBe unsetResponse
   }
 
-  it should "use direct replay after an unset pipeline response" in {
+  it should "directly replay only commands whose pipeline responses require it" in {
+    val successful = mock[Response[java.lang.Long]]
+    val redirected = mock[Response[java.lang.Long]]
+    val unchanged = mock[Response[java.lang.Long]]
+    val target = new HostAndPort("127.0.0.1", 6380)
+    val moved = new JedisMovedDataException("MOVED 42 127.0.0.1:6380", target, 42)
+    when(successful.get()).thenReturn(java.lang.Long.valueOf(1L))
+    when(redirected.get()).thenThrow(moved)
+    when(unchanged.get()).thenReturn(java.lang.Long.valueOf(0L))
+    val replayed = ArrayBuffer.empty[String]
+
+    val (results, failures) = Spark2RedisLoader.resolvePipelineResponses(
+      Seq("successful", "redirected", "unchanged"),
+      Seq(successful, redirected, unchanged)) { item =>
+      replayed += item
+      2L
+    }
+
+    results shouldBe Seq(1L, 2L, 0L)
+    failures shouldBe Seq(moved)
+    replayed shouldBe Seq("redirected")
+  }
+
+  it should "preserve a bounded whole-batch fallback when MOVED escapes response recovery" in {
+    val target = new HostAndPort("127.0.0.1", 6380)
+    val moved = new JedisMovedDataException("MOVED 42 127.0.0.1:6380", target, 42)
+
+    Spark2RedisLoader.directReplayRequired(moved, pipelineMovedFailures = 1, attemptsRemaining = 3) shouldBe false
+    Spark2RedisLoader.directReplayRequired(moved, pipelineMovedFailures = 2, attemptsRemaining = 2) shouldBe true
+    Spark2RedisLoader.directReplayRequired(moved, pipelineMovedFailures = 1, attemptsRemaining = 1) shouldBe true
+  }
+
+  it should "selectively replay only redirect, script, and unset response failures" in {
     val unsetResponse =
       new IllegalStateException("Please close pipeline or multi block before calling this method.")
+    val ask = new JedisAskDataException("ASK 42 127.0.0.1:6380", new HostAndPort("127.0.0.1", 6380), 42)
 
-    Spark2RedisLoader.directReplayRequired(unsetResponse) shouldBe true
-    Spark2RedisLoader.directReplayRequired(new JedisNoScriptException("NOSCRIPT missing")) shouldBe true
-    Spark2RedisLoader.directReplayRequired(new JedisConnectionException("connection reset")) shouldBe false
+    Spark2RedisLoader.pipelineResponseDirectReplayRequired(ask) shouldBe true
+    Spark2RedisLoader.pipelineResponseDirectReplayRequired(new JedisNoScriptException("NOSCRIPT missing")) shouldBe true
+    Spark2RedisLoader.pipelineResponseDirectReplayRequired(unsetResponse) shouldBe true
+    Spark2RedisLoader.pipelineResponseDirectReplayRequired(new JedisConnectionException("connection reset")) shouldBe false
+    Spark2RedisLoader.pipelineResponseDirectReplayRequired(new JedisDataException("WRONGTYPE bad input")) shouldBe false
   }
 
   "Redis OOM retries" should "recognize only Redis maxmemory failures" in {
