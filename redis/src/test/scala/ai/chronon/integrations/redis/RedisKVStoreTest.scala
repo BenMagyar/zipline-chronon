@@ -1493,7 +1493,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       shortDelta.refreshedKeys shouldBe 1L
       val cRedisKey = RedisKVStore.buildRedisKey("c".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
       jedisCluster.ttl(bRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
-      jedisCluster.ttl(cRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 3000L and be <= 3600L)
+      jedisCluster.ttl(cRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
       RedisBatchUpload.decodeValue(jedisCluster.get(cRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
         RedisBatchUpload.Delete
       read("c")("c") shouldBe empty

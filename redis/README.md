@@ -81,9 +81,8 @@ or as matching `-Z` properties. The node runner resolves them in that order, wit
 A state root is the durable identity of one Redis serving target and must not be shared across Redis clusters. A dataset
 lineage must keep the same key prefix. The first admitted generation fixes `state_buckets` for that lineage. A TTL change
 publishes a new generation; a refresh of an existing generation uses the TTL recorded with that generation. TTL may
-increase or decrease in place. The lineage separately retains its largest historical TTL for delete fences, so a shorter
-live-value lease cannot expose a value written by an older generation. Concurrent jobs sharing a cluster must use the
-same rate while the shared queue is active.
+increase or decrease in place, and each new generation uses its configured TTL for both live values and new delete
+fences. Concurrent jobs sharing a cluster must use the same rate while the shared queue is active.
 
 ## Publication Protocol
 
@@ -216,10 +215,12 @@ version 6 records containing both the key hash-tag mode and the separate delete-
 Redis value bytes retain their existing wire versions. Older loaders reject version 6 `_READY` records rather than
 losing the transition fence.
 
-Removed entity keys become tombstones for the lineage's largest historical TTL. This can retain tombstones longer than
-live values after a TTL decrease, but guarantees they outlive every value lease issued before the transition. If uploads
-for a GroupBy stop, its values, metadata, and active status age out. Marking a GroupBy `online=false` does not itself stop
-uploads because offline GroupBys can still be join inputs; the scheduler determines whether publication continues.
+Removed entity keys become tombstones for the generation's configured TTL. Existing values and tombstones keep the
+absolute expiration they already received, while new mutations use the shorter TTL after a decrease. Consequently, an
+older Redis snapshot restored after the shorter delete fence expires can temporarily expose a stale deleted value until
+its original value lease expires. If uploads for a GroupBy stop, its values, metadata, and active status age out. Marking
+a GroupBy `online=false` does not itself stop uploads because offline GroupBys can still be join inputs; the scheduler
+determines whether publication continues.
 
 A GroupBy upload must contain at least one entity row; a zero-row computation fails before publishing so a missing
 source partition cannot become a delete-all. Ordinary snapshots tombstone keys absent from the new state. To retire an

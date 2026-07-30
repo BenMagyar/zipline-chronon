@@ -448,10 +448,14 @@ object Spark2RedisLoader {
                                    conditionalWriter,
                                    !redisStatus.contains(committed.status))
       }
-      if (settings.liveTTLSeconds < committed.liveTTLSeconds) {
+      if (
+        settings.liveTTLSeconds < committed.liveTTLSeconds ||
+        settings.liveTTLSeconds < committed.deleteFenceTTLSeconds
+      ) {
         logger.info(
-          s"Redis live-value TTL is decreasing from ${committed.liveTTLSeconds} to ${settings.liveTTLSeconds} seconds; " +
-            s"retaining delete fences for ${committed.deleteFenceTTLSeconds} seconds")
+          s"Redis TTL is decreasing to ${settings.liveTTLSeconds} seconds: " +
+            s"live values were ${committed.liveTTLSeconds} seconds and delete fences were " +
+            s"${committed.deleteFenceTTLSeconds} seconds; existing keys retain their current absolute expiration")
       }
 
       // APPLIED makes the value-bearing S3 generation authoritative even if Redis loses its status marker or is
@@ -563,6 +567,7 @@ object Spark2RedisLoader {
             deletedKeys == 0L &&
             metadataMatches(metadataRows, settings, committed, spark) &&
             settings.liveTTLSeconds == committed.liveTTLSeconds &&
+            settings.liveTTLSeconds == committed.deleteFenceTTLSeconds &&
             !needsFullRebuild
           }
           if (unchangedRerun) {
@@ -612,8 +617,7 @@ object Spark2RedisLoader {
             deltaRows = deltaRows,
             tombstoneRows = tombstoneRows,
             liveTTLSeconds = settings.liveTTLSeconds,
-            deleteFenceTTLSeconds =
-              math.max(settings.liveTTLSeconds, head.map(_.deleteFenceTTLSeconds).getOrElse(settings.liveTTLSeconds)),
+            deleteFenceTTLSeconds = settings.liveTTLSeconds,
             fullRebuild = needsFullRebuild || head.isEmpty,
             retired = false
           )

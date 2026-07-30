@@ -364,7 +364,7 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     decoded.minimumActiveDeadlineMillis shouldBe 2000000L
   }
 
-  it should "read legacy READY records and retain the historical delete-fence TTL in new records" in {
+  it should "read legacy READY records and round-trip a separately recorded delete-fence TTL" in {
     val status = RedisBatchUpload.BatchStatus("generation-a", "2024-07-27", 1000L, 2L)
     val manifest = Spark2RedisLoader.ReadyManifest(
       status = status,
