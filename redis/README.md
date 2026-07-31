@@ -42,9 +42,65 @@ Connection settings retain their existing environment aliases for secrets and ru
 | `REDIS_CONNECTION_TIMEOUT_MS` | `redis.connection.timeout.ms` | `5000` |
 | `REDIS_SO_TIMEOUT_MS` | `redis.so.timeout.ms` | `2000` |
 | `REDIS_MAX_REDIRECTIONS` | `redis.max.redirections` | `5` |
+| `REDIS_PIPELINE_SYNC_THREADS` | `redis.pipeline.sync.threads` | `12` |
+| `REDIS_CLIENT` | `redis.client` | `jedis` |
+| `REDIS_READ_FROM` | `redis.read.from` | `primary` |
 
 Environment variables take precedence over submitted properties. Prefer environment variables for credentials. Bulk
 writers use a small internal pool and do not validate a connection on every borrow/return.
+
+### Serving client boundary
+
+`REDIS_CLIENT` selects the client used by the fetcher's hot `multiGet` path. The default, `jedis`, preserves the existing
+behavior. Setting it to `glide` adds a GLIDE cluster client for batch and streaming feature reads, but does not replace
+Jedis throughout the store. Status reads, `list`/scan, `multiPut`, incremental batch publication, Lua
+commands, and rate-limit/control operations continue to use Jedis. These operations and all writes remain primary-routed.
+This split makes the serving-read migration independently reversible without changing the publication protocol.
+
+The shared node, TLS, username, password, and key-prefix settings configure both clients.
+`REDIS_CONNECTION_TIMEOUT_MS` is the connection timeout for Jedis and GLIDE. `REDIS_SO_TIMEOUT_MS` is the Jedis socket
+timeout and GLIDE's request deadline; for a GLIDE read it covers the complete cluster batch. Jedis pool and redirection
+settings still configure the control/write client.
+`REDIS_PIPELINE_SYNC_THREADS` applies only when Jedis serves hot reads; the GLIDE read path does not build or use that
+executor.
+
+Production GLIDE reads always send the planned command list as one non-atomic `ClusterBatch`. GLIDE splits it into
+node-local pipelines and returns results in request order. This is a pipeline optimization, not a transaction or an
+atomic feature snapshot. The native channel and admission safeguards are internal implementation limits, not operator
+settings. Individually dispatched direct reads remain available only in the benchmark harness through
+`PERF_REDIS_GLIDE_EXECUTION_MODE`, so the client-migration comparison can be reproduced.
+
+### Read routing
+
+`REDIS_READ_FROM` applies only to GLIDE hot reads. Configuring a non-primary policy with `REDIS_CLIENT=jedis` is rejected.
+Policy semantics follow GLIDE's [read-strategy guide](https://glide.valkey.io/how-to/connections/read-strategy/);
+`all-nodes` is GLIDE 2.5's
+[`ALL_NODES` policy](https://glide.valkey.io/languages/java/api/glide/api/models/configuration/ReadFrom.html),
+which round-robins reads across every primary and replica.
+
+| Value | Read behavior |
+| --- | --- |
+| `primary` | Read from the slot owner primary. This is the default and freshest-data control. |
+| `all-nodes` | Round-robin across primaries and any replicas that exist. This is the main throughput treatment because it uses the available serving fleet. |
+| `az-affinity-replicas-and-primary` | Spread reads across replicas and the primary in the pod's projected availability zone, falling back to other nodes when needed. |
+
+`az-affinity-replicas-and-primary` reads `/etc/podinfo/availability-zone`, projected from the scheduled pod's
+`topology.kubernetes.io/zone` label. This keeps the AZ automatic for each replica in a multi-zone Deployment. The
+`redis.client.az` property is retained only as a non-Kubernetes/test override.
+
+Any policy that can select replicas, including `all-nodes`, can return stale values or misses while replication catches
+up. Compare latency, throughput, and replication visibility against `primary` before enabling it. Status/control reads
+stay on the primary-routed Jedis path and do not make replica-served feature values strongly consistent. A lagging
+replica can briefly return the preceding payload under the current primary status, including a value that a newer
+tombstone has deleted.
+
+For the GLIDE cluster-batch throughput stage:
+
+```text
+KV_STORE_TYPE=redis
+REDIS_CLIENT=glide
+REDIS_READ_FROM=all-nodes
+```
 
 There are distinct configuration paths:
 
@@ -279,7 +335,8 @@ achieved rate.
 ## Valkey 9 and Tiered Storage
 
 Valkey 9 does not change the value protocol. The path uses RESP-compatible Jedis operations, pipelined `EVALSHA`, Lua
-script reload, expiration metadata, and Redis Cluster hash slots. Tiered storage also needs no alternate value format.
+script reload, expiration metadata, and Redis Cluster hash slots. The optional GLIDE hot-read path uses binary-safe
+`GET`, same-slot `MGET`, and `ZRANGE` commands against those same keys. Tiered storage also needs no alternate value format.
 The loader probes `CLIENT NO-TOUCH` support and enables it on every physical connection borrowed by its dedicated bulk
 client. Probe connections are restored to normal mode, and serving/control clients are not changed. Once a generation
 has `_LEASE`, normal unchanged-key validation reads only expiration metadata; a later-than-checkpoint expiration reads
@@ -304,6 +361,7 @@ Use the repository's Mill targets directly:
 ./mill --no-server redis.test
 ./mill --no-server redis.test.testOnly ai.chronon.integrations.redis.RedisKVStoreTest
 ./mill --no-server redis.test.testOnly ai.chronon.integrations.redis.Valkey9CompatibilityTest
+./mill --no-server redis.test.testOnly ai.chronon.integrations.redis.GlideRedisKVStoreTest
 ```
 
 Testcontainers uses the caller's Docker environment. For Colima, configure the shell rather than relying on repository
@@ -314,3 +372,70 @@ DOCKER_HOST="unix://$HOME/.colima/default/docker.sock" \
 TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock \
 ./mill --no-server redis.test
 ```
+
+## Staged serving-read benchmark
+
+`RedisFetcherReadPerfTestHarness` measures the real `KVStore.multiGet` path after join-level context deduplication. Keep
+the workload, topology, CPU limit, concurrency, worker count, and iteration counts fixed while changing the stage knobs.
+The local Valkey fixture prints `REDIS_FETCHER_READ_ROUTE` so primary/replica routing can be verified rather than
+inferred from latency.
+The latest local staged smoke result is recorded in
+[`benchmarks/2026-07-29-valkey-glide-smoke.md`](benchmarks/2026-07-29-valkey-glide-smoke.md).
+`PERF_REDIS_GLIDE_EXECUTION_MODE` is benchmark-only: it retains the direct client-migration control, while production
+GLIDE reads always use cluster batching.
+
+Use this shell helper for fixed-resource local comparisons:
+
+```bash
+# Example for a four-vCPU Docker VM; never set this above `docker info --format '{{.NCPU}}'`.
+export PERF_REDIS_CPU_LIMIT=4
+
+run_redis_read_benchmark() {
+  env \
+    CHRONON_PERF_TEST_ENABLED=true \
+    PERF_REDIS_SERVER="$1" \
+    PERF_REDIS_CLIENT="$2" \
+    PERF_REDIS_GLIDE_EXECUTION_MODE="$3" \
+    PERF_REDIS_READ_FROM="$4" \
+    PERF_REDIS_SO_TIMEOUT_MS=10000 \
+    PERF_REDIS_PROFILES=deduplicated,deduplicated-cross-day-24h,synthetic-context-hot-candidate-hit-80 \
+    PERF_WARMUP_ITERATIONS=500 \
+    PERF_MEASUREMENT_ITERATIONS=5000 \
+    PERF_BATCH_CONCURRENCIES=64 \
+    PERF_REDIS_THREAD_COUNTS=48 \
+    PERF_REDIS_PIPELINE_SYNC_THREAD_COUNTS=12 \
+    PERF_REDIS_QUEUE_CAPACITIES=10000 \
+    PERF_REDIS_MAX_CONNECTIONS=64 \
+    PERF_REDIS_MIN_IDLE_CONNECTIONS=5 \
+    PERF_REDIS_MAX_IDLE_CONNECTIONS=10 \
+    PERF_REDIS_PRIMARY_COUNT=3 \
+    PERF_REDIS_REPLICAS_PER_PRIMARY=1 \
+    PERF_REDIS_CPU_LIMIT="$PERF_REDIS_CPU_LIMIT" \
+    PERF_REDIS_IO_THREADS=1 \
+    PERF_REDIS_IO_THREADS_DO_READS=false \
+    ./mill --no-server redis.test.testOnly ai.chronon.integrations.redis.RedisFetcherReadPerfTestHarness
+}
+
+# 0. Existing server and client baseline. The GLIDE execution value is ignored by Jedis.
+run_redis_read_benchmark redis jedis direct primary
+
+# 1. Change only the server implementation/version.
+run_redis_read_benchmark valkey jedis direct primary
+
+# 2. Measure the benchmark-only GLIDE direct baseline; keep primary routing.
+run_redis_read_benchmark valkey glide direct primary
+
+# 3a. Use GLIDE's production cluster-batch dispatch; keep primary reads.
+run_redis_read_benchmark valkey glide cluster-batch primary
+
+# 3b. Use available primary and replica capacity for the throughput treatment.
+run_redis_read_benchmark valkey glide cluster-batch all-nodes
+```
+
+The local CPU limit covers the entire container and all cluster-node processes; it is not a per-node limit. It is only a
+ceiling and does not allocate CPUs, so the Docker VM must have at least that many. Run each cell in a fresh JVM several
+times and compare `REDIS_FETCHER_READ_RESULT` latency/throughput with the corresponding
+`REDIS_FETCHER_READ_ROUTE` evidence. Use `PERF_REDIS_USE_EXTERNAL=true` and `REDIS_CLUSTER_NODES` for the final managed
+cluster result; omit `PERF_REDIS_CPU_LIMIT` for external runs. External runs cannot reset or inspect managed node command
+counters and therefore do not emit `REDIS_FETCHER_READ_ROUTE`; verify the primary/replica split with the managed
+service's per-node command metrics.

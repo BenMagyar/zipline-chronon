@@ -19,6 +19,7 @@ trait RedisModule extends Cross.Module[String] with build.BaseModule {
     build.Constants.loggingApiDeps ++
     build.Constants.utilityDeps ++
     Seq(
+      mvn"io.valkey:valkey-glide:2.5.0",
       mvn"redis.clients:jedis:7.5.2",
       mvn"org.apache.commons:commons-pool2:2.12.1"
       // RedisLabs' spark-redis only supports Jedis 3.x (unmaintained since 2021)

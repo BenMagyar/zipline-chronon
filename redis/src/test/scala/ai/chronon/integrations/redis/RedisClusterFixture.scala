@@ -11,6 +11,7 @@ import scala.jdk.CollectionConverters._
 private[redis] final class RedisClusterFixture private (
     val container: GenericContainer[_],
     val client: JedisCluster,
+    val clientSettings: RedisKVStoreFactory.ClientSettings,
     val image: String,
     val primaryCount: Int,
     val replicasPerPrimary: Int,
@@ -19,6 +20,32 @@ private[redis] final class RedisClusterFixture private (
     val ioThreadsDoReads: Boolean
 ) extends AutoCloseable {
 
+  def resetCommandStats(): Unit =
+    clientSettings.advertisedPortMappings.toVector.sortBy(_._1).foreach { case (_, endpoint) =>
+      val jedis = new Jedis(endpoint.host, endpoint.port, 3000)
+      try jedis.configResetStat()
+      finally jedis.close()
+    }
+
+  def readCommandStats(): Vector[RedisClusterFixture.NodeReadStats] =
+    clientSettings.advertisedPortMappings.toVector.sortBy(_._1).map { case (advertisedPort, endpoint) =>
+      val jedis = new Jedis(endpoint.host, endpoint.port, 3000)
+      try {
+        val replication = jedis.info("replication")
+        val server = jedis.info("server")
+        val commandStats = jedis.info("commandstats")
+        RedisClusterFixture.NodeReadStats(
+          s"${endpoint.host}:${endpoint.port}(advertised:$advertisedPort)",
+          RedisClusterFixture.infoValue(replication, "role").getOrElse("unknown"),
+          RedisClusterFixture.infoValue(server, "availability_zone").filter(_.nonEmpty),
+          RedisClusterFixture.commandCalls(commandStats, "get"),
+          RedisClusterFixture.commandCalls(commandStats, "mget"),
+          RedisClusterFixture.commandCalls(commandStats, "zrange") +
+            RedisClusterFixture.commandCalls(commandStats, "zrangebyscore")
+        )
+      } finally jedis.close()
+    }
+
   override def close(): Unit = {
     try client.close()
     finally container.stop()
@@ -26,16 +53,44 @@ private[redis] final class RedisClusterFixture private (
 }
 
 private[redis] object RedisClusterFixture {
+  final case class NodeReadStats(address: String,
+                                 role: String,
+                                 availabilityZone: Option[String],
+                                 getCalls: Long,
+                                 mgetCalls: Long,
+                                 zrangeCalls: Long) {
+    def totalReadCalls: Long = getCalls + mgetCalls + zrangeCalls
+  }
+
   private final class RedisContainer(image: DockerImageName) extends GenericContainer[RedisContainer](image)
 
   private val Image = "grokzen/redis-cluster:7.0.10"
-  private val NativeImage = "redis:7.2.5-alpine"
+  private val RedisNativeImage = "redis:7.2.5-alpine"
+  private val ValkeyNativeImage = "valkey/valkey:9.0.5"
   private val FirstInternalPort = 7000
   private val DefaultPrimaryCount = 3
   private val DefaultReplicasPerPrimary = 1
   private val LegacyInternalPorts = (FirstInternalPort until FirstInternalPort + 6)
 
-  private def nativeClusterCommand(internalPorts: Seq[Int],
+  private def infoValue(info: String, key: String): Option[String] =
+    info.split("\\r?\\n").iterator.collectFirst {
+      case line if line.startsWith(s"$key:") => line.substring(key.length + 1).trim
+    }
+
+  private def commandCalls(info: String, command: String): Long =
+    info
+      .split("\\r?\\n")
+      .iterator
+      .find(_.startsWith(s"cmdstat_$command:"))
+      .flatMap(
+        _.stripPrefix(s"cmdstat_$command:").split(",").iterator.find(_.startsWith("calls=")))
+      .map(_.stripPrefix("calls=").toLong)
+      .getOrElse(0L)
+
+  private def nativeClusterCommand(serverBinary: String,
+                                   cliBinary: String,
+                                   internalPorts: Seq[Int],
+                                   primaryCount: Int,
                                    replicasPerPrimary: Int,
                                    ioThreads: Int,
                                    ioThreadsDoReads: Boolean): String = {
@@ -47,16 +102,27 @@ private[redis] object RedisClusterFixture {
       } else {
         ""
       }
+    val startCommands = internalPorts.zipWithIndex.map { case (port, index) =>
+      val availabilityZoneArgs =
+        if (serverBinary == "valkey-server") {
+          val shardIndex = index % primaryCount
+          val replicaOrdinal = index / primaryCount
+          val zone = ('a' + ((shardIndex + replicaOrdinal) % 3)).toChar
+          s"--availability-zone zone-$zone"
+        } else ""
+      s"mkdir -p /data/$port\n" +
+        s"$serverBinary --port $port --cluster-enabled yes --cluster-config-file /data/$port/nodes.conf " +
+        s"--cluster-node-timeout 5000 --appendonly no --save '' --protected-mode no --bind 0.0.0.0 " +
+        s"--repl-diskless-sync yes --repl-diskless-sync-delay 0 " +
+        s"--daemonize yes --dir /data/$port $availabilityZoneArgs $ioThreadArgs"
+    }.mkString("\n")
     s"""
        |set -eu
+       |$startCommands
        |for port in ${internalPorts.mkString(" ")}; do
-       |  mkdir -p /data/$$port
-       |  redis-server --port $$port --cluster-enabled yes --cluster-config-file /data/$$port/nodes.conf --cluster-node-timeout 5000 --appendonly no --save '' --protected-mode no --bind 0.0.0.0 --daemonize yes --dir /data/$$port $ioThreadArgs
+       |  until $cliBinary -p $$port ping >/dev/null 2>&1; do sleep 0.1; done
        |done
-       |for port in ${internalPorts.mkString(" ")}; do
-       |  until redis-cli -p $$port ping >/dev/null 2>&1; do sleep 0.1; done
-       |done
-       |redis-cli --cluster create $nodes --cluster-replicas $replicasPerPrimary --cluster-yes
+       |$cliBinary --cluster create $nodes --cluster-replicas $replicasPerPrimary --cluster-yes
        |exec tail -f /dev/null
        |""".stripMargin
   }
@@ -113,7 +179,8 @@ private[redis] object RedisClusterFixture {
                   maxIdleConnections: Int,
                   primaryCount: Int,
                   replicasPerPrimary: Int,
-                  cpuLimit: Option[Double]): RedisClusterFixture = {
+                  cpuLimit: Option[Double],
+                  server: String = "valkey"): RedisClusterFixture = {
     require(primaryCount >= 3, s"primaryCount must be at least 3, got $primaryCount")
     require(replicasPerPrimary >= 0, s"replicasPerPrimary must be non-negative, got $replicasPerPrimary")
     require(cpuLimit.forall(_ > 0), s"cpuLimit must be positive when set, got $cpuLimit")
@@ -127,7 +194,8 @@ private[redis] object RedisClusterFixture {
       internalPorts,
       primaryCount,
       replicasPerPrimary,
-      cpuLimit
+      cpuLimit,
+      server
     )
   }
 
@@ -138,10 +206,19 @@ private[redis] object RedisClusterFixture {
                     internalPorts: Seq[Int],
                     primaryCount: Int,
                     replicasPerPrimary: Int,
-                    cpuLimit: Option[Double]): RedisClusterFixture = {
+                    cpuLimit: Option[Double],
+                    server: String = "redis"): RedisClusterFixture = {
     require(maxConnections > 0, s"maxConnections must be positive, got $maxConnections")
 
-    val image = if (native) NativeImage else Image
+    val (image, serverBinary, cliBinary) =
+      if (!native) (Image, "redis-server", "redis-cli")
+      else
+        server.toLowerCase match {
+          case "redis"  => (RedisNativeImage, "redis-server", "redis-cli")
+          case "valkey" => (ValkeyNativeImage, "valkey-server", "valkey-cli")
+          case other =>
+            throw new IllegalArgumentException(s"Unsupported local cluster server '$other'; expected redis or valkey")
+        }
     val container = new RedisContainer(DockerImageName.parse(image))
     var client: JedisCluster = null
     try {
@@ -155,7 +232,13 @@ private[redis] object RedisClusterFixture {
         container.withCommand(
           "sh",
           "-c",
-          nativeClusterCommand(internalPorts, replicasPerPrimary, ioThreads, ioThreadsDoReads)
+          nativeClusterCommand(serverBinary,
+                               cliBinary,
+                               internalPorts,
+                               primaryCount,
+                               replicasPerPrimary,
+                               ioThreads,
+                               ioThreadsDoReads)
         )
       }
       cpuLimit.foreach { cpus =>
@@ -174,7 +257,7 @@ private[redis] object RedisClusterFixture {
           s"Redis container CPU limit mismatch: requested $expectedNanoCpus NanoCPUs, applied $actualNanoCpus"
         )
       }
-      awaitClusterReady(container, internalPorts)
+      awaitClusterReady(container, internalPorts, replicasPerPrimary)
 
       val hostAndPortMapper = new HostAndPortMapper {
         override def getHostAndPort(hostAndPort: HostAndPort): HostAndPort = {
@@ -194,8 +277,36 @@ private[redis] object RedisClusterFixture {
       )
 
       val seed = new HostAndPort(container.getHost, container.getMappedPort(internalPorts.head))
+      val advertisedPortMappings = internalPorts.iterator.map { port =>
+        port -> RedisKVStoreFactory.RedisEndpoint(container.getHost, container.getMappedPort(port))
+      }.toMap
+      val mappedClusterNodes = internalPorts
+        .map(port => advertisedPortMappings(port))
+        .map(endpoint => s"${endpoint.host}:${endpoint.port}")
+        .mkString(",")
+      val clientSettings = RedisKVStoreFactory.ClientSettings(
+        nodes = mappedClusterNodes,
+        username = None,
+        password = None,
+        ssl = false,
+        maxConnections = maxConnections,
+        minIdleConnections = minIdleConnections,
+        maxIdleConnections = maxIdleConnections,
+        connectionTimeoutMs = RedisKVStoreConstants.DefaultConnectionTimeoutMs,
+        soTimeoutMs = RedisKVStoreConstants.DefaultSoTimeoutMs,
+        maxRedirections = RedisKVStoreConstants.DefaultMaxRedirections,
+        advertisedPortMappings = advertisedPortMappings
+      )
       client = new JedisCluster(Set(seed).asJava, clientConfig, 5, poolConfig)
-      new RedisClusterFixture(container, client, image, primaryCount, replicasPerPrimary, cpuLimit, ioThreads, ioThreadsDoReads)
+      new RedisClusterFixture(container,
+                              client,
+                              clientSettings,
+                              image,
+                              primaryCount,
+                              replicasPerPrimary,
+                              cpuLimit,
+                              ioThreads,
+                              ioThreadsDoReads)
     } catch {
       case throwable: Throwable =>
         if (client != null) {
@@ -208,7 +319,9 @@ private[redis] object RedisClusterFixture {
     }
   }
 
-  private def awaitClusterReady(container: GenericContainer[_], internalPorts: Seq[Int]): Unit = {
+  private def awaitClusterReady(container: GenericContainer[_],
+                                internalPorts: Seq[Int],
+                                replicasPerPrimary: Int): Unit = {
     val deadlineNanos = System.nanoTime() + Duration.ofSeconds(45).toNanos
     var lastFailure: Throwable = null
     var consecutiveHealthyChecks = 0
@@ -218,12 +331,32 @@ private[redis] object RedisClusterFixture {
           val probe = new Jedis(container.getHost, container.getMappedPort(port), 3000)
           try {
             val clusterInfo = probe.clusterInfo()
-            clusterInfo.contains("cluster_state:ok") && clusterInfo.contains("cluster_slots_assigned:16384")
+            val replicationInfo = probe.info("replication")
+            val role = infoValue(replicationInfo, "role").getOrElse("unknown")
+            val replicationReady =
+              if (replicasPerPrimary == 0) true
+              else if (role == "master") {
+                infoValue(replicationInfo, "connected_slaves").exists(_.toInt >= replicasPerPrimary)
+              } else if (role == "slave" || role == "replica") {
+                infoValue(replicationInfo, "master_link_status").contains("up") &&
+                !infoValue(replicationInfo, "master_sync_in_progress").contains("1")
+              } else false
+            clusterInfo.contains("cluster_state:ok") &&
+            clusterInfo.contains("cluster_slots_assigned:16384") &&
+            replicationReady
           } finally {
             probe.close()
           }
         }
-        consecutiveHealthyChecks = if (allNodesHealthy) consecutiveHealthyChecks + 1 else 0
+        val slotsExposeReplicas = {
+          val probe = new Jedis(container.getHost, container.getMappedPort(internalPorts.head), 3000)
+          try {
+            val slots = probe.clusterSlots().asScala
+            slots.nonEmpty && slots.forall(_.asInstanceOf[java.util.List[_]].size() >= 3 + replicasPerPrimary)
+          } finally probe.close()
+        }
+        consecutiveHealthyChecks =
+          if (allNodesHealthy && slotsExposeReplicas) consecutiveHealthyChecks + 1 else 0
         if (consecutiveHealthyChecks >= 4) {
           return
         }
@@ -235,6 +368,8 @@ private[redis] object RedisClusterFixture {
       Thread.sleep(500)
     }
 
-    throw new IllegalStateException("Redis cluster did not become ready within 45 seconds", lastFailure)
+    throw new IllegalStateException(
+      s"Redis cluster did not become ready with $replicasPerPrimary replica(s) per primary within 45 seconds",
+      lastFailure)
   }
 }

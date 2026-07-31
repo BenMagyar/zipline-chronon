@@ -1,6 +1,16 @@
 package ai.chronon.integrations.redis
 
 import ai.chronon.integrations.redis.RedisKVStoreConstants._
+import glide.api.GlideClusterClient
+import glide.api.models.configuration.{
+  AddressResolver,
+  AdvancedGlideClusterClientConfiguration,
+  GlideClusterClientConfiguration,
+  NodeAddress,
+  ReadFrom => GlideReadFrom,
+  ResolvedAddress,
+  ServerCredentials
+}
 import org.slf4j.LoggerFactory
 import redis.clients.jedis.{
   Connection,
@@ -15,8 +25,11 @@ import redis.clients.jedis.exceptions.JedisDataException
 import redis.clients.jedis.providers.ClusterConnectionProvider
 
 import java.time.Duration
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
 import java.util.{Locale, WeakHashMap}
 import scala.jdk.CollectionConverters._
+import scala.language.existentials
 import scala.util.Try
 
 /** Factory for creating Redis KVStore instances.
@@ -41,11 +54,29 @@ object RedisKVStoreFactory {
                           requireBatchStatus: Boolean): RedisKVStoreImpl = {
     val clientSettings = settings(conf)
     val jedisCluster = createClient(clientSettings)
-    val effectiveConf = conf.updated(ConfigPipelineSyncThreads, clientSettings.pipelineSyncThreads.toString)
-    val kvStore =
-      new RedisKVStoreImpl(jedisCluster, effectiveConf, conditionalObjectWriter, requireBatchStatus)
-    kvStore.init()
-    kvStore
+    var glideReadClient = Option.empty[GlideRedisReadClient]
+    try {
+      glideReadClient =
+        if (clientSettings.client == RedisClientGlide) Some(createGlideReadClient(clientSettings)) else None
+      val effectiveConf = conf ++ Map(
+        ConfigPipelineSyncThreads -> clientSettings.pipelineSyncThreads.toString,
+        PropRedisClient -> clientSettings.client,
+        PropRedisReadFrom -> clientSettings.readFrom
+      ) ++ clientSettings.clientAz.map(PropRedisClientAz -> _)
+      val kvStore =
+        new RedisKVStoreImpl(jedisCluster, effectiveConf, conditionalObjectWriter, requireBatchStatus, glideReadClient)
+      kvStore.init()
+      kvStore
+    } catch {
+      case error: Throwable =>
+        glideReadClient.foreach { client =>
+          try client.close()
+          catch { case closeError: Throwable => error.addSuppressed(closeError) }
+        }
+        try jedisCluster.close()
+        catch { case closeError: Throwable => error.addSuppressed(closeError) }
+        throw error
+    }
   }
 
   case class RedisEndpoint(host: String, port: Int) extends Serializable
@@ -63,7 +94,10 @@ object RedisKVStoreFactory {
                             pipelineSyncThreads: Int = DefaultPipelineSyncThreads,
                             validateConnections: Boolean = false,
                             advertisedPortMappings: Map[Int, RedisEndpoint] = Map.empty,
-                            clientNoTouch: Boolean = false)
+                            clientNoTouch: Boolean = false,
+                            client: String = DefaultRedisClient,
+                            readFrom: String = DefaultRedisReadFrom,
+                            clientAz: Option[String] = None)
       extends Serializable {
 
     /** Spark tasks issue one pipeline at a time. Keep their per-node pools deliberately small. */
@@ -71,7 +105,12 @@ object RedisKVStoreFactory {
       copy(maxConnections = 2, minIdleConnections = 0, maxIdleConnections = 1, validateConnections = false)
   }
 
-  def settings(conf: Map[String, String], env: Map[String, String] = sys.env): ClientSettings = {
+  def settings(conf: Map[String, String], env: Map[String, String] = sys.env): ClientSettings =
+    settings(conf, env, () => projectedClientAz())
+
+  private[redis] def settings(conf: Map[String, String],
+                              env: Map[String, String],
+                              projectedClientAzLookup: () => Option[String]): ClientSettings = {
     val maxConnections =
       intSetting(EnvRedisMaxConnections, PropRedisMaxConnections, DefaultMaxConnections, conf, env)
     val poolConfig = buildConnectionPoolConfig(
@@ -82,6 +121,48 @@ object RedisKVStoreFactory {
     val pipelineSyncThreads =
       intSetting(EnvRedisPipelineSyncThreads, ConfigPipelineSyncThreads, DefaultPipelineSyncThreads, conf, env)
     require(pipelineSyncThreads >= 0, s"$ConfigPipelineSyncThreads must be non-negative, got $pipelineSyncThreads")
+    val connectionTimeoutMs =
+      intSetting(EnvRedisConnectionTimeoutMs, PropRedisConnectionTimeoutMs, DefaultConnectionTimeoutMs, conf, env)
+    val soTimeoutMs = intSetting(EnvRedisSoTimeoutMs, PropRedisSoTimeoutMs, DefaultSoTimeoutMs, conf, env)
+
+    val client = enumSetting(
+      EnvRedisClient,
+      PropRedisClient,
+      DefaultRedisClient,
+      Set(RedisClientJedis, RedisClientGlide),
+      conf,
+      env
+    )
+    require(
+      client != RedisClientGlide || connectionTimeoutMs > 0,
+      s"$EnvRedisConnectionTimeoutMs/$PropRedisConnectionTimeoutMs must be positive for GLIDE, got $connectionTimeoutMs"
+    )
+    require(
+      client != RedisClientGlide || soTimeoutMs > 0,
+      s"$EnvRedisSoTimeoutMs/$PropRedisSoTimeoutMs must be positive for GLIDE, got $soTimeoutMs"
+    )
+    val readFrom = enumSetting(
+      EnvRedisReadFrom,
+      PropRedisReadFrom,
+      DefaultRedisReadFrom,
+      Set(RedisReadFromPrimary, RedisReadFromAllNodes, RedisReadFromAzAffinityReplicasAndPrimary),
+      conf,
+      env
+    )
+    val configuredClientAz = conf.get(PropRedisClientAz).map(_.trim).filter(_.nonEmpty)
+    val clientAz =
+      if (readFrom == RedisReadFromAzAffinityReplicasAndPrimary)
+        configuredClientAz.orElse(projectedClientAzLookup())
+      else configuredClientAz
+    require(
+      client == RedisClientGlide || readFrom == RedisReadFromPrimary,
+      s"$EnvRedisReadFrom/$PropRedisReadFrom=$readFrom requires $EnvRedisClient/$PropRedisClient=$RedisClientGlide"
+    )
+    require(
+      readFrom != RedisReadFromAzAffinityReplicasAndPrimary || clientAz.isDefined,
+      s"A projected client availability zone at $DefaultRedisClientAzPath or $PropRedisClientAz is required when " +
+        s"$EnvRedisReadFrom/$PropRedisReadFrom=$RedisReadFromAzAffinityReplicasAndPrimary"
+    )
 
     ClientSettings(
       nodes = getOrElseThrow(EnvRedisClusterNodes, PropRedisClusterNodes, conf, env),
@@ -91,12 +172,14 @@ object RedisKVStoreFactory {
       maxConnections = maxConnections,
       minIdleConnections = poolConfig.getMinIdle,
       maxIdleConnections = poolConfig.getMaxIdle,
-      connectionTimeoutMs =
-        intSetting(EnvRedisConnectionTimeoutMs, PropRedisConnectionTimeoutMs, DefaultConnectionTimeoutMs, conf, env),
-      soTimeoutMs = intSetting(EnvRedisSoTimeoutMs, PropRedisSoTimeoutMs, DefaultSoTimeoutMs, conf, env),
+      connectionTimeoutMs = connectionTimeoutMs,
+      soTimeoutMs = soTimeoutMs,
       maxRedirections =
         intSetting(EnvRedisMaxRedirections, PropRedisMaxRedirections, DefaultMaxRedirections, conf, env),
-      pipelineSyncThreads = pipelineSyncThreads
+      pipelineSyncThreads = pipelineSyncThreads,
+      client = client,
+      readFrom = readFrom,
+      clientAz = clientAz
     )
   }
 
@@ -237,6 +320,81 @@ object RedisKVStoreFactory {
     }
   }
 
+  private[redis] def createGlideReadClient(settings: ClientSettings): GlideRedisReadClient =
+    createGlideReadClient(settings, GlideExecutionClusterBatch)
+
+  /** Benchmark/test hook for retaining the staged direct-versus-batch comparison without exposing a deployment knob. */
+  private[redis] def createGlideReadClient(settings: ClientSettings, executionMode: String): GlideRedisReadClient = {
+    require(
+      settings.client == RedisClientGlide,
+      s"Cannot create a GLIDE read client when ${PropRedisClient}=${settings.client}"
+    )
+
+    val clusterNodes = settings.nodes
+      .split(",", -1)
+      .map(parseEndpoint)
+
+    logger.info(
+      s"Creating GLIDE Redis Cluster read client with nodes: ${clusterNodes.mkString(", ")}. " +
+        s"Params: ssl=${settings.ssl}, usernameSet=${settings.username.isDefined}, " +
+        s"requestTimeout=${settings.soTimeoutMs}, connectionTimeout=${settings.connectionTimeoutMs}, " +
+        s"executionMode=$executionMode, readFrom=${settings.readFrom}, clientAz=${settings.clientAz.getOrElse("unset")}"
+    )
+
+    val builder = GlideClusterClientConfiguration.builder()
+    builder.useTLS(settings.ssl)
+    builder.readFrom(glideReadFrom(settings.readFrom))
+    settings.clientAz.foreach(builder.clientAZ)
+    builder.requestTimeout(settings.soTimeoutMs)
+    if (executionMode == GlideExecutionDirect)
+      builder.inflightRequestsLimit(GlideRedisReadClient.InternalDirectNativeInflightLimit)
+    builder.advancedConfiguration(
+      AdvancedGlideClusterClientConfiguration
+        .builder()
+        .connectionTimeout(settings.connectionTimeoutMs)
+        .build())
+
+    clusterNodes.foreach { node =>
+      builder.address(NodeAddress.builder().host(node.getHost).port(node.getPort).build())
+    }
+
+    if (settings.username.nonEmpty || settings.password.nonEmpty) {
+      val credentials = ServerCredentials.builder()
+      settings.username.foreach(credentials.username)
+      settings.password.foreach(credentials.password)
+      builder.credentials(credentials.build())
+    }
+
+    if (settings.advertisedPortMappings.nonEmpty) {
+      builder.addressResolver(new AddressResolver {
+        override def resolve(host: String, port: Int): ResolvedAddress =
+          settings.advertisedPortMappings
+            .get(port)
+            .map(endpoint => new ResolvedAddress(endpoint.host, endpoint.port))
+            .getOrElse(new ResolvedAddress(host, port))
+      })
+    }
+
+    val client = GlideClusterClient.createClient(builder.build()).get()
+    new GlideRedisReadClient(client,
+                             executionMode,
+                             GlideRedisReadClient.InternalDirectMaxInflight,
+                             GlideRedisReadClient.InternalDirectMaxPending,
+                             settings.soTimeoutMs)
+  }
+
+  private[redis] def glideReadFrom(readFrom: String): GlideReadFrom = readFrom match {
+    case RedisReadFromPrimary                      => GlideReadFrom.PRIMARY
+    case RedisReadFromAllNodes                     => GlideReadFrom.ALL_NODES
+    case RedisReadFromAzAffinityReplicasAndPrimary => GlideReadFrom.AZ_AFFINITY_REPLICAS_AND_PRIMARY
+    case other => throw new IllegalArgumentException(s"Unsupported Redis read strategy: $other")
+  }
+
+  private[redis] def projectedClientAz(): Option[String] =
+    Try(new String(Files.readAllBytes(Paths.get(DefaultRedisClientAzPath)), StandardCharsets.UTF_8)).toOption
+      .map(_.trim)
+      .filter(_.nonEmpty)
+
   private[redis] def parseEndpoint(node: String): HostAndPort = {
     val trimmed = node.trim
     require(trimmed.nonEmpty, "Redis cluster node must not be empty")
@@ -325,6 +483,20 @@ object RedisKVStoreFactory {
                                  conf: Map[String, String],
                                  env: Map[String, String]): Option[Int] =
     getOptional(envKey, propKey, conf, env).map(_.toInt)
+
+  private def enumSetting(envKey: String,
+                          propKey: String,
+                          default: String,
+                          allowed: Set[String],
+                          conf: Map[String, String],
+                          env: Map[String, String]): String = {
+    val value = getOptional(envKey, propKey, conf, env).getOrElse(default).toLowerCase(Locale.ROOT)
+    require(
+      allowed.contains(value),
+      s"$envKey/$propKey must be one of ${allowed.toSeq.sorted.mkString(", ")}, got '$value'"
+    )
+    value
+  }
 
   private[redis] def keyPrefix(conf: Map[String, String], env: Map[String, String] = sys.env): String =
     env

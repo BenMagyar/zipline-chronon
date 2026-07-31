@@ -24,6 +24,17 @@ object RedisKVStoreConstants {
   val DefaultMaxRedirections = 5 // Matches Jedis default, protects against redirect loops during rebalancing
   val DefaultSoTimeoutMs = 2000 // Socket timeout for Redis commands (typical P99 < 10ms, 2s allows for network jitter)
   val DefaultPipelineSyncThreads = 12 // Set REDIS_PIPELINE_SYNC_THREADS=0 to restore Jedis' per-pipeline executors
+  val RedisClientJedis = "jedis"
+  val RedisClientGlide = "glide"
+  val GlideExecutionDirect = "direct"
+  val GlideExecutionClusterBatch = "cluster-batch"
+  val RedisReadFromPrimary = "primary"
+  val RedisReadFromAllNodes = "all-nodes"
+  val RedisReadFromAzAffinityReplicasAndPrimary = "az-affinity-replicas-and-primary"
+  val DefaultRedisClient = RedisClientJedis
+  val DefaultGlideExecutionMode = GlideExecutionClusterBatch
+  val DefaultRedisReadFrom = RedisReadFromPrimary
+  val DefaultRedisClientAzPath = "/etc/podinfo/availability-zone"
 
   // Incremental batch upload defaults. Absolute expirations fence rollback without reading unchanged value payloads;
   // the five-day lease leaves several missed daily uploads of recovery margin.
@@ -53,6 +64,8 @@ object RedisKVStoreConstants {
   val EnvRedisSoTimeoutMs = "REDIS_SO_TIMEOUT_MS"
   val EnvRedisMaxRedirections = "REDIS_MAX_REDIRECTIONS"
   val EnvRedisPipelineSyncThreads = "REDIS_PIPELINE_SYNC_THREADS"
+  val EnvRedisClient = "REDIS_CLIENT"
+  val EnvRedisReadFrom = "REDIS_READ_FROM"
 
   // RedisKVStoreImpl configuration keys
   val ConfigPipelineSyncThreads = "redis.pipeline.sync.threads"
@@ -69,6 +82,9 @@ object RedisKVStoreConstants {
   val PropRedisConnectionTimeoutMs = "redis.connection.timeout.ms"
   val PropRedisSoTimeoutMs = "redis.so.timeout.ms"
   val PropRedisMaxRedirections = "redis.max.redirections"
+  val PropRedisClient = "redis.client"
+  val PropRedisReadFrom = "redis.read.from"
+  val PropRedisClientAz = "redis.client.az"
 
   val PropRedisBulkUploadStateRoot = "spark.chronon.kv_upload.redis.state_root"
   val PropRedisBulkUploadBatchSize = "spark.chronon.kv_upload.redis.batch_size"
