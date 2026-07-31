@@ -1,6 +1,6 @@
 package ai.chronon.online.test
 
-import ai.chronon.online.{DEBUG, ERROR, INFO, LogLevel, ThrottledLogging, WARN}
+import ai.chronon.online.{DEBUG, ERROR, INFO, LogLevel, LogSampling, ThrottledLogging, WARN}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -23,6 +23,17 @@ class CapturingLogging(windowMs: Long) extends ThrottledLogging {
 }
 
 class ThrottledLoggingTest extends AnyFlatSpec with Matchers {
+
+  behavior of "LogSampling"
+
+  it should "parse a positive global sample interval" in {
+    LogSampling.parseIntervalMillis("2500") shouldBe 2500L
+  }
+
+  it should "reject invalid global sample intervals" in {
+    an[IllegalArgumentException] should be thrownBy LogSampling.parseIntervalMillis("0")
+    an[IllegalArgumentException] should be thrownBy LogSampling.parseIntervalMillis("not-a-number")
+  }
 
   behavior of "ThrottledLogging.logThrottled"
 

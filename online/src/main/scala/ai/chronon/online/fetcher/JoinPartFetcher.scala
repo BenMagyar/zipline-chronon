@@ -33,7 +33,7 @@ object JoinPartFetcher {
   private val PreparedJoinMetricsCacheMaxEntries = 10000
 }
 
-class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) {
+class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) extends ThrottledLogging {
 
   import JoinPartFetcher._
 
@@ -263,10 +263,8 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
         }
       }
       .recover { case ex: Throwable =>
-        if (fetchContext.debug || Math.random() < 0.001) {
-          println(s"Failed to fetch $key with \n${ex.traceString}")
-        }
-        Map(prefix + "exception" -> ex.traceString)
+        logThrottled(ERROR, s"join_part_response_failure_${prefix}_${ex.getClass.getName}", s"Failed to fetch $key", ex)
+        Map(prefix + "exception" -> ex.toString)
       }
       .get
   }

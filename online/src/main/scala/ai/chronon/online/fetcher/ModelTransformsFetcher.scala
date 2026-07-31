@@ -2,7 +2,7 @@ package ai.chronon.online.fetcher
 
 import ai.chronon.api
 import ai.chronon.api.{DataType, Model, StructType}
-import ai.chronon.api.Extensions.{MetadataOps, ThrowableOps}
+import ai.chronon.api.Extensions.MetadataOps
 import ai.chronon.online._
 import ai.chronon.online.fetcher.Fetcher.{Request, Response}
 import ai.chronon.online.metrics.Metrics
@@ -114,7 +114,7 @@ class ModelTransformsFetcher(modelPlatformProvider: ModelPlatformProvider, debug
           // Return error features for this model instead of failing entire request
           requests.map { request =>
             val errorFeatures =
-              Map(s"${model.metaData.name}${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString)
+              Map(s"${model.metaData.name}${FetcherUtil.FeatureExceptionSuffix}" -> exception.toString)
             request -> errorFeatures
           }
         }

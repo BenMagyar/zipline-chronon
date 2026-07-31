@@ -19,6 +19,7 @@ package ai.chronon.online.metrics
 import ai.chronon.api.Extensions._
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api._
+import ai.chronon.online.LogSampling
 import io.opentelemetry.api.OpenTelemetry
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -28,7 +29,7 @@ import scala.collection.mutable
 object Metrics {
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
-  private[metrics] val ExceptionLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(60L)
+  private[metrics] val ExceptionLogIntervalNanos: Long = TimeUnit.MILLISECONDS.toNanos(LogSampling.intervalMillis)
   private[metrics] val ExceptionLogBucketCount: Int = 4096
   private[metrics] val ContextSuffixMemoMaxEntries: Int = 16
   private[metrics] val ContextMetricNameMemoMaxEntries: Int = 64

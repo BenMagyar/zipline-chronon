@@ -28,8 +28,8 @@ trait ThrottledLogging {
   // Named distinctly from `logger` since most mixing-in classes already declare their own SLF4J logger val.
   @transient private lazy val throttledLoggingLogger: Logger = LoggerFactory.getLogger(getClass)
 
-  /** Throttle window duration. Override in the operator class if a different window is needed. */
-  protected val throttleWindowMs: Long = 60000L
+  /** Global hot-log sample interval. Tests and specialized operators may override it explicitly. */
+  protected val throttleWindowMs: Long = LogSampling.intervalMillis
 
   // key -> (windowStartMs, suppressedCount); lazily initialized per task-manager process
   @transient private lazy val throttleState = new ConcurrentHashMap[String, ThrottleEntry]()
@@ -73,3 +73,22 @@ trait ThrottledLogging {
 }
 
 private case class ThrottleEntry(windowStartMs: Long, suppressedCount: Long)
+
+object LogSampling {
+  val IntervalMillisProperty = "ai.chronon.logging.sample.interval.millis"
+  val DefaultIntervalMillis: Long = 60000L
+
+  private[online] def parseIntervalMillis(value: String): Long = {
+    val parsed =
+      try value.toLong
+      catch {
+        case _: NumberFormatException =>
+          throw new IllegalArgumentException(s"$IntervalMillisProperty must be a positive integer, found '$value'")
+      }
+    require(parsed > 0L, s"$IntervalMillisProperty must be positive, found '$value'")
+    parsed
+  }
+
+  lazy val intervalMillis: Long =
+    Option(System.getProperty(IntervalMillisProperty)).map(parseIntervalMillis).getOrElse(DefaultIntervalMillis)
+}

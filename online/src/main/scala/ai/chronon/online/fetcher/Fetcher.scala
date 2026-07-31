@@ -18,7 +18,7 @@ package ai.chronon.online.fetcher
 
 import ai.chronon.api
 import ai.chronon.api.Constants.UTF8
-import ai.chronon.api.Extensions.{ExternalPartOps, JoinOps, ModelTransformsOps, StringOps, ThrowableOps}
+import ai.chronon.api.Extensions.{ExternalPartOps, JoinOps, ModelTransformsOps, StringOps}
 import ai.chronon.api._
 import ai.chronon.online.OnlineDerivationUtil.applyDeriveFunc
 import ai.chronon.online._
@@ -354,8 +354,8 @@ class Fetcher(val kvStore: KVStore,
 
         val derivedResults = zipped.map { case (internalResponse, externalResponse) =>
           val cleanInternalRequest = internalResponse.request.copy(context = None)
-          val internalMap = internalResponse.values.getOrElse(Map(
-            s"join_part_fetch${FetcherUtil.FeatureExceptionSuffix}" -> internalResponse.values.failed.get.traceString))
+          val internalMap = internalResponse.values.getOrElse(
+            Map(s"join_part_fetch${FetcherUtil.FeatureExceptionSuffix}" -> internalResponse.values.failed.get.toString))
 
           val baseMap = if (externalResponse != null) {
 
@@ -370,7 +370,7 @@ class Fetcher(val kvStore: KVStore,
             )
 
             val externalMap = externalResponse.values.getOrElse(Map(
-              s"external_part_fetch${FetcherUtil.FeatureExceptionSuffix}" -> externalResponse.values.failed.get.traceString))
+              s"external_part_fetch${FetcherUtil.FeatureExceptionSuffix}" -> externalResponse.values.failed.get.toString))
 
             internalMap ++ externalMap
           } else {
@@ -638,13 +638,13 @@ class Fetcher(val kvStore: KVStore,
                 case Failure(exception) =>
                   ctx.incrementException(exception)
                   Map(
-                    s"derivation_rename${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString
+                    s"derivation_rename${FetcherUtil.FeatureExceptionSuffix}" -> exception.toString
                       .asInstanceOf[AnyRef])
               }
 
             val derivedExceptionMap: Map[String, AnyRef] =
               Map(
-                s"derivation_fetch${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString
+                s"derivation_fetch${FetcherUtil.FeatureExceptionSuffix}" -> exception.toString
                   .asInstanceOf[AnyRef])
 
             renameOnlyDerivedMap ++ derivedExceptionMap
@@ -669,7 +669,7 @@ class Fetcher(val kvStore: KVStore,
         joinCodecCache.refresh(joinName)
         ctx.incrementException(exception)
         ResponseWithContext(request,
-                            Map(s"join_codec_fetch${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString),
+                            Map(s"join_codec_fetch${FetcherUtil.FeatureExceptionSuffix}" -> exception.toString),
                             Map.empty)
 
     }
@@ -699,7 +699,7 @@ class Fetcher(val kvStore: KVStore,
       joinCodecCache.refresh(resp.request.name)
 
       resp.request.context.foreach(
-        _.incrementException(new RuntimeException(s"Logging failed due to: ${exception.traceString}", exception)))
+        _.incrementException(new RuntimeException("Logging failed while encoding the feature response", exception)))
     }
 
     if (joinCodecTry.isSuccess && joinCodecTry.get.hasPartialFailure) {

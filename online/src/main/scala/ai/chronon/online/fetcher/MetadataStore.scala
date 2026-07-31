@@ -263,7 +263,7 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
             getJoinConf.refresh(joinName)
             Failure(
               new RuntimeException(
-                s"Couldn't fetch joinName = ${joinName} or build join codec due to ${th.traceString}",
+                s"Couldn't fetch joinName = ${joinName} or build join codec due to ${th.toString}",
                 th
               ))
         }

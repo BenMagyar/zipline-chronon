@@ -150,7 +150,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                      s"derivation_failure_${request.name}",
                      s"Failed to derive values for request: ${request.name}@${request.keys}",
                      exception)
-        Map(s"derivation${FetcherUtil.FeatureExceptionSuffix}" -> exception.traceString.asInstanceOf[AnyRef])
+        Map(s"derivation${FetcherUtil.FeatureExceptionSuffix}" -> exception.toString.asInstanceOf[AnyRef])
     }
   }
 
@@ -351,9 +351,10 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
           }
           .recoverWith { // capture exception as a key
             case ex: Throwable =>
-              if (fetchContext.debug || Math.random() < 0.001) {
-                logger.error(s"Failed to fetch $request", ex)
-              }
+              logThrottled(ERROR,
+                           s"group_by_query_failure_${request.name}_${ex.getClass.getName}",
+                           s"Failed to fetch $request",
+                           ex)
               Failure(ex)
           }
         val response = Response(request, results)

@@ -96,6 +96,9 @@ JVM_OPTS="$JVM_OPTS $GC_OPTS $ADD_OPENS_OPTS -XX:MaxMetaspaceSize=1g -XX:MaxRAMP
 
 # Container runtimes collect and rotate stdout. Keep fetcher logs out of the writable image layer.
 LOGGING_OPTS="-Dlogback.configurationFile=$FETCHER_LOGBACK_CONFIG -Dlog4j.configurationFile=$FETCHER_LOG4J2_CONFIG"
+if [ -n "$CHRONON_LOG_SAMPLE_INTERVAL_MILLIS" ]; then
+  LOGGING_OPTS="$LOGGING_OPTS -Dai.chronon.logging.sample.interval.millis=$CHRONON_LOG_SAMPLE_INTERVAL_MILLIS"
+fi
 
 # TTL cache configuration
 TTL_OPTS=""
