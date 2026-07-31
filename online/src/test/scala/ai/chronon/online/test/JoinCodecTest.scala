@@ -78,23 +78,33 @@ class JoinCodecTest extends AnyFlatSpec {
     assertEquals(java.lang.Integer.valueOf(10), result("int_feature"))
   }
 
-  it should "cast numeric string request keys before evaluating SQL derivations" in {
-    val keySchema = StructType("key", Array(StructField("product_id", LongType)))
+  it should "cast numeric string request keys including produced_ts before evaluating SQL derivations" in {
+    val keySchema = StructType(
+      "key",
+      Array(StructField("product_id", LongType), StructField("produced_ts", LongType))
+    )
     val baseValueSchema = StructType("value", Array(StructField("recent_product_ids", ListType(LongType))))
     val derivationsScala = List(
       Builders.Derivation(
         name = "overlap_count",
         expression = "size(filter(recent_product_ids, candidate -> candidate = product_id))"
-      ))
+      ),
+      Builders.Derivation(name = "request_produced_ts", expression = "produced_ts")
+    )
     val deriveFunc = buildDerivationFunction(derivationsScala, keySchema, baseValueSchema)
     val recentProductIds = new java.util.ArrayList[java.lang.Long]()
     recentProductIds.add(Long.box(1L))
     recentProductIds.add(Long.box(2L))
     recentProductIds.add(Long.box(3L))
-    val request = Request("test_join", Map("product_id" -> "2"), atMillis = Some(System.currentTimeMillis()))
+    val request = Request(
+      "test_join",
+      Map("product_id" -> "2", "produced_ts" -> "1785513600000"),
+      atMillis = Some(System.currentTimeMillis())
+    )
 
     val result = applyDeriveFunc(deriveFunc, request, Map("recent_product_ids" -> recentProductIds))
 
     assertEquals(java.lang.Integer.valueOf(1), result("overlap_count"))
+    assertEquals(java.lang.Long.valueOf(1785513600000L), result("request_produced_ts"))
   }
 }
