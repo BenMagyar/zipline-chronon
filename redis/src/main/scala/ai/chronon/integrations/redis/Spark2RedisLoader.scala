@@ -105,6 +105,15 @@ object Spark2RedisLoader {
   private val MaxAdmissionAttempts = 64
   private val GenerationCleanupGraceMillis = 6L * 60L * 60L * 1000L
   private val ServingInfoKeyBytes = GroupByServingInfoKey.getBytes(StandardCharsets.UTF_8)
+  private val VersionedDatasetPattern = """^(.*)__(\d+)$""".r
+  private val VersionedBatchDatasetPattern = """^(.*)__(\d+)_BATCH$""".r
+
+  private[redis] case class VersionedDataset(base: String, version: Long) {
+    require(base.nonEmpty, "Redis versioned dataset base must be non-empty")
+    require(version >= 0, s"Redis dataset version must be non-negative: $version")
+  }
+
+  private case class PriorLineage(settings: Settings, manifest: ReadyManifest)
 
   case class Settings(sourceTable: String,
                       destinationDataset: String,
@@ -121,7 +130,8 @@ object Spark2RedisLoader {
                       maxRetries: Int = DefaultBulkUploadMaxRetries,
                       retryBackoffMs: Long = DefaultBulkUploadRetryBackoffMs,
                       liveTTLSeconds: Int = DefaultBulkUploadTTLSeconds,
-                      requireNoEviction: Boolean = DefaultBulkUploadRequireNoEviction) {
+                      requireNoEviction: Boolean = DefaultBulkUploadRequireNoEviction,
+                      deleteOlderVersions: Boolean = DefaultBulkUploadDeleteOlderVersions) {
     require(sourceTable != null && sourceTable.trim.nonEmpty, "Redis source table must be non-empty")
     require(destinationDataset != null && destinationDataset.trim.nonEmpty,
             "Redis destination dataset must be non-empty")
@@ -374,6 +384,8 @@ object Spark2RedisLoader {
       !spark.sparkContext.getConf.getBoolean("spark.speculation", false),
       "Redis incremental upload requires spark.speculation=false so duplicate task attempts cannot bypass mutation accounting"
     )
+    if (settings.deleteOlderVersions)
+      requireMatchingVersionedDatasets(settings.destinationDataset, settings.batchDataset)
     validateConditionalWriter(settings, conditionalWriter)
     if (settings.requireNoEviction) validateNoEviction(controlClient)
     else
@@ -391,6 +403,8 @@ object Spark2RedisLoader {
     while (attempts < MaxAdmissionAttempts) {
       try {
         val summary = runAttempt(effectiveSettings, spark, controlClient, conditionalWriter)
+        if (effectiveSettings.deleteOlderVersions)
+          retireOlderVersions(effectiveSettings, spark, controlClient, conditionalWriter)
         cleanupObsoleteGenerations(effectiveSettings, spark, conditionalWriter)
         return summary
       } catch {
@@ -1307,6 +1321,337 @@ object Spark2RedisLoader {
       .filter(_.nonEmpty)
       .map(_.toBoolean)
       .getOrElse(default)
+
+  private[redis] def parseVersionedDataset(name: String): Option[VersionedDataset] =
+    Option(name).flatMap {
+      case VersionedDatasetPattern(base, version) =>
+        Try(version.toLong).toOption.map(VersionedDataset(base, _))
+      case _ => None
+    }
+
+  private[redis] def parseVersionedBatchDataset(name: String): Option[VersionedDataset] =
+    Option(name).flatMap {
+      case VersionedBatchDatasetPattern(base, version) =>
+        Try(version.toLong).toOption.map(VersionedDataset(base, _))
+      case _ => None
+    }
+
+  private def requireVersionedDataset(name: String): VersionedDataset =
+    parseVersionedDataset(name).getOrElse(
+      throw new IllegalArgumentException(
+        s"$PropRedisBulkUploadDeleteOlderVersions requires a GroupBy name ending in __<numeric-version>; got '$name'"))
+
+  private def requireVersionedBatchDataset(name: String): VersionedDataset =
+    parseVersionedBatchDataset(name).getOrElse(
+      throw new IllegalArgumentException(
+        s"$PropRedisBulkUploadDeleteOlderVersions requires a batch dataset ending in __<numeric-version>_BATCH; " +
+          s"got '$name'"))
+
+  private[redis] def requireMatchingVersionedDatasets(destinationDataset: String,
+                                                      batchDataset: String): (VersionedDataset, VersionedDataset) = {
+    val current = requireVersionedDataset(destinationDataset)
+    val currentBatch = requireVersionedBatchDataset(batchDataset)
+    require(
+      current.version == currentBatch.version,
+      s"Redis GroupBy version ${current.version} does not match batch dataset version ${currentBatch.version}"
+    )
+    current -> currentBatch
+  }
+
+  /** Retires every committed lower numeric version after the current version is fully published. A retirement is an
+    * immutable child generation in the old lineage, not an out-of-band DEL: the old S3 head therefore fences delayed
+    * or retried publishers, while its DELETE mutations and persistent retired status make retries idempotent.
+    */
+  private def retireOlderVersions(settings: Settings,
+                                  spark: SparkSession,
+                                  controlClient: JedisCluster,
+                                  conditionalWriter: ConditionalObjectWriter): Unit = {
+    val (current, currentBatch) =
+      requireMatchingVersionedDatasets(settings.destinationDataset, settings.batchDataset)
+
+    val prior = discoverPriorLineages(settings, current, currentBatch, spark, conditionalWriter)
+    prior.foreach { lineage =>
+      retirePriorLineage(lineage.settings, spark, controlClient, conditionalWriter)
+      cleanupObsoleteGenerations(lineage.settings, spark, conditionalWriter)
+    }
+  }
+
+  private def discoverPriorLineages(settings: Settings,
+                                    current: VersionedDataset,
+                                    currentBatch: VersionedDataset,
+                                    spark: SparkSession,
+                                    conditionalWriter: ConditionalObjectWriter): Seq[PriorLineage] = {
+    val stateRoot = new Path(settings.stateRoot.stripSuffix("/"))
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val fs = stateRoot.getFileSystem(hadoopConf)
+    if (!fs.exists(stateRoot)) return Seq.empty
+
+    // batchDataset is sanitized by construction, so its base is safe to place in a Hadoop glob.
+    val candidateGlob = new Path(new Path(stateRoot, "*"), s"${currentBatch.base}__*_BATCH")
+    val candidateRoots = Option(fs.globStatus(candidateGlob))
+      .map(_.iterator.filter(_.isDirectory).map(_.getPath).toSeq)
+      .getOrElse(Seq.empty)
+
+    val discovered = candidateRoots.flatMap { candidateRoot =>
+      parseVersionedBatchDataset(candidateRoot.getName) match {
+        case Some(candidate) if candidate.base == currentBatch.base && candidate.version < current.version =>
+          conditionalWriter.read(new Path(candidateRoot, HeadFile), hadoopConf).map { headValue =>
+            val head = VersionedHead(decodeHead(headValue.bytes), headValue.version, headValue.lastModifiedMillis)
+            val readyPath = new Path(
+              new Path(new Path(candidateRoot, GenerationsDirectory), head.record.generation),
+              ReadyFile
+            )
+            val readyBytes = readBytes(readyPath, spark)
+            val manifest = decodeReady(readyBytes)
+            val manifestVersion = requireVersionedBatchDataset(manifest.batchDataset)
+            require(
+              manifestVersion == candidate,
+              s"Redis lineage at $candidateRoot contains batch dataset ${manifest.batchDataset}, " +
+                s"which does not match its path"
+            )
+            require(
+              Arrays.equals(head.record.readyDigest, sha256(readyBytes)),
+              s"Redis S3 head digest does not match generation ${head.record.generation} at $candidateRoot"
+            )
+
+            val oldDestinationDataset = s"${current.base}__${candidate.version}"
+            val oldSettings = settings.copy(
+              sourceTable = manifest.sourceTable,
+              destinationDataset = oldDestinationDataset,
+              keyPrefix = manifest.keyPrefix,
+              keyHashTagMode = manifest.keyHashTagMode,
+              stateBuckets = manifest.stateBuckets,
+              liveTTLSeconds = manifest.liveTTLSeconds,
+              deleteOlderVersions = false
+            )
+            require(
+              oldSettings.batchDataset == manifest.batchDataset,
+              s"Redis prior-version destination $oldDestinationDataset maps to ${oldSettings.batchDataset}, " +
+                s"but S3 records ${manifest.batchDataset}"
+            )
+            require(
+              normalizedPath(datasetRoot(oldSettings)) == normalizedPath(candidateRoot),
+              s"Redis prior-version manifest at $candidateRoot resolves to ${datasetRoot(oldSettings)}"
+            )
+            val (validated, validatedBytes) = validateReady(oldSettings, head.record.generation, spark)
+            require(
+              Arrays.equals(validatedBytes, readyBytes) && validated == manifest,
+              s"Redis prior-version manifest changed while it was being discovered at $candidateRoot"
+            )
+            require(
+              manifest.parentGeneration == head.record.parentGeneration,
+              s"Redis generation ${manifest.status.generation} does not match its S3 head parent"
+            )
+            PriorLineage(oldSettings, manifest)
+          }
+        case _ => None
+      }
+    }
+
+    discovered
+      .groupBy(_.manifest.batchDataset)
+      .foreach { case (batchDataset, lineages) =>
+        require(
+          lineages.size == 1,
+          s"Redis older-version cleanup found multiple headed S3 lineages for $batchDataset: " +
+            lineages.map(lineage => datasetRoot(lineage.settings)).mkString(", ")
+        )
+      }
+    discovered.sortBy(_.manifest.batchDataset)
+  }
+
+  private def retirePriorLineage(settings: Settings,
+                                 spark: SparkSession,
+                                 controlClient: JedisCluster,
+                                 conditionalWriter: ConditionalObjectWriter): Unit = {
+    var attempts = 0
+    while (attempts < MaxAdmissionAttempts) {
+      val head = readHead(settings, spark, conditionalWriter) match {
+        case Some(value) => value
+        case None        => return
+      }
+      val (parent, readyBytes) = validateReady(settings, head.record.generation, spark)
+      require(
+        Arrays.equals(head.record.readyDigest, sha256(readyBytes)),
+        s"Redis S3 head digest does not match generation ${head.record.generation}"
+      )
+      require(parent.parentGeneration == head.record.parentGeneration,
+              s"Redis generation ${parent.status.generation} does not match its S3 head parent")
+
+      if (parent.retired) {
+        val statusKey = RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix)
+        val redisStatus = RedisBatchUpload.readStatus(controlClient, statusKey)
+        if (!redisStatus.contains(parent.status)) {
+          val result = applyGeneration(
+            settings,
+            parent,
+            head.record.readyDigest,
+            spark,
+            controlClient,
+            conditionalWriter,
+            recoverFull = false,
+            leaseDeadlineMillis = uploadDeadlineMillis(parent.deleteFenceTTLSeconds)
+          )
+          require(
+            result.mutationKeys >= parent.deltaRows,
+            s"Redis retired generation ${parent.status.generation} replayed ${result.mutationKeys} mutations; " +
+              s"expected at least ${parent.deltaRows}"
+          )
+        }
+        val committed = resolveHead(settings, spark, controlClient, conditionalWriter)
+        require(committed.exists(_.retired), s"Redis retired lineage ${settings.batchDataset} lost its S3 head")
+        ensureRetiredStatus(settings, parent, controlClient)
+        return
+      }
+
+      val generation = buildRetirementGeneration(settings, parent, spark, conditionalWriter)
+      val retirementReady = readBytes(generationPaths(settings, generation).ready, spark)
+      val admitted = claimHead(settings,
+                               Some(parent.status.generation),
+                               generation,
+                               sha256(retirementReady),
+                               spark,
+                               conditionalWriter)
+      if (admitted.generation == generation) {
+        val committed = resolveHead(settings, spark, controlClient, conditionalWriter)
+        require(
+          committed.exists(manifest => manifest.status.generation == generation && manifest.retired),
+          s"Redis retirement generation $generation did not become the S3 head for ${settings.batchDataset}"
+        )
+        ensureRetiredStatus(settings, committed.get, controlClient)
+        logger.info(
+          s"Retired older Redis dataset ${settings.batchDataset} with ${parent.dataRows} active keys in generation $generation")
+        return
+      }
+
+      attempts += 1
+      logger.info(
+        s"Redis older-version lineage ${settings.batchDataset} advanced to ${admitted.generation} during retirement; " +
+          s"recomputing (attempt $attempts/$MaxAdmissionAttempts)"
+      )
+    }
+    throw new IllegalStateException(
+      s"Redis older-version lineage ${settings.batchDataset} could not be retired after $MaxAdmissionAttempts S3 head changes")
+  }
+
+  private def buildRetirementGeneration(settings: Settings,
+                                        parent: ReadyManifest,
+                                        spark: SparkSession,
+                                        conditionalWriter: ConditionalObjectWriter): String = {
+    val writeEpoch = java.lang.Math.addExact(parent.status.writeEpoch, 1L)
+    val generation = UUID.randomUUID().toString
+    val status = parent.status.copy(generation = generation, writeEpoch = writeEpoch, retired = true)
+    val paths = generationPaths(settings, generation)
+    val activeState = loadState(settings, parent.stateGeneration, spark).persist(StorageLevel.DISK_ONLY)
+    var completeDelta: DataFrame = null
+    var tombstoneState: DataFrame = null
+    try {
+      val activeCount = activeState.count()
+      require(
+        activeCount == parent.dataRows,
+        s"Redis state ${parent.stateGeneration} contains $activeCount active rows; its head records ${parent.dataRows}"
+      )
+      val emptyState = activeState.limit(0)
+      val entityDeletes = activeState
+        .select(col(KeyColumn), col(BucketColumn))
+        .withColumn(ValueColumn, lit(null).cast(BinaryType))
+        .withColumn(OperationColumn, lit(RedisBatchUpload.DeleteOperation))
+        .withColumn(BatchTimestampColumn, lit(status.batchTimestamp))
+        .withColumn(WriteEpochColumn, lit(writeEpoch))
+        .withColumn(TombstoneExpiresAtColumn, lit(PendingTombstoneExpiry))
+        .select(KeyColumn,
+                ValueColumn,
+                OperationColumn,
+                BatchTimestampColumn,
+                WriteEpochColumn,
+                BucketColumn,
+                TombstoneExpiresAtColumn)
+      val metadataDelete = spark
+        .createDataFrame(
+          java.util.Arrays.asList(Row(ServingInfoKeyBytes)),
+          StructType(Seq(StructField(KeyColumn, BinaryType, nullable = false)))
+        )
+        .withColumn(ValueColumn, lit(null).cast(BinaryType))
+        .withColumn(OperationColumn, lit(RedisBatchUpload.DeleteOperation))
+        .withColumn(BatchTimestampColumn, lit(status.batchTimestamp))
+        .withColumn(WriteEpochColumn, lit(writeEpoch))
+        .withColumn(BucketColumn, bucketColumn(parent.stateBuckets))
+        .withColumn(TombstoneExpiresAtColumn, lit(PendingTombstoneExpiry))
+        .select(KeyColumn,
+                ValueColumn,
+                OperationColumn,
+                BatchTimestampColumn,
+                WriteEpochColumn,
+                BucketColumn,
+                TombstoneExpiresAtColumn)
+      completeDelta = entityDeletes.unionByName(metadataDelete).persist(StorageLevel.DISK_ONLY)
+
+      val previousTombstones =
+        if (parent.tombstoneRows == 0) None
+        else if (pathExists(generationPaths(settings, parent.status.generation).applied, spark))
+          Some(loadCommittedTombstones(settings, parent, spark, conditionalWriter))
+        else Some(loadTombstones(settings, parent, spark))
+      tombstoneState =
+        buildTombstoneState(emptyState, previousTombstones, entityDeletes).persist(StorageLevel.DISK_ONLY)
+      val tombstoneRows = tombstoneState.count()
+      val deltaRows = completeDelta.count()
+      require(deltaRows == activeCount + 1L,
+              s"Redis retirement delta contains $deltaRows rows; expected ${activeCount + 1L}")
+
+      val manifest = ReadyManifest(
+        status = status,
+        parentGeneration = Some(parent.status.generation),
+        stateGeneration = generation,
+        sourceTable = settings.sourceTable,
+        batchDataset = settings.batchDataset,
+        keyPrefix = parent.keyPrefix,
+        keyHashTagMode = parent.keyHashTagMode,
+        stateBuckets = parent.stateBuckets,
+        sourceRows = 0L,
+        dataRows = 0L,
+        changedKeys = 0L,
+        deletedKeys = activeCount,
+        deltaRows = deltaRows,
+        tombstoneRows = tombstoneRows,
+        liveTTLSeconds = parent.liveTTLSeconds,
+        deleteFenceTTLSeconds = parent.deleteFenceTTLSeconds,
+        fullRebuild = false,
+        retired = true
+      )
+      val createdAt = System.currentTimeMillis()
+      val candidate = CandidateRecord(generation,
+                                      manifest.parentGeneration,
+                                      createdAt,
+                                      java.lang.Math.addExact(createdAt, GenerationCleanupGraceMillis))
+      writeImmutable(paths.candidate, encodeCandidate(candidate), spark, conditionalWriter)
+      writeBucketed(emptyState, paths.state, parent.stateBuckets)
+      writeBucketed(completeDelta, paths.delta, parent.stateBuckets)
+      if (tombstoneRows > 0) writeBucketed(tombstoneState, paths.tombstones, parent.stateBuckets)
+      writeImmutable(paths.ready, encodeReady(manifest), spark, conditionalWriter)
+      generation
+    } finally {
+      Option(completeDelta).foreach(_.unpersist())
+      Option(tombstoneState).foreach(_.unpersist())
+      activeState.unpersist()
+    }
+  }
+
+  private def ensureRetiredStatus(settings: Settings, manifest: ReadyManifest, controlClient: JedisCluster): Unit = {
+    require(manifest.retired, s"Redis generation ${manifest.status.generation} is not retired")
+    val operationDeadline = uploadDeadlineMillis(manifest.deleteFenceTTLSeconds)
+    val result = writeStatusWithOomRetry(
+      controlClient,
+      RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix),
+      manifest.status,
+      expireAtMillis = 0L,
+      settings = settings,
+      leaseDeadlineMillis = operationDeadline
+    )
+    require(result == 1L || result == 2L,
+            s"Redis retired status for ${manifest.status.generation} was rejected without a newer S3 head")
+  }
+
+  private def normalizedPath(path: Path): String = path.toUri.normalize().toString.stripSuffix("/")
 
   private def isServingInfo(column: org.apache.spark.sql.Column) =
     coalesce(column === lit(ServingInfoKeyBytes), lit(false))

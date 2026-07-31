@@ -114,5 +114,6 @@ class RedisBatchUploadTest extends AnyFlatSpec with Matchers {
     DefaultBulkUploadOomRetryTimeoutMs shouldBe 30 * 60 * 1000L
     DefaultBulkUploadOomRetryMaxBackoffMs shouldBe 30 * 1000L
     DefaultBulkUploadTTLSeconds shouldBe 5 * 24 * 60 * 60
+    DefaultBulkUploadDeleteOlderVersions shouldBe false
   }
 }

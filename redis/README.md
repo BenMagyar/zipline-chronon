@@ -77,12 +77,21 @@ or as matching `-Z` properties. The node runner resolves them in that order, wit
 | `spark.chronon.kv_upload.redis.retry_backoff_ms` | `1000` | Initial exponential retry backoff, including maxmemory OOM retries |
 | `spark.chronon.kv_upload.redis.ttl_seconds` | `432000` | Renewable value, metadata, and status lease |
 | `spark.chronon.kv_upload.redis.require_noeviction` | `true` | Require Redis `maxmemory-policy=noeviction` before writing |
+| `spark.chronon.kv_upload.redis.delete_older_versions` | `false` | After publishing a numeric `__N` GroupBy version, retire lower versions found under the same S3 state root |
 
 A state root is the durable identity of one Redis serving target and must not be shared across Redis clusters. A dataset
 lineage must keep the same key prefix. The first admitted generation fixes `state_buckets` for that lineage. A TTL change
 publishes a new generation; a refresh of an existing generation uses the TTL recorded with that generation. TTL may
 increase or decrease in place, and each new generation uses its configured TTL for both live values and new delete
 fences. Concurrent jobs sharing a cluster must use the same rate while the shared queue is active.
+
+Older-version retirement is opt-in and only runs after the new version is fully published. It recognizes GroupBy names
+ending in `__<number>`, discovers lower versions from the durable state root, and CAS-admits an immutable retired child
+generation in each old lineage. That child tombstones the old active keys and serving metadata and leaves a persistent
+retired status, so a delayed old uploader cannot refill the dataset. A missing state root or an old lineage without a
+`_HEAD` is a no-op; a headed but corrupt lineage fails cleanup so leaked live keys are not silently ignored. Retirement
+releases the old value payloads immediately, while each small Redis tombstone and its key remain until the old lineage's
+delete-fence TTL expires.
 
 ## Publication Protocol
 

@@ -37,6 +37,7 @@ object RedisKVStoreConstants {
   val DefaultBulkUploadOomRetryMaxBackoffMs = 30L * 1000L
   val DefaultBulkUploadTTLSeconds = DataTTLSeconds
   val DefaultBulkUploadRequireNoEviction = true
+  val DefaultBulkUploadDeleteOlderVersions = false
 
   // Environment variable keys for Redis Cluster
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
@@ -78,4 +79,5 @@ object RedisKVStoreConstants {
   val PropRedisBulkUploadRetryBackoffMs = "spark.chronon.kv_upload.redis.retry_backoff_ms"
   val PropRedisBulkUploadTTLSeconds = "spark.chronon.kv_upload.redis.ttl_seconds"
   val PropRedisBulkUploadRequireNoEviction = "spark.chronon.kv_upload.redis.require_noeviction"
+  val PropRedisBulkUploadDeleteOlderVersions = "spark.chronon.kv_upload.redis.delete_older_versions"
 }

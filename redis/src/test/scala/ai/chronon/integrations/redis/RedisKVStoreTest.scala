@@ -1503,6 +1503,119 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     }
   }
 
+  it should "retire lower GroupBy versions from their durable S3 state after publishing the new version" in {
+    val container = redisFixture.container
+    val host = container.getHost
+    val port = container.getMappedPort(7000)
+    val internalPorts =
+      7000 until (7000 + redisFixture.primaryCount * (redisFixture.replicasPerPrimary + 1))
+    val spark = RedisSparkSessionTestHelper.acquire("RedisOlderVersionRetirementTest")
+    val suffix = System.nanoTime()
+    val sourceBase = s"redis_retirement_$suffix"
+    val destinationBase = s"retirement_e2e_$suffix"
+    val stateRoot = Files.createTempDirectory("redis-retirement-state").toUri.toString
+    val partition = "2024-07-27"
+    val advertisedPortMappings = internalPorts.map { internalPort =>
+      internalPort -> RedisKVStoreFactory.RedisEndpoint(host, container.getMappedPort(internalPort))
+    }.toMap
+    val clientSettings = RedisKVStoreFactory
+      .settings(Map("redis.cluster.nodes" -> s"$host:$port"), env = Map.empty)
+      .copy(advertisedPortMappings = advertisedPortMappings)
+
+    def settings(version: Int, deleteOlderVersions: Boolean): Spark2RedisLoader.Settings =
+      Spark2RedisLoader.Settings(
+        sourceTable = s"${sourceBase}__${version}__upload",
+        destinationDataset = s"${destinationBase}__${version}",
+        sourcePartition = partition,
+        partitionSpec = PartitionSpec.daily,
+        stateRoot = stateRoot,
+        keyPrefix = "chronon",
+        clientSettings = clientSettings,
+        batchSize = 10,
+        maxKeysPerSecond = 100000,
+        writerPartitions = 1,
+        stateBuckets = 4,
+        liveTTLSeconds = 3600,
+        deleteOlderVersions = deleteOlderVersions
+      )
+
+    def rows(values: (String, String)*): org.apache.spark.sql.DataFrame = {
+      import spark.implicits._
+      (values.map { case (key, value) =>
+        (key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), partition)
+      } :+ (GroupByServingInfoKey.getBytes(StandardCharsets.UTF_8),
+            "metadata".getBytes(StandardCharsets.UTF_8),
+            partition)).toDF("key_bytes", "value_bytes", "ds")
+    }
+
+    val v1 = settings(version = 1, deleteOlderVersions = false)
+    val v2 = settings(version = 2, deleteOlderVersions = true)
+    try {
+      rows("a" -> "a-v1", "b" -> "b-v1")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v1.sourceTable)
+      rows("b" -> "b-v2", "c" -> "c-v2")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v2.sourceTable)
+
+      val v1Upload = Spark2RedisLoader.run(v1, spark, jedisCluster)
+      v1Upload.changedKeys shouldBe 2L
+      val v1StatusKey = RedisBatchUpload.buildStatusKey(v1.batchDataset, v1.keyPrefix)
+      val v1Keys = Seq("a", "b", GroupByServingInfoKey).map { key =>
+        RedisKVStore.buildRedisKey(key.getBytes(StandardCharsets.UTF_8).toSeq, v1.batchDataset)
+      }
+      val preRetirementValues = v1Keys.map { key =>
+        key -> jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))
+      }
+      val v2Upload = Spark2RedisLoader.run(v2, spark, jedisCluster)
+      v2Upload.changedKeys shouldBe 2L
+
+      val retiredStatus = RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get
+      retiredStatus.retired shouldBe true
+      jedisCluster.ttl(v1StatusKey.getBytes(StandardCharsets.UTF_8)) shouldBe -1L
+
+      v1Keys.foreach { key =>
+        RedisBatchUpload.decodeValue(jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
+          RedisBatchUpload.Delete
+        jedisCluster.ttl(key.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
+      }
+
+      Seq("b" -> "b-v2", "c" -> "c-v2").foreach { case (key, expected) =>
+        val redisKey = RedisKVStore.buildRedisKey(key.getBytes(StandardCharsets.UTF_8).toSeq, v2.batchDataset)
+        val decoded = RedisBatchUpload.decodeValue(jedisCluster.get(redisKey.getBytes(StandardCharsets.UTF_8))).get
+        decoded.operation shouldBe RedisBatchUpload.Upsert
+        new String(decoded.payload, StandardCharsets.UTF_8) shouldBe expected
+      }
+
+      val tombstoneDeadlineBefore = jedisCluster.pttl(v1Keys.head.getBytes(StandardCharsets.UTF_8))
+      Spark2RedisLoader.run(v2, spark, jedisCluster)
+      val rerunStatus = RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get
+      rerunStatus shouldBe retiredStatus
+      jedisCluster.pttl(v1Keys.head.getBytes(StandardCharsets.UTF_8)) should be <= tombstoneDeadlineBefore
+
+      // Simulate a Redis restore from before v1 was retired. The durable retired S3 head must replay its deletes
+      // rather than merely recreating the status marker and leaving the restored values live.
+      preRetirementValues.foreach { case (key, value) =>
+        jedisCluster.set(key.getBytes(StandardCharsets.UTF_8), value)
+      }
+      jedisCluster.del(v1StatusKey.getBytes(StandardCharsets.UTF_8))
+      Spark2RedisLoader.run(v2, spark, jedisCluster)
+      RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get shouldBe retiredStatus
+      v1Keys.foreach { key =>
+        RedisBatchUpload.decodeValue(jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
+          RedisBatchUpload.Delete
+      }
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS ${v1.sourceTable}")
+      spark.sql(s"DROP TABLE IF EXISTS ${v2.sourceTable}")
+      RedisSparkSessionTestHelper.release()
+    }
+  }
+
   it should "bulk put batch IR data from Spark" in {
     // Note: bulkPut appends "_BATCH" suffix via GroupBy.batchDataset (same as BigTable)
     val dataset = "TEST_GROUPBY"

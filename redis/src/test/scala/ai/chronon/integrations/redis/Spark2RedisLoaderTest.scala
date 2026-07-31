@@ -605,6 +605,45 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
       Spark2RedisLoader.configuredBoolean(Map(property -> "not-a-boolean"), property, default = true)
   }
 
+  it should "leave older-version retirement disabled by default and parse an explicit opt-in" in {
+    val property = RedisKVStoreConstants.PropRedisBulkUploadDeleteOlderVersions
+
+    RedisKVStoreConstants.DefaultBulkUploadDeleteOlderVersions shouldBe false
+    Spark2RedisLoader.configuredBoolean(Map.empty, property, default = false) shouldBe false
+    Spark2RedisLoader.configuredBoolean(Map(property -> "true"), property, default = false) shouldBe true
+    an[IllegalArgumentException] should be thrownBy
+      Spark2RedisLoader.configuredBoolean(Map(property -> "not-a-boolean"), property, default = false)
+  }
+
+  "Redis version parsing" should "recognize only trailing numeric GroupBy and batch versions" in {
+    Spark2RedisLoader.parseVersionedDataset("ranking.user.views__14") shouldBe
+      Some(Spark2RedisLoader.VersionedDataset("ranking.user.views", 14L))
+    Spark2RedisLoader.parseVersionedDataset("ranking.user.views") shouldBe None
+    Spark2RedisLoader.parseVersionedDataset("ranking.user.views__v14") shouldBe None
+    Spark2RedisLoader.parseVersionedDataset("ranking.user.views__latest") shouldBe None
+
+    Spark2RedisLoader.parseVersionedBatchDataset("RANKING_USER_VIEWS__14_BATCH") shouldBe
+      Some(Spark2RedisLoader.VersionedDataset("RANKING_USER_VIEWS", 14L))
+    Spark2RedisLoader.parseVersionedBatchDataset("RANKING_USER_VIEWS_BATCH") shouldBe None
+    Spark2RedisLoader.parseVersionedBatchDataset("RANKING_USER_VIEWS__14_STREAMING") shouldBe None
+  }
+
+  it should "require matching numeric GroupBy and batch versions before retirement" in {
+    Spark2RedisLoader.requireMatchingVersionedDatasets(
+      "ranking.user.views__14",
+      "RANKING_USER_VIEWS__14_BATCH") shouldBe
+      (Spark2RedisLoader.VersionedDataset("ranking.user.views", 14L) ->
+        Spark2RedisLoader.VersionedDataset("RANKING_USER_VIEWS", 14L))
+
+    an[IllegalArgumentException] should be thrownBy
+      Spark2RedisLoader.requireMatchingVersionedDatasets("ranking.user.views", "RANKING_USER_VIEWS__14_BATCH")
+    an[IllegalArgumentException] should be thrownBy
+      Spark2RedisLoader.requireMatchingVersionedDatasets("ranking.user.views__14", "RANKING_USER_VIEWS_BATCH")
+    an[IllegalArgumentException] should be thrownBy
+      Spark2RedisLoader.requireMatchingVersionedDatasets("ranking.user.views__14",
+                                                         "RANKING_USER_VIEWS__13_BATCH")
+  }
+
   "Redis publisher Spark configuration" should "prefer submitted Spark settings over metadata defaults" in {
     val credentialKey = "spark.sql.catalog.depop_iceberg.credential"
     val warehouseKey = "spark.sql.catalog.depop_iceberg.warehouse"

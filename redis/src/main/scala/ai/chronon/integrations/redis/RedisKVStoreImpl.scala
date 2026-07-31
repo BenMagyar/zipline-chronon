@@ -833,7 +833,10 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
             liveTTLSeconds = configuredInt(uploadConf, PropRedisBulkUploadTTLSeconds, DefaultBulkUploadTTLSeconds),
             requireNoEviction = Spark2RedisLoader.configuredBoolean(uploadConf,
                                                                     PropRedisBulkUploadRequireNoEviction,
-                                                                    DefaultBulkUploadRequireNoEviction)
+                                                                    DefaultBulkUploadRequireNoEviction),
+            deleteOlderVersions = Spark2RedisLoader.configuredBoolean(uploadConf,
+                                                                      PropRedisBulkUploadDeleteOlderVersions,
+                                                                      DefaultBulkUploadDeleteOlderVersions)
           )
           Spark2RedisLoader.run(settings, spark, jedisCluster, conditionalObjectWriter)
         } finally if (existingSpark.isEmpty) spark.stop()
