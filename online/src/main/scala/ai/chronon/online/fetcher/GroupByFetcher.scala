@@ -284,7 +284,6 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                   // not all exceptions are due to stale schema, so we want to control how often we hit kv store
                   metadataStore.getGroupByServingInfo.refresh(groupByServingInfo.groupByOps.metaData.name)
                   context.incrementException(ex)
-                  ex.printStackTrace()
                   throw ex
 
               }

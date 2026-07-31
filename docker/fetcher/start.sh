@@ -94,6 +94,9 @@ ADD_OPENS_OPTS="
 
 JVM_OPTS="$JVM_OPTS $GC_OPTS $ADD_OPENS_OPTS -XX:MaxMetaspaceSize=1g -XX:MaxRAMPercentage=70.0 -XX:MinRAMPercentage=70.0 -XX:InitialRAMPercentage=70.0 -XX:MaxHeapFreeRatio=100 -XX:MinHeapFreeRatio=0"
 
+# Container runtimes collect and rotate stdout. Keep fetcher logs out of the writable image layer.
+LOGGING_OPTS="-Dlogback.configurationFile=$FETCHER_LOGBACK_CONFIG -Dlog4j.configurationFile=$FETCHER_LOG4J2_CONFIG"
+
 # TTL cache configuration
 TTL_OPTS=""
 if [ -n "$CHRONON_JOIN_CONF_TTL_MILLIS" ]; then
@@ -104,7 +107,7 @@ if [ -n "$CHRONON_JOIN_CODEC_TTL_MILLIS" ]; then
 fi
 
 echo "Starting Fetcher service with online jar $ONLINE_JAR and online class $ONLINE_CLASS"
-if ! java $JVM_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
+if ! java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
   run ai.chronon.service.FetcherVerticle \
   -Dserver.port=$FETCHER_PORT \
   -Donline.jar=$ONLINE_JAR \

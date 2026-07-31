@@ -26,6 +26,8 @@ ENV CLOUD_GCP_JAR_PATH=build_output/cloud_gcp_lib_deploy.jar
 ENV CLOUD_AZURE_JAR_PATH=build_output/cloud_azure_lib_deploy.jar
 ENV FETCHER_SVC_JAR_PATH=build_output/service_assembly_deploy.jar
 ENV FETCHER_LAUNCH_SCRIPT=docker/fetcher/start.sh
+ENV FETCHER_LOGBACK_CONFIG_PATH=docker/fetcher/logback.xml
+ENV FETCHER_LOG4J2_CONFIG_PATH=docker/fetcher/log4j2.xml
 ENV GCP_ONLINE_CLASS=ai.chronon.integrations.cloud_gcp.GcpApiImpl
 ENV AWS_ONLINE_CLASS=ai.chronon.integrations.aws.AwsApiImpl
 ENV AZURE_ONLINE_CLASS=ai.chronon.integrations.cloud_azure.AzureApiImpl
@@ -43,12 +45,16 @@ ENV CLOUD_GCP_JAR=${CLOUD_GCP_JAR:-"/srv/zipline/cloud_gcp/cloud_gcp.jar"}
 ENV CLOUD_AZURE_JAR=${CLOUD_AZURE_JAR:-"/srv/zipline/cloud_azure/cloud_azure.jar"}
 ENV FETCHER_JAR=${FETCHER_JAR:-"/srv/zipline/fetcher/service.jar"}
 ENV LOG_PATH=${LOG_PATH:-"/srv/zipline/fetcher/logs"}
+ENV FETCHER_LOGBACK_CONFIG=${FETCHER_LOGBACK_CONFIG:-"/srv/zipline/fetcher/logback.xml"}
+ENV FETCHER_LOG4J2_CONFIG=${FETCHER_LOG4J2_CONFIG:-"/srv/zipline/fetcher/log4j2.xml"}
 
 COPY $CLOUD_AWS_JAR_PATH "$CLOUD_AWS_JAR"
 COPY $CLOUD_GCP_JAR_PATH "$CLOUD_GCP_JAR"
 COPY $CLOUD_AZURE_JAR_PATH "$CLOUD_AZURE_JAR"
 COPY $FETCHER_SVC_JAR_PATH "$FETCHER_JAR"
 COPY $FETCHER_LAUNCH_SCRIPT /srv/zipline/fetcher/start.sh
+COPY $FETCHER_LOGBACK_CONFIG_PATH "$FETCHER_LOGBACK_CONFIG"
+COPY $FETCHER_LOG4J2_CONFIG_PATH "$FETCHER_LOG4J2_CONFIG"
 
 ENV FETCHER_PORT=9000
 

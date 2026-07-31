@@ -22,16 +22,89 @@ import ai.chronon.api._
 import io.opentelemetry.api.OpenTelemetry
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 
 object Metrics {
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+
+  private[metrics] val ExceptionLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(60L)
+  private[metrics] val ExceptionLogBucketCount: Int = 4096
+
+  private final class ExceptionLogState {
+    private var hasLogged = false
+    private var lastLogNanos = 0L
+    private var suppressed = 0L
+
+    def acquire(nowNanos: Long, intervalNanos: Long): Option[Long] = synchronized {
+      if (!hasLogged || nowNanos - lastLogNanos >= intervalNanos) {
+        val suppressedSinceLastLog = suppressed
+        hasLogged = true
+        lastLogNanos = nowNanos
+        suppressed = 0L
+        Some(suppressedSinceLastLog)
+      } else {
+        if (suppressed < Long.MaxValue) suppressed += 1L
+        None
+      }
+    }
+  }
+
+  /** Bounded, thread-safe full-stack log limiter. Stable signatures map deterministically into a fixed array. Hash
+    * collisions can conservatively suppress more logs, but can never evict a live cooldown and allow extra stacks.
+    */
+  private[metrics] final class ExceptionLogLimiter(intervalNanos: Long = ExceptionLogIntervalNanos,
+                                                   bucketCount: Int = ExceptionLogBucketCount,
+                                                   ticker: () => Long = () => System.nanoTime()) {
+    require(intervalNanos > 0L, "Exception log interval must be positive")
+    require(bucketCount > 0, "Exception log bucket count must be positive")
+
+    private val states: Array[ExceptionLogState] = Array.fill(bucketCount)(new ExceptionLogState)
+
+    def acquire(signature: String): Option[Long] = {
+      val bucket = Math.floorMod(signature.hashCode, states.length)
+      states(bucket).acquire(ticker(), intervalNanos)
+    }
+
+    private[metrics] def capacity: Int = states.length
+  }
+
+  private lazy val exceptionLogLimiter = new ExceptionLogLimiter()
 
   val MetricsEnabled = "ai.chronon.metrics.enabled"
   val MetricsReporter = "ai.chronon.metrics.reporter"
   val MetricsPrefix = "ai.chronon.metrics.prefix"
 
   private val globalMetricsPrefix: Option[String] = Option(System.getProperty(MetricsPrefix)).filter(_.nonEmpty)
+
+  private[metrics] def exceptionSignature(exception: Throwable): String = {
+    val stackTrace = exception.getStackTrace
+    if (stackTrace.isEmpty) {
+      exception.getClass.toString
+    } else {
+      val stackRoot = stackTrace.apply(0)
+      val file = stackRoot.getFileName
+      val line = stackRoot.getLineNumber
+      val method = stackRoot.getMethodName
+      s"[$method@$file:$line]${exception.getClass.toString}"
+    }
+  }
+
+  private[metrics] def logException(exception: Throwable,
+                                    signature: String,
+                                    logger: Logger,
+                                    limiter: ExceptionLogLimiter = exceptionLogLimiter): Unit = {
+    if (logger.isErrorEnabled) {
+      limiter.acquire(signature).foreach { suppressed =>
+        val suppressionSummary =
+          if (suppressed == 0L) ""
+          else s" ($suppressed exception logs suppressed in the same sampling bucket since the previous full stack)"
+        // Keep traceString inside the admitted branch: formatting a stack is one of the expensive operations this
+        // limiter protects during exception storms.
+        logger.error(s"Exception Message$suppressionSummary: ${exception.traceString}")
+      }
+    }
+  }
 
   object Environment extends Enumeration {
     type Environment = String
@@ -235,18 +308,10 @@ object Metrics {
       Context.client.count(prefix(metric), 1, additionalTags)
 
     def incrementException(exception: Throwable)(implicit logger: org.slf4j.Logger): Unit = {
-      val stackTrace = exception.getStackTrace
-      val exceptionSignature = if (stackTrace.isEmpty) {
-        exception.getClass.toString
-      } else {
-        val stackRoot = stackTrace.apply(0)
-        val file = stackRoot.getFileName
-        val line = stackRoot.getLineNumber
-        val method = stackRoot.getMethodName
-        s"[$method@$file:$line]${exception.getClass.toString}"
-      }
-      logger.error(s"Exception Message: ${exception.traceString}")
-      Context.client.count(prefix(Name.Exception), 1, Map(Metrics.Name.Exception -> exceptionSignature))
+      val signature = Metrics.exceptionSignature(exception)
+      // Counting is deliberately unconditional; only the expensive full-stack log is sampled.
+      Context.client.count(prefix(Name.Exception), 1, Map(Metrics.Name.Exception -> signature))
+      Metrics.logException(exception, signature, logger)
     }
 
     def distribution(metric: String, value: Long): Unit =
