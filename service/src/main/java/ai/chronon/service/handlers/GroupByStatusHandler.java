@@ -6,16 +6,12 @@ import ai.chronon.online.JavaGroupByStatusResponse;
 import io.vertx.core.Handler;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.Collections;
 import java.util.List;
 
 public class GroupByStatusHandler implements Handler<RoutingContext> {
 
     private final JavaFetcher fetcher;
-    private static final Logger logger = LoggerFactory.getLogger(GroupByStatusHandler.class);
 
     public GroupByStatusHandler(JavaFetcher fetcher) {
         this.fetcher = fetcher;
@@ -25,19 +21,15 @@ public class GroupByStatusHandler implements Handler<RoutingContext> {
     public void handle(RoutingContext ctx) {
         String entityName = ctx.pathParam("name");
 
-        logger.debug("Retrieving groupBy status for {}", entityName);
-
         ctx.vertx()
                 .<JTry<JavaGroupByStatusResponse>>executeBlocking(() -> fetcher.fetchGroupByStatus(entityName))
-                .onSuccess(groupByStatusResponseTry -> handleResult(ctx, entityName, groupByStatusResponseTry))
-                .onFailure(exception -> writeError(ctx, entityName, exception));
+                .onSuccess(groupByStatusResponseTry -> handleResult(ctx, groupByStatusResponseTry))
+                .onFailure(exception -> writeError(ctx, exception));
     }
 
-    private void handleResult(RoutingContext ctx,
-                              String entityName,
-                              JTry<JavaGroupByStatusResponse> groupByStatusResponseTry) {
+    private void handleResult(RoutingContext ctx, JTry<JavaGroupByStatusResponse> groupByStatusResponseTry) {
         if (!groupByStatusResponseTry.isSuccess()) {
-            writeError(ctx, entityName, groupByStatusResponseTry.getException());
+            writeError(ctx, groupByStatusResponseTry.getException());
             return;
         }
 
@@ -49,9 +41,7 @@ public class GroupByStatusHandler implements Handler<RoutingContext> {
                 .end(JsonObject.mapFrom(groupByStatusResponse).encode());
     }
 
-    private void writeError(RoutingContext ctx, String entityName, Throwable exception) {
-        logger.error("Unable to retrieve groupBy status for: {}", entityName, exception);
-
+    private void writeError(RoutingContext ctx, Throwable exception) {
         String errorMessage =
                 exception == null || exception.getMessage() == null ? "Unknown error" : exception.getMessage();
         List<String> errorMessages = Collections.singletonList(errorMessage);

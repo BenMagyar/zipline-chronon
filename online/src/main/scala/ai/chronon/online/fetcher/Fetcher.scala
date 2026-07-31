@@ -1039,8 +1039,7 @@ class Fetcher(val kvStore: KVStore,
     // GroupBy configs are embedded in the batch serving-info record rather than uploaded as standalone entries in
     // CHRONON_METADATA. The serving info is also the authoritative upload watermark, so read it directly and bypass
     // the long-lived serving caches used by the feature-fetch hot path.
-    metadataStore
-      .getGroupByServingInfoFresh(groupByName)
+    Try(metadataStore.getGroupByServingInfoFresh(groupByName)).flatten
       .flatMap { servingInfo =>
         if (!servingInfo.groupByServingInfo.groupBy.metaData.online) {
           Failure(

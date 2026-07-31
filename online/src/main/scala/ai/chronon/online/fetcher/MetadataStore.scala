@@ -449,7 +449,6 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
                          e)
             throw e
         }
-    logger.info(s"Fetched ${Constants.GroupByServingInfoKey} from: $batchDataset (fresh=$fresh)")
     if (metaData.isFailure) {
       Metrics
         .Context(Metrics.Environment.MetaDataFetching, groupBy = name)

@@ -114,6 +114,22 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     failure.getMessage should include("upload the GroupBy")
   }
 
+  it should "return a sampled-path failure when fresh serving info is malformed" in {
+    val kvStore = InMemoryKvStore.build(s"FetcherSchemaTest_status_malformed_${System.nanoTime()}")
+    kvStore.create(Constants.MetadataDataset)
+
+    val servingInfo = GroupByDerivationsTest.makeTestGroupByServingInfoParsed().groupByServingInfo
+    val groupByName = servingInfo.groupBy.metaData.name
+    val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
+    kvStore.create(batchDataset)
+    putString(kvStore, Constants.GroupByServingInfoKey, "not-json", batchDataset)
+
+    val fetcher = new Fetcher(kvStore, Constants.MetadataDataset)
+    val result = fetcher.fetchGroupByStatus(groupByName)
+
+    result shouldBe a[scala.util.Failure[_]]
+  }
+
   it should "retain the two-field status response API" in {
     val scalaResponse = Fetcher.GroupByStatusResponse("legacy_group_by", "2026-05-20")
     val javaResponse = new JavaGroupByStatusResponse("legacy_group_by", "2026-05-20")
