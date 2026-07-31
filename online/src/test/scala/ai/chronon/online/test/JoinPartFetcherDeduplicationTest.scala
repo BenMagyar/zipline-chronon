@@ -37,6 +37,7 @@ import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
+import scala.collection.JavaConverters._
 import scala.util.{Success, Try}
 
 /** Tests that fetchJoins deduplicates GroupBy requests with identical (name, keys) across a bulk batch,
@@ -135,6 +136,155 @@ class JoinPartFetcherDeduplicationTest
 
     responses should have size 5
     verify(joinConfCache, times(1)).apply(testJoin.metaData.name)
+  }
+
+  it should "reuse the correct join and part metric contexts in a mixed-join batch" in {
+    stubFetchGroupBys()
+    val secondGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.second_product_features"),
+      keyColumns = Seq("product_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val secondJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.second_recsys_join"),
+      joinParts = Seq(Builders.JoinPart(groupBy = secondGroupBy, keyMapping = Map("product_id" -> "product_id")))
+    )
+    val joinConfCache = mock[TTLCache[String, Try[JoinOps]]]
+    when(joinConfCache.apply(testJoin.metaData.name)).thenReturn(Success(new JoinOps(testJoin)))
+    when(joinConfCache.apply(secondJoin.metaData.name)).thenReturn(Success(new JoinOps(secondJoin)))
+    doReturn(joinConfCache).when(metadataStore).getJoinConf
+
+    val requests = Seq(
+      Request(testJoin.metaData.name,
+              Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p1".asInstanceOf[AnyRef])),
+      Request(testJoin.metaData.name,
+              Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p2".asInstanceOf[AnyRef])),
+      Request(secondJoin.metaData.name, Map("product_id" -> "p3".asInstanceOf[AnyRef])),
+      Request(secondJoin.metaData.name, Map("product_id" -> "p4".asInstanceOf[AnyRef]))
+    )
+
+    val responses = Await.result(joinPartFetcher.fetchJoins(requests), 1.second)
+    val firstJoinContexts = responses.take(2).map(_.request.context.get)
+    val secondJoinContexts = responses.drop(2).map(_.request.context.get)
+    (firstJoinContexts.head eq firstJoinContexts.last) shouldBe true
+    (secondJoinContexts.head eq secondJoinContexts.last) shouldBe true
+    (firstJoinContexts.head eq secondJoinContexts.head) shouldBe false
+    firstJoinContexts.head.join shouldBe "unit_test_recsys_join"
+    secondJoinContexts.head.join shouldBe "unit_test_second_recsys_join"
+
+    val captor = ArgumentCaptor.forClass(classOf[Seq[_]])
+    verify(joinPartFetcher).fetchGroupBys(captor.capture().asInstanceOf[Seq[Request]])
+    val sentRequests = captor.getValue.asInstanceOf[Seq[Request]]
+    val firstProductContexts = sentRequests.filter(_.name == productGroupBy.metaData.name).map(_.context.get)
+    val secondProductContexts = sentRequests.filter(_.name == secondGroupBy.metaData.name).map(_.context.get)
+    firstProductContexts should have size 2
+    secondProductContexts should have size 2
+    firstProductContexts.foreach(context => (context eq firstProductContexts.head) shouldBe true)
+    secondProductContexts.foreach(context => (context eq secondProductContexts.head) shouldBe true)
+    firstProductContexts.head.join shouldBe "unit_test_recsys_join"
+    firstProductContexts.head.groupBy shouldBe "unit_test_product_features"
+    firstProductContexts.head.accuracy shouldBe Accuracy.SNAPSHOT
+    secondProductContexts.head.join shouldBe "unit_test_second_recsys_join"
+    secondProductContexts.head.groupBy shouldBe "unit_test_second_product_features"
+    secondProductContexts.head.accuracy shouldBe Accuracy.SNAPSHOT
+  }
+
+  it should "reuse prepared metric contexts until the underlying join configuration is refreshed" in {
+    stubFetchGroupBys()
+    val refreshedProductGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.refreshed_product_features"),
+      keyColumns = Seq("product_id"),
+      accuracy = Accuracy.TEMPORAL
+    )
+    val addedProductGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.added_product_features"),
+      keyColumns = Seq("product_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val refreshedJoin = Builders.Join(
+      metaData = Builders.MetaData(name = testJoin.metaData.name, production = true, team = "refreshed_team"),
+      joinParts = Seq(
+        Builders.JoinPart(groupBy = contextualGroupBy, keyMapping = Map("user_id" -> "user_id")),
+        Builders.JoinPart(
+          groupBy = refreshedProductGroupBy,
+          keyMapping = Map("product_id" -> "product_id"),
+          prefix = "refreshed"
+        ),
+        Builders.JoinPart(groupBy = addedProductGroupBy, keyMapping = Map("product_id" -> "product_id"))
+      )
+    )
+    val joinConfCache = mock[TTLCache[String, Try[JoinOps]]]
+    when(joinConfCache.apply(testJoin.metaData.name))
+      .thenReturn(
+        Success(new JoinOps(testJoin)),
+        Success(new JoinOps(testJoin)),
+        Success(new JoinOps(refreshedJoin))
+      )
+    doReturn(joinConfCache).when(metadataStore).getJoinConf
+    val request = Request(
+      testJoin.metaData.name,
+      Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p1".asInstanceOf[AnyRef])
+    )
+
+    val responseContexts = (0 until 3).map { _ =>
+      Await.result(joinPartFetcher.fetchJoins(Seq(request)), 1.second).head.request.context.get
+    }
+    (responseContexts(0) eq responseContexts(1)) shouldBe true
+    (responseContexts(1) eq responseContexts(2)) shouldBe false
+    responseContexts(2).join shouldBe "unit_test_recsys_join"
+    responseContexts(2).production shouldBe true
+    responseContexts(2).team shouldBe "refreshed_team"
+
+    val captor = ArgumentCaptor.forClass(classOf[Seq[_]])
+    verify(joinPartFetcher, times(3)).fetchGroupBys(captor.capture().asInstanceOf[Seq[Request]])
+    val capturedRequests = captor.getAllValues.asScala.map(_.asInstanceOf[Seq[Request]])
+    val originalPartContexts = capturedRequests.take(2).map { captured =>
+      captured
+        .find(_.name == productGroupBy.metaData.name)
+        .flatMap(_.context)
+        .get
+    }
+    (originalPartContexts(0) eq originalPartContexts(1)) shouldBe true
+
+    capturedRequests(2).map(_.name).toSet shouldBe Set(
+      contextualGroupBy.metaData.name,
+      refreshedProductGroupBy.metaData.name,
+      addedProductGroupBy.metaData.name
+    )
+    val refreshedPartContext = capturedRequests(2)
+      .find(_.name == refreshedProductGroupBy.metaData.name)
+      .flatMap(_.context)
+      .get
+    (originalPartContexts(1) eq refreshedPartContext) shouldBe false
+    refreshedPartContext.groupBy shouldBe "unit_test_refreshed_product_features"
+    refreshedPartContext.accuracy shouldBe Accuracy.TEMPORAL
+    refreshedPartContext.joinPartPrefix shouldBe "refreshed"
+    refreshedPartContext.production shouldBe true
+    refreshedPartContext.team shouldBe "refreshed_team"
+  }
+
+  it should "reuse prepared metric contexts across repeated join overrides" in {
+    stubFetchGroupBys()
+    val request = Request(
+      testJoin.metaData.name,
+      Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p1".asInstanceOf[AnyRef])
+    )
+
+    val responseContexts = (0 until 2).map { _ =>
+      Await.result(joinPartFetcher.fetchJoins(Seq(request), Some(testJoin)), 1.second).head.request.context.get
+    }
+    (responseContexts(0) eq responseContexts(1)) shouldBe true
+
+    val captor = ArgumentCaptor.forClass(classOf[Seq[_]])
+    verify(joinPartFetcher, times(2)).fetchGroupBys(captor.capture().asInstanceOf[Seq[Request]])
+    val productPartContexts = captor.getAllValues.asScala.map { captured =>
+      captured
+        .asInstanceOf[Seq[Request]]
+        .find(_.name == productGroupBy.metaData.name)
+        .flatMap(_.context)
+        .get
+    }
+    (productPartContexts(0) eq productPartContexts(1)) shouldBe true
   }
 
   it should "dedup contextual GroupBy requests when user_id is repeated across bulk product rows" in {

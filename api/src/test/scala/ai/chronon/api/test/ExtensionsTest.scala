@@ -27,6 +27,31 @@ import java.util.Arrays
 
 class ExtensionsTest extends AnyFlatSpec {
 
+  it should "preserve metadata name sanitization and version splitting" in {
+    assertEquals("team_group_by__12", "team.group-by__12".sanitize)
+
+    val numbered = Builders.MetaData(name = "team.group_by__12")
+    assertEquals("team.group_by", numbered.nameWithoutVersion)
+    assertEquals("group_by", numbered.nameWithoutTeamOrVersion)
+
+    val legacy = Builders.MetaData(name = "team.group-by__v12")
+    assertEquals("team_group_by", legacy.cleanNameWithoutVersion)
+
+    assertEquals(null, Builders.MetaData(name = null).nameWithoutVersion)
+  }
+
+  it should "infer group by accuracy without changing explicit and topic-based semantics" in {
+    val explicit = Builders.GroupBy(accuracy = Accuracy.SNAPSHOT)
+    assertEquals(Accuracy.SNAPSHOT, inferGroupByAccuracy(explicit))
+
+    val inferred = Builders.GroupBy(
+      sources = Seq(Builders.Source.events(query = null, table = "table", topic = "topic")),
+      accuracy = null
+    )
+    assertEquals(Accuracy.TEMPORAL, inferGroupByAccuracy(inferred))
+    assertEquals(inferred.inferredAccuracy, inferGroupByAccuracy(inferred))
+  }
+
   it should "sub partition filters" in {
     val source = Builders.Source.events(query = null, table = "db.table/system=mobile/currency=USD")
     assertEquals(

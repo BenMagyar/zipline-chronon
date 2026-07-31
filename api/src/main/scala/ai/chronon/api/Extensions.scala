@@ -34,9 +34,24 @@ import scala.collection.mutable
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import scala.util.matching.Regex
 
 object Extensions {
+
+  private val UnsafeNameCharactersPattern: Pattern = Pattern.compile("[^a-zA-Z0-9_]")
+  private val LegacyVersionSuffixPattern: Pattern = Pattern.compile("__v\\d+$")
+  private val TrailingVersionPattern: Pattern = Pattern.compile("^(.*)__(\\d+)$")
+
+  /** Infer accuracy without constructing the legacy GroupByOps wrapper, whose Thrift copy constructor deep-copies
+    * the complete GroupBy. Hot online paths that only need this scalar should call this helper directly.
+    */
+  private[chronon] def inferGroupByAccuracy(groupBy: GroupBy): Accuracy = {
+    if (groupBy.accuracy != null) {
+      groupBy.accuracy
+    } else {
+      val hasTopic = groupBy.sources.toScala.exists(_.topic != null)
+      if (hasTopic) Accuracy.TEMPORAL else Accuracy.SNAPSHOT
+    }
+  }
 
   private def _keyNameForKvStore(metaData: MetaData, keywordType: String): String = {
     s"$keywordType/" + metaData.name
@@ -202,7 +217,7 @@ object Extensions {
     // TODO: we no longer use __v{version} - it is just __{version}, deprecate this method
     def cleanNameWithoutVersion: String = {
       val clean = metaData.name.sanitize
-      clean.replaceAll("__v\\d+$", "")
+      LegacyVersionSuffixPattern.matcher(clean).replaceAll("")
     }
 
     def outputTable: String = {
@@ -271,12 +286,12 @@ object Extensions {
       }
     }
 
-    private val trailingVersionPattern: Regex = """^(.*)__(\d+)$""".r
-
     private def splitTrailingVersion(s: String): (String, Option[Int]) = {
-      s match {
-        case trailingVersionPattern(prefix, num) => (prefix, Some(num.toInt))
-        case _                                   => (s, None)
+      if (s == null) {
+        (null, None)
+      } else {
+        val matcher = TrailingVersionPattern.matcher(s)
+        if (matcher.matches()) (matcher.group(1), Some(matcher.group(2).toInt)) else (s, None)
       }
     }
 
@@ -636,17 +651,7 @@ object Extensions {
       models.head
     }
 
-    lazy val inferredAccuracy: Accuracy = inferredAccuracyImpl
-
-    private def inferredAccuracyImpl: Accuracy = {
-      // if user specified something - respect it
-      if (groupBy.accuracy != null) return groupBy.accuracy
-      // if a topic is specified - then treat it as temporally accurate
-      val validTopics = groupBy.sources.toScala
-        .map(_.topic)
-        .filter(_ != null)
-      if (validTopics.nonEmpty) Accuracy.TEMPORAL else Accuracy.SNAPSHOT
-    }
+    lazy val inferredAccuracy: Accuracy = inferGroupByAccuracy(groupBy)
 
     def setups: Seq[String] = {
       groupBy.sources
@@ -826,7 +831,8 @@ object Extensions {
   }
 
   implicit class StringOps(string: String) {
-    def sanitize: String = Option(string).map(_.replaceAll("[^a-zA-Z0-9_]", "_")).orNull
+    def sanitize: String =
+      if (string == null) null else UnsafeNameCharactersPattern.matcher(string).replaceAll("_")
 
     def cleanSpec: String = string.split("/").head
 

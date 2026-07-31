@@ -22,7 +22,7 @@ import ai.chronon.api._
 import io.opentelemetry.api.OpenTelemetry
 import org.slf4j.{Logger, LoggerFactory}
 
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import scala.collection.mutable
 
 object Metrics {
@@ -30,6 +30,8 @@ object Metrics {
 
   private[metrics] val ExceptionLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(60L)
   private[metrics] val ExceptionLogBucketCount: Int = 4096
+  private[metrics] val ContextSuffixMemoMaxEntries: Int = 16
+  private[metrics] val ContextMetricNameMemoMaxEntries: Int = 64
 
   private final class ExceptionLogState {
     private var hasLogged = false
@@ -194,7 +196,7 @@ object Metrics {
         environment = environment,
         groupBy = groupBy.metaData.cleanName,
         production = groupBy.metaData.isProduction,
-        accuracy = groupBy.inferredAccuracy,
+        accuracy = inferGroupByAccuracy(groupBy),
         team = groupBy.metaData.team,
         join = groupBy.sources.toScala
           .find(_.isSetJoinSource)
@@ -205,7 +207,7 @@ object Metrics {
 
     def apply(joinContext: Context, joinPart: JoinPart): Context = {
       joinContext.copy(groupBy = joinPart.groupBy.metaData.cleanName,
-                       accuracy = joinPart.groupBy.inferredAccuracy,
+                       accuracy = inferGroupByAccuracy(joinPart.groupBy),
                        joinPartPrefix = joinPart.prefix)
     }
 
@@ -257,19 +259,59 @@ object Metrics {
     // product hash so a batch does not traverse every context field for each metric emission.
     @transient private lazy val cachedHashCode: Int = scala.util.hashing.MurmurHash3.productHash(this)
 
+    @transient private lazy val suffixMemo = new ConcurrentHashMap[String, Context]()
+    @transient private lazy val metricNameMemo = new ConcurrentHashMap[String, String]()
+
     override def hashCode(): Int = cachedHashCode
 
-    def withSuffix(suffixN: String): Context = copy(suffix = (Option(suffix) ++ Seq(suffixN)).mkString("."))
+    private def memoized[V <: AnyRef](cache: ConcurrentHashMap[String, V], key: String, maxEntries: Int)(
+        compute: => V): V = {
+      if (key == null) {
+        compute
+      } else {
+        val existing = cache.get(key)
+        if (existing != null) {
+          existing
+        } else {
+          // Misses are rare and the fixed bound is deliberately small. Serializing only misses keeps the common
+          // path lock-free while ensuring concurrent callers cannot grow either per-context memo past its bound.
+          this.synchronized {
+            val raced = cache.get(key)
+            if (raced != null) {
+              raced
+            } else if (cache.size() >= maxEntries) {
+              compute
+            } else {
+              val value = compute
+              cache.put(key, value)
+              value
+            }
+          }
+        }
+      }
+    }
+
+    def withSuffix(suffixN: String): Context =
+      memoized(suffixMemo, suffixN, ContextSuffixMemoMaxEntries) {
+        val appendedSuffix = if (suffix == null) String.valueOf(suffixN) else suffix + "." + String.valueOf(suffixN)
+        copy(suffix = appendedSuffix)
+      }
 
     private val prefixString =
       globalMetricsPrefix.map(_ + ".").getOrElse("") + environment + Option(suffix).map("." + _).getOrElse("")
 
     private def prefix(s: String): String =
-      new java.lang.StringBuilder(prefixString.length + s.length + 1)
-        .append(prefixString)
-        .append('.')
-        .append(s)
-        .toString
+      memoized(metricNameMemo, s, ContextMetricNameMemoMaxEntries) {
+        new java.lang.StringBuilder(prefixString.length + s.length + 1)
+          .append(prefixString)
+          .append('.')
+          .append(s)
+          .toString
+      }
+
+    private[metrics] def prefixedMetricName(metric: String): String = prefix(metric)
+    private[metrics] def memoizedSuffixCount: Int = suffixMemo.size()
+    private[metrics] def memoizedMetricNameCount: Int = metricNameMemo.size()
 
     def toTags: Map[String, String] = {
       val joinNames: Array[String] = Option(join).map(_.split(",")).getOrElse(Array.empty[String]).map(_.sanitize)

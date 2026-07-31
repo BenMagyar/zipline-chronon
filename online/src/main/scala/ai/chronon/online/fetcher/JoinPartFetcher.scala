@@ -21,18 +21,59 @@ import ai.chronon.api._
 import ai.chronon.online._
 import ai.chronon.online.fetcher.Fetcher.{ColumnSpec, PrefixedRequest, Request, Response}
 import ai.chronon.online.fetcher.FetcherCache.BatchResponses
+import ai.chronon.online.metrics.Metrics
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.util.function.BiFunction
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
+object JoinPartFetcher {
+  private val PreparedJoinMetricsCacheMaxEntries = 10000
+}
+
 class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) {
+
+  import JoinPartFetcher._
+
+  private final class PreparedJoinMetrics(val joinOps: JoinOps,
+                                          val joinContext: Metrics.Context,
+                                          val parts: Seq[(JoinPartOps, Metrics.Context)])
+
+  private val preparedJoinMetricsByName =
+    LRUCache[String, PreparedJoinMetrics]("join_part_prepared_metrics", PreparedJoinMetricsCacheMaxEntries)
 
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   private[online] val groupByFetcher = new GroupByFetcher(fetchContext, metadataStore)
   private implicit val executionContext: ExecutionContext = fetchContext.getOrCreateExecutionContext
+
+  private def preparedJoinMetrics(joinName: String, joinOps: JoinOps): PreparedJoinMetrics = {
+    val cached = preparedJoinMetricsByName.getIfPresent(joinName)
+    if (cached != null && cached.joinOps.join.eq(joinOps.join)) {
+      cached
+    } else {
+      // Only metadata refreshes and first access take the per-name cache update lock. The normal request path above
+      // is a concurrent cache lookup, which matters when many candidate batches target the same join.
+      preparedJoinMetricsByName
+        .asMap()
+        .compute(
+          joinName,
+          new BiFunction[String, PreparedJoinMetrics, PreparedJoinMetrics] {
+            override def apply(ignored: String, current: PreparedJoinMetrics): PreparedJoinMetrics = {
+              if (current != null && current.joinOps.join.eq(joinOps.join)) {
+                current
+              } else {
+                val joinContext = Metrics.Context(Metrics.Environment.JoinFetching, joinOps.join)
+                val parts = joinOps.joinPartOps.map(part => part -> Metrics.Context(joinContext, part))
+                new PreparedJoinMetrics(joinOps, joinContext, parts)
+              }
+            }
+          }
+        )
+    }
+  }
 
   def fetchGroupBys(requests: Seq[Request]): Future[Seq[Response]] = {
     groupByFetcher.fetchGroupBys(requests)
@@ -64,6 +105,7 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
       Success(JoinOps(join))
     }
     val joinOpsByName = mutable.HashMap.empty[String, Try[JoinOps]]
+    val preparedMetricsByName = mutable.HashMap.empty[String, PreparedJoinMetrics]
 
     // convert join requests to groupBy requests
     val joinDecomposed: Seq[(Request, Try[Seq[Either[PrefixedRequest, KeyMissingException]]])] =
@@ -84,13 +126,12 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
         var joinContext: Option[metrics.Metrics.Context] = None
 
         val decomposedTry = joinTry.map { join =>
-          import ai.chronon.online.metrics
-          joinContext = Some(metrics.Metrics.Context(metrics.Metrics.Environment.JoinFetching, join.join))
-          joinContext.get.increment("join_request.count")
+          val preparedMetrics =
+            preparedMetricsByName.getOrElseUpdate(request.name, preparedJoinMetrics(request.name, join))
+          joinContext = Some(preparedMetrics.joinContext)
+          preparedMetrics.joinContext.increment("join_request.count")
 
-          join.joinPartOps.map { part =>
-            import ai.chronon.online.metrics
-            val joinContextInner = metrics.Metrics.Context(joinContext.get, part)
+          preparedMetrics.parts.map { case (part, joinContextInner) =>
             val needsDerivation = JoinRequestKeys.needsDerivation(request, join.join, part)
             lazy val currentServingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName)
             lazy val keyMapping = joinCodecForName(request.name).flatMap(_.toOption).flatMap { codec =>
