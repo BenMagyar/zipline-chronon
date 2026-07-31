@@ -1503,7 +1503,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     }
   }
 
-  it should "retire lower GroupBy versions from their durable S3 state after publishing the new version" in {
+  it should "retire lower GroupBy versions after durable admission and before applying the new version" in {
     val container = redisFixture.container
     val host = container.getHost
     val port = container.getMappedPort(7000)
@@ -1573,14 +1573,142 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       correctedV1Upload.changedKeys shouldBe 0L
       correctedV1Upload.deletedKeys shouldBe 1L
       val v1StatusKey = RedisBatchUpload.buildStatusKey(v1.batchDataset, v1.keyPrefix)
+      val v2StatusKey = RedisBatchUpload.buildStatusKey(v2.batchDataset, v2.keyPrefix)
       val v1Keys = Seq("a", "b", GroupByServingInfoKey).map { key =>
         RedisKVStore.buildRedisKey(key.getBytes(StandardCharsets.UTF_8).toSeq, v1.batchDataset)
       }
+      val v2Keys = Seq("b", "c", GroupByServingInfoKey).map { key =>
+        RedisKVStore.buildRedisKey(key.getBytes(StandardCharsets.UTF_8).toSeq, v2.batchDataset)
+      }
+      val activeV1Status = RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get
       val preRetirementValues = v1Keys.map { key =>
         key -> jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))
       }
-      val v2Upload = Spark2RedisLoader.run(v2, spark, jedisCluster)
-      v2Upload.changedKeys shouldBe 2L
+
+      def assertV1Untouched(): Unit = {
+        RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get shouldBe activeV1Status
+        preRetirementValues.foreach { case (key, expected) =>
+          Option(jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))).map(_.toSeq) shouldBe
+            Option(expected).map(_.toSeq)
+        }
+        v2Keys.foreach(key => jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null)
+        RedisBatchUpload.readStatus(jedisCluster, v2StatusKey) shouldBe None
+      }
+
+      val v2StateRoot = new org.apache.hadoop.fs.Path(
+        new org.apache.hadoop.fs.Path(new org.apache.hadoop.fs.Path(stateRoot), v2.sourceTable),
+        v2.batchDataset)
+      val stateFs = v2StateRoot.getFileSystem(spark.sparkContext.hadoopConfiguration)
+
+      rows("duplicate" -> "first", "duplicate" -> "second")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v2.sourceTable)
+      val duplicate = the[IllegalArgumentException] thrownBy Spark2RedisLoader.run(v2, spark, jedisCluster)
+      duplicate.getMessage should include("duplicate key_bytes")
+      stateFs.exists(v2StateRoot) shouldBe false
+      assertV1Untouched()
+
+      rows()
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v2.sourceTable)
+      val empty = the[IllegalArgumentException] thrownBy Spark2RedisLoader.run(v2, spark, jedisCluster)
+      empty.getMessage should include("contains no data keys")
+      stateFs.exists(v2StateRoot) shouldBe false
+      assertV1Untouched()
+
+      rows("b" -> "b-v2", "c" -> "c-v2")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v2.sourceTable)
+
+      def belongsTo(path: org.apache.hadoop.fs.Path, dataset: String): Boolean =
+        path.toUri.getPath.split('/').contains(dataset)
+
+      var lostV2HeadResponse = false
+      val lostHeadWriter = new ConditionalObjectWriter {
+        override def read(path: org.apache.hadoop.fs.Path,
+                          hadoopConf: org.apache.hadoop.conf.Configuration): Option[VersionedBytes] =
+          HadoopConditionalObjectWriter.read(path, hadoopConf)
+
+        override def putIfAbsent(path: org.apache.hadoop.fs.Path,
+                                 contents: Array[Byte],
+                                 hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes = {
+          val result = HadoopConditionalObjectWriter.putIfAbsent(path, contents, hadoopConf)
+          if (!lostV2HeadResponse && path.getName == "_HEAD" && belongsTo(path, v2.batchDataset)) {
+            lostV2HeadResponse = true
+            throw new RuntimeException("simulated lost v2 head response")
+          }
+          result
+        }
+
+        override def compareAndSet(path: org.apache.hadoop.fs.Path,
+                                   expectedVersion: String,
+                                   contents: Array[Byte],
+                                   hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes =
+          HadoopConditionalObjectWriter.compareAndSet(path, expectedVersion, contents, hadoopConf)
+      }
+
+      val interrupted = the[RuntimeException] thrownBy {
+        Spark2RedisLoader.run(v2, spark, jedisCluster, lostHeadWriter)
+      }
+      interrupted.getMessage shouldBe "simulated lost v2 head response"
+      lostV2HeadResponse shouldBe true
+      assertV1Untouched()
+
+      val v2HeadPath = new org.apache.hadoop.fs.Path(v2StateRoot, "_HEAD")
+      val v2ReadyGlob = new org.apache.hadoop.fs.Path(
+        new org.apache.hadoop.fs.Path(v2StateRoot, "generations"),
+        "*/_READY")
+      val v2AppliedGlob = new org.apache.hadoop.fs.Path(
+        new org.apache.hadoop.fs.Path(v2StateRoot, "generations"),
+        "*/_APPLIED")
+      stateFs.exists(v2HeadPath) shouldBe true
+      Option(stateFs.globStatus(v2ReadyGlob)).fold(0)(_.length) shouldBe 1
+      Option(stateFs.globStatus(v2AppliedGlob)).fold(0)(_.length) shouldBe 0
+
+      val appliedOrder = ArrayBuffer.empty[String]
+      val orderingWriter = new ConditionalObjectWriter {
+        override def read(path: org.apache.hadoop.fs.Path,
+                          hadoopConf: org.apache.hadoop.conf.Configuration): Option[VersionedBytes] =
+          HadoopConditionalObjectWriter.read(path, hadoopConf)
+
+        override def putIfAbsent(path: org.apache.hadoop.fs.Path,
+                                 contents: Array[Byte],
+                                 hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes = {
+          val result = HadoopConditionalObjectWriter.putIfAbsent(path, contents, hadoopConf)
+          if (path.getName == "_APPLIED" && belongsTo(path, v1.batchDataset)) {
+            stateFs.exists(v2HeadPath) shouldBe true
+            Option(stateFs.globStatus(v2ReadyGlob)).fold(0)(_.length) shouldBe 1
+            v1Keys.foreach(key => jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null)
+            v2Keys.foreach(key => jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null)
+            RedisBatchUpload.readStatus(jedisCluster, v2StatusKey) shouldBe None
+            appliedOrder += v1.batchDataset
+          } else if (path.getName == "_APPLIED" && belongsTo(path, v2.batchDataset)) {
+            v2Keys.foreach(key => jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) should not be null)
+            RedisBatchUpload.readStatus(jedisCluster, v2StatusKey) should not be empty
+            appliedOrder += v2.batchDataset
+          }
+          result
+        }
+
+        override def compareAndSet(path: org.apache.hadoop.fs.Path,
+                                   expectedVersion: String,
+                                   contents: Array[Byte],
+                                   hadoopConf: org.apache.hadoop.conf.Configuration): VersionedBytes =
+          HadoopConditionalObjectWriter.compareAndSet(path, expectedVersion, contents, hadoopConf)
+      }
+
+      val v2Upload = Spark2RedisLoader.run(v2, spark, jedisCluster, orderingWriter)
+      // The retry applies the already-admitted generation while resolving its head, then reports the unchanged-source
+      // follow-up from the same invocation.
+      v2Upload.changedKeys shouldBe 0L
+      appliedOrder shouldBe Seq(v1.batchDataset, v2.batchDataset)
+      Option(stateFs.globStatus(v2AppliedGlob)).fold(0)(_.length) shouldBe 1
 
       val retiredStatus = RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get
       retiredStatus.retired shouldBe true

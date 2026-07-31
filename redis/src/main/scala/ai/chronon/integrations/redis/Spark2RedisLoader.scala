@@ -404,8 +404,6 @@ object Spark2RedisLoader {
     while (attempts < MaxAdmissionAttempts) {
       try {
         val summary = runAttempt(effectiveSettings, spark, controlClient, conditionalWriter)
-        if (effectiveSettings.deleteOlderVersions)
-          retireOlderVersions(effectiveSettings, spark, controlClient, conditionalWriter)
         cleanupObsoleteGenerations(effectiveSettings, spark, conditionalWriter)
         return summary
       } catch {
@@ -430,7 +428,25 @@ object Spark2RedisLoader {
                          controlClient: JedisCluster,
                          conditionalWriter: ConditionalObjectWriter): UploadSummary = {
     val tableUtils = TableUtils(spark, settings.partitionSpec)
-    val head = resolveHead(settings, spark, controlClient, conditionalWriter)
+    var priorVersionsRetired = false
+    def retirePriorVersionsOnce(): Unit =
+      if (settings.deleteOlderVersions && !priorVersionsRetired) {
+        retireOlderVersions(settings, spark, controlClient, conditionalWriter)
+        priorVersionsRetired = true
+      }
+
+    val head = resolveHead(
+      settings,
+      spark,
+      controlClient,
+      conditionalWriter,
+      beforeApply = manifest => {
+        require(
+          !manifest.retired,
+          s"Redis dataset ${settings.batchDataset} was explicitly retired in generation ${manifest.status.generation}")
+        retirePriorVersionsOnce()
+      }
+    )
     val statusKey = RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix)
     var redisStatus = RedisBatchUpload.readStatus(controlClient, statusKey)
 
@@ -661,7 +677,11 @@ object Spark2RedisLoader {
 
           if (admitted.generation != generation) throw HeadAdvanced(admitted.generation)
 
-          val committed = resolveHead(settings, spark, controlClient, conditionalWriter)
+          val committed = resolveHead(settings,
+                                      spark,
+                                      controlClient,
+                                      conditionalWriter,
+                                      beforeApply = _ => retirePriorVersionsOnce())
           require(committed.exists(_.status == status), s"Redis generation $generation did not become the S3 head")
           val applied = readCommittedApplied(paths.applied, spark, conditionalWriter).record
           logger.info(
@@ -693,7 +713,8 @@ object Spark2RedisLoader {
   private def resolveHead(settings: Settings,
                           spark: SparkSession,
                           controlClient: JedisCluster,
-                          conditionalWriter: ConditionalObjectWriter): Option[ReadyManifest] = {
+                          conditionalWriter: ConditionalObjectWriter,
+                          beforeApply: ReadyManifest => Unit = _ => ()): Option[ReadyManifest] = {
     readHead(settings, spark, conditionalWriter).map { head =>
       val (manifest, readyBytes) = validateReady(settings, head.record.generation, spark)
       require(Arrays.equals(head.record.readyDigest, sha256(readyBytes)),
@@ -705,23 +726,31 @@ object Spark2RedisLoader {
         validateApplied(readCommittedApplied(paths.applied, spark, conditionalWriter).record,
                         manifest,
                         head.record.readyDigest)
+        beforeApply(manifest)
       } else {
-        // Compute the deadline before the second APPLIED check. Every duplicate applier that can still proceed therefore
-        // has a deadline no later than the first successful applier's completion time plus the generation TTL.
-        val leaseDeadlineMillis = uploadDeadlineMillis(manifest.liveTTLSeconds)
+        val statusKey = RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix)
+        def validatedCurrentStatus(): Option[BatchStatus] = {
+          val status = RedisBatchUpload.readStatus(controlClient, statusKey)
+          status.filter(value => compareStatus(value, manifest.status) > 0).foreach { value =>
+            if (headAdvancedPast(settings, manifest, spark, conditionalWriter)) throw HeadAdvanced(value.generation)
+            throw new IllegalStateException(
+              s"Redis status ${value.generation} is newer than S3 head ${manifest.status.generation}")
+          }
+          status
+        }
+
+        // Validate the serving status before a capacity-first retirement can remove prior-version keys. The callback may
+        // take time, so it is deliberately outside the new generation's lease and followed by another APPLIED/status
+        // check for a concurrent publisher.
+        validatedCurrentStatus()
+        beforeApply(manifest)
         if (pathExists(paths.applied, spark)) {
           validateApplied(readCommittedApplied(paths.applied, spark, conditionalWriter).record,
                           manifest,
                           head.record.readyDigest)
         } else {
-          val currentStatus =
-            RedisBatchUpload.readStatus(controlClient,
-                                        RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix))
-          currentStatus.filter(status => compareStatus(status, manifest.status) > 0).foreach { status =>
-            if (headAdvancedPast(settings, manifest, spark, conditionalWriter)) throw HeadAdvanced(status.generation)
-            throw new IllegalStateException(
-              s"Redis status ${status.generation} is newer than S3 head ${manifest.status.generation}")
-          }
+          val currentStatus = validatedCurrentStatus()
+          val leaseDeadlineMillis = uploadDeadlineMillis(manifest.liveTTLSeconds)
           val recoverFull = requiresFullRecovery(manifest, currentStatus)
           val result = applyGeneration(settings,
                                        manifest,
@@ -1369,10 +1398,10 @@ object Spark2RedisLoader {
     current -> currentBatch
   }
 
-  /** Retires every committed lower numeric version after the current version is fully published. A retirement is an
-    * immutable child generation in the old lineage whose persisted delete set is applied with Redis UNLINK. The
-    * durable retired head and persistent Redis status keep the removed version unavailable while allowing retries to
-    * replay physical deletion idempotently.
+  /** Retires every committed lower numeric version after the replacement is durably admitted but before its Redis
+    * mutations begin. A retirement is an immutable child generation in the old lineage whose persisted delete set is
+    * applied with Redis UNLINK. The durable retired head and persistent Redis status keep the removed version
+    * unavailable while allowing retries to replay physical deletion idempotently.
     */
   private def retireOlderVersions(settings: Settings,
                                   spark: SparkSession,
@@ -1992,9 +2021,10 @@ object Spark2RedisLoader {
   private def validateReady(settings: Settings,
                             generation: String,
                             spark: SparkSession): (ReadyManifest, Array[Byte]) = {
-    val path = generationPaths(settings, generation).ready
+    val paths = generationPaths(settings, generation)
+    val path = paths.ready
     require(pathExists(path, spark), s"Redis S3 head references an incomplete generation: $path")
-    val candidatePath = generationPaths(settings, generation).candidate
+    val candidatePath = paths.candidate
     require(pathExists(candidatePath, spark), s"Redis S3 generation is missing its candidate record: $candidatePath")
     val candidate = decodeCandidate(readBytes(candidatePath, spark))
     require(candidate.generation == generation, s"Redis candidate record does not identify generation $generation")
@@ -2041,8 +2071,10 @@ object Spark2RedisLoader {
     }
     require(manifest.deltaRows == manifest.changedKeys + manifest.deletedKeys + 1,
             s"Redis generation manifest delta count is inconsistent: $path")
+    require(pathExists(paths.state, spark), s"Redis generation $generation is missing its durable state")
+    require(pathExists(paths.delta, spark), s"Redis generation $generation is missing its durable delta")
     if (manifest.tombstoneRows > 0) {
-      require(pathExists(generationPaths(settings, generation).tombstones, spark),
+      require(pathExists(paths.tombstones, spark),
               s"Redis generation $generation is missing retained tombstones")
     }
     manifest -> readyBytes

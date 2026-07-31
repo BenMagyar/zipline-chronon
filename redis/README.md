@@ -85,14 +85,21 @@ publishes a new generation; a refresh of an existing generation uses the TTL rec
 increase or decrease in place, and each new generation uses its configured TTL for both live values and new delete
 fences. Concurrent jobs sharing a cluster must use the same rate while the shared queue is active.
 
-Older-version retirement is opt-in and only runs after the new version is fully published. It recognizes GroupBy names
+Older-version retirement is opt-in. The new version's source snapshot, state, delta, and `_READY` record must first be
+validated and durably admitted as the S3 head; lower versions are then retired before the new Redis mutations begin so
+their memory is available to the replacement upload. This capacity-first cutover can leave the feature unavailable if
+the replacement apply is interrupted, but the admitted immutable generation is replayed by the next invocation. For a
+fresh version, invalid or empty replacement snapshots fail before retirement. The loader recognizes GroupBy names
 ending in `__<number>`, discovers lower versions from the durable state root, and CAS-admits an immutable retired child
 generation in each old lineage. That child first publishes a small persistent retired status and then physically removes
-the old active keys, retained tombstones, and serving metadata with Redis `UNLINK`. `UNLINK` makes each key immediately
-absent while reclaiming its value memory asynchronously off the Redis command thread. A missing state root or an old
-lineage without a `_HEAD` is a no-op; a headed but corrupt lineage fails cleanup so leaked live keys are not silently
-ignored. Retired heads written by the earlier tombstone-based protocol are migrated once to a zero-tombstone physical
-delete generation. The immutable S3 delete set makes an interrupted cleanup replayable and a Redis restore recoverable.
+the old active keys,
+retained tombstones, and serving metadata with Redis `UNLINK`. `UNLINK` makes each key immediately absent while reclaiming
+its value memory asynchronously off the Redis command thread. The bounded retirement status and rate-limiter scripts
+remain executable above `maxmemory`, so cleanup can reach `UNLINK`; replacement writes retain their OOM retry while
+asynchronous reclamation catches up. A missing state root or an old lineage without a `_HEAD` is a no-op; a headed but
+corrupt lineage fails cleanup so leaked live keys are not silently ignored. Retired heads written by the earlier
+tombstone-based protocol are migrated once to a zero-tombstone physical delete generation. The immutable S3 delete set
+makes an interrupted cleanup replayable and a Redis restore recoverable.
 
 ## Publication Protocol
 

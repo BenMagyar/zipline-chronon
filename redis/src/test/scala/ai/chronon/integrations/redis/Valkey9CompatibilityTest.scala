@@ -8,6 +8,7 @@ import org.testcontainers.containers.GenericContainer
 import org.testcontainers.containers.wait.strategy.Wait
 import org.testcontainers.utility.DockerImageName
 import redis.clients.jedis.{Connection, DefaultJedisClientConfig, HostAndPort, HostAndPortMapper, JedisCluster}
+import redis.clients.jedis.exceptions.JedisDataException
 
 import java.nio.charset.StandardCharsets
 import scala.jdk.CollectionConverters._
@@ -134,6 +135,30 @@ class Valkey9CompatibilityTest extends AnyFlatSpec with BeforeAndAfterAll with M
     val status = RedisBatchUpload.BatchStatus("valkey9-generation", "2026-07-27", 2000L, 2L)
     RedisBatchUpload.writeStatus(client, statusKey, status) shouldBe 1L
     RedisBatchUpload.readStatus(client, statusKey) shouldBe Some(status)
+  }
+
+  it should "run bounded retirement control writes above maxmemory" in {
+    val statusKey = RedisBatchUpload.buildStatusKey("VALKEY9_OOM_BATCH", "chronon")
+    val active = RedisBatchUpload.BatchStatus("active", "2026-07-30", 3000L, 1L)
+    val retired = RedisBatchUpload.BatchStatus("retired", "2026-07-30", 3000L, 2L, retired = true)
+    val probeKey = "chronon:{VALKEY9_OOM_BATCH}:probe"
+
+    RedisBatchUpload.writeStatus(client, statusKey, active) shouldBe 1L
+    RedisBatchUpload.reserveRate(client, RedisBatchUpload.RateLimiterKey, 1, 100000, 1) should be >= 0L
+    try {
+      client.configSet("maxmemory-policy", "noeviction") shouldBe "OK"
+      client.configSet("maxmemory", "1") shouldBe "OK"
+      an[JedisDataException] should be thrownBy client.set(probeKey, "cannot-allocate")
+      client.scriptFlush()
+
+      RedisBatchUpload.writeStatus(client, statusKey, retired) shouldBe 1L
+      RedisBatchUpload.readStatus(client, statusKey) shouldBe Some(retired)
+      RedisBatchUpload.reserveRate(client, RedisBatchUpload.RateLimiterKey, 1, 100000, 1) should be >= 0L
+    } finally {
+      client.configSet("maxmemory", "0")
+      client.configSet("maxmemory-policy", "noeviction")
+      Seq(statusKey, RedisBatchUpload.RateLimiterKey, probeKey).foreach(key => client.unlink(key))
+    }
   }
 
   it should "set no-touch mode on direct and pipeline connections without changing control clients" in {

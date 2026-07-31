@@ -303,7 +303,7 @@ object RedisBatchUpload {
       |""".stripMargin.getBytes(StandardCharsets.UTF_8)
 
   private val SetStatusIfNewerScript: Array[Byte] =
-    """
+    """#!lua flags=allow-oom
       |local function numberAt(value, startIndex)
       |  local result = 0
       |  for i = startIndex, startIndex + 7 do result = result * 256 + string.byte(value, i) end
@@ -357,8 +357,10 @@ object RedisBatchUpload {
 
   // Reserve one position on a cluster-wide virtual timeline. A reservation counts attempted key commands, not
   // pipeline requests. The configured burst allows at most one full pipeline batch immediately after an idle period.
+  // Status and limiter state are bounded control-plane records and must remain writable above maxmemory so a retired
+  // generation can reach its allocation-free UNLINK operations and release capacity.
   private val ReserveRateScript: Array[Byte] =
-    """
+    """#!lua flags=allow-oom
       |local nowParts = redis.call('TIME')
       |local now = tonumber(nowParts[1]) * 1000 + math.floor(tonumber(nowParts[2]) / 1000)
       |local requestedCount = tonumber(ARGV[1])
