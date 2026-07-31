@@ -61,7 +61,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
         spark.sql(s"""
           INSERT INTO $partitionedDeltaTable VALUES
             (1, '2024-01-01'),
-            (2, '2024-01-03')
+            (2, '2024-01-02')
         """)
 
         spark.sql(s"""
@@ -93,7 +93,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
           nodeName = "driver_readiness",
           tableDependencies = Seq(
             dependency(deltaTable),
-            dependency(partitionedDeltaTable, partitionColumn = "ds", timePartitioned = false),
+            dependency(partitionedDeltaTable, partitionColumn = "ds", timePartitioned = true),
             dependency(icebergTable)
           ),
           stepDays = Some(1),
@@ -122,9 +122,9 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
         byTable.values.foreach { status =>
           status.firstAvailablePartition shouldBe Some("2024-01-01")
         }
-        byTable(deltaTable).lastAvailablePartition shouldBe Some("2024-01-02")
-        byTable(icebergTable).lastAvailablePartition shouldBe Some("2024-01-02")
-        byTable(partitionedDeltaTable).lastAvailablePartition shouldBe Some("2024-01-03")
+        byTable(deltaTable).lastAvailablePartition shouldBe Some("2024-01-01")
+        byTable(icebergTable).lastAvailablePartition shouldBe Some("2024-01-01")
+        byTable(partitionedDeltaTable).lastAvailablePartition shouldBe Some("2024-01-02")
         val submittedJobs = spark.sparkContext.statusTracker.getJobIdsForGroup(jobGroup).toSeq
         withClue(s"readiness submitted Spark jobs: ${submittedJobs.mkString(", ")}") {
           submittedJobs shouldBe empty

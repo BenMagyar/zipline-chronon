@@ -15,9 +15,9 @@ import ai.chronon.spark.join.UnionJoin
 import ai.chronon.spark.submission.{NodeConfReader, SparkSessionBuilder}
 import ai.chronon.spark.utils.SemanticUtils
 import ai.chronon.spark.{GroupBy, GroupByUpload, Join, ModelTransformsJob, RunnerUtils}
+import org.apache.spark.sql.types.{DateType, NumericType, TimestampNTZType, TimestampType}
 import org.rogach.scallop.{ScallopConf, ScallopOption}
 import org.slf4j.{Logger, LoggerFactory}
-import org.apache.spark.sql.types.StringType
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -128,7 +128,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     if (hasPartitionColumn) {
       val readinessCoverage = BatchNodeRunner
         .timePartitionedReadinessCoverage(tableUtils)
-        .filter(_ => BatchNodeRunner.readinessCoverageApplies(tableName, tableInfo, tableUtils))
+        .filter(coverage => BatchNodeRunner.readinessCoverageApplies(tableName, tableInfo, tableUtils, coverage))
       @tailrec
       def retry(attempt: Long): Try[Unit] = {
         Try {
@@ -665,7 +665,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
           val tableInfo = deps.head.tableInfo
           val inputPartitionSpec = tableInfo.partitionSpec(tableUtils.partitionSpec)
           val readinessCoverage = configuredReadinessCoverage
-            .filter(_ => BatchNodeRunner.readinessCoverageApplies(table, tableInfo, tableUtils))
+            .filter(coverage => BatchNodeRunner.readinessCoverageApplies(table, tableInfo, tableUtils, coverage))
           val (watermark, requiredEndMillis) = readinessCoverage match {
             case Some(coverage) =>
               (tableUtils
@@ -842,9 +842,13 @@ object BatchNodeRunner {
 
   private[batch] def readinessCoverageApplies(tableName: String,
                                               tableInfo: TableInfo,
-                                              tableUtils: TableUtils): Boolean =
-    (tableInfo.isSetTimePartitioned && tableInfo.timePartitioned) ||
-      tableUtils.partitionColumnType(tableName, tableInfo.partitionColumn) != StringType
+                                              tableUtils: TableUtils,
+                                              coverage: Double): Boolean =
+    tableUtils.partitionColumnType(tableName, tableInfo.partitionColumn) match {
+      case TimestampType | TimestampNTZType | _: NumericType => true
+      case DateType                                          => coverage == 0.0
+      case _                                                 => false
+    }
 
   def main(args: Array[String]): Unit = {
     val batchArgs = new BatchNodeRunnerArgs(args)

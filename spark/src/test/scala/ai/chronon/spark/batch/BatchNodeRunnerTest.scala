@@ -1666,6 +1666,35 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     runner.checkPartitions(sensorFor(dep), sixOClockFire).isSuccess shouldBe true
   }
 
+  it should "keep time-partitioned string labels on legacy readiness" in {
+    spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "0.8")
+    createSubDailyPartsTable()
+
+    val dep = TableDependencies.fromTable(
+      "test_db.subdaily_parts",
+      subDailyQuery().setTimePartitioned(true)
+    )
+    val runner = defaultRunner()
+    val sixOClockFire = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
+
+    runner.checkPartitions(sensorFor(dep), sixOClockFire).isSuccess shouldBe true
+
+    implicit val partitionSpec: PartitionSpec = threeHourSpec
+    val metadata = MetaDataUtils.layer(
+      baseMetadata = new MetaData().setOutputNamespace("test_db").setTeam("test_team"),
+      modeName = "backfill",
+      nodeName = "string_coverage_preflight",
+      tableDependencies = Seq(dep),
+      stepDays = Some(1),
+      outputTableOverride = Some("test_db.output_table")
+    )
+    val status = runner.computeInputTablePartitionStatuses(metadata, sixOClockFire, tableUtils).toSeq.head
+
+    status.ready shouldBe true
+    status.lastAvailablePartition shouldBe Some("2024-01-01-06-00")
+    status.requiredEndMillis shouldBe threeHourSpec.partitionEndMillis("2024-01-01-06-00")
+  }
+
   it should "require the configured fraction of the final dependency partition" in {
     BatchNodeRunner.timePartitionedReadinessCoverage(tableUtils) shouldBe None
     spark.conf.set(BatchNodeRunner.TimePartitionedReadinessCoverageConf, "1.1")
