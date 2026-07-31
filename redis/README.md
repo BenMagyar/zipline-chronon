@@ -43,7 +43,7 @@ Connection settings retain their existing environment aliases for secrets and ru
 | `REDIS_SO_TIMEOUT_MS` | `redis.so.timeout.ms` | `2000` |
 | `REDIS_MAX_REDIRECTIONS` | `redis.max.redirections` | `5` |
 | `REDIS_PIPELINE_SYNC_THREADS` | `redis.pipeline.sync.threads` | `12` |
-| `REDIS_CLIENT` | `redis.client` | `jedis` |
+| `REDIS_CLIENT` | `redis.client` | `glide` |
 | `REDIS_READ_FROM` | `redis.read.from` | `primary` |
 
 Environment variables take precedence over submitted properties. Prefer environment variables for credentials. Bulk
@@ -51,9 +51,9 @@ writers use a small internal pool and do not validate a connection on every borr
 
 ### Serving client boundary
 
-`REDIS_CLIENT` selects the client used by the fetcher's hot `multiGet` path. The default, `jedis`, preserves the existing
-behavior. Setting it to `glide` adds a GLIDE cluster client for batch and streaming feature reads, but does not replace
-Jedis throughout the store. Status reads, `list`/scan, `multiPut`, incremental batch publication, Lua
+`REDIS_CLIENT` selects the client used by the fetcher's hot `multiGet` path. The default, `glide`, adds a GLIDE cluster
+client for batch and streaming feature reads. Setting it to `jedis` restores the previous hot-read path. GLIDE does not
+replace Jedis throughout the store: status reads, `list`/scan, `multiPut`, incremental batch publication, Lua
 commands, and rate-limit/control operations continue to use Jedis. These operations and all writes remain primary-routed.
 This split makes the serving-read migration independently reversible without changing the publication protocol.
 
