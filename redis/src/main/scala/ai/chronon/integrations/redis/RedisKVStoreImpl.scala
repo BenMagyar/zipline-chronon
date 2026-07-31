@@ -36,9 +36,8 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, Da
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.Base64
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{
-  CompletableFuture,
   CompletionException,
   ExecutionException,
   LinkedBlockingQueue,
@@ -52,6 +51,7 @@ import scala.collection.mutable
 import scala.concurrent.{Await, Future, Promise}
 import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 import scala.concurrent.duration._
 
 /** Redis Cluster-based KV store implementation with hash tags for load distribution.
@@ -182,24 +182,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
             }
           }
         case Some(_) =>
-          val startedAt = System.currentTimeMillis()
-          Future {
-            recordReadPhase("multiGet.plan.latency") {
-              val defaultEndTs = System.currentTimeMillis()
-              requests.map(request => planRead(request, defaultEndTs))
-            }
-          }.flatMap { plans =>
-            val redisPlans = plans.collect { case plan: RedisReadPlan => plan }
-            executeGlideReads(redisPlans).map(results => buildReadResponses(plans, results))
-          }.map { responses =>
-            if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
-            responses
-          }.recover { case e: Exception =>
-            logger.error("Error getting values from Redis Cluster", e)
-            val responses = requests.map(request => GetResponse(request, Failure(e)))
-            if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
-            responses
-          }
+          multiGetWithGlide(requests)
       }
     }
   }
@@ -214,7 +197,118 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
     responses
   }
 
-  private def executeGlideReads(plans: Seq[RedisReadPlan]): Future[Seq[Try[Seq[TimedValue]]]] = {
+  private final class PreparedGlideReads(val commands: IndexedSeq[GlideReadCommand],
+                                         val commandRanges: Array[Range],
+                                         val mgetValueIndexes: Array[Int])
+
+  /** Runs one GLIDE multi-get with exactly two shared-executor tasks on the success path:
+    *   1. Chronon read planning, GLIDE command planning, and native submission;
+    *   2. native-result decoding, response construction, metrics, and promise completion.
+    *
+    * The native future waits on GLIDE's own event loop. Its callback only timestamps completion and submits task 2, so
+    * no chronon-fetcher worker is occupied while Redis is in flight.
+    */
+  private def multiGetWithGlide(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = {
+    val startedAt = System.currentTimeMillis()
+    val responsePromise = Promise[Seq[GetResponse]]()
+
+    def completeSuccess(responses: Seq[GetResponse]): Unit = responsePromise.synchronized {
+      if (!responsePromise.isCompleted) {
+        if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
+        responsePromise.success(responses)
+      }
+    }
+
+    def completeFailure(error: Exception): Unit = responsePromise.synchronized {
+      if (!responsePromise.isCompleted) {
+        try {
+          logger.error("Error getting values from Redis Cluster", error)
+          val responses = requests.map(request => GetResponse(request, Failure(error)))
+          if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
+          responsePromise.success(responses)
+        } catch {
+          case completionError: Throwable =>
+            responsePromise.tryFailure(completionError)
+            if (!NonFatal(completionError)) throw completionError
+        }
+      }
+    }
+
+    def failOuter(error: Throwable): Unit = responsePromise.synchronized {
+      if (!responsePromise.isCompleted) responsePromise.failure(error)
+    }
+
+    def completeAsyncFailure(error: Throwable): Unit = error match {
+      case exception: Exception => completeFailure(exception)
+      case other                => failOuter(other)
+    }
+
+    def completeThrown(error: Throwable): Unit = error match {
+      case exception: Exception => completeFailure(exception)
+      case other =>
+        failOuter(other)
+        if (!NonFatal(other)) throw other
+    }
+
+    def submit(task: Runnable): Unit =
+      try executionContext.execute(task)
+      catch {
+        case error: Throwable => completeThrown(error)
+      }
+
+    submit(
+      new Runnable {
+        override def run(): Unit = {
+          try {
+            val plans = recordReadPhase("multiGet.plan.latency") {
+              val defaultEndTs = System.currentTimeMillis()
+              requests.map(request => planRead(request, defaultEndTs))
+            }
+            val redisPlans = plans.collect { case plan: RedisReadPlan => plan }.toIndexedSeq
+            val prepared = prepareGlideReads(redisPlans)
+            val nativeStartedAtNanos = System.nanoTime()
+            val nativeFuture = glideReadClient.get.execute(prepared.commands)
+
+            nativeFuture.whenComplete(new BiConsumer[IndexedSeq[Try[GlideReadResult]], Throwable] {
+              override def accept(commandResults: IndexedSeq[Try[GlideReadResult]], nativeError: Throwable): Unit = {
+                val nativeCompletedAtNanos = System.nanoTime()
+                val completionTask = new Runnable {
+                  override def run(): Unit = {
+                    try {
+                      if (nativeError != null) {
+                        completeAsyncFailure(unwrapCompletionError(nativeError))
+                      } else {
+                        val decodeStartedAtNanos = System.nanoTime()
+                        recordReadDuration("multiGet.glide.completion_queue.latency",
+                                           nativeCompletedAtNanos,
+                                           decodeStartedAtNanos)
+                        val redisResults = decodeGlideReads(redisPlans, prepared, commandResults, decodeStartedAtNanos)
+                        val responses = buildReadResponses(plans, redisResults)
+                        completeSuccess(responses)
+                      }
+                    } catch {
+                      case error: Throwable => completeThrown(error)
+                    }
+                  }
+                }
+
+                submit(completionTask)
+                // Submit the completion task first so metric reporting on GLIDE's callback thread is not counted as
+                // shared-executor completion-queue latency.
+                recordReadDuration("multiGet.glide.native.latency", nativeStartedAtNanos, nativeCompletedAtNanos)
+              }
+            })
+          } catch {
+            case error: Throwable => completeThrown(error)
+          }
+        }
+      }
+    )
+
+    responsePromise.future
+  }
+
+  private def prepareGlideReads(plans: IndexedSeq[RedisReadPlan]): PreparedGlideReads = {
     val commands = mutable.ArrayBuffer.empty[GlideReadCommand]
     val commandRanges = Array.fill[Range](plans.size)(0 until 0)
     val mgetValueIndexes = Array.fill(plans.size)(-1)
@@ -264,31 +358,29 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
 
     if (recordReadMetrics)
       metricsContext.distribution("multiGet.glide.command_count", commands.size.toLong, redisReadMetricTags)
-    val nativeStartedAtNanos = System.nanoTime()
-    val nativeCompletedAtNanos = new AtomicLong(nativeStartedAtNanos)
-    completableToScala(glideReadClient.get.execute(commands.toIndexedSeq), nativeStartedAtNanos, nativeCompletedAtNanos)
-      .map { commandResults =>
-        val decodeStartedAtNanos = System.nanoTime()
-        recordReadDuration("multiGet.glide.completion_queue.latency",
-                           nativeCompletedAtNanos.get(),
-                           decodeStartedAtNanos)
-        require(
-          commandResults.size == commands.size,
-          s"GLIDE returned ${commandResults.size} command results for ${commands.size} commands"
-        )
-        val decoded = plans.indices.map { index =>
-          val plan = plans(index)
-          val range = commandRanges(index)
-          plan match {
-            case batchPlan: BatchReadPlan if mgetValueIndexes(index) >= 0 =>
-              decodeGlideMGet(batchPlan, commandResults(range.start), mgetValueIndexes(index))
-            case _ =>
-              decodeGlideRead(plan, commandResults.slice(range.start, range.end))
-          }
-        }
-        recordReadDuration("multiGet.glide.decode.latency", decodeStartedAtNanos, System.nanoTime())
-        decoded
+    new PreparedGlideReads(commands.toIndexedSeq, commandRanges, mgetValueIndexes)
+  }
+
+  private def decodeGlideReads(plans: IndexedSeq[RedisReadPlan],
+                               prepared: PreparedGlideReads,
+                               commandResults: IndexedSeq[Try[GlideReadResult]],
+                               decodeStartedAtNanos: Long): Seq[Try[Seq[TimedValue]]] = {
+    require(
+      commandResults.size == prepared.commands.size,
+      s"GLIDE returned ${commandResults.size} command results for ${prepared.commands.size} commands"
+    )
+    val decoded = plans.indices.map { index =>
+      val plan = plans(index)
+      val range = prepared.commandRanges(index)
+      plan match {
+        case batchPlan: BatchReadPlan if prepared.mgetValueIndexes(index) >= 0 =>
+          decodeGlideMGet(batchPlan, commandResults(range.start), prepared.mgetValueIndexes(index))
+        case _ =>
+          decodeGlideRead(plan, commandResults.slice(range.start, range.end))
       }
+    }
+    recordReadDuration("multiGet.glide.decode.latency", decodeStartedAtNanos, System.nanoTime())
+    decoded
   }
 
   private def decodeGlideMGet(batchPlan: BatchReadPlan,
@@ -322,22 +414,6 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
         case (_, Failure(error)) => Failure(error)
       }
       members.map(decodeStreamingMembers)
-  }
-
-  private def completableToScala[A](future: CompletableFuture[A],
-                                    startedAtNanos: Long,
-                                    completedAtNanos: AtomicLong): Future[A] = {
-    val promise = Promise[A]()
-    future.whenComplete(new BiConsumer[A, Throwable] {
-      override def accept(result: A, error: Throwable): Unit = {
-        val completedAt = System.nanoTime()
-        completedAtNanos.set(completedAt)
-        if (error == null) promise.trySuccess(result)
-        else promise.tryFailure(unwrapCompletionError(error))
-        recordReadDuration("multiGet.glide.native.latency", startedAtNanos, completedAt)
-      }
-    })
-    promise.future
   }
 
   private def unwrapCompletionError(error: Throwable): Throwable = error match {

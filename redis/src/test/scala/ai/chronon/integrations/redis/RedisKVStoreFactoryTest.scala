@@ -103,7 +103,7 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
   it should "reject invalid GLIDE routing combinations" in {
     val base = Map(PropRedisClusterNodes -> "localhost:6379")
     Seq(
-      base ++ Map(PropRedisReadFrom -> RedisReadFromAllNodes),
+      base ++ Map(PropRedisClient -> RedisClientJedis, PropRedisReadFrom -> RedisReadFromAllNodes),
       base ++ Map(PropRedisClient -> RedisClientGlide, PropRedisReadFrom -> "prefer-replica"),
       base ++ Map(PropRedisClient -> RedisClientGlide, PropRedisReadFrom -> "az-affinity"),
       base ++ Map(PropRedisClient -> RedisClientGlide,
@@ -125,6 +125,7 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
     val settings = RedisKVStoreFactory.settings(
       Map(
         PropRedisClusterNodes -> "localhost:6379",
+        PropRedisClient -> RedisClientJedis,
         PropRedisConnectionTimeoutMs -> "0",
         PropRedisSoTimeoutMs -> "0"
       ),
@@ -134,6 +135,16 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
     settings.client shouldBe RedisClientJedis
     settings.connectionTimeoutMs shouldBe 0
     settings.soTimeoutMs shouldBe 0
+  }
+
+  it should "use GLIDE by default" in {
+    val settings = RedisKVStoreFactory.settings(
+      Map(PropRedisClusterNodes -> "localhost:6379"),
+      env = Map.empty
+    )
+
+    settings.client shouldBe RedisClientGlide
+    settings.readFrom shouldBe RedisReadFromPrimary
   }
 
   it should "give process environment values precedence over submitted properties" in {

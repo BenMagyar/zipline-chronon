@@ -31,7 +31,7 @@ object RedisKVStoreConstants {
   val RedisReadFromPrimary = "primary"
   val RedisReadFromAllNodes = "all-nodes"
   val RedisReadFromAzAffinityReplicasAndPrimary = "az-affinity-replicas-and-primary"
-  val DefaultRedisClient = RedisClientJedis
+  val DefaultRedisClient = RedisClientGlide
   val DefaultGlideExecutionMode = GlideExecutionClusterBatch
   val DefaultRedisReadFrom = RedisReadFromPrimary
   val DefaultRedisClientAzPath = "/etc/podinfo/availability-zone"
