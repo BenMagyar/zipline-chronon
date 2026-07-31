@@ -157,3 +157,66 @@ def selects(*args, **kwargs):
     for k, v in kwargs.items():
         result[k] = v
     return result
+
+
+# Sentinel distinguishing "no ELSE branch" (SQL defaults to NULL) from an
+# explicit `.else_(None)` (which also renders NULL but is author-intended).
+_NO_DEFAULT = object()
+
+
+class CaseWhen(str):
+    """Fluent builder for a SQL ``CASE WHEN`` expression.
+
+    Renders to a plain SQL string, so it can be used directly as a `selects`
+    value (or anywhere a SQL expression string is expected)::
+
+        when("status = 'failed'", "amount").when("status = 'pending'", "0").else_(-1)
+        # -> "CASE WHEN status = 'failed' THEN amount WHEN status = 'pending' THEN 0 ELSE -1 END"
+
+    Omitting ``else_`` leaves the default as SQL ``NULL``. ``condition`` and
+    ``value`` are raw SQL expressions (a Python ``None`` renders as ``NULL``);
+    string *literals* must be quoted by the caller (e.g. ``"'SMS'"``).
+    """
+
+    def __new__(cls, branches, default=_NO_DEFAULT):
+        obj = super().__new__(cls, cls._render(branches, default))
+        obj._branches = branches
+        obj._default = default
+        return obj
+
+    @staticmethod
+    def _to_sql(value) -> str:
+        return "NULL" if value is None else str(value)
+
+    @classmethod
+    def _render(cls, branches, default) -> str:
+        parts = ["CASE"]
+        for condition, value in branches:
+            parts.append(f"WHEN {condition} THEN {cls._to_sql(value)}")
+        if default is not _NO_DEFAULT:
+            parts.append(f"ELSE {cls._to_sql(default)}")
+        parts.append("END")
+        return " ".join(parts)
+
+    def when(self, condition: str, value) -> "CaseWhen":
+        return CaseWhen(self._branches + [(condition, value)], self._default)
+
+    def else_(self, default) -> "CaseWhen":
+        return CaseWhen(self._branches, default)
+
+    # `else` is a reserved keyword in Python; `otherwise` mirrors Spark's Column API.
+    otherwise = else_
+
+    # deepcopy/copy of a `str` subclass would otherwise re-invoke __new__ with the
+    # rendered string rather than (branches, default); reconstruct explicitly so the
+    # object survives `deepcopy(source)` during GroupBy compilation.
+    def __deepcopy__(self, memo) -> "CaseWhen":
+        return CaseWhen(list(self._branches), self._default)
+
+    def __copy__(self) -> "CaseWhen":
+        return CaseWhen(list(self._branches), self._default)
+
+
+def when(condition: str, value) -> CaseWhen:
+    """Start a SQL ``CASE WHEN`` expression. See :class:`CaseWhen`."""
+    return CaseWhen([(condition, value)])

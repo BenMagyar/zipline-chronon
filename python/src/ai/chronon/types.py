@@ -16,6 +16,8 @@ from ai.chronon.derivation import Derivation  # noqa: F401
 # source related concepts
 Query = query.Query
 selects = query.selects
+when = query.when
+CaseWhen = query.CaseWhen
 
 Source = ttypes.Source
 EventSource = source.EventSource

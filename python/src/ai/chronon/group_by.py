@@ -273,6 +273,8 @@ def Aggregation(
     windows: Union[List[common.Window], List[str]] = None,
     buckets: List[str] = None,
     tags: Dict[str, str] = None,
+    filter: str = None,
+    column_alias: str = None,
 ) -> ttypes.Aggregation:
     """
     :param input_column:
@@ -292,6 +294,17 @@ def Aggregation(
         Besides the GroupBy.keys, this is another level of keys for use under this aggregation.
         Using this would create an output as a map of string to aggregate.
     :type buckets: List[str]
+    :param filter:
+        Optional SQL boolean expression restricting which rows feed this aggregation.
+        Compiled away in the Python layer into a `CASE WHEN (<filter>) THEN <input_column>
+        ELSE NULL END` column on the source `selects` (non-matching rows become NULL and are
+        skipped by every operation). Use AND/OR/parentheses for compound conditions. Requires
+        `column_alias` so the output feature has an explicit, collision-free name.
+    :type filter: str
+    :param column_alias:
+        Output-name prefix, replacing `input_column`; the feature becomes
+        `<column_alias>_<op>_<window>`. Only valid together with `filter`.
+    :type column_alias: str
     :return: An aggregate defined with the specified operation.
     """
     # Default to last
@@ -305,6 +318,10 @@ def Aggregation(
     agg = ttypes.Aggregation(input_column, operation, arg_map, norm_windows, buckets)
 
     agg.tags = tags
+    # Carried as attributes (like `tags`) and consumed by GroupBy() at compile time; not
+    # thrift fields. See _desugar_agg_filters.
+    agg.filter = filter
+    agg.column_alias = column_alias
     return agg
 
 
@@ -489,6 +506,87 @@ def get_output_col_names(aggregation):
         bucketed_names = windowed_names
 
     return bucketed_names
+
+
+def _desugar_agg_filters(
+    aggregations: Optional[List[ttypes.Aggregation]],
+    keys: List[str],
+) -> Tuple[Optional[List[ttypes.Aggregation]], Dict[str, str]]:
+    """Desugar per-aggregation `filter` / `column_alias` into synthetic `selects` columns.
+
+    For each aggregation carrying a `filter`, generate a
+    ``CASE WHEN (<filter>) THEN <input_column> ELSE NULL END`` column named after
+    `column_alias`, repoint the aggregation's `inputColumn` to it, and return the mapping of
+    generated columns to inject into every source's `selects`. This keeps the authored source
+    clean while reusing Chronon's existing null-skipping aggregation path (identical in Spark
+    and Flink) -- no engine changes needed.
+
+    Returns the (possibly rewritten) aggregations and the generated `{alias: expr}` selects.
+    """
+    if not aggregations:
+        return aggregations, {}
+
+    has_filter = any(getattr(a, "filter", None) for a in aggregations)
+    has_alias = any(getattr(a, "column_alias", None) for a in aggregations)
+    if not has_filter and not has_alias:
+        return aggregations, {}
+
+    # Repointing inputColumn mutates the aggregation, so operate on a copy to avoid
+    # surprising callers that reuse Aggregation objects across GroupBys.
+    aggregations = deepcopy(aggregations)
+    # Names a generated alias column must never clobber: GroupBy keys, the reserved `ts`
+    # time-column keyword, and every aggregation's (original) input column. All of these are
+    # materialized as identity `selects` during normalization (even when Query(selects=None)),
+    # so overwriting one with the CASE WHEN would silently corrupt the grouping key, the time
+    # column, or another aggregation's input. Computed before the loop repoints inputColumns.
+    reserved = set(keys or []) | {"ts"} | {a.inputColumn for a in aggregations if a.inputColumn}
+    filter_selects: Dict[str, str] = {}
+    for agg in aggregations:
+        agg_filter = getattr(agg, "filter", None)
+        alias = getattr(agg, "column_alias", None)
+        if alias and not agg_filter:
+            raise ValueError(
+                f"column_alias '{alias}' is set without a filter on input_column "
+                f"'{agg.inputColumn}'. column_alias only names a filtered aggregation; "
+                "use derivations to rename an unfiltered output."
+            )
+        if not agg_filter:
+            continue
+        if not alias:
+            raise ValueError(
+                f"filter '{agg_filter}' on input_column '{agg.inputColumn}' requires a "
+                "column_alias to name the resulting feature column."
+            )
+        if alias in reserved:
+            raise ValueError(
+                f"column_alias '{alias}' collides with a reserved column name (a GroupBy key, "
+                "the 'ts' time keyword, or an aggregation input_column). "
+                "Choose a distinct column_alias."
+            )
+        expr = f"CASE WHEN ({agg_filter}) THEN {agg.inputColumn} ELSE NULL END"
+        existing = filter_selects.get(alias)
+        if existing is not None and existing != expr:
+            raise ValueError(
+                f"column_alias '{alias}' maps to two different filtered expressions:\n"
+                f"  {existing}\n  {expr}\nUse distinct column_alias values."
+            )
+        filter_selects[alias] = expr
+        agg.inputColumn = alias
+
+    # Reject duplicate output feature names (common once one column is aggregated under
+    # multiple filters). Only enforced when filter/alias is in play, so existing configs
+    # are unaffected.
+    seen = set()
+    for agg in aggregations:
+        for name in get_output_col_names(agg):
+            if name in seen:
+                raise ValueError(
+                    f"Aggregations produce duplicate output column '{name}'. "
+                    "Set a distinct column_alias to disambiguate."
+                )
+            seen.add(name)
+
+    return aggregations, filter_selects
 
 
 def GroupBy(
@@ -693,6 +791,10 @@ def GroupBy(
         f"Version must be an integer or None, but found {type(version).__name__}"
     )
 
+    # Desugar per-aggregation filter/column_alias into synthetic CASE WHEN selects
+    # (injected per source in _sanitize_columns) before we collect input columns.
+    aggregations, _filter_selects = _desugar_agg_filters(aggregations, keys)
+
     agg_inputs = []
     if aggregations is not None:
         agg_inputs = [agg.inputColumn for agg in aggregations]
@@ -709,9 +811,21 @@ def GroupBy(
 
         if query.selects is None:
             query.selects = {}
+        # Snapshot the author's own select keys before we add anything, so the collision
+        # check below only flags user-defined columns (not our identity placeholders).
+        authored_selects = set(query.selects.keys())
         for col in required_columns:
             if col not in query.selects:
                 query.selects[col] = col
+        # Inject the desugared filter columns, overriding the identity placeholder the loop
+        # above added for the alias (which is now a repointed inputColumn).
+        for alias, expr in _filter_selects.items():
+            if alias in authored_selects:
+                raise ValueError(
+                    f"column_alias '{alias}' collides with an existing select in the "
+                    "source. Choose a different column_alias."
+                )
+            query.selects[alias] = expr
         if "ts" in query.selects:  # ts cannot be in selects.
             ts = query.selects["ts"]
             del query.selects["ts"]

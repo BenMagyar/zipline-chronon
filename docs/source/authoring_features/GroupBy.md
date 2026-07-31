@@ -120,6 +120,57 @@ Here's what the above example looks like modified to include buckets. Note that 
 
 See the [Bucketed Example](#bucketed-groupby-example)
 
+### Filtering
+
+By default an aggregation consumes every row of the source. To aggregate only the rows matching a
+condition, add a `filter` (a SQL boolean expression) and a `column_alias` to name the resulting
+feature. For example, to count only the `SMS` sign-ups per device:
+
+```python
+Aggregation(
+    input_column="requestId",
+    operation=Operation.COUNT,
+    windows=[Window(1, TimeUnit.DAYS)],
+    filter="intent = 'SMS'",       # only rows where this is true feed the aggregation
+    column_alias="smsRequest",     # output feature -> smsRequest_count_1d
+)
+```
+
+- `filter` is any SQL boolean expression over the source's columns; combine conditions with `AND` / `OR` / parentheses.
+- `column_alias` replaces `input_column` in the output name (`<column_alias>_<op>_<window>`) and is **required** whenever `filter` is set. It keeps names explicit, so one column can be aggregated under several filters without colliding.
+- The filter composes with `windows` and `buckets`.
+
+The same source column can back multiple filtered features:
+
+```python
+aggregations=[
+    Aggregation(input_column="phoneNumber", operation=Operation.COUNT, windows=[Window(1, TimeUnit.DAYS)],
+                filter="status = 'failed'",  column_alias="failedPhoneNumber"),   # -> failedPhoneNumber_count_1d
+    Aggregation(input_column="phoneNumber", operation=Operation.COUNT, windows=[Window(1, TimeUnit.DAYS)],
+                filter="status = 'success'", column_alias="successPhoneNumber"),  # -> successPhoneNumber_count_1d
+]
+```
+
+> `COUNT` counts non-null values of `input_column`, so a filtered `COUNT` counts rows where the predicate holds **and** `input_column` is non-null. To count all matching rows, point `COUNT` at a non-null column such as a key/id.
+
+#### Conditional values with `when` / `else`
+
+`filter` chooses *which rows* count. To compute *what value* to aggregate, use the `when`/`else` builder,
+which renders a SQL `CASE WHEN … END` expression for use in a source's `selects`:
+
+```python
+from ai.chronon.types import when
+
+Query(selects={
+    "adjusted_amount": when("region = 'US'", "amount * 1.1")
+                       .when("region = 'EU'", "amount * 1.2")
+                       .else_("amount"),
+    # -> "CASE WHEN region = 'US' THEN amount * 1.1 WHEN region = 'EU' THEN amount * 1.2 ELSE amount END"
+})
+```
+
+Chain `.when(...)` for more branches; `.otherwise(...)` aliases `.else_(...)`. Omitting the else defaults to `NULL`. Values are raw SQL (a Python `None` renders as `NULL`; quote string literals yourself, e.g. `"'SMS'"`).
+
 ## Flattening
 
 Chronon can extract values nested in containers and perform aggregations - over lists and maps. See details below for semantics.
