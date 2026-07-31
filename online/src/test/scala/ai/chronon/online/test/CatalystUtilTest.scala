@@ -503,6 +503,71 @@ class CatalystUtilTest extends AnyFlatSpec with CatalystUtilTestSparkSQLStructs 
     assertEquals(res.get("a"), 8L)
   }
 
+  it should "normalize integer request values declared as longs in array filters" in {
+    val inputSchema = StructType(
+      "LongFilterInput",
+      Array(
+        StructField("product_id", LongType),
+        StructField("product_ids", ListType(LongType))
+      )
+    )
+    val input = Map[String, Any](
+      "product_id" -> java.lang.Integer.valueOf(2),
+      "product_ids" -> makeArrayList(1L, 2L, 3L)
+    )
+    val cu = new CatalystUtil(
+      inputSchema,
+      Seq("matches" -> "size(filter(product_ids, x -> x = product_id))")
+    )
+
+    assertEquals(cu.performSql(input).head("matches"), 1)
+  }
+
+  it should "normalize integer array elements declared as longs" in {
+    val inputSchema = StructType(
+      "LongArrayInput",
+      Array(StructField("product_ids", ListType(LongType)))
+    )
+    val input = Map[String, Any](
+      "product_ids" -> makeArrayList(
+        java.lang.Integer.valueOf(1),
+        java.lang.Integer.valueOf(2),
+        java.lang.Integer.valueOf(3)
+      )
+    )
+    val cu = new CatalystUtil(
+      inputSchema,
+      Seq("matches" -> "size(filter(product_ids, x -> x = CAST(2 AS BIGINT)))")
+    )
+
+    assertEquals(cu.performSql(input).head("matches"), 1)
+  }
+
+  it should "normalize primitive numeric values to their declared types" in {
+    val inputSchema = StructType(
+      "NumericInput",
+      Array(
+        StructField("byte_value", ByteType),
+        StructField("short_value", ShortType),
+        StructField("int_value", IntType),
+        StructField("long_value", LongType),
+        StructField("float_value", FloatType),
+        StructField("double_value", DoubleType)
+      )
+    )
+    val input = inputSchema.fields.map(_.name -> java.lang.Integer.valueOf(7)).toMap
+    val selects = inputSchema.fields.map(field => field.name -> field.name)
+
+    val result = new CatalystUtil(inputSchema, selects).performSql(input).head
+
+    assertEquals(result("byte_value"), 7.toByte)
+    assertEquals(result("short_value"), 7.toShort)
+    assertEquals(result("int_value"), 7)
+    assertEquals(result("long_value"), 7L)
+    assertEquals(result("float_value"), 7.0f)
+    assertEquals(result("double_value"), 7.0d)
+  }
+
   it should "functions with list containers should work" in {
 
     val listContainersStruct: StructType = StructType(

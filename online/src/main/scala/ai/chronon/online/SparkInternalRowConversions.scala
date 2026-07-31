@@ -196,6 +196,54 @@ object SparkInternalRowConversions {
         def stringConvertor(x: Any): Any = { UTF8String.fromString(x.asInstanceOf[String]) }
 
         stringConvertor
+      case types.ByteType =>
+        def byteConverter(x: Any): Any = x match {
+          case value: java.lang.Byte => value
+          case value: Number         => java.lang.Byte.valueOf(value.byteValue())
+          case value                 => value
+        }
+
+        byteConverter
+      case types.ShortType =>
+        def shortConverter(x: Any): Any = x match {
+          case value: java.lang.Short => value
+          case value: Number          => java.lang.Short.valueOf(value.shortValue())
+          case value                  => value
+        }
+
+        shortConverter
+      case types.IntegerType =>
+        def integerConverter(x: Any): Any = x match {
+          case value: java.lang.Integer => value
+          case value: Number            => java.lang.Integer.valueOf(value.intValue())
+          case value                    => value
+        }
+
+        integerConverter
+      case types.LongType =>
+        def longConverter(x: Any): Any = x match {
+          case value: java.lang.Long => value
+          case value: Number         => java.lang.Long.valueOf(value.longValue())
+          case value                 => value
+        }
+
+        longConverter
+      case types.FloatType =>
+        def floatConverter(x: Any): Any = x match {
+          case value: java.lang.Float => value
+          case value: Number          => java.lang.Float.valueOf(value.floatValue())
+          case value                  => value
+        }
+
+        floatConverter
+      case types.DoubleType =>
+        def doubleConverter(x: Any): Any = x match {
+          case value: java.lang.Double => value
+          case value: Number           => java.lang.Double.valueOf(value.doubleValue())
+          case value                   => value
+        }
+
+        doubleConverter
       case dt: types.DecimalType =>
         def decimalConverter(x: Any): Any = {
           org.apache.spark.sql.types.Decimal(x.asInstanceOf[java.math.BigDecimal], dt.precision, dt.scale)
