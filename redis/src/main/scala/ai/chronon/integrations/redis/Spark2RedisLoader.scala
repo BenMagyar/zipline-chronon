@@ -374,6 +374,7 @@ object Spark2RedisLoader {
 
   private sealed trait WriteMode extends Product with Serializable
   private case object MutationWrite extends WriteMode
+  private case object PhysicalDelete extends WriteMode
   private case class LeaseRefresh(expectedMinimumDeadlineMillis: Option[Long]) extends WriteMode
 
   def run(settings: Settings,
@@ -767,6 +768,9 @@ object Spark2RedisLoader {
     if (headAdvancedPast(settings, manifest, spark, conditionalWriter)) {
       throw HeadAdvanced(readHead(settings, spark, conditionalWriter).get.record.generation)
     }
+    // Stop serving this version before removing its keys. If physical cleanup is interrupted, the durable retired
+    // head has no APPLIED record, so resolveHead replays the immutable delete set on the next invocation.
+    if (manifest.retired) ensureRetiredStatus(settings, manifest, controlClient)
     val limiterKey = RedisBatchUpload.RateLimiterKey
     val persistedDelta = loadDelta(settings, manifest.status.generation, spark)
     val dataDelta = persistedDelta.where(not(isServingInfo(col(KeyColumn))))
@@ -788,9 +792,10 @@ object Spark2RedisLoader {
       else generationLeaseDeadline(leaseDeadlineMillis, currentLeaseDeadline)
     val deleteFenceDeadlineMillis = uploadDeadlineMillis(manifest.deleteFenceTTLSeconds)
 
+    val retirementMode = if (manifest.retired) PhysicalDelete else MutationWrite
     val dataSummary = writeToRedis(
       dataDelta,
-      MutationWrite,
+      retirementMode,
       settings,
       limiterKey,
       activeLeaseDeadlineMillis,
@@ -861,13 +866,18 @@ object Spark2RedisLoader {
 
     var tombstoneSummary = WriteSummary(0, 0, 0, 0, 0)
     if (manifest.tombstoneRows > 0) {
+      val tombstones =
+        if (manifest.retired)
+          loadTombstones(settings, manifest, spark).select(KeyColumn, BucketColumn)
+        else
+          buildTombstoneReplay(settings,
+                               manifest,
+                               spark,
+                               deleteFenceDeadlineMillis,
+                               excludeStatus = Some(manifest.status))
       tombstoneSummary = writeToRedis(
-        buildTombstoneReplay(settings,
-                             manifest,
-                             spark,
-                             deleteFenceDeadlineMillis,
-                             excludeStatus = Some(manifest.status)),
-        MutationWrite,
+        tombstones,
+        retirementMode,
         settings,
         limiterKey,
         activeLeaseDeadlineMillis,
@@ -877,7 +887,8 @@ object Spark2RedisLoader {
       rejectedKeys += tombstoneSummary.rejected
     }
 
-    val metadataSummary = writeToRedis(metadataDelta, MutationWrite, settings, limiterKey, activeLeaseDeadlineMillis)
+    val metadataSummary =
+      writeToRedis(metadataDelta, retirementMode, settings, limiterKey, activeLeaseDeadlineMillis)
     require(metadataSummary.attempted == 1,
             s"Redis generation ${manifest.status.generation} must apply exactly one serving-info mutation")
     rejectedKeys += metadataSummary.rejected
@@ -1359,8 +1370,9 @@ object Spark2RedisLoader {
   }
 
   /** Retires every committed lower numeric version after the current version is fully published. A retirement is an
-    * immutable child generation in the old lineage, not an out-of-band DEL: the old S3 head therefore fences delayed
-    * or retried publishers, while its DELETE mutations and persistent retired status make retries idempotent.
+    * immutable child generation in the old lineage whose persisted delete set is applied with Redis UNLINK. The
+    * durable retired head and persistent Redis status keep the removed version unavailable while allowing retries to
+    * replay physical deletion idempotently.
     */
   private def retireOlderVersions(settings: Settings,
                                   spark: SparkSession,
@@ -1544,7 +1556,7 @@ object Spark2RedisLoader {
     val paths = generationPaths(settings, generation)
     val activeState = loadState(settings, parent.stateGeneration, spark).persist(StorageLevel.DISK_ONLY)
     var completeDelta: DataFrame = null
-    var tombstoneState: DataFrame = null
+    var deleteKeys: DataFrame = null
     try {
       val activeCount = activeState.count()
       require(
@@ -1552,8 +1564,18 @@ object Spark2RedisLoader {
         s"Redis state ${parent.stateGeneration} contains $activeCount active rows; its head records ${parent.dataRows}"
       )
       val emptyState = activeState.limit(0)
-      val entityDeletes = activeState
-        .select(col(KeyColumn), col(BucketColumn))
+      val previousTombstoneKeys =
+        if (parent.tombstoneRows == 0) emptyTombstones(spark).select(KeyColumn, BucketColumn)
+        else if (pathExists(generationPaths(settings, parent.status.generation).applied, spark))
+          loadCommittedTombstones(settings, parent, spark, conditionalWriter).select(KeyColumn, BucketColumn)
+        else loadTombstones(settings, parent, spark).select(KeyColumn, BucketColumn)
+      deleteKeys = activeState
+        .select(KeyColumn, BucketColumn)
+        .unionByName(previousTombstoneKeys)
+        .dropDuplicates(KeyColumn, BucketColumn)
+        .persist(StorageLevel.DISK_ONLY)
+      val deleteCount = deleteKeys.count()
+      val entityDeletes = deleteKeys
         .withColumn(ValueColumn, lit(null).cast(BinaryType))
         .withColumn(OperationColumn, lit(RedisBatchUpload.DeleteOperation))
         .withColumn(BatchTimestampColumn, lit(status.batchTimestamp))
@@ -1585,18 +1607,9 @@ object Spark2RedisLoader {
                 BucketColumn,
                 TombstoneExpiresAtColumn)
       completeDelta = entityDeletes.unionByName(metadataDelete).persist(StorageLevel.DISK_ONLY)
-
-      val previousTombstones =
-        if (parent.tombstoneRows == 0) None
-        else if (pathExists(generationPaths(settings, parent.status.generation).applied, spark))
-          Some(loadCommittedTombstones(settings, parent, spark, conditionalWriter))
-        else Some(loadTombstones(settings, parent, spark))
-      tombstoneState =
-        buildTombstoneState(emptyState, previousTombstones, entityDeletes).persist(StorageLevel.DISK_ONLY)
-      val tombstoneRows = tombstoneState.count()
       val deltaRows = completeDelta.count()
-      require(deltaRows == activeCount + 1L,
-              s"Redis retirement delta contains $deltaRows rows; expected ${activeCount + 1L}")
+      require(deltaRows == deleteCount + 1L,
+              s"Redis retirement delta contains $deltaRows rows; expected ${deleteCount + 1L}")
 
       val manifest = ReadyManifest(
         status = status,
@@ -1610,9 +1623,9 @@ object Spark2RedisLoader {
         sourceRows = 0L,
         dataRows = 0L,
         changedKeys = 0L,
-        deletedKeys = activeCount,
+        deletedKeys = deleteCount,
         deltaRows = deltaRows,
-        tombstoneRows = tombstoneRows,
+        tombstoneRows = 0L,
         liveTTLSeconds = parent.liveTTLSeconds,
         deleteFenceTTLSeconds = parent.deleteFenceTTLSeconds,
         fullRebuild = false,
@@ -1626,12 +1639,11 @@ object Spark2RedisLoader {
       writeImmutable(paths.candidate, encodeCandidate(candidate), spark, conditionalWriter)
       writeBucketed(emptyState, paths.state, parent.stateBuckets)
       writeBucketed(completeDelta, paths.delta, parent.stateBuckets)
-      if (tombstoneRows > 0) writeBucketed(tombstoneState, paths.tombstones, parent.stateBuckets)
       writeImmutable(paths.ready, encodeReady(manifest), spark, conditionalWriter)
       generation
     } finally {
       Option(completeDelta).foreach(_.unpersist())
-      Option(tombstoneState).foreach(_.unpersist())
+      Option(deleteKeys).foreach(_.unpersist())
       activeState.unpersist()
     }
   }
@@ -2425,6 +2437,7 @@ object Spark2RedisLoader {
         pipeline.evalsha(RedisBatchUpload.putBaseIfNewerSha,
                          List(key).asJava,
                          List(timestamp, writeEpoch, encoded, expireAt, allowExpired).asJava)
+      case PhysicalDelete => pipeline.unlink(key)
       case LeaseRefresh(Some(expectedDeadline)) =>
         pipeline.evalsha(
           RedisBatchUpload.validateExpiryAndAdvanceSha,
@@ -2452,6 +2465,7 @@ object Spark2RedisLoader {
         val (timestamp, writeEpoch, encoded, expireAt, allowExpired) =
           encodedMutation(row, leaseDeadlineMillis, tombstoneDeadlineMillis)
         RedisBatchUpload.putBaseIfNewer(client, key, List(timestamp, writeEpoch, encoded, expireAt, allowExpired))
+      case PhysicalDelete => client.unlink(key)
       case LeaseRefresh(Some(expectedDeadline)) =>
         RedisBatchUpload.validateExpiryAndAdvance(client,
                                                   key,
@@ -2521,6 +2535,10 @@ object Spark2RedisLoader {
       case MutationWrite =>
         val codes = results.map(redisLong)
         WriteSummary(codes.size, codes.count(_ == 1L), codes.count(_ == 2L), codes.count(_ == 0L), retries = 0)
+      case PhysicalDelete =>
+        val codes = results.map(redisLong)
+        require(codes.forall(code => code == 0L || code == 1L), s"Redis UNLINK returned unexpected counts: $codes")
+        WriteSummary(codes.size, codes.count(_ == 1L), codes.count(_ == 0L), rejected = 0L, retries = 0L)
       case _: LeaseRefresh =>
         val codes = results.map(redisLong)
         WriteSummary(codes.size, codes.count(_ == 1L), codes.count(_ == 2L), codes.count(_ == 0L), retries = 0)
@@ -2645,6 +2663,7 @@ object Spark2RedisLoader {
 
   private def writeModeName(mode: WriteMode): String = mode match {
     case MutationWrite   => "mutation"
+    case PhysicalDelete  => "physical-delete"
     case _: LeaseRefresh => "lease-refresh"
   }
 

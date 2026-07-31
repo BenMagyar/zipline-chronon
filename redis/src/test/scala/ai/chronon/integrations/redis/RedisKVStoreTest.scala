@@ -1564,6 +1564,14 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
 
       val v1Upload = Spark2RedisLoader.run(v1, spark, jedisCluster)
       v1Upload.changedKeys shouldBe 2L
+      rows("a" -> "a-v1")
+        .write
+        .mode("overwrite")
+        .partitionBy("ds")
+        .saveAsTable(v1.sourceTable)
+      val correctedV1Upload = Spark2RedisLoader.run(v1, spark, jedisCluster)
+      correctedV1Upload.changedKeys shouldBe 0L
+      correctedV1Upload.deletedKeys shouldBe 1L
       val v1StatusKey = RedisBatchUpload.buildStatusKey(v1.batchDataset, v1.keyPrefix)
       val v1Keys = Seq("a", "b", GroupByServingInfoKey).map { key =>
         RedisKVStore.buildRedisKey(key.getBytes(StandardCharsets.UTF_8).toSeq, v1.batchDataset)
@@ -1579,9 +1587,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       jedisCluster.ttl(v1StatusKey.getBytes(StandardCharsets.UTF_8)) shouldBe -1L
 
       v1Keys.foreach { key =>
-        RedisBatchUpload.decodeValue(jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
-          RedisBatchUpload.Delete
-        jedisCluster.ttl(key.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
+        jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null
       }
 
       Seq("b" -> "b-v2", "c" -> "c-v2").foreach { case (key, expected) =>
@@ -1591,11 +1597,14 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
         new String(decoded.payload, StandardCharsets.UTF_8) shouldBe expected
       }
 
-      val tombstoneDeadlineBefore = jedisCluster.pttl(v1Keys.head.getBytes(StandardCharsets.UTF_8))
+      val missingKeyTtlBefore = jedisCluster.pttl(v1Keys.head.getBytes(StandardCharsets.UTF_8))
       Spark2RedisLoader.run(v2, spark, jedisCluster)
       val rerunStatus = RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get
       rerunStatus shouldBe retiredStatus
-      jedisCluster.pttl(v1Keys.head.getBytes(StandardCharsets.UTF_8)) should be <= tombstoneDeadlineBefore
+      missingKeyTtlBefore shouldBe -2L
+      v1Keys.foreach { key =>
+        jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null
+      }
 
       // Simulate a Redis restore from before v1 was retired. The durable retired S3 head must replay its deletes
       // rather than merely recreating the status marker and leaving the restored values live.
@@ -1606,8 +1615,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       Spark2RedisLoader.run(v2, spark, jedisCluster)
       RedisBatchUpload.readStatus(jedisCluster, v1StatusKey).get shouldBe retiredStatus
       v1Keys.foreach { key =>
-        RedisBatchUpload.decodeValue(jedisCluster.get(key.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe
-          RedisBatchUpload.Delete
+        jedisCluster.get(key.getBytes(StandardCharsets.UTF_8)) shouldBe null
       }
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS ${v1.sourceTable}")

@@ -87,11 +87,11 @@ fences. Concurrent jobs sharing a cluster must use the same rate while the share
 
 Older-version retirement is opt-in and only runs after the new version is fully published. It recognizes GroupBy names
 ending in `__<number>`, discovers lower versions from the durable state root, and CAS-admits an immutable retired child
-generation in each old lineage. That child tombstones the old active keys and serving metadata and leaves a persistent
-retired status, so a delayed old uploader cannot refill the dataset. A missing state root or an old lineage without a
-`_HEAD` is a no-op; a headed but corrupt lineage fails cleanup so leaked live keys are not silently ignored. Retirement
-releases the old value payloads immediately, while each small Redis tombstone and its key remain until the old lineage's
-delete-fence TTL expires.
+generation in each old lineage. That child first publishes a small persistent retired status and then physically removes
+the old active keys, retained tombstones, and serving metadata with Redis `UNLINK`. `UNLINK` makes each key immediately
+absent while reclaiming its value memory asynchronously off the Redis command thread. A missing state root or an old
+lineage without a `_HEAD` is a no-op; a headed but corrupt lineage fails cleanup so leaked live keys are not silently
+ignored. The immutable S3 delete set makes an interrupted cleanup replayable and a Redis restore recoverable.
 
 ## Publication Protocol
 
