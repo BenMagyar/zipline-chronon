@@ -62,10 +62,7 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
     kvStore.create(batchDataset)
 
-    putString(kvStore,
-              servingInfo.groupBy.keyNameForKvStore,
-              ThriftJsonCodec.toJsonStr(servingInfo.groupBy),
-              Constants.MetadataDataset)
+    // GroupBy uploads persist the full conf inside serving info; there is no standalone GroupBy entry in metadata.
     putString(kvStore,
               Constants.GroupByServingInfoKey,
               ThriftJsonCodec.toJsonStr(servingInfo),
@@ -92,18 +89,22 @@ class FetcherSchemaTest extends AnyFlatSpec with Matchers {
     refreshedResponse.batchEndTs shouldBe 1784764800000L
   }
 
-  it should "return a user-facing status error for offline groupBys" in {
+  it should "return a user-facing status error when the fresh serving info embeds an offline groupBy" in {
     val kvStore = InMemoryKvStore.build(s"FetcherSchemaTest_status_offline_${System.nanoTime()}")
     kvStore.create(Constants.MetadataDataset)
 
     val servingInfo = GroupByDerivationsTest.makeTestGroupByServingInfoParsed().groupByServingInfo
     servingInfo.groupBy.metaData.setOnline(false)
+    servingInfo.setBatchEndDate("2026-07-23")
+    servingInfo.setBatchEndTs(1784764800000L)
     val groupByName = servingInfo.groupBy.metaData.name
+    val batchDataset = new GroupByOps(servingInfo.groupBy).batchDataset
+    kvStore.create(batchDataset)
 
     putString(kvStore,
-              servingInfo.groupBy.keyNameForKvStore,
-              ThriftJsonCodec.toJsonStr(servingInfo.groupBy),
-              Constants.MetadataDataset)
+              Constants.GroupByServingInfoKey,
+              ThriftJsonCodec.toJsonStr(servingInfo),
+              batchDataset)
 
     val fetcher = new Fetcher(kvStore, Constants.MetadataDataset)
     val failure = fetcher.fetchGroupByStatus(groupByName).failed.get

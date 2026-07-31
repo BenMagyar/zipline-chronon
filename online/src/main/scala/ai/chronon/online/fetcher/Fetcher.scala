@@ -1036,18 +1036,19 @@ class Fetcher(val kvStore: KVStore,
     val ctx =
       Metrics.Context(Metrics.Environment.MetaDataFetching, groupBy = groupByName).withSuffix("group_by_status")
 
-    val groupByConfTry = metadataStore.getConf[api.GroupBy](ConfPathOrName(confName = Some(groupByName)))
-
-    groupByConfTry
-      .flatMap { groupByConf =>
-        if (!groupByConf.metaData.online) {
+    // GroupBy configs are embedded in the batch serving-info record rather than uploaded as standalone entries in
+    // CHRONON_METADATA. The serving info is also the authoritative upload watermark, so read it directly and bypass
+    // the long-lived serving caches used by the feature-fetch hot path.
+    metadataStore
+      .getGroupByServingInfoFresh(groupByName)
+      .flatMap { servingInfo =>
+        if (!servingInfo.groupByServingInfo.groupBy.metaData.online) {
           Failure(
             new IllegalArgumentException(
               s"GroupBy $groupByName is not online. Fetcher status is only available for online GroupBys. " +
                 "Enable online=True and upload the GroupBy."))
         } else {
-          // Serving info is the authoritative upload watermark; status bypasses its long-lived read caches.
-          metadataStore.getGroupByServingInfoFresh(groupByName)
+          Success(servingInfo)
         }
       }
       .map { servingInfo =>
