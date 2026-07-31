@@ -1490,7 +1490,10 @@ object Spark2RedisLoader {
       require(parent.parentGeneration == head.record.parentGeneration,
               s"Redis generation ${parent.status.generation} does not match its S3 head parent")
 
-      if (parent.retired) {
+      // The first retirement implementation persisted DELETE tombstones. Those manifests are retired but still have
+      // tombstone rows, so admit one newer retirement generation that physically UNLINKs them. A zero-tombstone retired
+      // head is the durable marker that physical cleanup has already completed.
+      if (parent.retired && !requiresRetiredPhysicalDeleteMigration(parent)) {
         val statusKey = RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix)
         val redisStatus = RedisBatchUpload.readStatus(controlClient, statusKey)
         if (!redisStatus.contains(parent.status)) {
@@ -1530,9 +1533,10 @@ object Spark2RedisLoader {
           committed.exists(manifest => manifest.status.generation == generation && manifest.retired),
           s"Redis retirement generation $generation did not become the S3 head for ${settings.batchDataset}"
         )
-        ensureRetiredStatus(settings, committed.get, controlClient)
+        val retiredManifest = committed.get
+        ensureRetiredStatus(settings, retiredManifest, controlClient)
         logger.info(
-          s"Retired older Redis dataset ${settings.batchDataset} with ${parent.dataRows} active keys in generation $generation")
+          s"Retired older Redis dataset ${settings.batchDataset} with ${retiredManifest.deletedKeys} keys in generation $generation")
         return
       }
 
@@ -1545,6 +1549,9 @@ object Spark2RedisLoader {
     throw new IllegalStateException(
       s"Redis older-version lineage ${settings.batchDataset} could not be retired after $MaxAdmissionAttempts S3 head changes")
   }
+
+  private[redis] def requiresRetiredPhysicalDeleteMigration(manifest: ReadyManifest): Boolean =
+    manifest.retired && manifest.tombstoneRows > 0
 
   private def buildRetirementGeneration(settings: Settings,
                                         parent: ReadyManifest,
@@ -2159,7 +2166,7 @@ object Spark2RedisLoader {
     val maxRetries = settings.maxRetries
     val retryBackoffMs = settings.retryBackoffMs
     // This absolute driver-created deadline is captured by every task attempt in the Spark stage. A retried task cannot
-    // start a fresh OOM window and multiply the 30-minute timeout by Spark's task retry count.
+    // start a fresh OOM window and multiply the one-hour timeout by Spark's task retry count.
     val oomRetryStartMillis = System.currentTimeMillis()
     val oomRetryDeadlineMillis =
       redisOomRetryDeadline(oomRetryStartMillis, DefaultBulkUploadOomRetryTimeoutMs, leaseDeadlineMillis)

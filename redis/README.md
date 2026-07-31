@@ -91,7 +91,8 @@ generation in each old lineage. That child first publishes a small persistent re
 the old active keys, retained tombstones, and serving metadata with Redis `UNLINK`. `UNLINK` makes each key immediately
 absent while reclaiming its value memory asynchronously off the Redis command thread. A missing state root or an old
 lineage without a `_HEAD` is a no-op; a headed but corrupt lineage fails cleanup so leaked live keys are not silently
-ignored. The immutable S3 delete set makes an interrupted cleanup replayable and a Redis restore recoverable.
+ignored. Retired heads written by the earlier tombstone-based protocol are migrated once to a zero-tombstone physical
+delete generation. The immutable S3 delete set makes an interrupted cleanup replayable and a Redis restore recoverable.
 
 ## Publication Protocol
 
@@ -242,7 +243,7 @@ still applying. The uploader verifies this through `INFO memory`, so its ACL mus
 
 With `noeviction`, Redis rejects writes when `maxmemory` is reached. The current failed batch (or final status write) is
 retried with exponential backoff capped at 30 seconds, logging each wait so external scaling or memory release has time
-to complete. Spark retries of one writer stage share a 30-minute deadline rather than starting a new window per attempt.
+to complete. Spark retries of one writer stage share a one-hour deadline rather than starting a new window per attempt.
 
 ## Throughput Limits
 

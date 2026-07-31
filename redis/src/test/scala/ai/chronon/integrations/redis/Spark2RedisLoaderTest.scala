@@ -268,10 +268,10 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     events.map(_.elapsedMillis) shouldBe Seq(0L, 100L)
   }
 
-  it should "stop at the shared thirty-minute deadline" in {
+  it should "stop at the shared one-hour deadline" in {
     val oom = new JedisDataException("OOM command not allowed when used memory > 'maxmemory'.")
     val sevenMinutes = 7.minutes.toMillis
-    val thirtyMinutes = 30.minutes.toMillis
+    val oneHour = 1.hour.toMillis
     var nowMillis = 0L
     var attempts = 0
     val sleeps = ArrayBuffer.empty[Long]
@@ -283,7 +283,7 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
           throw oom
         },
         retryStartMillis = 0L,
-        retryDeadlineMillis = thirtyMinutes,
+        retryDeadlineMillis = oneHour,
         retryWaitMillis = _ => sevenMinutes,
         nowMillis = () => nowMillis,
         sleepMillis = millis => {
@@ -294,8 +294,8 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
       )
     }
 
-    attempts shouldBe 5
-    sleeps shouldBe Seq(sevenMinutes, sevenMinutes, sevenMinutes, sevenMinutes, 2.minutes.toMillis)
+    attempts shouldBe 9
+    sleeps shouldBe (Seq.fill(8)(sevenMinutes) :+ 4.minutes.toMillis)
     failure.getMessage should include("external scaling or memory release")
     failure.getCause shouldBe oom
   }
@@ -329,7 +329,7 @@ class Spark2RedisLoaderTest extends AnyFlatSpec with BeforeAndAfterAll with Matc
     (1 to 8).map(Spark2RedisLoader.cappedOomRetryBackoffMillis(_, 1000L)) shouldBe
       Seq(1000L, 2000L, 4000L, 8000L, 16000L, 30000L, 30000L, 30000L)
     Spark2RedisLoader.redisOomRetryDeadline(startMillis = 1000L,
-                                            timeoutMillis = 30.minutes.toMillis,
+                                            timeoutMillis = RedisKVStoreConstants.DefaultBulkUploadOomRetryTimeoutMs,
                                             leaseDeadlineMillis = 5000L) shouldBe 5000L
   }
 
