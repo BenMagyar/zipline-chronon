@@ -114,13 +114,10 @@ if [ -n "$CHRONON_JOIN_CODEC_TTL_MILLIS" ]; then
 fi
 
 echo "Starting Fetcher service with online jar $ONLINE_JAR and online class $ONLINE_CLASS"
-if ! java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
+exec java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
   run ai.chronon.service.FetcherVerticle \
   -Dserver.port=$FETCHER_PORT \
   -Donline.jar=$ONLINE_JAR \
   -Donline.api.props='{"kv.tablePrefix":"'"$KV_TABLE_PREFIX"'"}' \
   $TTL_OPTS \
-  -Donline.class=$ONLINE_CLASS; then
-  echo "Error: Fetcher service failed to start"
-  exit 1
-fi
+  -Donline.class=$ONLINE_CLASS

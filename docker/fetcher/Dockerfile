@@ -63,4 +63,4 @@ HEALTHCHECK --start-period=2m --retries=4 CMD curl --fail http://localhost:$FETC
 RUN mkdir -p $LOG_PATH && \
     chmod 755 $LOG_PATH
 
-CMD /srv/zipline/fetcher/start.sh
+CMD ["/srv/zipline/fetcher/start.sh"]
