@@ -28,7 +28,7 @@ import org.slf4j.LoggerFactory
 import java.io.File
 import java.net.URI
 import java.nio.file.Files
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{CompletableFuture, CompletionException, ConcurrentHashMap}
 import java.util.function
 
 object CatalystUtil {
@@ -97,7 +97,7 @@ object CatalystUtil {
   // A setup is part of the blueprint key, so the same UDF jar can otherwise be copied to a new temp file for
   // every distinct query that uses it. Spark's session and jar classloader live for the process lifetime, so cache
   // the complete successful localization and registration operation by source URI.
-  private val localizedJars = new ConcurrentHashMap[URI, File]()
+  private val localizedJars = new ConcurrentHashMap[URI, CompletableFuture[File]]()
 
   private[online] def normalizeJarUri(jarPath: String): URI = {
     val uri = new URI(jarPath)
@@ -112,20 +112,57 @@ object CatalystUtil {
   private[online] def localizeJar(jarPath: String): File = {
     val normalizedUri = normalizeJarUri(jarPath)
     // Loading a changed implementation at the same URI cannot safely replace classes already defined by Spark's
-    // process-wide classloader. Publishers must use immutable, versioned paths. computeIfAbsent also means a failed
-    // copy is not inserted, so the next request can retry it.
-    localizedJars.computeIfAbsent(
-      normalizedUri,
-      new function.Function[URI, File] {
-        override def apply(uri: URI): File = copyAndRegisterJar(uri)
+    // process-wide classloader. Publishers must use immutable, versioned paths. Keep remote I/O outside the
+    // ConcurrentHashMap mutation: callers for the same URI share the promise, while an unrelated hash-bin collision
+    // cannot hold up a different jar copy.
+    val pending = new CompletableFuture[File]()
+    val existing = localizedJars.putIfAbsent(normalizedUri, pending)
+    if (existing == null) {
+      try {
+        val localized = copyAndRegisterJar(normalizedUri)
+        if (!pending.complete(localized)) {
+          // Startup may have expired this promise so request threads fail fast rather than waiting on a stuck Hadoop
+          // copy. If the original copy eventually succeeds, publish that successful file atomically; never start a
+          // competing copy or register the same jar concurrently.
+          localizedJars.replace(normalizedUri, pending, CompletableFuture.completedFuture(localized))
+        }
+        localized
+      } catch {
+        case exception: Throwable =>
+          pending.completeExceptionally(exception)
+          localizedJars.remove(normalizedUri, pending)
+          throw exception
       }
-    )
+    } else {
+      try existing.join()
+      catch {
+        case wrapper: CompletionException if wrapper.getCause != null => throw wrapper.getCause
+      }
+    }
   }
+
+  /** Localize and register an immutable derivation jar before request traffic begins.
+    *
+    * This is intentionally jar-only: callers do not need a live Join configuration, representative keys, or a
+    * feature-store read. The same process-wide cache is used by `ADD JAR`, so request-time setup reuses the
+    * completed startup copy.
+    */
+  def prefetchJar(jarPath: String): File = localizeJar(jarPath)
+
+  /** Expire an unresolved startup prefetch without removing its single-flight owner.
+    *
+    * Existing/request-time callers fail promptly with `error`. If the original copy later succeeds it replaces this
+    * exceptional promise with its completed file; if it fails, the owner removes the entry so a later request can retry.
+    */
+  def expirePrefetchJar(jarPath: String, error: Throwable): Boolean =
+    Option(localizedJars.get(normalizeJarUri(jarPath))).exists(_.completeExceptionally(error))
 
   private[online] def localizedJarCount: Int = localizedJars.size()
 
   private[online] def isJarLocalized(jarPath: String): Boolean =
-    localizedJars.containsKey(normalizeJarUri(jarPath))
+    Option(localizedJars.get(normalizeJarUri(jarPath))).exists { pending =>
+      pending.isDone && !pending.isCompletedExceptionally && !pending.isCancelled
+    }
 
   private def copyAndRegisterJar(uri: URI): File = {
     val sparkContext = session.sparkContext
@@ -146,15 +183,27 @@ object CatalystUtil {
       localFile
     } catch {
       case exception: Exception =>
-        Files.deleteIfExists(localFile.toPath)
-        Files.deleteIfExists(tempDir.toPath)
+        Option(tempDir.listFiles()).getOrElse(Array.empty[File]).foreach { child =>
+          try Files.deleteIfExists(child.toPath)
+          catch {
+            case cleanupError: Exception => exception.addSuppressed(cleanupError)
+          }
+        }
+        try Files.deleteIfExists(tempDir.toPath)
+        catch {
+          case cleanupError: Exception => exception.addSuppressed(cleanupError)
+        }
         throw exception
     }
   }
 
   private[online] def evictLocalizedJarForTest(jarPath: String): Unit = {
-    val localizedFile = localizedJars.remove(normalizeJarUri(jarPath))
-    Option(localizedFile).foreach { file =>
+    val localizedFile = Option(localizedJars.remove(normalizeJarUri(jarPath))).flatMap { pending =>
+      if (pending.isDone && !pending.isCompletedExceptionally && !pending.isCancelled)
+        Option(pending.getNow(null))
+      else None
+    }
+    localizedFile.foreach { file =>
       val directory = file.getParentFile
       // LocalFileSystem may put a hidden checksum beside the copied jar.
       Option(directory.listFiles()).getOrElse(Array.empty[File]).foreach(child => Files.deleteIfExists(child.toPath))
