@@ -1215,6 +1215,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       stateRoot = Files.createTempDirectory("redis-incremental-state").toUri.toString,
       keyPrefix = "chronon",
       clientSettings = clientSettings,
+      keyHashTagMode = RedisKVStore.EntityHashTagMode,
       batchSize = 10,
       maxKeysPerSecond = 100000,
       writerPartitions = 1,
@@ -1237,7 +1238,11 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       val requests = keys.map(key => GetRequest(key.getBytes(StandardCharsets.UTF_8), batchDataset, None, None))
       Await
         .result(
-          new RedisKVStoreImpl(jedisCluster, requireBatchStatus = true).multiGet(requests),
+          new RedisKVStoreImpl(
+            jedisCluster,
+            Map("redis.key.hash.tag.mode" -> settings.keyHashTagMode),
+            requireBatchStatus = true
+          ).multiGet(requests),
           10.seconds)
         .map(response => new String(response.request.keyBytes, StandardCharsets.UTF_8) -> response.values.get)
         .toMap
@@ -1289,7 +1294,19 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       initialStatus.generation shouldBe initial.generation.get
       jedisCluster.ttl(statusKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 3600L)
 
-      val aRedisKey = RedisKVStore.buildRedisKey("a".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      val incompatibleHashMode = the[IllegalArgumentException] thrownBy {
+        Spark2RedisLoader.run(
+          settings.copy(keyHashTagMode = RedisKVStore.DatasetAndEntityHashTagMode),
+          spark,
+          jedisCluster)
+      }
+      incompatibleHashMode.getMessage should include("key hash tag mode cannot change within a lineage")
+
+      val aRedisKey = RedisKVStore.buildRedisKey(
+        "a".getBytes(StandardCharsets.UTF_8).toSeq,
+        batchDataset,
+        keyPrefix = settings.keyPrefix,
+        hashTagMode = settings.keyHashTagMode)
       jedisCluster.expire(aRedisKey.getBytes(StandardCharsets.UTF_8), 30L) shouldBe 1L
 
       val checkedInitial = Spark2RedisLoader.run(settings, spark, jedisCluster)
@@ -1322,7 +1339,11 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       new String(secondValues("c").head.bytes, StandardCharsets.UTF_8) shouldBe "c-1"
       secondValues("d") shouldBe empty
 
-      val bRedisKey = RedisKVStore.buildRedisKey("b".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      val bRedisKey = RedisKVStore.buildRedisKey(
+        "b".getBytes(StandardCharsets.UTF_8).toSeq,
+        batchDataset,
+        keyPrefix = settings.keyPrefix,
+        hashTagMode = settings.keyHashTagMode)
       jedisCluster.set(
         bRedisKey.getBytes(StandardCharsets.UTF_8),
         RedisBatchUpload.encodeValue(
@@ -1343,7 +1364,11 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       samePartitionCorrection.deletedKeys shouldBe 0L
       new String(read("b")("b").head.bytes, StandardCharsets.UTF_8) shouldBe "b-2-corrected"
 
-      val dRedisKey = RedisKVStore.buildRedisKey("d".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      val dRedisKey = RedisKVStore.buildRedisKey(
+        "d".getBytes(StandardCharsets.UTF_8).toSeq,
+        batchDataset,
+        keyPrefix = settings.keyPrefix,
+        hashTagMode = settings.keyHashTagMode)
       RedisBatchUpload
         .decodeValue(jedisCluster.get(dRedisKey.getBytes(StandardCharsets.UTF_8)))
         .get
@@ -1492,7 +1517,11 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       shortDelta.changedKeys shouldBe 1L
       shortDelta.deletedKeys shouldBe 1L
       shortDelta.refreshedKeys shouldBe 1L
-      val cRedisKey = RedisKVStore.buildRedisKey("c".getBytes(StandardCharsets.UTF_8).toSeq, batchDataset)
+      val cRedisKey = RedisKVStore.buildRedisKey(
+        "c".getBytes(StandardCharsets.UTF_8).toSeq,
+        batchDataset,
+        keyPrefix = settings.keyPrefix,
+        hashTagMode = settings.keyHashTagMode)
       jedisCluster.ttl(bRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
       jedisCluster.ttl(cRedisKey.getBytes(StandardCharsets.UTF_8)) should (be > 0L and be <= 1800L)
       RedisBatchUpload.decodeValue(jedisCluster.get(cRedisKey.getBytes(StandardCharsets.UTF_8))).get.operation shouldBe

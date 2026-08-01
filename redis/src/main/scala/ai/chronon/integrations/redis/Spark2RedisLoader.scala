@@ -677,11 +677,8 @@ object Spark2RedisLoader {
 
           if (admitted.generation != generation) throw HeadAdvanced(admitted.generation)
 
-          val committed = resolveHead(settings,
-                                      spark,
-                                      controlClient,
-                                      conditionalWriter,
-                                      beforeApply = _ => retirePriorVersionsOnce())
+          val committed =
+            resolveHead(settings, spark, controlClient, conditionalWriter, beforeApply = _ => retirePriorVersionsOnce())
           require(committed.exists(_.status == status), s"Redis generation $generation did not become the S3 head")
           val applied = readCommittedApplied(paths.applied, spark, conditionalWriter).record
           logger.info(
@@ -2074,8 +2071,7 @@ object Spark2RedisLoader {
     require(pathExists(paths.state, spark), s"Redis generation $generation is missing its durable state")
     require(pathExists(paths.delta, spark), s"Redis generation $generation is missing its durable delta")
     if (manifest.tombstoneRows > 0) {
-      require(pathExists(paths.tombstones, spark),
-              s"Redis generation $generation is missing retained tombstones")
+      require(pathExists(paths.tombstones, spark), s"Redis generation $generation is missing retained tombstones")
     }
     manifest -> readyBytes
   }

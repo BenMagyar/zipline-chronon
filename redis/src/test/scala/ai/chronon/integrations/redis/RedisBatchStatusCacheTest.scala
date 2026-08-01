@@ -82,6 +82,39 @@ class RedisBatchStatusCacheTest extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "single-flight concurrent refreshes for one dataset" in {
+    val statusReads = new AtomicInteger()
+    val readEntered = new CountDownLatch(1)
+    val releaseRead = new CountDownLatch(1)
+
+    withStore(
+      _ => {
+        statusReads.incrementAndGet()
+        readEntered.countDown()
+        releaseRead.await(2, TimeUnit.SECONDS)
+        Some(activeStatus)
+      },
+      storedBytes = null,
+      threads = 4
+    ) { store =>
+      val requests = batchRequests("SINGLE_FLIGHT_STATUS_BATCH", 1)
+      val first = store.multiGet(requests)
+      readEntered.await(1, TimeUnit.SECONDS) shouldBe true
+      val second = store.multiGet(requests)
+
+      try {
+        Thread.sleep(50L)
+        statusReads.get() shouldBe 1
+      } finally {
+        releaseRead.countDown()
+      }
+
+      Await.result(first, 2.seconds).head.values.get shouldBe empty
+      Await.result(second, 2.seconds).head.values.get shouldBe empty
+      statusReads.get() shouldBe 1
+    }
+  }
+
   it should "not block one dataset behind another dataset's status read" in {
     val slowReadEntered = new CountDownLatch(1)
     val releaseSlowRead = new CountDownLatch(1)
@@ -165,6 +198,34 @@ class RedisBatchStatusCacheTest extends AnyFlatSpec with Matchers {
       recovered shouldBe Success(Some(activeStatus))
       directReads.get() shouldBe 1
     }
+  }
+
+  it should "leave failed marker refreshes uncached so the next request retries" in {
+    val batchReads = new AtomicInteger()
+
+    withStore(
+      _ => Some(activeStatus),
+      storedBytes = null,
+      batchStatusReader = Some { datasets =>
+        val attempt = batchReads.incrementAndGet()
+        datasets.map { _ =>
+          if (attempt == 1) Failure(new IllegalStateException("temporary marker failure"))
+          else Success(Some(activeStatus))
+        }
+      }
+    ) { store =>
+      val requests = batchRequests("RETRY_STATUS_BATCH", 10)
+      val failed = Await.result(store.multiGet(requests), 2.seconds)
+      all(failed.map(_.values.isFailure)) shouldBe true
+
+      val recovered = Await.result(store.multiGet(requests), 2.seconds)
+      all(recovered.map(_.values.get.isEmpty)) shouldBe true
+      batchReads.get() shouldBe 2
+    }
+  }
+
+  it should "bound the publication marker cache" in {
+    RedisKVStore.BatchStatusCacheMaxEntries shouldBe 4096
   }
 
   private def batchRequests(dataset: String, count: Int): Vector[GetRequest] =
