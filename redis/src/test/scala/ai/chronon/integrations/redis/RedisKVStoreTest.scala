@@ -1131,6 +1131,7 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
       jedisCluster,
       RedisBatchUpload.buildStatusKey(missingStatusDataset, "chronon"),
       status.copy(generation = "recovered-generation")) shouldBe 1L
+    Thread.sleep(RedisKVStore.MissingBatchStatusCacheMillis + 50L)
     Await.result(missingStatusStore.multiGet(Seq(missingStatusRequest)), 10.seconds).head.values.get shouldBe empty
 
     val metadataDataset = "CHRONON_METADATA"

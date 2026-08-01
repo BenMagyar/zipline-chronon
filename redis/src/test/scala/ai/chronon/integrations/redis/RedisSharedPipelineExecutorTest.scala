@@ -89,6 +89,37 @@ class RedisSharedPipelineExecutorTest extends AnyFlatSpec with Matchers {
     kvStore.pipelineSyncExecutor shouldBe None
   }
 
+  it should "retain the shared pipeline executor for managed GLIDE status reads" in {
+    val cluster = mock(classOf[JedisCluster])
+    val glideClient = mock(classOf[GlideRedisReadClient])
+    val kvStore = new RedisKVStoreImpl(
+      cluster,
+      Map(ConfigPipelineSyncThreads -> "2"),
+      requireBatchStatus = true,
+      glideReadClient = Some(glideClient)
+    )
+    val executor = kvStore.pipelineSyncExecutor.get
+
+    try {
+      executor.getPoolSize shouldBe 2
+      executor.isShutdown shouldBe false
+    } finally {
+      kvStore.shutdownPipelineSyncExecutor()
+    }
+
+    executor.isTerminated shouldBe true
+  }
+
+  it should "avoid a Jedis pipeline executor for unmanaged GLIDE reads" in {
+    val kvStore = new RedisKVStoreImpl(
+      mock(classOf[JedisCluster]),
+      Map(ConfigPipelineSyncThreads -> "2"),
+      glideReadClient = Some(mock(classOf[GlideRedisReadClient]))
+    )
+
+    kvStore.pipelineSyncExecutor shouldBe None
+  }
+
   it should "reject a negative pipeline executor size" in {
     val error = intercept[IllegalArgumentException] {
       new RedisKVStoreImpl(mock(classOf[JedisCluster]), Map(ConfigPipelineSyncThreads -> "-1"))

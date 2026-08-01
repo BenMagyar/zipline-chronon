@@ -16,6 +16,7 @@ import ai.chronon.integrations.redis.GlideReadResult.{
 import ai.chronon.integrations.redis.RedisKVStoreConstants.{DefaultListLimit, _}
 import ai.chronon.online.KVStore
 import ai.chronon.online.KVStore.{GetRequest, GetResponse, ListRequest, ListResponse, ListValue, PutRequest, TimedValue}
+import ai.chronon.online.fetcher.LRUCache
 import ai.chronon.online.metrics.Metrics
 import ai.chronon.spark.submission.SparkSessionBuilder
 import org.apache.spark.SparkConf
@@ -36,8 +37,9 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, Da
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.Base64
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import java.util.concurrent.{
+  CompletableFuture,
   CompletionException,
   ExecutionException,
   LinkedBlockingQueue,
@@ -141,13 +143,18 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
   require(pipelineSyncThreads >= 0, s"$ConfigPipelineSyncThreads must be non-negative, got $pipelineSyncThreads")
 
   private[redis] val pipelineSyncExecutor: Option[ThreadPoolExecutor] =
-    if (glideReadClient.isEmpty && pipelineSyncThreads > 0) Some(buildPipelineSyncExecutor(pipelineSyncThreads))
+    if ((glideReadClient.isEmpty || requireBatchStatus) && pipelineSyncThreads > 0)
+      Some(buildPipelineSyncExecutor(pipelineSyncThreads))
     else None
 
   // TTL is now configurable via RedisKVStoreConstants or via props in create()
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("redis")
   protected val tableToContext = new TrieMap[String, Metrics.Context]()
-  private val batchStatusCache = new TrieMap[String, RedisKVStore.CachedBatchStatus]()
+  private val batchStatusCache =
+    LRUCache[String, RedisKVStore.CachedBatchStatus]("redis_batch_status", RedisKVStore.BatchStatusCacheMaxEntries)
+  private val batchStatusLocks = Array.fill[AnyRef](RedisKVStore.BatchStatusLockStripes)(new AnyRef)
+  private val batchStatusRefreshes = new TrieMap[String, CompletableFuture[RedisKVStore.CachedBatchStatus]]()
+  private val batchStatusRefreshVersions = new AtomicLong()
 
   // Resolved lazily so direct store construction only needs client configuration when bulk upload is used.
   private lazy val clientSettings: RedisKVStoreFactory.ClientSettings = RedisKVStoreFactory.settings(conf)
@@ -168,7 +175,8 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
             val startedAt = System.currentTimeMillis()
             val defaultEndTs = System.currentTimeMillis()
             try {
-              val plans = requests.map(request => planRead(request, defaultEndTs))
+              val batchStatuses = snapshotBatchStatuses(requests)
+              val plans = requests.map(request => planRead(request, defaultEndTs, batchStatuses))
               val redisPlans = plans.collect { case plan: RedisReadPlan => plan }
               val responses = buildReadResponses(plans, executeReadPipelineWithRetry(redisPlans))
               if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
@@ -262,7 +270,8 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
           try {
             val plans = recordReadPhase("multiGet.plan.latency") {
               val defaultEndTs = System.currentTimeMillis()
-              requests.map(request => planRead(request, defaultEndTs))
+              val batchStatuses = snapshotBatchStatuses(requests)
+              requests.map(request => planRead(request, defaultEndTs, batchStatuses))
             }
             val redisPlans = plans.collect { case plan: RedisReadPlan => plan }.toIndexedSeq
             val prepared = prepareGlideReads(redisPlans)
@@ -422,7 +431,9 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
     case other                                                    => other
   }
 
-  private def planRead(request: GetRequest, defaultEndTs: Long): PlannedRead = {
+  private def planRead(request: GetRequest,
+                       defaultEndTs: Long,
+                       batchStatuses: Map[String, Try[BatchStatusSnapshot]]): PlannedRead = {
     val planned = Try {
       getTableType(request.dataset) match {
         case BatchTable =>
@@ -430,15 +441,9 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
             buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix, hashTagMode = keyHashTagMode)
           val publishedStatus =
             if (requireBatchStatus && request.dataset.endsWith("_BATCH")) {
-              cachedBatchStatus(request.dataset) match {
-                case Some(status) => Some(status)
-                case None =>
-                  throw new IllegalStateException(
-                    s"Redis incremental batch dataset ${request.dataset} has no applied-status marker; " +
-                      "reads are disabled until a full upload succeeds")
-              }
+              Some(batchStatuses(request.dataset).get)
             } else None
-          if (publishedStatus.exists(_.retired)) ImmediateReadPlan(request, Success(Seq.empty))
+          if (publishedStatus.exists(_.status.retired)) ImmediateReadPlan(request, Success(Seq.empty))
           else BatchReadPlan(request, redisKey.getBytes(StandardCharsets.UTF_8), publishedStatus)
         case StreamingTable if request.startTsMillis.isDefined =>
           val startTs = request.startTsMillis.get
@@ -467,43 +472,206 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
     planned.recover { case error => ImmediateReadPlan(request, Failure(error)) }.get
   }
 
-  private def cachedBatchStatus(dataset: String): Option[RedisBatchUpload.BatchStatus] = {
-    val now = System.currentTimeMillis()
-    batchStatusCache.get(dataset) match {
-      case Some(cached) if cached.expiresAtMillis > now => cached.status
-      case _ =>
-        batchStatusCache.synchronized {
-          val refreshedNow = System.currentTimeMillis()
-          batchStatusCache.get(dataset) match {
-            case Some(cached) if cached.expiresAtMillis > refreshedNow => cached.status
-            case _ => refreshBatchStatusLocked(dataset, refreshedNow)
+  /** Resolve each managed batch marker once per multiGet and pipeline distinct stale markers together. Candidate-owned
+    * GroupBys can contribute dozens of keys for one dataset, while a search request can span dozens of datasets.
+    */
+  private def snapshotBatchStatuses(requests: Seq[GetRequest]): Map[String, Try[BatchStatusSnapshot]] = {
+    if (!requireBatchStatus) Map.empty
+    else {
+      val datasets = mutable.LinkedHashSet.empty[String]
+      requests.iterator.foreach { request =>
+        val dataset = request.dataset
+        if (dataset.endsWith("_BATCH")) datasets += dataset
+      }
+      resolveBatchStatuses(datasets.toVector).iterator.map { case (dataset, cached) =>
+        dataset -> cached.flatMap { value =>
+          value.status match {
+            case Some(status) => Success(BatchStatusSnapshot(status, value.refreshVersion))
+            case None         => Failure(missingBatchStatusException(dataset))
           }
         }
+      }.toMap
     }
   }
 
-  private def refreshBatchStatus(dataset: String): Option[RedisBatchUpload.BatchStatus] =
-    batchStatusCache.synchronized {
-      refreshBatchStatusLocked(dataset, System.currentTimeMillis())
+  /** Claim stale datasets independently, then fetch all claims owned by this request in one cluster pipeline. Other
+    * requests for the same dataset wait on its in-flight refresh instead of issuing duplicate marker reads.
+    */
+  private def resolveBatchStatuses(datasets: Seq[String]): Map[String, Try[RedisKVStore.CachedBatchStatus]] = {
+    val resolved = mutable.LinkedHashMap.empty[String, Try[RedisKVStore.CachedBatchStatus]]
+    val pending = mutable.LinkedHashMap.empty[String, CompletableFuture[RedisKVStore.CachedBatchStatus]]
+    val owned = mutable.ArrayBuffer.empty[(String, CompletableFuture[RedisKVStore.CachedBatchStatus], Option[Long])]
+
+    datasets.foreach { dataset =>
+      val now = System.currentTimeMillis()
+      Option(batchStatusCache.getIfPresent(dataset)) match {
+        case Some(cached) if cached.expiresAtMillis > now => resolved.put(dataset, Success(cached))
+        case _ =>
+          val candidate = new CompletableFuture[RedisKVStore.CachedBatchStatus]()
+          batchStatusRefreshes.putIfAbsent(dataset, candidate) match {
+            case Some(existing) => pending.put(dataset, existing)
+            case None =>
+              batchStatusLock(dataset).synchronized {
+                val claimedAt = System.currentTimeMillis()
+                val observed = Option(batchStatusCache.getIfPresent(dataset))
+                observed match {
+                  case Some(cached) if cached.expiresAtMillis > claimedAt =>
+                    candidate.complete(cached)
+                    batchStatusRefreshes.remove(dataset)
+                  case _ => owned += ((dataset, candidate, observed.map(_.refreshVersion)))
+                }
+              }
+              pending.put(dataset, candidate)
+          }
+      }
+    }
+
+    refreshClaimedBatchStatuses(owned.toVector)
+    pending.foreach { case (dataset, refresh) =>
+      val result = Try(refresh.join()).recoverWith { case error => Failure(unwrapCompletionError(error)) }
+      resolved.put(dataset, result)
+    }
+    resolved.toMap
+  }
+
+  private def refreshClaimedBatchStatuses(
+      claims: Seq[(String, CompletableFuture[RedisKVStore.CachedBatchStatus], Option[Long])]): Unit = {
+    if (claims.nonEmpty) {
+      val datasets = claims.map(_._1)
+      val results = Try(readBatchStatuses(datasets)) match {
+        case Success(statuses) if statuses.size == claims.size => statuses
+        case Success(statuses) =>
+          val error = new IllegalStateException(
+            s"Redis batch status pipeline returned ${statuses.size} responses for ${claims.size} datasets")
+          Vector.fill(claims.size)(Failure(error))
+        case Failure(error) => Vector.fill(claims.size)(Failure(error))
+      }
+
+      claims.iterator.zip(results.iterator).foreach { case ((dataset, refresh, observedRefreshVersion), result) =>
+        result match {
+          case Success(status) =>
+            val cached = batchStatusLock(dataset).synchronized {
+              Option(batchStatusCache.getIfPresent(dataset)) match {
+                case Some(current) if !observedRefreshVersion.contains(current.refreshVersion) => current
+                case _ => cacheBatchStatus(dataset, status, System.currentTimeMillis(), aheadRefresh = false)
+              }
+            }
+            refresh.complete(cached)
+          case Failure(error) => refresh.completeExceptionally(error)
+        }
+        batchStatusRefreshes.remove(dataset)
+      }
+    }
+  }
+
+  private def missingBatchStatusException(dataset: String): IllegalStateException =
+    new IllegalStateException(
+      s"Redis incremental batch dataset $dataset has no applied-status marker; " +
+        "reads are disabled until a full upload succeeds")
+
+  private def batchStatusLock(dataset: String): AnyRef =
+    batchStatusLocks(Math.floorMod(dataset.hashCode, batchStatusLocks.length))
+
+  /** Force-refresh an ahead-of-marker value at most once per short backoff window. The refresh version lets values
+    * planned from the same stale snapshot reuse the first refresh even when the marker is still behind.
+    */
+  private def refreshBatchStatusForAhead(dataset: String,
+                                         decoded: RedisBatchUpload.DecodedValue,
+                                         observed: BatchStatusSnapshot): Option[RedisBatchUpload.BatchStatus] =
+    batchStatusLock(dataset).synchronized {
+      val now = System.currentTimeMillis()
+      Option(batchStatusCache.getIfPresent(dataset)) match {
+        case Some(current) if current.refreshVersion != observed.refreshVersion                  => current.status
+        case Some(current) if current.status.exists(status => !isAheadOfStatus(decoded, status)) => current.status
+        case Some(current) if current.forceRefreshAfterMillis > now                              => current.status
+        case _ => refreshBatchStatusLocked(dataset, now, aheadRefresh = true).status
+      }
     }
 
   private def refreshBatchStatusLocked(dataset: String,
-                                       refreshedAtMillis: Long): Option[RedisBatchUpload.BatchStatus] = {
-    val status = RedisBatchUpload.readStatus(jedisCluster, RedisBatchUpload.buildStatusKey(dataset, keyPrefix))
-    cacheBatchStatus(dataset, status, refreshedAtMillis)
-    status
+                                       refreshedAtMillis: Long,
+                                       aheadRefresh: Boolean): RedisKVStore.CachedBatchStatus = {
+    val status = readBatchStatus(dataset)
+    cacheBatchStatus(dataset, status, refreshedAtMillis, aheadRefresh)
   }
+
+  protected[redis] def readBatchStatus(dataset: String): Option[RedisBatchUpload.BatchStatus] =
+    RedisBatchUpload.readStatus(jedisCluster, RedisBatchUpload.buildStatusKey(dataset, keyPrefix))
+
+  protected[redis] def readBatchStatuses(datasets: Seq[String]): Seq[Try[Option[RedisBatchUpload.BatchStatus]]] = {
+    val pipelineResult = Try {
+      val pipeline = pipelineSyncExecutor match {
+        case Some(executor) => jedisCluster.pipelined(executor)
+        case None           => jedisCluster.pipelined()
+      }
+      var queueError = Option.empty[Exception]
+      val responses =
+        try {
+          datasets.map { dataset =>
+            pipeline.get(RedisBatchUpload.buildStatusKey(dataset, keyPrefix).getBytes(StandardCharsets.UTF_8))
+          }
+        } catch {
+          case error: Exception =>
+            queueError = Some(error)
+            throw error
+        } finally {
+          try {
+            pipeline.close()
+          } catch {
+            case closeError: Exception =>
+              queueError match {
+                case Some(error) => error.addSuppressed(closeError)
+                case None        => throw closeError
+              }
+          }
+        }
+      responses.map { response =>
+        Try(Option(response.get()).map(bytes => RedisBatchUpload.decodeStatus(bytes).get))
+      }
+    }
+
+    pipelineResult match {
+      case Success(results) =>
+        datasets.iterator
+          .zip(results.iterator)
+          .map { case (dataset, result) =>
+            recoverBatchStatusRead(dataset, result)
+          }
+          .toVector
+      case Failure(error) if isRetryablePipelineFailure(error) =>
+        datasets.map(dataset => recoverBatchStatusRead(dataset, Failure(error)))
+      case Failure(error) => throw error
+    }
+  }
+
+  /** Cluster pipelines do not transparently follow MOVED/ASK responses. Retry only failed markers through the direct
+    * JedisCluster path, which refreshes routing while preserving successful pipelined marker reads.
+    */
+  protected[redis] def recoverBatchStatusRead(
+      dataset: String,
+      result: Try[Option[RedisBatchUpload.BatchStatus]]): Try[Option[RedisBatchUpload.BatchStatus]] =
+    result.recoverWith {
+      case error if isRetryablePipelineFailure(error) =>
+        recordPipelineRetry(dataset, error)
+        Try(readBatchStatus(dataset))
+    }
 
   private def cacheBatchStatus(dataset: String,
                                status: Option[RedisBatchUpload.BatchStatus],
-                               refreshedAtMillis: Long): Unit =
-    status match {
-      case Some(_) =>
-        batchStatusCache.put(
-          dataset,
-          RedisKVStore.CachedBatchStatus(status, refreshedAtMillis + RedisKVStore.BatchStatusCacheMillis))
-      case None => batchStatusCache.remove(dataset)
-    }
+                               refreshedAtMillis: Long,
+                               aheadRefresh: Boolean): RedisKVStore.CachedBatchStatus = {
+    val ttlMillis =
+      if (status.isDefined) RedisKVStore.BatchStatusCacheMillis
+      else RedisKVStore.MissingBatchStatusCacheMillis
+    val cached = RedisKVStore.CachedBatchStatus(
+      status,
+      refreshedAtMillis + ttlMillis,
+      if (aheadRefresh) refreshedAtMillis + RedisKVStore.AheadBatchStatusRefreshBackoffMillis else refreshedAtMillis,
+      batchStatusRefreshVersions.incrementAndGet()
+    )
+    batchStatusCache.put(dataset, cached)
+    cached
+  }
 
   private def isAheadOfStatus(decoded: RedisBatchUpload.DecodedValue, status: RedisBatchUpload.BatchStatus): Boolean =
     decoded.storedTimestamp > status.batchTimestamp ||
@@ -740,14 +908,12 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
   private def decodeBatchValue(storedBytes: Array[Byte], plan: BatchReadPlan): Seq[TimedValue] =
     Option(storedBytes).toSeq.flatMap { bytes =>
       val decoded = RedisBatchUpload.decodeValue(bytes).get
-      val effectiveStatus = plan.publishedStatus.map { cachedStatus =>
+      val effectiveStatus = plan.publishedStatus.map { snapshot =>
         val status =
-          if (isAheadOfStatus(decoded, cachedStatus)) {
-            refreshBatchStatus(plan.request.dataset).getOrElse(
-              throw new IllegalStateException(
-                s"Redis incremental batch dataset ${plan.request.dataset} has no applied-status marker; " +
-                  "reads are disabled until a full upload succeeds"))
-          } else cachedStatus
+          if (isAheadOfStatus(decoded, snapshot.status)) {
+            refreshBatchStatusForAhead(plan.request.dataset, decoded, snapshot)
+              .getOrElse(throw missingBatchStatusException(plan.request.dataset))
+          } else snapshot.status
         if (isAheadOfStatus(decoded, status)) {
           throw new IllegalStateException(
             s"Redis batch value for ${plan.request.dataset} is newer than applied status ${status.generation}")
@@ -1271,9 +1437,11 @@ private[redis] object RedisKVStoreImpl {
 
   final case class ImmediateReadPlan(request: GetRequest, values: Try[Seq[TimedValue]]) extends PlannedRead
 
+  final case class BatchStatusSnapshot(status: RedisBatchUpload.BatchStatus, refreshVersion: Long)
+
   final case class BatchReadPlan(request: GetRequest,
                                  redisKey: Array[Byte],
-                                 publishedStatus: Option[RedisBatchUpload.BatchStatus])
+                                 publishedStatus: Option[BatchStatusSnapshot])
       extends RedisReadPlan
 
   final case class StreamingReadPlan(
@@ -1302,8 +1470,15 @@ object RedisKVStore {
   val DatasetAndEntityHashTagMode = "dataset_and_entity"
   val EntityHashTagMode = "entity"
   private[redis] val BatchStatusCacheMillis = 5000L
+  private[redis] val MissingBatchStatusCacheMillis = 250L
+  private[redis] val AheadBatchStatusRefreshBackoffMillis = 250L
+  private[redis] val BatchStatusCacheMaxEntries = 4096
+  private[redis] val BatchStatusLockStripes = 1024
 
-  private[redis] case class CachedBatchStatus(status: Option[RedisBatchUpload.BatchStatus], expiresAtMillis: Long)
+  private[redis] case class CachedBatchStatus(status: Option[RedisBatchUpload.BatchStatus],
+                                              expiresAtMillis: Long,
+                                              forceRefreshAfterMillis: Long,
+                                              refreshVersion: Long)
 
   /** Reapply metadata Spark defaults when the Redis publisher creates its session, while preserving the effective
     * spark-submit configuration. The submitted configuration wins over compiled metadata.
