@@ -19,7 +19,7 @@ package ai.chronon.online.fetcher
 import ai.chronon.api.Extensions._
 import ai.chronon.api._
 import ai.chronon.online._
-import ai.chronon.online.fetcher.Fetcher.{ColumnSpec, PrefixedRequest, Request, Response}
+import ai.chronon.online.fetcher.Fetcher.{ColumnSpec, Request, Response}
 import ai.chronon.online.fetcher.FetcherCache.BatchResponses
 import ai.chronon.online.metrics.Metrics
 import org.slf4j.{Logger, LoggerFactory}
@@ -28,6 +28,7 @@ import java.util.function.BiFunction
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 object JoinPartFetcher {
   private val PreparedJoinMetricsCacheMaxEntries = 10000
@@ -37,9 +38,67 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
 
   import JoinPartFetcher._
 
-  private final class PreparedJoinMetrics(val joinOps: JoinOps,
+  private final class PreparedJoinMetrics(val mutableJoinSnapshot: Join,
+                                          val joinOps: JoinOps,
                                           val joinContext: Metrics.Context,
-                                          val parts: Seq[(JoinPartOps, Metrics.Context)])
+                                          val parts: Seq[PreparedJoinPart])
+
+  private final class PreparedJoinPart(join: Join, val joinPartOps: JoinPartOps, val metricsContext: Metrics.Context) {
+    // Parsing SQL expressions can fail. Cache the Try rather than a throwing lazy initializer: Scala retries failed
+    // lazy vals, which would otherwise reparse the same invalid expression for every candidate in the request. The
+    // accessor still throws only after fetchJoins has attached the prepared join metrics context.
+    private lazy val requestPlanResult = Try(JoinRequestKeys.prepare(join, joinPartOps))
+    def requestPlan: JoinRequestKeys.RequestPlan = requestPlanResult.get
+    lazy val unqualifiedPartKey: String = JoinRequestKeys.partKey(join, joinPartOps)
+    private final class QualifiedPartKey(val servingInfo: GroupByServingInfoParsed, val value: String)
+    @volatile private var cachedQualifiedPartKey: QualifiedPartKey = _
+    private val prefix = joinPartOps.columnPrefix
+    private lazy val prefixedFeatureNames = {
+      val responseFeatureNames = Try {
+        val groupBy = joinPartOps.groupBy
+        val baseFeatureNames = groupBy.valueColumns.toSeq
+        if (!groupBy.hasDerivations) {
+          baseFeatureNames
+        } else {
+          val wildcardFeatureNames =
+            if (groupBy.derivationsContainStar)
+              baseFeatureNames.filterNot(groupBy.derivationExpressionSet.contains)
+            else Seq.empty
+          wildcardFeatureNames ++ groupBy.derivationsWithoutStar.map(_.name)
+        }
+      }.getOrElse(Seq.empty)
+
+      (responseFeatureNames.iterator ++ Iterator("exception", s"derivation${FetcherUtil.FeatureExceptionSuffix}"))
+        .map(featureName => featureName -> (prefix + featureName))
+        .toMap
+    }
+
+    def prefixedFeatureName(featureName: String): String =
+      prefixedFeatureNames.getOrElse(featureName, prefix + featureName)
+
+    def qualifiedPartKey(servingInfo: GroupByServingInfoParsed): String = {
+      val cached = cachedQualifiedPartKey
+      if ((cached ne null) && (cached.servingInfo eq servingInfo)) {
+        cached.value
+      } else {
+        this.synchronized {
+          val current = cachedQualifiedPartKey
+          if ((current ne null) && (current.servingInfo eq servingInfo)) {
+            current.value
+          } else {
+            val key = JoinRequestKeys.partKey(join, joinPartOps, servingInfo)
+            cachedQualifiedPartKey = new QualifiedPartKey(servingInfo, key)
+            key
+          }
+        }
+      }
+    }
+  }
+
+  private final class PreparedPrefixedRequest(val part: PreparedJoinPart, val request: Request)
+
+  private final class ResolvedDerivedKeys(val servingInfo: Try[GroupByServingInfoParsed],
+                                          val keyMapping: Option[JoinRequestKeys.KeyMapping])
 
   private val preparedJoinMetricsByName =
     LRUCache[String, PreparedJoinMetrics]("join_part_prepared_metrics", PreparedJoinMetricsCacheMaxEntries)
@@ -49,9 +108,19 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
   private[online] val groupByFetcher = new GroupByFetcher(fetchContext, metadataStore)
   private implicit val executionContext: ExecutionContext = fetchContext.getOrCreateExecutionContext
 
-  private def preparedJoinMetrics(joinName: String, joinOps: JoinOps): PreparedJoinMetrics = {
+  private def preparedJoinMetrics(joinName: String,
+                                  joinOps: JoinOps,
+                                  validateMutableOverride: Boolean): PreparedJoinMetrics = {
+    def matches(prepared: PreparedJoinMetrics): Boolean =
+      if (validateMutableOverride) {
+        prepared.mutableJoinSnapshot != null && prepared.mutableJoinSnapshot == joinOps.join
+      } else {
+        // MetadataStore refreshes publish a new Join object, making identity the mutation-free production fast path.
+        prepared.joinOps.join.eq(joinOps.join)
+      }
+
     val cached = preparedJoinMetricsByName.getIfPresent(joinName)
-    if (cached != null && cached.joinOps.join.eq(joinOps.join)) {
+    if (cached != null && matches(cached)) {
       cached
     } else {
       // Only metadata refreshes and first access take the per-name cache update lock. The normal request path above
@@ -62,12 +131,18 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
           joinName,
           new BiFunction[String, PreparedJoinMetrics, PreparedJoinMetrics] {
             override def apply(ignored: String, current: PreparedJoinMetrics): PreparedJoinMetrics = {
-              if (current != null && current.joinOps.join.eq(joinOps.join)) {
+              if (current != null && matches(current)) {
                 current
               } else {
                 val joinContext = Metrics.Context(Metrics.Environment.JoinFetching, joinOps.join)
-                val parts = joinOps.joinPartOps.map(part => part -> Metrics.Context(joinContext, part))
-                new PreparedJoinMetrics(joinOps, joinContext, parts)
+                val parts =
+                  joinOps.joinPartOps.map(part =>
+                    new PreparedJoinPart(joinOps.join, part, Metrics.Context(joinContext, part)))
+                // Caller-provided Thrift overrides are mutable. Snapshot those so in-place changes cannot reuse stale
+                // key or output-prefix plans. Metadata-owned joins have an immutable publication contract and use
+                // identity above, avoiding a 43-part structural scan on every production request.
+                val mutableJoinSnapshot = if (validateMutableOverride) joinOps.join.deepCopy() else null
+                new PreparedJoinMetrics(mutableJoinSnapshot, joinOps, joinContext, parts)
               }
             }
           }
@@ -106,9 +181,36 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
     }
     val joinOpsByName = mutable.HashMap.empty[String, Try[JoinOps]]
     val preparedMetricsByName = mutable.HashMap.empty[String, PreparedJoinMetrics]
+    // A derived part uses the same JoinCodec and serving metadata for every candidate in this outer request. Resolve
+    // its schema-qualified mapping once rather than rebuilding the large part key (left selects + setups) per row.
+    // Keep this cache request-scoped so metadata and codec refreshes are visible on the next fetchJoins call.
+    val resolvedDerivedKeysByPart = mutable.HashMap.empty[PreparedJoinPart, ResolvedDerivedKeys]
+
+    def resolveDerivedKeys(requestName: String, join: JoinOps, preparedPart: PreparedJoinPart): ResolvedDerivedKeys =
+      resolvedDerivedKeysByPart.get(preparedPart).getOrElse {
+        val part = preparedPart.joinPartOps
+        val servingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName)
+        val keyMapping = joinCodecForName(requestName).flatMap(_.toOption).flatMap { codec =>
+          servingInfo.toOption
+            .flatMap(info => codec.joinPartKeyMappings.get(preparedPart.qualifiedPartKey(info)))
+            .orElse {
+              if (servingInfo.isFailure) {
+                codec.joinPartKeyMappings.get(preparedPart.unqualifiedPartKey)
+              } else {
+                None
+              }
+            }
+        }
+        val resolved = new ResolvedDerivedKeys(servingInfo, keyMapping)
+        // A cold serving-info Failure is deliberately stamped expired by TTLCache so a later candidate can observe an
+        // asynchronous recovery. Do not turn that transient failure into an all-candidate request failure. A cached
+        // JoinCodec mapping remains usable without the current serving info, so it is safe to memoize that case.
+        if (servingInfo.isSuccess || keyMapping.isDefined) resolvedDerivedKeysByPart.put(preparedPart, resolved)
+        resolved
+      }
 
     // convert join requests to groupBy requests
-    val joinDecomposed: Seq[(Request, Try[Seq[Either[PrefixedRequest, KeyMissingException]]])] =
+    val joinDecomposed: Seq[(Request, Try[Seq[Either[PreparedPrefixedRequest, KeyMissingException]]])] =
       requests.map { request =>
         // use passed-in join or fetch one
         val joinTry: Try[JoinOps] = overrideJoinOps.getOrElse {
@@ -127,31 +229,22 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
 
         val decomposedTry = joinTry.map { join =>
           val preparedMetrics =
-            preparedMetricsByName.getOrElseUpdate(request.name, preparedJoinMetrics(request.name, join))
+            preparedMetricsByName.getOrElseUpdate(
+              request.name,
+              preparedJoinMetrics(request.name, join, validateMutableOverride = joinConf.isDefined))
           joinContext = Some(preparedMetrics.joinContext)
           preparedMetrics.joinContext.increment("join_request.count")
 
-          preparedMetrics.parts.map { case (part, joinContextInner) =>
-            val needsDerivation = JoinRequestKeys.needsDerivation(request, join.join, part)
-            lazy val currentServingInfo = metadataStore.getGroupByServingInfo(part.groupBy.metaData.getName)
-            lazy val keyMapping = joinCodecForName(request.name).flatMap(_.toOption).flatMap { codec =>
-              currentServingInfo.toOption
-                .flatMap(servingInfo =>
-                  codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part, servingInfo)))
-                .orElse {
-                  if (currentServingInfo.isFailure) {
-                    codec.joinPartKeyMappings.get(JoinRequestKeys.partKey(join.join, part))
-                  } else {
-                    None
-                  }
-                }
-            }
-            val staticMissingKeys = JoinRequestKeys.missingRequestKeys(request, join.join, part)
+          preparedMetrics.parts.map { preparedPart =>
+            val part = preparedPart.joinPartOps
+            val needsDerivation = preparedPart.requestPlan.needsDerivation(request)
+            lazy val derivedKeys = resolveDerivedKeys(request.name, join, preparedPart)
+            val staticMissingKeys = preparedPart.requestPlan.missingRequestKeys(request)
             val missingKeys =
               if (staticMissingKeys.nonEmpty || !needsDerivation) {
                 staticMissingKeys
               } else {
-                keyMapping.map(_.missingRequestKeys(request)).getOrElse(staticMissingKeys)
+                derivedKeys.keyMapping.map(_.missingRequestKeys(request)).getOrElse(staticMissingKeys)
               }
 
             if (missingKeys.nonEmpty) {
@@ -159,18 +252,20 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
             } else {
               val leftKeys =
                 if (needsDerivation) {
-                  keyMapping.map(_.leftKeys(request)).getOrElse {
-                    val servingInfo = currentServingInfo.get
-                    JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo)
+                  derivedKeys.keyMapping.map(_.leftKeys(request)).getOrElse {
+                    val servingInfo = derivedKeys.servingInfo.get
+                    JoinRequestKeys.deriveLeftKeys(request, join.join, part, servingInfo, preparedPart.requestPlan)
                   }
                 } else {
                   part.leftToRight.keys.map(leftKey => leftKey -> request.keys(leftKey)).toMap
                 }
               val rightKeys = part.leftToRight.map { case (leftKey, rightKey) => rightKey -> leftKeys(leftKey) }
               Left(
-                PrefixedRequest(
-                  part.columnPrefix,
-                  Request(part.groupBy.getMetaData.getName, rightKeys, request.atMillis, Some(joinContextInner))))
+                new PreparedPrefixedRequest(preparedPart,
+                                            Request(part.groupBy.getMetaData.getName,
+                                                    rightKeys,
+                                                    request.atMillis,
+                                                    Some(preparedPart.metricsContext))))
             }
 
           }
@@ -208,15 +303,18 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
         val featureMetrics = new Fetcher.FeatureMetricsAccumulator
         val responses = joinDecomposed.iterator.map { case (joinRequest, decomposedRequestsTry) =>
           val joinValuesTry = decomposedRequestsTry.map { groupByRequestsWithPrefix =>
-            groupByRequestsWithPrefix.iterator.flatMap {
+            var result = Map.empty[String, AnyRef]
+            groupByRequestsWithPrefix.foreach {
 
               case Right(keyMissingException) =>
-                Map(
-                  keyMissingException.requestName + FetcherUtil.FeatureExceptionSuffix -> keyMissingException.getMessage)
+                result = result.updated(keyMissingException.requestName + FetcherUtil.FeatureExceptionSuffix,
+                                        keyMissingException.getMessage)
 
-              case Left(PrefixedRequest(prefix, groupByRequest)) =>
-                parseGroupByResponse(prefix, groupByKey(groupByRequest), responseMap)
-            }.toMap
+              case Left(preparedRequest) =>
+                result =
+                  appendGroupByResponse(preparedRequest.part, groupByKey(preparedRequest.request), responseMap, result)
+            }
+            result
 
           }
           joinValuesTry match {
@@ -238,23 +336,61 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
       }
   }
 
-  def parseGroupByResponse(
-      prefix: String,
+  private def appendGroupByResponse(
+      part: PreparedJoinPart,
+      key: (String, Map[String, AnyRef], Option[Long]),
+      responseMap: Map[(String, Map[String, AnyRef], Option[Long]), Try[Map[String, AnyRef]]],
+      result: Map[String, AnyRef]
+  ): Map[String, AnyRef] = {
+    groupByResponse(key, responseMap) match {
+      case Success(valueMap) if valueMap != null =>
+        var updated = result
+        try {
+          valueMap.foreach { case (featureName, featureValue) =>
+            updated = updated.updated(part.prefixedFeatureName(featureName), featureValue)
+          }
+          updated
+        } catch {
+          // The previous parseGroupByResponse contract converted response-map transformation failures into a
+          // part-scoped exception. Persistent maps let us discard any partial updates without an intermediate map.
+          case NonFatal(ex) => appendGroupByFailure(part, key, ex, result)
+        }
+      case Success(_)  => result // A response with all-null request keys is intentionally absent.
+      case Failure(ex) => appendGroupByFailure(part, key, ex, result)
+    }
+  }
+
+  private def appendGroupByFailure(part: PreparedJoinPart,
+                                   key: (String, Map[String, AnyRef], Option[Long]),
+                                   ex: Throwable,
+                                   result: Map[String, AnyRef]): Map[String, AnyRef] = {
+    val prefix = part.joinPartOps.columnPrefix
+    logThrottled(ERROR, s"join_part_response_failure_${prefix}_${ex.getClass.getName}", s"Failed to fetch $key", ex)
+    result.updated(part.prefixedFeatureName("exception"), ex.toString)
+  }
+
+  private def groupByResponse(
       key: (String, Map[String, AnyRef], Option[Long]),
       responseMap: Map[(String, Map[String, AnyRef], Option[Long]), Try[Map[String, AnyRef]]]
-  ): Map[String, AnyRef] = {
+  ): Try[Map[String, AnyRef]] = {
     // Group bys with all null keys won't be requested from the KV store and we don't expect a response.
     val isRequiredRequest = key._2.values.exists(_ != null) || key._2.isEmpty
 
-    val response: Try[Map[String, AnyRef]] = responseMap.get(key) match {
+    responseMap.get(key) match {
       case Some(value) => value
       case None =>
         if (isRequiredRequest)
           Failure(new IllegalStateException(s"Couldn't find a groupBy response for $key in response map"))
         else Success(null)
     }
+  }
 
-    response
+  def parseGroupByResponse(
+      prefix: String,
+      key: (String, Map[String, AnyRef], Option[Long]),
+      responseMap: Map[(String, Map[String, AnyRef], Option[Long]), Try[Map[String, AnyRef]]]
+  ): Map[String, AnyRef] = {
+    groupByResponse(key, responseMap)
       .map { valueMap =>
         if (valueMap != null) {
           valueMap.map { case (aggName, aggValue) => prefix + aggName -> aggValue }

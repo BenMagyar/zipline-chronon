@@ -29,6 +29,7 @@ import ai.chronon.online.metrics.{Metrics, TTLCache}
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.nio.charset.StandardCharsets
+import java.util.function.BiFunction
 import scala.collection.immutable.SortedMap
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
@@ -60,6 +61,40 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
   private val CONF_BATCH_SIZE = 50
 
   implicit val executionContext: ExecutionContext = fetchContext.getOrCreateExecutionContext
+
+  private final class CachedGroupByServingInfo(val rawMetadata: String, val parsed: GroupByServingInfoParsed)
+  private val ParsedGroupByServingInfoCacheMaxEntries = 4096
+
+  // The hot path intentionally checks batch serving metadata every few seconds so a newly published batch becomes
+  // visible even when every feature value is served from Caffeine. Most checks return byte-for-byte identical JSON.
+  // Preserve the parsed object's identity in that case so its lazy codecs, derivations, and aggregator are not rebuilt.
+  @transient private lazy val parsedGroupByServingInfo =
+    LRUCache[String, CachedGroupByServingInfo]("group_by_serving_info_parsed", ParsedGroupByServingInfoCacheMaxEntries)
+
+  private def parseOrReuseGroupByServingInfo(cacheKey: String, rawMetadata: String): GroupByServingInfoParsed = {
+    val cached = parsedGroupByServingInfo.getIfPresent(cacheKey)
+    if (cached != null && cached.rawMetadata == rawMetadata) {
+      cached.parsed
+    } else {
+      parsedGroupByServingInfo.asMap
+        .compute(
+          cacheKey,
+          new BiFunction[String, CachedGroupByServingInfo, CachedGroupByServingInfo] {
+            override def apply(key: String, existing: CachedGroupByServingInfo): CachedGroupByServingInfo = {
+              if (existing != null && existing.rawMetadata == rawMetadata) {
+                existing
+              } else {
+                val parsed = new GroupByServingInfoParsed(
+                  ThriftJsonCodec
+                    .fromJsonStr[GroupByServingInfo](rawMetadata, check = false, classOf[GroupByServingInfo]))
+                new CachedGroupByServingInfo(rawMetadata, parsed)
+              }
+            }
+          }
+        )
+        .parsed
+    }
+  }
 
   def getConf[T <: TBase[_, _]: Manifest](confPathOrName: ConfPathOrName): Try[T] = {
     val clazz = implicitly[ClassTag[T]].runtimeClass.asInstanceOf[Class[T]]
@@ -460,13 +495,12 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
                              metaData.failed.get))
     } else {
       import ai.chronon.online.metrics
-      val groupByServingInfo = ThriftJsonCodec
-        .fromJsonStr[GroupByServingInfo](metaData.get, check = false, classOf[GroupByServingInfo])
+      val groupByServingInfo = parseOrReuseGroupByServingInfo(batchDataset, metaData.get)
       metrics.Metrics
         .Context(metrics.Metrics.Environment.MetaDataFetching, groupByServingInfo.groupBy)
         .withSuffix("group_by")
         .distribution(metrics.Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTimeMs)
-      Success(new GroupByServingInfoParsed(groupByServingInfo))
+      Success(groupByServingInfo)
     }
   }
 

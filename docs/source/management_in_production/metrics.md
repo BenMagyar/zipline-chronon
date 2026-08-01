@@ -215,6 +215,7 @@ Metrics collection is **disabled by default**. Set the following JVM system prop
 | `ai.chronon.metrics.enabled` | `false` | Set to `true` to enable metrics collection |
 | `ai.chronon.metrics.reporter` | `otel` | Reporter backend; only `otel` (OpenTelemetry) is supported |
 | `ai.chronon.metrics.prefix` | _(none)_ | Optional global prefix prepended to all metric names |
+| `ai.chronon.metrics.hot_path.sample.rate` | `1.0` | Probability in `[0.0, 1.0]` for recording detailed GroupBy response histograms. Request, error, and degraded counters remain exact. |
 | `ai.chronon.metrics.reader` | `http` | Export mode: `http` (OTLP HTTP), `grpc` (OTLP gRPC), or `prometheus` |
 | `ai.chronon.metrics.exporter.url` | `http://localhost:4318` | OTLP endpoint URL (for `http` and `grpc` modes) |
 | `ai.chronon.metrics.exporter.port` | `8905` | Port for the Prometheus HTTP server (for `prometheus` mode) |

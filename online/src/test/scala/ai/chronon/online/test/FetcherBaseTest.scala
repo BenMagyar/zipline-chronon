@@ -271,9 +271,12 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
       }
     }).when(joinPartFetcher).fetchGroupBys(any())
 
+    val requests = (0 until 50).map { index =>
+      Request(queryJoin.metaData.name, Map("query" -> s"SHOES$index"))
+    }
     Await.result(
       joinPartFetcher.fetchJoins(
-        Seq(Request(queryJoin.metaData.name, Map("query" -> "SHOES"))),
+        requests,
         Some(queryJoin),
         joinName => Map(queryJoin.metaData.name -> Success(joinCodec)).get(joinName)
       ),
@@ -282,10 +285,77 @@ class FetcherBaseTest extends AnyFlatSpec with MockitoSugar with Matchers with M
 
     val requestsCaptor = ArgumentCaptor.forClass(classOf[Seq[_]])
     verify(joinPartFetcher).fetchGroupBys(requestsCaptor.capture().asInstanceOf[Seq[Request]])
-    val groupByRequest = requestsCaptor.getValue.asInstanceOf[Seq[Request]].head
+    val groupByRequests = requestsCaptor.getValue.asInstanceOf[Seq[Request]]
+    groupByRequests should have size 50
+    val groupByRequest = groupByRequests.head
     groupByRequest.name shouldBe queryGroupBy.metaData.name
-    groupByRequest.keys shouldBe Map("query_normalized" -> "shoes")
+    groupByRequest.keys shouldBe Map("query_normalized" -> "shoes0")
     verify(ttlCache, times(1)).apply(queryGroupBy.metaData.name)
+  }
+
+  it should "let later candidates observe recovery from an initial derived-key serving info failure" in {
+    val queryGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.recovering_query_group_by"),
+      keyColumns = Seq("query_normalized"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val queryJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.recovering_query_join"),
+      left = Builders.Source.events(
+        query = Builders.Query(selects = Map("query_normalized" -> "lower(query)")),
+        table = "unit_test.queries"
+      ),
+      joinParts = Seq(
+        Builders.JoinPart(
+          groupBy = queryGroupBy,
+          keyMapping = Map("query_normalized" -> "query_normalized")
+        ))
+    )
+
+    val groupByServingInfo = new GroupByServingInfo()
+      .setGroupBy(queryGroupBy)
+      .setKeyAvroSchema(
+        AvroConversions
+          .fromChrononSchema(StructType("Key", Array(StructField("query_normalized", StringType))))
+          .toString)
+      .setInputAvroSchema(
+        AvroConversions.fromChrononSchema(StructType("Input", Array(StructField("query", StringType)))).toString)
+    val servingInfo = new GroupByServingInfoParsed(groupByServingInfo)
+    val ttlCache = mock[TTLCache[String, Try[GroupByServingInfoParsed]]]
+    doReturn(ttlCache).when(metadataStore).getGroupByServingInfo
+    val servingInfoResponses =
+      Iterator[Try[GroupByServingInfoParsed]](Failure(new RuntimeException("transient serving info failure")),
+                                              Success(servingInfo))
+    doAnswer((_: InvocationOnMock) => servingInfoResponses.next())
+      .when(ttlCache)
+      .apply(queryGroupBy.metaData.name)
+
+    doAnswer(new Answer[Future[Seq[Response]]] {
+      def answer(invocation: InvocationOnMock): Future[Seq[Response]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[Request]]
+        Future.successful(requests.map(request => Response(request, Success(Map.empty))))
+      }
+    }).when(joinPartFetcher).fetchGroupBys(any())
+
+    val responses = Await.result(
+      joinPartFetcher.fetchJoins(
+        Seq(
+          Request(queryJoin.metaData.name, Map("query" -> "FIRST")),
+          Request(queryJoin.metaData.name, Map("query" -> "SECOND"))
+        ),
+        Some(queryJoin)
+      ),
+      1.second
+    )
+
+    responses.head.values.isFailure shouldBe true
+    responses(1).values shouldBe Success(Map.empty)
+    verify(ttlCache, times(2)).apply(queryGroupBy.metaData.name)
+
+    val requestsCaptor = ArgumentCaptor.forClass(classOf[Seq[_]])
+    verify(joinPartFetcher).fetchGroupBys(requestsCaptor.capture().asInstanceOf[Seq[Request]])
+    requestsCaptor.getValue.asInstanceOf[Seq[Request]].map(_.keys) shouldBe
+      Seq(Map("query_normalized" -> "second"))
   }
 
   it should "deduplicate direct Join request keys using GroupBy key types" in {

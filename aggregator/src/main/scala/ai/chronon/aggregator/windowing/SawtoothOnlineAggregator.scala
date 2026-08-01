@@ -38,6 +38,8 @@ class SawtoothOnlineAggregator(val batchEndTs: Long,
                                        inputSchema: Seq[(String, DataType)],
                                        resolution: Resolution,
                                        tailBufferMillis: Long) {
+  // Retain the existing public accessor for source/binary compatibility. Constructor logging was removed because
+  // this object is rebuilt during serving-info refreshes; callers that explicitly use the logger still can.
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   // logically, batch response is arranged like so
@@ -53,12 +55,6 @@ class SawtoothOnlineAggregator(val batchEndTs: Long,
   // 5min_irs - [(txn-sum, login-count, ..., ts)]
 
   val batchTailTs: Array[Option[Long]] = tailTs(batchEndTs)
-
-  logger.info(s"Batch End: ${TsUtils.toStr(batchEndTs)}")
-  logger.info("Window Tails: ")
-  for (i <- windowMappings.indices) {
-    logger.info(s"  ${windowMappings(i).aggregationPart.outputColumnName} -> ${batchTailTs(i).map(TsUtils.toStr)}")
-  }
 
   def update(batchIr: BatchIr, row: Row): BatchIr = update(batchEndTs, batchIr, row, batchTailTs)
 

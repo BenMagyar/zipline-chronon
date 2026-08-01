@@ -5,16 +5,19 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import scala.collection.mutable
 
 /** Captures all emissions via the protected emit() hook so we can test throttle logic
   * without needing a real SLF4J logger or a mocking framework.
   */
-class CapturingLogging(windowMs: Long) extends ThrottledLogging {
+class CapturingLogging(windowMs: Long, clock: () => Long = () => System.currentTimeMillis()) extends ThrottledLogging {
   override protected val throttleWindowMs: Long = windowMs
+  override protected def currentTimeMillis: Long = clock()
   val emitCount: AtomicInteger = new AtomicInteger(0)
   val messages: mutable.ListBuffer[String] = mutable.ListBuffer.empty
+
+  def acquire(key: String): Long = acquireThrottle(key)
 
   override protected def emit(level: LogLevel, msg: => String, t: Throwable): Unit = {
     emitCount.incrementAndGet()
@@ -50,6 +53,19 @@ class ThrottledLoggingTest extends AnyFlatSpec with Matchers {
     op.logThrottled(ERROR, "test_key", "error 2")
     op.logThrottled(ERROR, "test_key", "error 3")
     op.emitCount.get() shouldBe 1
+  }
+
+  it should "admit through the primitive path without constructing a log message" in {
+    val clock = new AtomicLong(0L)
+    val op = new CapturingLogging(windowMs = 1000L, clock = () => clock.get())
+
+    op.acquire("hot_key") shouldBe 0L
+    op.acquire("hot_key") shouldBe -1L
+    op.acquire("hot_key") shouldBe -1L
+    op.emitCount.get() shouldBe 0
+
+    clock.set(1000L)
+    op.acquire("hot_key") shouldBe 2L
   }
 
   it should "track different keys independently" in {
@@ -112,6 +128,55 @@ class ThrottledLoggingTest extends AnyFlatSpec with Matchers {
       op.logThrottled(ERROR, "concurrent_key", "after window")
       op.emitCount.get() shouldBe 2
       op.messages.last should include(s"suppressed ${threadCount - 1} occurrences")
+    } finally {
+      pool.shutdownNow()
+    }
+  }
+
+  it should "emit one periodic reminder and preserve suppression counts across a concurrent window boundary" in {
+    val clock = new AtomicLong(0L)
+    val op = new CapturingLogging(windowMs = 1000L, clock = () => clock.get())
+    val threadCount = 64
+    val pool = Executors.newFixedThreadPool(threadCount)
+
+    def invokeConcurrently(): Unit = {
+      val startLatch = new CountDownLatch(1)
+      val doneLatch = new CountDownLatch(threadCount)
+      (0 until threadCount).foreach { i =>
+        pool.submit(new Runnable {
+          override def run(): Unit = {
+            try {
+              startLatch.await()
+              op.logThrottled(WARN, "hot_key", s"message $i")
+            } finally {
+              doneLatch.countDown()
+            }
+          }
+        })
+      }
+      startLatch.countDown()
+      doneLatch.await(10, TimeUnit.SECONDS) shouldBe true
+    }
+
+    try {
+      op.logThrottled(WARN, "hot_key", "first")
+      invokeConcurrently()
+      op.emitCount.get() shouldBe 1
+
+      clock.set(1000L)
+      invokeConcurrently()
+      op.emitCount.get() shouldBe 2
+
+      clock.set(2000L)
+      op.logThrottled(WARN, "hot_key", "final reminder")
+      op.emitCount.get() shouldBe 3
+
+      val SuppressedCount = """\[suppressed ([0-9]+) occurrences.*""".r
+      val totalReportedSuppressions = op.messages.drop(1).flatMap {
+        case SuppressedCount(count) => Some(count.toLong)
+        case _                      => None
+      }.sum
+      totalReportedSuppressions shouldBe (threadCount * 2L - 1L)
     } finally {
       pool.shutdownNow()
     }

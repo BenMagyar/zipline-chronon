@@ -214,25 +214,34 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
     kvResponseFuture
       .map { kvResponses: Seq[GetResponse] =>
         val multiGetMillis = System.currentTimeMillis() - startTimeMs
+        val degradedCounter = new BatchedMetricsCounter("group_by.degraded_counter.count")
 
         val responsesMap: Map[GetRequest, Try[Seq[TimedValue]]] = kvResponses.map { response =>
           response.request -> response.values
         }.toMap
 
-        val totalResponseValueBytes =
-          responsesMap.iterator
-            .map(_._2)
-            .filter(v => v.isSuccess && v.get != null)
-            .flatMap(_.get.map(v => Option(v.bytes).map(_.length).getOrElse(0)))
-            .sum
         val requestCount = allRequestsToFetch.length
         val responseCount = kvResponses.length
+        // These three distributions describe the same physical multi-get. Sample them as one unit so dashboards do
+        // not combine independently sampled size, response, and latency observations. Keep batch.size exact because
+        // it is an additive counter rather than a distribution.
+        val recordDetailedMultiGetMetrics = metrics.HotPathMetricsSampler.global.shouldSample()
+        val totalResponseValueBytes =
+          if (recordDetailedMultiGetMetrics) {
+            responsesMap.iterator
+              .map(_._2)
+              .filter(v => v.isSuccess && v.get != null)
+              .flatMap(_.get.map(v => Option(v.bytes).map(_.length).getOrElse(0)))
+              .sum
+          } else 0
 
         multiGetMetricContexts.foreach { context: metrics.Metrics.Context =>
           context.count("multi_get.batch.size", requestCount)
-          context.distribution("multi_get.bytes", totalResponseValueBytes)
-          context.distribution("multi_get.response.length", responseCount)
-          context.distribution("multi_get.latency.millis", multiGetMillis)
+          if (recordDetailedMultiGetMetrics) {
+            context.distribution("multi_get.bytes", totalResponseValueBytes)
+            context.distribution("multi_get.response.length", responseCount)
+            context.distribution("multi_get.latency.millis", multiGetMillis)
+          }
         }
 
         val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
@@ -267,7 +276,9 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             }
 
             val queryTs = request.atMillis.getOrElse(System.currentTimeMillis())
-            val requestContext = RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)
+            val requestContext =
+              RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)
+                .withInstrumentation(degradedCounter, metrics.HotPathMetricsSampler.global.shouldSample())
 
             val groupByResponse: Map[String, AnyRef] =
               try {
@@ -298,6 +309,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
           Response(request, responseMapTry)
         }.toList
+        degradedCounter.flush()
         responses
       }
   }
@@ -373,3 +385,23 @@ case class LambdaKvRequest(groupByServingInfoParsed: GroupByServingInfoParsed,
                            streamingRequestOpt: Option[GetRequest],
                            endTs: Option[Long],
                            context: metrics.Metrics.Context)
+
+/** Aggregates an additive counter within one fetch batch. The totals map is allocated only if a non-zero value is
+  * recorded, which keeps the healthy request path to one small collector allocation.
+  */
+private[online] final class BatchedMetricsCounter(metricName: String) {
+  private var totals: mutable.LinkedHashMap[metrics.Metrics.Context, Long] = null
+
+  def record(context: metrics.Metrics.Context, value: Long): Unit =
+    if (value != 0L) {
+      if (totals == null) totals = mutable.LinkedHashMap.empty[metrics.Metrics.Context, Long]
+      totals.update(context, totals.getOrElse(context, 0L) + value)
+    }
+
+  def flush(): Unit =
+    if (totals != null) {
+      val pending = totals
+      totals = null
+      pending.foreach { case (context, total) => context.count(metricName, total) }
+    }
+}

@@ -3,6 +3,7 @@ package ai.chronon.online
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 sealed trait LogLevel
 case object DEBUG extends LogLevel
@@ -31,36 +32,60 @@ trait ThrottledLogging {
   /** Global hot-log sample interval. Tests and specialized operators may override it explicitly. */
   protected val throttleWindowMs: Long = LogSampling.intervalMillis
 
-  // key -> (windowStartMs, suppressedCount); lazily initialized per task-manager process
+  // key -> mutable atomic window state; lazily initialized per task-manager process
   @transient private lazy val throttleState = new ConcurrentHashMap[String, ThrottleEntry]()
+
+  // Overridable to make the window-boundary concurrency tests deterministic.
+  protected def currentTimeMillis: Long = System.currentTimeMillis()
 
   def log(level: LogLevel, msg: => String, t: Throwable = null): Unit = emit(level, msg, t)
 
-  def logThrottled(level: LogLevel, key: String, msg: => String, t: Throwable = null): Unit = {
-    val now = System.currentTimeMillis()
-    // Decided atomically inside compute (which serializes concurrent calls for the same key), then
-    // read out here to actually emit - keeps the by-name `msg` unevaluated for suppressed calls.
-    var emitPrefix: String = null
+  /** Returns -1 when the caller should suppress this occurrence, otherwise the approximate number of occurrences
+    * suppressed since the previous admission. Hot callers can use this primitive before constructing a by-name log
+    * message. Under exact window-boundary concurrency, a racing occurrence can be counted by either adjacent reminder.
+    */
+  protected def acquireThrottle(key: String): Long = {
+    val now = currentTimeMillis
+    var entry = throttleState.get(key)
 
-    throttleState.compute(
-      key,
-      (_, entry) => {
-        if (entry == null) {
-          emitPrefix = ""
-          ThrottleEntry(now, 0L)
-        } else if (now - entry.windowStartMs >= throttleWindowMs) {
-          emitPrefix =
-            if (entry.suppressedCount > 0)
-              s"[suppressed ${entry.suppressedCount} occurrences in last ${throttleWindowMs / 1000L}s] "
-            else ""
-          ThrottleEntry(now, 0L)
-        } else {
-          entry.copy(suppressedCount = entry.suppressedCount + 1)
-        }
+    if (entry == null) {
+      val candidate = new ThrottleEntry(now + throttleWindowMs)
+      val raced = throttleState.putIfAbsent(key, candidate)
+      if (raced == null) {
+        return 0L
       }
-    )
+      entry = raced
+    }
 
-    if (emitPrefix != null) emit(level, emitPrefix + msg, t)
+    var decided = false
+    var result = -1L
+    while (!decided) {
+      val nextEmitAt = entry.nextEmitAtMs.get()
+      if (now < nextEmitAt) {
+        entry.suppressedCount.incrementAndGet()
+        decided = true
+      } else if (entry.nextEmitAtMs.compareAndSet(nextEmitAt, now + throttleWindowMs)) {
+        // Counting stays off the map lock, so a racing increment can be reported by either adjacent reminder. The
+        // aggregate is preserved; the diagnostic count is intentionally approximate at the exact window boundary.
+        result = entry.suppressedCount.getAndSet(0L)
+        decided = true
+      }
+    }
+    result
+  }
+
+  /** Emits an occurrence previously admitted by acquireThrottle. */
+  protected def emitThrottled(level: LogLevel, suppressedCount: Long, msg: => String, t: Throwable = null): Unit = {
+    val prefix =
+      if (suppressedCount > 0)
+        s"[suppressed $suppressedCount occurrences in last ${throttleWindowMs / 1000L}s] "
+      else ""
+    emit(level, prefix + msg, t)
+  }
+
+  def logThrottled(level: LogLevel, key: String, msg: => String, t: Throwable = null): Unit = {
+    val suppressedCount = acquireThrottle(key)
+    if (suppressedCount >= 0L) emitThrottled(level, suppressedCount, msg, t)
   }
 
   // Protected so subclasses (e.g. in tests) can intercept emissions without a real SLF4J logger.
@@ -72,7 +97,10 @@ trait ThrottledLogging {
   }
 }
 
-private case class ThrottleEntry(windowStartMs: Long, suppressedCount: Long)
+private final class ThrottleEntry(initialNextEmitAtMs: Long) {
+  val nextEmitAtMs = new AtomicLong(initialNextEmitAtMs)
+  val suppressedCount = new AtomicLong(0L)
+}
 
 object LogSampling {
   val IntervalMillisProperty = "ai.chronon.logging.sample.interval.millis"

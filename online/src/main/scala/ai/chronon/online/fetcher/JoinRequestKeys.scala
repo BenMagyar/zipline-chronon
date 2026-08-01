@@ -32,6 +32,58 @@ import scala.util.Try
   *     supplied left keys before JoinPartFetcher maps them to right-side GroupBy keys.
   */
 private[online] object JoinRequestKeys {
+
+  /** Request-only portion of a Join part's key mapping.
+    *
+    * Unlike [[KeyMapping]], this does not depend on GroupBy serving schemas and can therefore be prepared alongside
+    * the Join metadata. In particular, selected SQL expressions are parsed once here instead of once per candidate
+    * and Join part in `JoinPartFetcher`.
+    */
+  final class RequestPlan private[JoinRequestKeys] (private val leftKeys: Array[String],
+                                                    private val selectedLeftKeySet: Set[String],
+                                                    private val selfReferencingLeftKeys: Set[String],
+                                                    private[fetcher] val rawInputsByLeftKey: Map[String, Seq[String]],
+                                                    private[fetcher] val selectedLeftKeys: Seq[(String, String)]) {
+
+    def missingRequestKeys(request: Request): Seq[String] = {
+      var missing: mutable.LinkedHashSet[String] = null
+      var index = 0
+      while (index < leftKeys.length) {
+        val leftKey = leftKeys(index)
+        if (!request.keys.contains(leftKey)) {
+          val requiredKeys =
+            if (selectedLeftKeySet.contains(leftKey)) rawInputsByLeftKey(leftKey)
+            else Seq(leftKey)
+          requiredKeys.foreach { requestKey =>
+            if (!request.keys.contains(requestKey)) {
+              if (missing == null) missing = mutable.LinkedHashSet.empty[String]
+              missing += requestKey
+            }
+          }
+        }
+        index += 1
+      }
+      if (missing == null) Seq.empty else missing.toSeq
+    }
+
+    def needsDerivation(request: Request): Boolean = {
+      var index = 0
+      while (index < leftKeys.length) {
+        val leftKey = leftKeys(index)
+        if (
+          selectedLeftKeySet.contains(leftKey) &&
+          (!request.keys.contains(leftKey) || selfReferencingLeftKeys.contains(leftKey))
+        ) {
+          return true
+        }
+        index += 1
+      }
+      false
+    }
+
+    private[fetcher] def derives(leftKey: String): Boolean = selectedLeftKeySet.contains(leftKey)
+  }
+
   case class KeyMapping(leftToRight: Map[String, String],
                         requestKeyFields: Iterable[StructField],
                         rawInputsByLeftKey: Map[String, Seq[String]],
@@ -112,6 +164,32 @@ private[online] object JoinRequestKeys {
   private def selectExpression(join: Join, leftKey: String): Option[String] =
     leftSelects(join).get(leftKey).filter(_ != leftKey)
 
+  def prepare(join: Join, joinPart: JoinPartOps): RequestPlan = {
+    val leftKeys = joinPart.leftToRight.keys.toArray
+    val selectedLeftKeys = leftKeys.toSeq.flatMap { leftKey =>
+      selectExpression(join, leftKey).map(leftKey -> _)
+    }
+    val rawInputsByLeftKey = leftKeys.iterator.map { leftKey =>
+      val inputs = selectedLeftKeys
+        .find(_._1 == leftKey)
+        .map { case (_, expression) => rawInputs(expression) }
+        .getOrElse(Seq(leftKey))
+      leftKey -> inputs
+    }.toMap
+    val selectedLeftKeySet = selectedLeftKeys.iterator.map(_._1).toSet
+    val selfReferencingLeftKeys = selectedLeftKeySet.filter { leftKey =>
+      rawInputsByLeftKey(leftKey).contains(leftKey)
+    }
+
+    new RequestPlan(
+      leftKeys,
+      selectedLeftKeySet,
+      selfReferencingLeftKeys,
+      rawInputsByLeftKey,
+      selectedLeftKeys
+    )
+  }
+
   private[fetcher] def rawInputs(expression: String): Seq[String] =
     CatalystSqlParser
       .parseExpression(expression)
@@ -130,10 +208,9 @@ private[online] object JoinRequestKeys {
       selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey))
     }.distinct
 
-  private def requestKeyFields(join: Join,
-                               joinPart: JoinPartOps,
+  private def requestKeyFields(joinPart: JoinPartOps,
                                servingInfo: GroupByServingInfoParsed,
-                               rawInputsByLeftKey: Map[String, Seq[String]]): Iterable[StructField] = {
+                               requestPlan: RequestPlan): Iterable[StructField] = {
     val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
     val fieldsByRightKey = keySchema.fields.map(field => field.name -> field).toMap
     val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
@@ -147,8 +224,8 @@ private[online] object JoinRequestKeys {
               s"but $rightKey is not present in GroupBy key schema ${keySchema.fields.map(_.name).mkString(", ")}")
         )
         .fieldType
-      val derivesLeftKey = selectExpression(join, leftKey).isDefined
-      val requestKeys = rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
+      val derivesLeftKey = requestPlan.derives(leftKey)
+      val requestKeys = requestPlan.rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
       requestKeys.foreach { requestKey =>
         if (!fieldsByRequestKey.contains(requestKey)) {
           val requestFieldType =
@@ -164,49 +241,48 @@ private[online] object JoinRequestKeys {
     fieldsByRequestKey.values
   }
 
-  def buildKeyMapping(join: Join, joinPart: JoinPartOps, servingInfo: GroupByServingInfoParsed): KeyMapping = {
-    val selectedLeftKeys = joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
-      selectExpression(join, leftKey).map(leftKey -> _)
-    }
-    val rawInputsByLeftKey = joinPart.leftToRight.keys.map { leftKey =>
-      leftKey -> selectedLeftKeys
-        .find(_._1 == leftKey)
-        .map { case (_, expression) =>
-          rawInputs(expression)
-        }
-        .getOrElse(Seq(leftKey))
-    }.toMap
-    val keyFields = requestKeyFields(join, joinPart, servingInfo, rawInputsByLeftKey)
+  def buildKeyMapping(join: Join, joinPart: JoinPartOps, servingInfo: GroupByServingInfoParsed): KeyMapping =
+    buildKeyMapping(join, joinPart, servingInfo, prepare(join, joinPart))
+
+  private[fetcher] def buildKeyMapping(join: Join,
+                                       joinPart: JoinPartOps,
+                                       servingInfo: GroupByServingInfoParsed,
+                                       requestPlan: RequestPlan): KeyMapping = {
+    val keyFields = requestKeyFields(joinPart, servingInfo, requestPlan)
     val catalystUtil =
-      if (selectedLeftKeys.isEmpty) None
+      if (requestPlan.selectedLeftKeys.isEmpty) None
       else
         Some(
-          Try(new PooledCatalystUtil(selectedLeftKeys, StructType("JoinRequest", keyFields.toArray), leftSetups(join))))
+          Try(
+            new PooledCatalystUtil(requestPlan.selectedLeftKeys,
+                                   StructType("JoinRequest", keyFields.toArray),
+                                   leftSetups(join))))
 
-    KeyMapping(joinPart.leftToRight, keyFields, rawInputsByLeftKey, selectedLeftKeys, catalystUtil)
+    KeyMapping(joinPart.leftToRight,
+               keyFields,
+               requestPlan.rawInputsByLeftKey,
+               requestPlan.selectedLeftKeys,
+               catalystUtil)
   }
 
   def missingRequestKeys(request: Request, join: Join, joinPart: JoinPartOps): Seq[String] =
-    joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
-      if (request.keys.contains(leftKey)) {
-        Seq.empty
-      } else {
-        selectExpression(join, leftKey).map(rawInputs).getOrElse(Seq(leftKey)).filterNot(request.keys.contains)
-      }
-    }.distinct
-
-  private def shouldDeriveLeftKey(request: Request, join: Join, leftKey: String): Boolean =
-    selectExpression(join, leftKey).exists { expression =>
-      !request.keys.contains(leftKey) || rawInputs(expression).contains(leftKey)
-    }
+    prepare(join, joinPart).missingRequestKeys(request)
 
   def needsDerivation(request: Request, join: Join, joinPart: JoinPartOps): Boolean =
-    joinPart.leftToRight.keys.exists(shouldDeriveLeftKey(request, join, _))
+    prepare(join, joinPart).needsDerivation(request)
 
   def deriveLeftKeys(request: Request,
                      join: Join,
                      joinPart: JoinPartOps,
                      servingInfo: GroupByServingInfoParsed): Map[String, AnyRef] = {
     buildKeyMapping(join, joinPart, servingInfo).leftKeys(request)
+  }
+
+  private[fetcher] def deriveLeftKeys(request: Request,
+                                      join: Join,
+                                      joinPart: JoinPartOps,
+                                      servingInfo: GroupByServingInfoParsed,
+                                      requestPlan: RequestPlan): Map[String, AnyRef] = {
+    buildKeyMapping(join, joinPart, servingInfo, requestPlan).leftKeys(request)
   }
 }

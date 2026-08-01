@@ -1,13 +1,17 @@
 package ai.chronon.online.test
 
-import ai.chronon.api.{Accuracy, Builders, Join}
-import ai.chronon.online.KVStore
+import ai.chronon.api.Extensions._
+import ai.chronon.api.{Accuracy, Builders, GroupByServingInfo, Join, ThriftJsonCodec}
+import ai.chronon.online.{GroupByServingInfoParsed, KVStore}
 import ai.chronon.online.KVStore.{GetRequest, GetResponse, PutRequest}
 import ai.chronon.online.fetcher.Fetcher.{Request, Response}
-import ai.chronon.online.fetcher.{FetchContext, JoinPartFetcher, MetadataStore}
+import ai.chronon.online.fetcher.{FetchContext, JoinPartFetcher, JoinRequestKeys, MetadataStore}
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.lang.management.ManagementFactory
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import scala.concurrent.duration.DurationInt
@@ -105,6 +109,197 @@ class JoinPartFetcherPlanningPerfTest extends AnyFlatSpec with Matchers {
       }
     }
   }
+
+  it should "compare prepared and per-request key planning for an actual compiled Join" in {
+    val confPath = sys.env.get("CHRONON_JOIN_REQUEST_KEYS_BENCHMARK_CONF")
+    if (confPath.isEmpty) {
+      cancel(
+        "Set CHRONON_JOIN_REQUEST_KEYS_BENCHMARK_CONF to a compiled Join, such as ranking/search.attempt__50")
+    }
+
+    val join = ThriftJsonCodec.fromJsonFile[Join](confPath.get, check = false)
+    val parts = join.joinPartOps
+    val requestKeys = parts.iterator
+      .flatMap(part => JoinRequestKeys.valueInfoLeftKeys(join, part))
+      .toSeq
+      .distinct
+      .map(key => key -> s"benchmark-$key".asInstanceOf[AnyRef])
+      .toMap
+    val requests = Seq.fill(CandidateCount)(Request(join.metaData.name, requestKeys, BenchmarkAtMillis))
+    val prepared = parts.map(part => JoinRequestKeys.prepare(join, part))
+    val warmupBatches = envPositiveInt("CHRONON_JOIN_REQUEST_KEYS_WARMUP_BATCHES", 25)
+    val measuredBatches = envPositiveInt("CHRONON_JOIN_REQUEST_KEYS_MEASURED_BATCHES", 100)
+
+    runKeyPlanning(join, requests, prepared, warmupBatches, usePrepared = false)
+    runKeyPlanning(join, requests, prepared, warmupBatches, usePrepared = true)
+    val (currentNanos, currentAllocatedBytes, currentChecksum) =
+      runKeyPlanning(join, requests, prepared, measuredBatches, usePrepared = false)
+    val (preparedNanos, preparedAllocatedBytes, preparedChecksum) =
+      runKeyPlanning(join, requests, prepared, measuredBatches, usePrepared = true)
+
+    currentChecksum shouldBe preparedChecksum
+    val currentMillis = currentNanos.toDouble / measuredBatches / TimeUnit.MILLISECONDS.toNanos(1)
+    val preparedMillis = preparedNanos.toDouble / measuredBatches / TimeUnit.MILLISECONDS.toNanos(1)
+    val allocationSummary =
+      if (currentAllocatedBytes >= 0 && preparedAllocatedBytes >= 0) {
+        f" current_allocated_bytes_per_batch=${currentAllocatedBytes.toDouble / measuredBatches}%.0f " +
+          f"prepared_allocated_bytes_per_batch=${preparedAllocatedBytes.toDouble / measuredBatches}%.0f"
+      } else " allocated_bytes_per_batch=unsupported"
+    println(
+      f"JOIN_REQUEST_KEYS_PREPARED_RESULT join=${join.metaData.name} parts=${parts.size}%d " +
+        f"requests_per_batch=${requests.size}%d measured_batches=$measuredBatches%d " +
+        f"current_ms_per_batch=$currentMillis%.3f prepared_ms_per_batch=$preparedMillis%.3f " +
+        f"speedup=${currentMillis / preparedMillis}%.2fx" + allocationSummary)
+
+    val derivedParts = parts.zip(prepared).collect {
+      case (part, plan) if plan.needsDerivation(requests.head) => part
+    }
+    val servingInfos = derivedParts.map { part =>
+      new GroupByServingInfoParsed(
+        new GroupByServingInfo()
+          .setGroupBy(part.groupBy)
+          .setKeyAvroSchema("benchmark-key-schema")
+          .setInputAvroSchema("benchmark-input-schema"))
+    }
+    runPartKeyResolution(join, derivedParts, servingInfos, warmupBatches, perCandidate = true)
+    runPartKeyResolution(join, derivedParts, servingInfos, warmupBatches, perCandidate = false)
+    val (perCandidateNanos, perCandidateBytes, perCandidateChecksum) =
+      runPartKeyResolution(join, derivedParts, servingInfos, measuredBatches, perCandidate = true)
+    val (requestScopedNanos, requestScopedBytes, requestScopedChecksum) =
+      runPartKeyResolution(join, derivedParts, servingInfos, measuredBatches, perCandidate = false)
+    perCandidateChecksum shouldBe requestScopedChecksum * CandidateCount
+    val perCandidateMillis = perCandidateNanos.toDouble / measuredBatches / TimeUnit.MILLISECONDS.toNanos(1)
+    val requestScopedMillis = requestScopedNanos.toDouble / measuredBatches / TimeUnit.MILLISECONDS.toNanos(1)
+    val partKeyAllocationSummary =
+      if (perCandidateBytes >= 0 && requestScopedBytes >= 0) {
+        f" per_candidate_allocated_bytes_per_batch=${perCandidateBytes.toDouble / measuredBatches}%.0f " +
+          f"request_scoped_allocated_bytes_per_batch=${requestScopedBytes.toDouble / measuredBatches}%.0f"
+      } else " allocated_bytes_per_batch=unsupported"
+    println(
+      f"JOIN_DERIVED_PART_KEY_RESULT join=${join.metaData.name} derived_parts=${derivedParts.size}%d " +
+        f"candidates_per_batch=$CandidateCount%d measured_batches=$measuredBatches%d " +
+        f"per_candidate_ms_per_batch=$perCandidateMillis%.3f request_scoped_ms_per_batch=$requestScopedMillis%.3f " +
+        f"speedup=${perCandidateMillis / requestScopedMillis}%.2fx" + partKeyAllocationSummary)
+  }
+
+  private def runPartKeyResolution(join: Join,
+                                   parts: Seq[JoinPartOps],
+                                   servingInfos: Seq[GroupByServingInfoParsed],
+                                   batches: Int,
+                                   perCandidate: Boolean): (Long, Long, Long) = {
+    var checksum = 0L
+    var batch = 0
+    val repetitions = if (perCandidate) CandidateCount else 1
+    val allocatedBytesBefore = currentThreadAllocatedBytes
+    val startNanos = System.nanoTime()
+    while (batch < batches) {
+      var repetition = 0
+      while (repetition < repetitions) {
+        var partIndex = 0
+        while (partIndex < parts.size) {
+          checksum += JoinRequestKeys.partKey(join, parts(partIndex), servingInfos(partIndex)).hashCode
+          partIndex += 1
+        }
+        repetition += 1
+      }
+      batch += 1
+    }
+    val elapsedNanos = System.nanoTime() - startNanos
+    val allocatedBytesAfter = currentThreadAllocatedBytes
+    val allocatedBytes =
+      if (allocatedBytesBefore >= 0 && allocatedBytesAfter >= 0) allocatedBytesAfter - allocatedBytesBefore else -1L
+    (elapsedNanos, allocatedBytes, checksum)
+  }
+
+  private def runKeyPlanning(
+      join: Join,
+      requests: Seq[Request],
+      prepared: Seq[JoinRequestKeys.RequestPlan],
+      batches: Int,
+      usePrepared: Boolean
+  ): (Long, Long, Long) = {
+    val parts = join.joinPartOps
+    var checksum = 0L
+    var batch = 0
+    val allocatedBytesBefore = currentThreadAllocatedBytes
+    val startNanos = System.nanoTime()
+    while (batch < batches) {
+      requests.foreach { request =>
+        var partIndex = 0
+        while (partIndex < parts.size) {
+          val needsDerivation =
+            if (usePrepared) prepared(partIndex).needsDerivation(request)
+            else legacyNeedsDerivation(request, join, parts(partIndex))
+          val missing =
+            if (usePrepared) prepared(partIndex).missingRequestKeys(request)
+            else legacyMissingRequestKeys(request, join, parts(partIndex))
+          if (needsDerivation) checksum += 1
+          checksum += missing.size
+          partIndex += 1
+        }
+      }
+      batch += 1
+    }
+    val elapsedNanos = System.nanoTime() - startNanos
+    val allocatedBytesAfter = currentThreadAllocatedBytes
+    val allocatedBytes =
+      if (allocatedBytesBefore >= 0 && allocatedBytesAfter >= 0) allocatedBytesAfter - allocatedBytesBefore else -1L
+    (elapsedNanos, allocatedBytes, checksum)
+  }
+
+  private lazy val threadAllocationBean: Option[com.sun.management.ThreadMXBean] =
+    ManagementFactory.getThreadMXBean match {
+      case bean: com.sun.management.ThreadMXBean if bean.isThreadAllocatedMemorySupported =>
+        if (!bean.isThreadAllocatedMemoryEnabled) bean.setThreadAllocatedMemoryEnabled(true)
+        Some(bean)
+      case _ => None
+    }
+
+  private def currentThreadAllocatedBytes: Long =
+    threadAllocationBean.map(_.getThreadAllocatedBytes(Thread.currentThread().getId)).getOrElse(-1L)
+
+  // Keep an exact copy of the pre-preparation request checks in the opt-in benchmark. The compatibility helpers in
+  // JoinRequestKeys now intentionally construct a RequestPlan, which would otherwise make the comparison count plan
+  // construction twice and overstate the production-path savings.
+  private def legacyLeftSelects(join: Join): Map[String, String] =
+    Option(join.left)
+      .flatMap(source => Option(source.query))
+      .flatMap(query => Option(query.getQuerySelects))
+      .getOrElse(Map.empty)
+
+  private def legacySelectExpression(join: Join, leftKey: String): Option[String] =
+    legacyLeftSelects(join).get(leftKey).filter(_ != leftKey)
+
+  private def legacyRawInputs(expression: String): Seq[String] =
+    CatalystSqlParser
+      .parseExpression(expression)
+      .collect { case attr: UnresolvedAttribute =>
+        attr.nameParts.head
+      }
+      .distinct
+
+  private def legacyMissingRequestKeys(request: Request,
+                                       join: Join,
+                                       joinPart: JoinPartOps): Seq[String] =
+    joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
+      if (request.keys.contains(leftKey)) {
+        Seq.empty
+      } else {
+        legacySelectExpression(join, leftKey)
+          .map(legacyRawInputs)
+          .getOrElse(Seq(leftKey))
+          .filterNot(request.keys.contains)
+      }
+    }.distinct
+
+  private def legacyNeedsDerivation(request: Request,
+                                    join: Join,
+                                    joinPart: JoinPartOps): Boolean =
+    joinPart.leftToRight.keys.exists { leftKey =>
+      legacySelectExpression(join, leftKey).exists { expression =>
+        !request.keys.contains(leftKey) || legacyRawInputs(expression).contains(leftKey)
+      }
+    }
 
   private final class ImmediateGroupByJoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
       extends JoinPartFetcher(fetchContext, metadataStore) {

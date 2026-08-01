@@ -38,7 +38,7 @@ import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
 import scala.collection.JavaConverters._
-import scala.util.{Success, Try}
+import scala.util.{Failure, Success, Try}
 
 /** Tests that fetchJoins deduplicates GroupBy requests with identical (name, keys) across a bulk batch,
   * avoiding redundant KV lookups for contextual (e.g. user-level) GroupBys shared across all product rows.
@@ -287,6 +287,25 @@ class JoinPartFetcherDeduplicationTest
     (productPartContexts(0) eq productPartContexts(1)) shouldBe true
   }
 
+  it should "rebuild prepared join parts when the same mutable override changes" in {
+    stubFetchGroupBys()
+    val mutableJoin = testJoin.deepCopy()
+    val request = Request(
+      mutableJoin.metaData.name,
+      Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p1".asInstanceOf[AnyRef])
+    )
+
+    val original = Await.result(joinPartFetcher.fetchJoins(Seq(request), Some(mutableJoin)), 1.second).head
+    original.values.get should contain key "unit_test_product_features_feature"
+
+    mutableJoin.getJoinParts.get(1).setPrefix("mutated")
+    val mutated = Await.result(joinPartFetcher.fetchJoins(Seq(request), Some(mutableJoin)), 1.second).head
+
+    mutated.values.get should contain key "mutated_unit_test_product_features_feature"
+    mutated.values.get should not contain key("unit_test_product_features_feature")
+    (original.request.context.get eq mutated.request.context.get) shouldBe false
+  }
+
   it should "dedup contextual GroupBy requests when user_id is repeated across bulk product rows" in {
     stubFetchGroupBys()
 
@@ -379,5 +398,135 @@ class JoinPartFetcherDeduplicationTest
     val contextualRequests = sentRequests.filter(_.name == multiKeyContextualGroupBy.metaData.name)
     contextualRequests.length shouldBe 1
     contextualRequests.head.keys shouldBe Map("user_id" -> userId, "country" -> country, "score" -> score)
+  }
+
+  it should "assemble parts in join order and let the later part win duplicate output names" in {
+    val firstGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.duplicate_features__1"),
+      keyColumns = Seq("entity_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val secondGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.duplicate_features__2"),
+      keyColumns = Seq("entity_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val firstPart = Builders.JoinPart(groupBy = firstGroupBy, keyMapping = Map("entity_id" -> "entity_id"))
+    firstPart.setUseLongNames(false)
+    val secondPart = Builders.JoinPart(groupBy = secondGroupBy, keyMapping = Map("entity_id" -> "entity_id"))
+    secondPart.setUseLongNames(false)
+    val duplicateJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.duplicate_join"),
+      joinParts = Seq(firstPart, secondPart)
+    )
+    doAnswer(new Answer[Future[Seq[Response]]] {
+      override def answer(invocation: InvocationOnMock): Future[Seq[Response]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[Request]]
+        Future.successful(requests.reverse.map(request => Response(request, Success(Map("feature" -> request.name)))))
+      }
+    }).when(joinPartFetcher).fetchGroupBys(any())
+
+    val response = Await.result(
+      joinPartFetcher.fetchJoins(
+        Seq(Request(duplicateJoin.metaData.name, Map("entity_id" -> "entity-1".asInstanceOf[AnyRef]))),
+        Some(duplicateJoin)
+      ),
+      1.second
+    ).head
+
+    response.values.get shouldBe Map("entity_id_feature" -> secondGroupBy.metaData.name)
+  }
+
+  it should "preserve missing-key and failed GroupBy response entries during direct assembly" in {
+    val missingGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.missing_features"),
+      keyColumns = Seq("missing_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val failedGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.failed_features"),
+      keyColumns = Seq("entity_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val failureJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.failure_join"),
+      joinParts = Seq(
+        Builders.JoinPart(groupBy = missingGroupBy, keyMapping = Map("missing_id" -> "missing_id")),
+        Builders.JoinPart(groupBy = failedGroupBy, keyMapping = Map("entity_id" -> "entity_id"))
+      )
+    )
+    val groupByFailure = new IllegalStateException("expected GroupBy failure")
+    doAnswer(new Answer[Future[Seq[Response]]] {
+      override def answer(invocation: InvocationOnMock): Future[Seq[Response]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[Request]]
+        Future.successful(requests.map(request => Response(request, Failure(groupByFailure))))
+      }
+    }).when(joinPartFetcher).fetchGroupBys(any())
+
+    val response = Await.result(
+      joinPartFetcher.fetchJoins(
+        Seq(Request(failureJoin.metaData.name, Map("entity_id" -> "entity-1".asInstanceOf[AnyRef]))),
+        Some(failureJoin)
+      ),
+      1.second
+    ).head.values.get
+
+    response("unit_test_missing_features_exception").toString should include("missing_id")
+    response("unit_test_failed_features_exception") shouldBe groupByFailure.toString
+  }
+
+  it should "discard partial part values when response-map iteration fails" in {
+    val faultyGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.faulty_features"),
+      keyColumns = Seq("entity_id"),
+      accuracy = Accuracy.SNAPSHOT
+    )
+    val faultyJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.faulty_join"),
+      joinParts = Seq(Builders.JoinPart(groupBy = faultyGroupBy, keyMapping = Map("entity_id" -> "entity_id")))
+    )
+    val iterationFailure = new IllegalStateException("expected response iteration failure")
+    val faultyValues = new scala.collection.immutable.Map[String, AnyRef] {
+      override def get(key: String): Option[AnyRef] =
+        if (key == "partial") Some("value") else None
+      override def iterator: Iterator[(String, AnyRef)] = new Iterator[(String, AnyRef)] {
+        private var first = true
+        override def hasNext: Boolean = true
+        override def next(): (String, AnyRef) =
+          if (first) {
+            first = false
+            "partial" -> "value"
+          } else throw iterationFailure
+      }
+      override def +[V1 >: AnyRef](entry: (String, V1)): Map[String, V1] = Map(entry)
+      override def -(key: String): Map[String, AnyRef] = Map.empty
+    }
+    doAnswer(new Answer[Future[Seq[Response]]] {
+      override def answer(invocation: InvocationOnMock): Future[Seq[Response]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[Request]]
+        Future.successful(requests.map(request => Response(request, Success(faultyValues))))
+      }
+    }).when(joinPartFetcher).fetchGroupBys(any())
+
+    val response = Await.result(
+      joinPartFetcher.fetchJoins(
+        Seq(Request(faultyJoin.metaData.name, Map("entity_id" -> "entity-1".asInstanceOf[AnyRef]))),
+        Some(faultyJoin)
+      ),
+      1.second
+    ).head.values.get
+
+    response.keySet shouldBe Set("unit_test_faulty_features_exception")
+    response("unit_test_faulty_features_exception") shouldBe iterationFailure.toString
+  }
+
+  it should "keep parseGroupByResponse output compatibility" in {
+    val key = ("unit_test.parser", Map("entity_id" -> "entity-1".asInstanceOf[AnyRef]), None: Option[Long])
+    val failure = new IllegalStateException("expected parser failure")
+
+    joinPartFetcher.parseGroupByResponse("prefix_", key, Map(key -> Success(Map("feature" -> "value")))) shouldBe
+      Map("prefix_feature" -> "value")
+    joinPartFetcher.parseGroupByResponse("prefix_", key, Map(key -> Failure(failure))) shouldBe
+      Map("prefix_exception" -> failure.toString)
   }
 }

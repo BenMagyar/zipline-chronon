@@ -139,6 +139,45 @@ class FetcherCacheTest extends AnyFlatSpec with MockitoHelper {
     assert(cachedRequestsAfterAddingItem.head._2 == finalBatchIr)
   }
 
+  it should "aggregate cache metrics by context" in {
+    val testCache = new BatchIrCache("test", batchIrCacheMaximumSize)
+    val fetcherCache = new TestableFetcherCache(Some(testCache)) {
+      override def isCachingEnabled(groupBy: GroupBy) = true
+    }
+    val servingInfo = mock[GroupByServingInfoParsed]
+    val firstContext = mock[metrics.Metrics.Context]
+    val secondContext = mock[metrics.Metrics.Context]
+
+    def cachedRequest(index: Int, context: metrics.Metrics.Context): (Request, Try[LambdaKvRequest]) = {
+      val keys = Map("key" -> index.asInstanceOf[AnyRef])
+      val request = Request(s"request_$index", keys, context = Some(context))
+      val getRequest = KVStore.GetRequest(Array(index.toByte), "TEST_GROUPBY_BATCH")
+      val lambdaRequest = LambdaKvRequest(servingInfo, request, getRequest, None, None, context)
+      request -> Success(lambdaRequest)
+    }
+
+    val requests = Seq(
+      cachedRequest(0, firstContext),
+      cachedRequest(1, firstContext),
+      cachedRequest(2, firstContext),
+      cachedRequest(3, secondContext),
+      cachedRequest(4, secondContext)
+    )
+    Seq(0, 1, 3).foreach { index =>
+      val (request, Success(lambdaRequest)) = requests(index)
+      val key = BatchIrCache.Key(lambdaRequest.batchRequest.dataset, request.keys, 0L)
+      testCache.cache.put(key, CachedMapBatchResponse(Map("value" -> index.asInstanceOf[AnyRef])))
+    }
+
+    val cachedRequests = fetcherCache.getCachedRequests(requests)
+
+    assertEquals(3, cachedRequests.size)
+    verify(firstContext, times(1)).count("batch_cache_gb_hits", 2L)
+    verify(firstContext, times(1)).count("batch_cache_gb_misses", 1L)
+    verify(secondContext, times(1)).count("batch_cache_gb_hits", 1L)
+    verify(secondContext, times(1)).count("batch_cache_gb_misses", 1L)
+  }
+
   it should "get cached requests does not cache when cache is disabled for group by" in {
     val testCache = new BatchIrCache("test", batchIrCacheMaximumSize)
     val spiedTestCache = spy[BatchIrCache](testCache)

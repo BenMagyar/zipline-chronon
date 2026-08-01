@@ -29,7 +29,25 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
       startTimeMs: Long, // clock time
       metricsContext: Metrics.Context,
       keys: Map[String, Any]
-  )
+  ) {
+    // Keep instrumentation outside the case-class product so the established constructor, copy, extractor, and
+    // Product5 ABI remain unchanged. Fetcher initialization attaches this state before the context is published.
+    private var attachedDegradedCounter: BatchedMetricsCounter = null
+    private var attachedRecordDetailedMetrics: Boolean = true
+
+    private[fetcher] def degradedCounter: BatchedMetricsCounter = attachedDegradedCounter
+    private[fetcher] def recordDetailedMetrics: Boolean = attachedRecordDetailedMetrics
+
+    private[fetcher] def withInstrumentation(degradedCounter: BatchedMetricsCounter,
+                                             recordDetailedMetrics: Boolean): RequestContext = {
+      attachedDegradedCounter = degradedCounter
+      attachedRecordDetailedMetrics = recordDetailedMetrics
+      this
+    }
+
+    private[fetcher] def withServingInfo(updatedServingInfo: GroupByServingInfoParsed): RequestContext =
+      copy(servingInfo = updatedServingInfo).withInstrumentation(attachedDegradedCounter, attachedRecordDetailedMetrics)
+  }
 
   def decodeAndMerge(batchResponses: BatchResponses,
                      streamingResponsesOpt: Option[Seq[TimedValue]],
@@ -38,12 +56,14 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     val newServingInfo = getServingInfo(requestContext.servingInfo, batchResponses)
 
     // Batch metrics
-    batchResponses match {
-      case kvStoreResponse: KvStoreBatchResponse =>
-        kvStoreResponse.response.map(
-          reportKvResponse(requestContext.metricsContext.withSuffix("batch"), _, requestContext.queryTimeMs)
-        )
-      case _: CachedBatchResponse => // no-op;
+    if (requestContext.recordDetailedMetrics) {
+      batchResponses match {
+        case kvStoreResponse: KvStoreBatchResponse =>
+          kvStoreResponse.response.map(
+            reportKvResponse(requestContext.metricsContext.withSuffix("batch"), _, requestContext.queryTimeMs)
+          )
+        case _: CachedBatchResponse => // no-op;
+      }
     }
 
     // The bulk upload may not have removed an older batch values. We manually discard all but the latest one.
@@ -52,14 +72,16 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     val responseMap: Map[String, AnyRef] =
       if (newServingInfo.groupBy.aggregations == null || streamingResponsesOpt.isEmpty) { // no-agg
 
-        val batchResponseDecodeStartTime = System.currentTimeMillis()
+        val batchResponseDecodeStartTime =
+          if (requestContext.recordDetailedMetrics) System.currentTimeMillis() else 0L
         val response = getMapResponseFromBatchResponse(batchResponses,
                                                        batchBytes,
                                                        newServingInfo.outputCodec.decodeMap,
                                                        newServingInfo,
                                                        requestContext.keys)
-        requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
-                                                   System.currentTimeMillis() - batchResponseDecodeStartTime)
+        if (requestContext.recordDetailedMetrics)
+          requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
+                                                     System.currentTimeMillis() - batchResponseDecodeStartTime)
         response
 
       } else { // temporal accurate
@@ -68,7 +90,7 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
         val output: Array[Any] = mergeWithStreaming(batchResponses,
                                                     streamingResponses,
                                                     batchBytes,
-                                                    requestContext.copy(servingInfo = newServingInfo))
+                                                    requestContext.withServingInfo(newServingInfo))
 
         val fieldNames = newServingInfo.outputCodec.fieldNames
         if (output != null) {
@@ -80,8 +102,9 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
         }
       }
 
-    requestContext.metricsContext.distribution("group_by.latency.millis",
-                                               System.currentTimeMillis() - requestContext.startTimeMs)
+    if (requestContext.recordDetailedMetrics)
+      requestContext.metricsContext.distribution("group_by.latency.millis",
+                                                 System.currentTimeMillis() - requestContext.startTimeMs)
     responseMap
   }
 
@@ -113,16 +136,19 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     }
 
     // Streaming metrics
-    reportKvResponse(requestContext.metricsContext.withSuffix("streaming"),
-                     streamingResponses,
-                     requestContext.queryTimeMs)
+    if (requestContext.recordDetailedMetrics)
+      reportKvResponse(requestContext.metricsContext.withSuffix("streaming"),
+                       streamingResponses,
+                       requestContext.queryTimeMs)
 
     // If caching is enabled, we try to fetch the batch IR from the cache so we avoid the work of decoding it.
-    val batchIrDecodeStartTime = System.currentTimeMillis()
+    val batchIrDecodeStartTime =
+      if (requestContext.recordDetailedMetrics) System.currentTimeMillis() else 0L
     val batchIr: FinalBatchIr =
       getBatchIrFromBatchResponse(batchResponses, batchBytes, servingInfo, toBatchIr, requestContext.keys)
-    requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
-                                               System.currentTimeMillis() - batchIrDecodeStartTime)
+    if (requestContext.recordDetailedMetrics)
+      requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
+                                                 System.currentTimeMillis() - batchIrDecodeStartTime)
 
     // check if we have late batch data for this GroupBy resulting in degraded counters
     val degradedCount = checkLateBatchData(
@@ -130,9 +156,15 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
       servingInfo.groupBy.metaData.name,
       servingInfo.batchEndTsMillis,
       aggregator.tailBufferMillis,
-      aggregator.perWindowAggs.map(_.window)
+      servingInfo.hasWindowLongerThanTailBuffer,
+      servingInfo.staleBatchLogKey
     )
-    requestContext.metricsContext.count("group_by.degraded_counter.count", degradedCount)
+    if (degradedCount > 0L) {
+      if (requestContext.degradedCounter == null)
+        requestContext.metricsContext.count("group_by.degraded_counter.count", degradedCount)
+      else
+        requestContext.degradedCounter.record(requestContext.metricsContext, degradedCount)
+    }
 
     if (fetchContext.isTilingEnabled) {
       mergeTiledIrsFromStreaming(requestContext, servingInfo, streamingResponses, aggregator, batchIr)
@@ -208,7 +240,8 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
       null
     } else {
 
-      val allStreamingIrDecodeStartTime = System.currentTimeMillis()
+      val allStreamingIrDecodeStartTime =
+        if (requestContext.recordDetailedMetrics) System.currentTimeMillis() else 0L
 
       val tileIterator = streamingResponses.iterator
         .filter(tVal => tVal.millis >= servingInfo.batchEndTsMillis)
@@ -238,8 +271,9 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
         .toArray
         .iterator
 
-      requestContext.metricsContext.distribution("group_by.all_streamingir_decode.latency.millis",
-                                                 System.currentTimeMillis() - allStreamingIrDecodeStartTime)
+      if (requestContext.recordDetailedMetrics)
+        requestContext.metricsContext.distribution("group_by.all_streamingir_decode.latency.millis",
+                                                   System.currentTimeMillis() - allStreamingIrDecodeStartTime)
 
       tileIterator
     }
@@ -255,10 +289,12 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                      |""".stripMargin)
     }
 
-    val aggregatorStartTime = System.currentTimeMillis()
+    val aggregatorStartTime =
+      if (requestContext.recordDetailedMetrics) System.currentTimeMillis() else 0L
     val result = aggregator.lambdaAggregateFinalizedTiled(batchIr, streamingIrs, requestContext.queryTimeMs)
-    requestContext.metricsContext.distribution("group_by.aggregator.latency.millis",
-                                               System.currentTimeMillis() - aggregatorStartTime)
+    if (requestContext.recordDetailedMetrics)
+      requestContext.metricsContext.distribution("group_by.aggregator.latency.millis",
+                                                 System.currentTimeMillis() - aggregatorStartTime)
     result
   }
 
@@ -339,17 +375,33 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                                          groupByName: String,
                                          batchEndTsMillis: Long,
                                          tailBufferMillis: Long,
-                                         windows: Seq[Window]): Long = {
-    val groupByContainsLongerWinThanTailBuffer = windows.exists(p => p.millis > tailBufferMillis)
+                                         groupByContainsLongerWinThanTailBuffer: Boolean,
+                                         throttleKey: String): Long = {
     if (queryTimeMs > (tailBufferMillis + batchEndTsMillis) && groupByContainsLongerWinThanTailBuffer) {
-      logThrottled(
-        WARN,
-        s"stale_batch_data_$groupByName",
-        s"Encountered a request for $groupByName at $queryTimeMs which is more than $tailBufferMillis ms after the " +
-          s"batch dataset landing at $batchEndTsMillis. "
-      )
+      val suppressedCount = acquireThrottle(throttleKey)
+      if (suppressedCount >= 0L) {
+        emitThrottled(
+          WARN,
+          suppressedCount,
+          s"Encountered a request for $groupByName at $queryTimeMs which is more than $tailBufferMillis ms after the " +
+            s"batch dataset landing at $batchEndTsMillis. "
+        )
+      }
       1L
     } else
       0L
   }
+
+  // Compatibility/testing overload. The serving path passes the predicate cached on GroupByServingInfoParsed.
+  private[online] def checkLateBatchData(queryTimeMs: Long,
+                                         groupByName: String,
+                                         batchEndTsMillis: Long,
+                                         tailBufferMillis: Long,
+                                         windows: Seq[Window]): Long =
+    checkLateBatchData(queryTimeMs,
+                       groupByName,
+                       batchEndTsMillis,
+                       tailBufferMillis,
+                       windows.exists(_.millis > tailBufferMillis),
+                       s"stale_batch_data_$groupByName")
 }

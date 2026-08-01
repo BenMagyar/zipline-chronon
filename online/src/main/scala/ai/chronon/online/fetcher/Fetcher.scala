@@ -268,6 +268,9 @@ class Fetcher(val kvStore: KVStore,
 
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
+  // Fail startup on an invalid sampling property instead of failing the first live feature response.
+  ai.chronon.online.metrics.HotPathMetricsSampler.initialize()
+
   private val fetchContext: FetchContext =
     FetchContext(kvStore,
                  metaDataSet,
@@ -608,7 +611,9 @@ class Fetcher(val kvStore: KVStore,
 
     val derivationStartTs = System.currentTimeMillis()
     val joinName = request.name
-    val ctx = Metrics.Context(Metrics.Environment.JoinFetching, join = joinName)
+    // JoinPartFetcher attaches the prepared join context to every internal response. Reuse it here so a batched join
+    // does not rebuild the same context and metric-name caches once per row.
+    val ctx = request.context.getOrElse(Metrics.Context(Metrics.Environment.JoinFetching, join = joinName))
 
     joinCodecTry match {
       case Success(joinCodec) =>

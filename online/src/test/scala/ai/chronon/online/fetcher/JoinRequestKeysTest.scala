@@ -159,6 +159,49 @@ class JoinRequestKeysTest extends AnyFlatSpec {
     )
   }
 
+  it should "preserve prepared request planning for raw, direct derived, and missing keys" in {
+    val queryJoin = join("lower(query)")
+    val joinPart = queryJoin.joinPartOps.head
+    val plan = JoinRequestKeys.prepare(queryJoin, joinPart)
+    val cases = Seq(
+      Request(queryJoin.metaData.name, Map.empty) -> (true, Seq("query")),
+      Request(queryJoin.metaData.name, Map("query" -> "SHOES")) -> (true, Seq.empty),
+      Request(queryJoin.metaData.name, Map("query_normalized" -> "shoes")) -> (false, Seq.empty),
+      Request(queryJoin.metaData.name, Map("query" -> "SHOES", "query_normalized" -> "already-derived")) ->
+        (false, Seq.empty)
+    )
+
+    cases.foreach { case (request, (expectedNeedsDerivation, expectedMissingKeys)) =>
+      assertEquals(expectedNeedsDerivation, plan.needsDerivation(request))
+      assertEquals(expectedMissingKeys, plan.missingRequestKeys(request))
+      assertEquals(JoinRequestKeys.needsDerivation(request, queryJoin, joinPart), plan.needsDerivation(request))
+      assertEquals(JoinRequestKeys.missingRequestKeys(request, queryJoin, joinPart), plan.missingRequestKeys(request))
+    }
+  }
+
+  it should "keep deriving a selected alias when its expression reads that alias" in {
+    val selfReferencingJoin = join("lower(query_normalized)")
+    val joinPart = selfReferencingJoin.joinPartOps.head
+    val plan = JoinRequestKeys.prepare(selfReferencingJoin, joinPart)
+    val directAliasRequest =
+      Request(selfReferencingJoin.metaData.name, Map("query_normalized" -> "SHOES"))
+    val keyServingInfo =
+      servingInfo(StructType("Input", Array(StructField("query_normalized", StringType))))
+
+    assertEquals(true, plan.needsDerivation(directAliasRequest))
+    assertEquals(Seq.empty, plan.missingRequestKeys(directAliasRequest))
+    assertEquals(
+      Map("query_normalized" -> "shoes"),
+      JoinRequestKeys
+        .buildKeyMapping(selfReferencingJoin, joinPart, keyServingInfo, plan)
+        .leftKeys(directAliasRequest)
+    )
+
+    val missingAliasRequest = Request(selfReferencingJoin.metaData.name, Map.empty)
+    assertEquals(true, plan.needsDerivation(missingAliasRequest))
+    assertEquals(Seq("query_normalized"), plan.missingRequestKeys(missingAliasRequest))
+  }
+
   it should "derive GroupBy keys from raw request keys" in {
     val queryJoin = join("lower(query)")
     val joinPart = queryJoin.joinPartOps.head

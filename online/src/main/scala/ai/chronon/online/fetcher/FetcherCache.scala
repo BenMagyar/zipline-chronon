@@ -9,6 +9,7 @@ import ai.chronon.online.metrics.Metrics
 import com.github.benmanes.caffeine.cache.{Cache => CaffeineCache}
 import org.slf4j.{Logger, LoggerFactory}
 
+import scala.collection.mutable
 import scala.util.{Success, Try}
 
 /*
@@ -27,6 +28,14 @@ trait FetcherCache {
 
   val batchIrCacheName = "batch_cache"
   val defaultBatchIrCacheSize = "10000"
+
+  private lazy val batchIrCacheHitsMetric = s"${batchIrCacheName}_gb_hits"
+  private lazy val batchIrCacheMissesMetric = s"${batchIrCacheName}_gb_misses"
+
+  private final class CacheMetricCounts {
+    var hits: Long = 0L
+    var misses: Long = 0L
+  }
 
   val configuredBatchIrCacheSize: Option[Int] =
     Option(System.getProperty("ai.chronon.fetcher.batch_ir_cache_size_elements"))
@@ -125,6 +134,7 @@ trait FetcherCache {
     if (!isCacheSizeConfigured) return empty
 
     val cachedRequests = Map.newBuilder[GetRequest, CachedBatchResponse]
+    val metricCountsByContext = mutable.HashMap.empty[Metrics.Context, CacheMetricCounts]
     groupByRequestToKvRequest.foreach {
       case (request, Success(LambdaKvRequest(servingInfo, _, batchRequest, _, _, _)))
           if isCachingEnabled(servingInfo.groupBy) =>
@@ -134,17 +144,23 @@ trait FetcherCache {
         // Metrics so we can get per-group-by cache metrics
         val metricsContext =
           request.context.getOrElse(Metrics.Context(Metrics.Environment.JoinFetching, servingInfo.groupBy))
+        val metricCounts = metricCountsByContext.getOrElseUpdate(metricsContext, new CacheMetricCounts)
 
         maybeBatchIrCache.get.cache.getIfPresent(batchRequestCacheKey) match {
           case null =>
-            metricsContext.increment(s"${batchIrCacheName}_gb_misses")
+            metricCounts.misses += 1
           case cachedIr: CachedBatchResponse =>
-            metricsContext.increment(s"${batchIrCacheName}_gb_hits")
+            metricCounts.hits += 1
             cachedRequests += batchRequest -> cachedIr
           case _ =>
-            metricsContext.increment(s"${batchIrCacheName}_gb_misses")
+            metricCounts.misses += 1
         }
       case _ => ()
+    }
+
+    metricCountsByContext.foreach { case (metricsContext, metricCounts) =>
+      if (metricCounts.hits > 0) metricsContext.count(batchIrCacheHitsMetric, metricCounts.hits)
+      if (metricCounts.misses > 0) metricsContext.count(batchIrCacheMissesMetric, metricCounts.misses)
     }
     cachedRequests.result()
   }
