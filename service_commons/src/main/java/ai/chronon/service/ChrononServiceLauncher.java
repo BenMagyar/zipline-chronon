@@ -20,8 +20,11 @@ import io.vertx.micrometer.VertxPrometheusOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.LinkedHashMap;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -36,6 +39,8 @@ public class ChrononServiceLauncher extends Launcher {
 
     private static final String VertxPrometheusPort = "ai.chronon.vertx.metrics.exporter.port";
     private static final String DefaultVertxPrometheusPort = "8906";
+
+    private static final String ServiceInstanceIdKey = "service.instance.id";
 
     private static final Logger logger = LoggerFactory.getLogger(ChrononServiceLauncher.class);
 
@@ -139,7 +144,7 @@ public class ChrononServiceLauncher extends Launcher {
      *
      * Precedence (later entries override earlier ones, since Micrometer parses into a LinkedHashMap
      * where the last value for a given key wins):
-     *   1. service.name=&lt;default&gt;
+     *   1. service.name=&lt;default&gt;, service.instance.id=&lt;default&gt;
      *   2. OTEL_RESOURCE_ATTRIBUTES env var
      *   3. ai.chronon.metrics.exporter.resources system property
      *   4. OTEL_SERVICE_NAME env var (overrides service.name)
@@ -151,13 +156,15 @@ public class ChrononServiceLauncher extends Launcher {
     // Overload that takes an env lookup function for testability — System.getenv is immutable in-process.
     // Micrometer does not tolerate duplicate resource attribute keys, so dedupe before passing to OtlpConfig.
     // Produces a deduplicated, comma-separated key=value string. Precedence (later wins):
-    //   1. service.name=<default>
+    //   1. service.name=<default>, service.instance.id=<default>
     //   2. OTEL_RESOURCE_ATTRIBUTES env var
     //   3. ai.chronon.metrics.exporter.resources system property
     //   4. OTEL_SERVICE_NAME env var (overrides service.name)
     static String buildOtlpResourceAttributes(String defaultServiceName, Function<String, String> envLookup) {
         LinkedHashMap<String, String> attrs = new LinkedHashMap<>();
         attrs.put("service.name", defaultServiceName);
+        // Seeded before user config so an explicitly supplied service.instance.id still wins.
+        attrs.put(ServiceInstanceIdKey, defaultInstanceId(envLookup));
 
         appendParsedAttributes(attrs, envLookup.apply("OTEL_RESOURCE_ATTRIBUTES"));
         appendParsedAttributes(attrs, System.getProperty(OtelMetricsReporter.MetricsExporterResourceKey(), ""));
@@ -170,6 +177,28 @@ public class ChrononServiceLauncher extends Launcher {
         return attrs.entrySet().stream()
                 .map(e -> e.getKey() + "=" + e.getValue())
                 .collect(Collectors.joining(","));
+    }
+
+    // Without a per-instance resource attribute every replica exports a byte-identical OTLP resource
+    // block. Consumers key a timeseries by resource identity, so replica counters collide and
+    // overwrite each other (last-writer-wins) instead of summing. HOSTNAME is the pod name under
+    // Kubernetes and the container id under Docker.
+    static String defaultInstanceId(Function<String, String> envLookup) {
+        String hostnameEnv = envLookup.apply("HOSTNAME");
+        if (hostnameEnv != null && !hostnameEnv.trim().isEmpty()) {
+            return hostnameEnv.trim();
+        }
+
+        try {
+            String localHostname = InetAddress.getLocalHost().getHostName();
+            if (localHostname != null && !localHostname.trim().isEmpty()) {
+                return localHostname.trim();
+            }
+        } catch (UnknownHostException e) {
+            logger.debug("Unable to resolve local hostname for {}", ServiceInstanceIdKey, e);
+        }
+
+        return UUID.randomUUID().toString();
     }
 
     private static void appendParsedAttributes(LinkedHashMap<String, String> attrs, String raw) {

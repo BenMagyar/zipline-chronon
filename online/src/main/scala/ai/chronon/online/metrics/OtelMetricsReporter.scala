@@ -177,14 +177,37 @@ object OtelMetricsReporter {
       .build
   }
 
+  val ServiceInstanceIdKey = "service.instance.id"
+
+  // Without a per-instance resource attribute every replica exports a byte-identical OTLP resource
+  // block. Consumers key a timeseries by resource identity, so replica counters collide and
+  // overwrite each other (last-writer-wins) instead of summing. HOSTNAME is the pod name under
+  // Kubernetes and the container id under Docker.
+  private[metrics] def defaultInstanceId(envLookup: String => Option[String]): String =
+    envLookup("HOSTNAME")
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .orElse {
+        try {
+          Option(java.net.InetAddress.getLocalHost.getHostName).map(_.trim).filter(_.nonEmpty)
+        } catch {
+          case e: java.net.UnknownHostException =>
+            logger.debug(s"Unable to resolve local hostname for $ServiceInstanceIdKey", e)
+            None
+        }
+      }
+      .getOrElse(java.util.UUID.randomUUID().toString)
+
   // Build resource attributes. Precedence is last-write-wins:
   // system property first, then OTEL_SERVICE_NAME for service.name.
   private[metrics] def buildResource(envLookup: String => Option[String]): Resource = {
     // Precedence (later wins):
+    //   0. service.instance.id default (seeded first so an explicitly configured value still wins)
     //   1. OTEL_RESOURCE_ATTRIBUTES env var
     //   2. ai.chronon.metrics.exporter.resources system property
     //   3. OTEL_SERVICE_NAME env var (highest priority for service.name)
     val builder = Attributes.builder()
+    builder.put(AttributeKey.stringKey(ServiceInstanceIdKey), defaultInstanceId(envLookup))
     appendParsedAttributes(builder, envLookup("OTEL_RESOURCE_ATTRIBUTES"))
     appendParsedAttributes(builder, Option(System.getProperty(MetricsExporterResourceKey, "")).filter(_.trim.nonEmpty))
     envLookup("OTEL_SERVICE_NAME").filter(_.trim.nonEmpty).foreach { name =>

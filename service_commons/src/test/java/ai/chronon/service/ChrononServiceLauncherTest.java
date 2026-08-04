@@ -11,6 +11,9 @@ import java.util.Map;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 class ChrononServiceLauncherTest {
@@ -54,10 +57,12 @@ class ChrononServiceLauncherTest {
 
     @Test
     void onlyDefaultServiceNameWhenNothingElseConfigured() {
-        String result = ChrononServiceLauncher.buildOtlpResourceAttributes(
-                "ai.chronon", envOf(new HashMap<>()));
+        Map<String, String> env = new HashMap<>();
+        env.put("HOSTNAME", "fetcher-abc123");
 
-        assertEquals("service.name=ai.chronon", result);
+        String result = ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env));
+
+        assertEquals("service.name=ai.chronon,service.instance.id=fetcher-abc123", result);
     }
 
     @Test
@@ -143,10 +148,84 @@ class ChrononServiceLauncherTest {
         Map<String, String> env = new HashMap<>();
         env.put("OTEL_RESOURCE_ATTRIBUTES", "   ");
         env.put("OTEL_SERVICE_NAME", "");
+        env.put("HOSTNAME", "fetcher-abc123");
         System.setProperty(CHRONON_RESOURCES_PROP, "");
 
         String result = ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env));
 
-        assertEquals("service.name=ai.chronon", result);
+        assertEquals("service.name=ai.chronon,service.instance.id=fetcher-abc123", result);
+    }
+
+    // CTRL-281: without a per-instance attribute every replica exports an identical resource block
+    // and downstream consumers collapse the replicas onto one timeseries (last-writer-wins).
+    @Test
+    void serviceInstanceIdDefaultsToHostname() {
+        Map<String, String> env = new HashMap<>();
+        env.put("HOSTNAME", "chronon-fetcher-7d9f8b6c4-xk2mz");
+
+        Map<String, String> parsed = parseAsMicrometerWould(
+                ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env)));
+
+        assertEquals("chronon-fetcher-7d9f8b6c4-xk2mz", parsed.get("service.instance.id"));
+    }
+
+    @Test
+    void explicitServiceInstanceIdBeatsHostnameDefault() {
+        // The default is seeded before user config precisely so an explicit value still wins.
+        Map<String, String> env = new HashMap<>();
+        env.put("HOSTNAME", "pod-from-hostname");
+        env.put("OTEL_RESOURCE_ATTRIBUTES", "service.instance.id=explicitly-configured");
+
+        String result = ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env));
+
+        assertEquals("explicitly-configured", parseAsMicrometerWould(result).get("service.instance.id"));
+        // Micrometer's OtlpConfig throws on duplicate keys, so the override must replace rather than append.
+        long instanceIdCount = java.util.Arrays.stream(result.split(","))
+                .filter(s -> s.trim().startsWith("service.instance.id="))
+                .count();
+        assertEquals(1, instanceIdCount, "Output must not contain duplicate service.instance.id keys");
+    }
+
+    @Test
+    void systemPropertyCanOverrideServiceInstanceId() {
+        Map<String, String> env = new HashMap<>();
+        env.put("HOSTNAME", "pod-from-hostname");
+        System.setProperty(CHRONON_RESOURCES_PROP, "service.instance.id=from-sysprop");
+
+        Map<String, String> parsed = parseAsMicrometerWould(
+                ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env)));
+
+        assertEquals("from-sysprop", parsed.get("service.instance.id"));
+    }
+
+    @Test
+    void serviceInstanceIdIsAlwaysPopulatedWhenHostnameIsBlankOrAbsent() {
+        // Falls back to local hostname, then a random UUID — the attribute must never be missing,
+        // since an absent value reintroduces the collision this guards against.
+        Map<String, String> blankHostname = new HashMap<>();
+        blankHostname.put("HOSTNAME", "   ");
+
+        for (Map<String, String> env : java.util.List.of(new HashMap<String, String>(), blankHostname)) {
+            String instanceId = parseAsMicrometerWould(
+                    ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(env)))
+                    .get("service.instance.id");
+
+            assertNotNull(instanceId, "service.instance.id must always be set");
+            assertFalse(instanceId.trim().isEmpty(), "service.instance.id must not be blank");
+        }
+    }
+
+    @Test
+    void distinctHostnamesProduceDistinctInstanceIds() {
+        // The whole point of the attribute: two replicas must not be identical on the wire.
+        Map<String, String> podA = new HashMap<>();
+        podA.put("HOSTNAME", "fetcher-pod-a");
+        Map<String, String> podB = new HashMap<>();
+        podB.put("HOSTNAME", "fetcher-pod-b");
+
+        String a = ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(podA));
+        String b = ChrononServiceLauncher.buildOtlpResourceAttributes("ai.chronon", envOf(podB));
+
+        assertNotEquals(a, b);
     }
 }

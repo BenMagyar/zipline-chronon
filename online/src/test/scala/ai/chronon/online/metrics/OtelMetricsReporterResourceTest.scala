@@ -12,6 +12,7 @@ class OtelMetricsReporterResourceTest extends AnyFlatSpec with Matchers with Bef
   private val ServiceNameKey = AttributeKey.stringKey("service.name")
   private val RegionKey = AttributeKey.stringKey("region")
   private val EnvKey = AttributeKey.stringKey("env")
+  private val InstanceIdKey = AttributeKey.stringKey(OtelMetricsReporter.ServiceInstanceIdKey)
 
   private var savedProp: Option[String] = None
 
@@ -120,6 +121,70 @@ class OtelMetricsReporterResourceTest extends AnyFlatSpec with Matchers with Bef
     resource.getAttribute(AttributeKey.stringKey("")) shouldBe null
     resource.getAttribute(AttributeKey.stringKey("key")) shouldBe null
     resource.getAttribute(AttributeKey.stringKey("valid")) shouldBe "ok"
+  }
+
+  // CTRL-281: without a per-instance attribute every replica exports an identical resource block
+  // and downstream consumers collapse the replicas onto one timeseries (last-writer-wins).
+  "service.instance.id" should "default to HOSTNAME" in {
+    val envLookup: String => Option[String] = {
+      case "HOSTNAME" => Some("chronon-fetcher-7d9f8b6c4-xk2mz")
+      case _          => None
+    }
+
+    val resource = OtelMetricsReporter.buildResource(envLookup)
+
+    resource.getAttribute(InstanceIdKey) shouldBe "chronon-fetcher-7d9f8b6c4-xk2mz"
+  }
+
+  it should "be overridden by an explicitly configured value" in {
+    // The default is seeded before user config precisely so an explicit value still wins.
+    val envLookup: String => Option[String] = {
+      case "HOSTNAME"                 => Some("pod-from-hostname")
+      case "OTEL_RESOURCE_ATTRIBUTES" => Some("service.instance.id=explicitly-configured")
+      case _                          => None
+    }
+
+    val resource = OtelMetricsReporter.buildResource(envLookup)
+
+    resource.getAttribute(InstanceIdKey) shouldBe "explicitly-configured"
+  }
+
+  it should "be overridden by the system property" in {
+    System.setProperty(ResourceKey, "service.instance.id=from-sysprop")
+    val envLookup: String => Option[String] = {
+      case "HOSTNAME" => Some("pod-from-hostname")
+      case _          => None
+    }
+
+    val resource = OtelMetricsReporter.buildResource(envLookup)
+
+    resource.getAttribute(InstanceIdKey) shouldBe "from-sysprop"
+  }
+
+  it should "always be populated when HOSTNAME is absent or blank" in {
+    // Falls back to local hostname, then a random UUID — an absent value would reintroduce
+    // the collision this guards against.
+    val lookups: Seq[String => Option[String]] = Seq(
+      _ => None,
+      { case "HOSTNAME" => Some("   "); case _ => None }
+    )
+
+    lookups.foreach { envLookup =>
+      val instanceId = OtelMetricsReporter.buildResource(envLookup).getAttribute(InstanceIdKey)
+      instanceId should not be null
+      instanceId.trim should not be empty
+    }
+  }
+
+  it should "differ across replicas with distinct hostnames" in {
+    def resourceFor(hostname: String) =
+      OtelMetricsReporter.buildResource {
+        case "HOSTNAME" => Some(hostname)
+        case _          => None
+      }
+
+    resourceFor("fetcher-pod-a").getAttribute(InstanceIdKey) should not be
+      resourceFor("fetcher-pod-b").getAttribute(InstanceIdKey)
   }
 
 }
