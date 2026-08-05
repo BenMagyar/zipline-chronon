@@ -68,7 +68,7 @@
       "stepDays": 10000
     },
     "name": "aws_databricks.nvme_stress.scaled_dim_listings__0",
-    "outputNamespace": "workspace_iceberg.poc",
+    "outputNamespace": "zipline_catalog.default",
     "sourceFile": "staging_queries/aws_databricks/nvme_stress.py",
     "tags": {
       "payload_bytes_per_row": "512",
