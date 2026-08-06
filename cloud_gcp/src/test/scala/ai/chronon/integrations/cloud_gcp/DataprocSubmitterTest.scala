@@ -1380,6 +1380,161 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     assert(result.isEmpty)
   }
 
+  it should "surface an async cluster creation failure from triggerAsyncClusterCreation on the next poll" in {
+    // End-to-end regression guard: drives the actual two-poll production path (first poll
+    // triggers the async create via triggerAsyncClusterCreation, second poll observes the
+    // failed Future and throws). Planting a failed Future directly in pendingCreations would
+    // bypass triggerAsyncClusterCreation, so reintroducing the old .recover that swallowed
+    // failures could leave the assertion green.
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String])).thenReturn(null)
+
+    val rootCause =
+      new RuntimeException("NOT_FOUND: Custom Service Account 'zipline-dataproc@x.iam.gserviceaccount.com' not found")
+    when(mockClusterControllerClient.createClusterAsync(any[CreateClusterRequest])).thenThrow(rootCause)
+
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+
+    val clusterConfig = Map(
+      "dataproc.config" ->
+        """{ "masterConfig": { "numInstances": 1, "machineTypeUri": "n1-standard-4" } }"""
+    )
+    implicit val ec: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+
+    val firstResult = submitter.ensureClusterReady("test-cluster", Some(clusterConfig))
+    assert(firstResult.isEmpty)
+
+    val pending = submitter.pendingCreations.get("test-cluster")
+    assert(pending != null, "triggerAsyncClusterCreation should have registered a pending Future")
+    scala.concurrent.Await.ready(pending, scala.concurrent.duration.Duration(5, "seconds"))
+
+    val thrown = intercept[RuntimeException] {
+      submitter.ensureClusterReady("test-cluster", Some(clusterConfig))
+    }
+
+    assert(thrown.getMessage.contains("Async Dataproc cluster creation failed for test-cluster"))
+    // createDataprocCluster wraps the mock's exception, so the NOT_FOUND message lives
+    // somewhere in the cause chain, not necessarily on getCause() directly.
+    val causeChain = Iterator
+      .iterate[Throwable](thrown.getCause)(t => if (t == null) null else t.getCause)
+      .takeWhile(_ != null)
+      .toList
+    assert(causeChain.exists(_.getMessage.contains("NOT_FOUND: Custom Service Account")),
+           s"expected NOT_FOUND cause in chain: ${causeChain.map(_.getMessage)}")
+    assert(!submitter.pendingCreations.containsKey("test-cluster"))
+    // Deduplication: only one async creation attempt across the two polls.
+    verify(mockClusterControllerClient, times(1)).createClusterAsync(any[CreateClusterRequest])
+  }
+
+  it should "clear tracker on success and fall through to the normal state check" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    val runningCluster = Cluster
+      .newBuilder()
+      .setStatus(ClusterStatus.newBuilder().setState(ClusterStatus.State.RUNNING))
+      .build()
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String]))
+      .thenReturn(runningCluster)
+
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+    submitter.pendingCreations.put("test-cluster", scala.concurrent.Future.successful("test-cluster"))
+
+    val result = submitter.ensureClusterReady("test-cluster", None)(scala.concurrent.ExecutionContext.global)
+
+    assertEquals("test-cluster", result.get)
+    assert(!submitter.pendingCreations.containsKey("test-cluster"))
+  }
+
+  it should "return None without consulting Dataproc when an async creation is still in flight" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+    val neverCompletes = scala.concurrent.Promise[String]().future
+    submitter.pendingCreations.put("test-cluster", neverCompletes)
+
+    val result = submitter.ensureClusterReady("test-cluster", None)(scala.concurrent.ExecutionContext.global)
+
+    assert(result.isEmpty)
+    assert(submitter.pendingCreations.containsKey("test-cluster"))
+    verify(mockClusterControllerClient, never()).getCluster(any[String], any[String], any[String])
+  }
+
+  it should "not clobber a newer retry Future when clearing a stale completed Future" in {
+    // Regression guard: two poll cycles can concurrently observe the same completed Future.
+    // Between their observations and their remove calls, a fresh retry may be registered by
+    // another cycle. With single-arg remove(key), the second thread would nuke that retry —
+    // leading to duplicate concurrent cluster creations for the same name. The two-arg
+    // remove(key, value) is a compare-and-remove that leaves a newer entry untouched.
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mock[ClusterControllerClient])
+    )
+
+    val staleFailed = scala.concurrent.Future.failed[String](new RuntimeException("stale creation failure"))
+    val freshRetry = scala.concurrent.Promise[String]().future
+
+    submitter.pendingCreations.put("cluster-X", staleFailed)
+    // The first successful ensureClusterReady call surfaces staleFailed to its caller as a
+    // synchronous throw and clears it from the map.
+    intercept[RuntimeException] {
+      submitter.ensureClusterReady("cluster-X", None)(scala.concurrent.ExecutionContext.global)
+    }
+    assert(!submitter.pendingCreations.containsKey("cluster-X"))
+
+    // A subsequent poll (or retriggered step) registers a fresh retry Future for the same name.
+    submitter.pendingCreations.put("cluster-X", freshRetry)
+
+    // Now simulate a concurrent poll whose reference to `staleFailed` was captured before the
+    // first remove: it should compare-and-remove against `staleFailed`, find `freshRetry`
+    // instead, and leave the map alone. Bare `remove("cluster-X")` would have deleted freshRetry.
+    submitter.pendingCreations.remove("cluster-X", staleFailed)
+
+    assert(submitter.pendingCreations.containsKey("cluster-X"))
+    assert(submitter.pendingCreations.get("cluster-X") eq freshRetry)
+  }
+
+  it should "not populate pendingCreations for a cluster in DELETING state" in {
+    val mockClusterControllerClient = mock[ClusterControllerClient]
+    val deletingCluster = Cluster
+      .newBuilder()
+      .setStatus(ClusterStatus.newBuilder().setState(ClusterStatus.State.DELETING))
+      .build()
+    when(mockClusterControllerClient.getCluster(any[String], any[String], any[String]))
+      .thenReturn(deletingCluster)
+
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      clusterControllerClient = Some(mockClusterControllerClient)
+    )
+
+    val result = submitter.ensureClusterReady("test-cluster", None)(scala.concurrent.ExecutionContext.global)
+
+    assert(result.isEmpty)
+    assert(submitter.pendingCreations.isEmpty)
+  }
+
   it should "throw IllegalArgumentException when getOrCreateCluster is called with no config" in {
     val mockDataprocClient = mock[ClusterControllerClient]
 

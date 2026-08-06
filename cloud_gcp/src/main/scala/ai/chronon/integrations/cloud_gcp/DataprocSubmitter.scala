@@ -15,9 +15,11 @@ import com.google.cloud.storage.{Storage, StorageOptions}
 import com.google.protobuf.util.JsonFormat
 
 import java.time.{Duration, Instant}
+import java.util.concurrent.ConcurrentHashMap
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
 import scala.util.matching.Regex
+import scala.util.{Failure, Success}
 
 case class MoreThanOneRunningFlinkJob(message: String) extends Exception(message)
 
@@ -714,11 +716,37 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
 
   override def deprecatedClusterNameEnvVars: Seq[String] = Seq(GcpDataprocClusterNameEnvVar)
 
+  // Tracks in-flight async cluster creations by cluster name so ensureClusterReady can observe
+  // the outcome on a subsequent poll and surface a permanent failure (e.g. bad service account,
+  // permission denied) as a synchronous throw instead of silently retrying forever.
+  private[cloud_gcp] val pendingCreations: ConcurrentHashMap[String, Future[String]] =
+    new ConcurrentHashMap[String, Future[String]]()
+
   override def ensureClusterReady(clusterName: String, clusterConf: Option[Map[String, String]])(implicit
       ec: ExecutionContext): Option[String] = {
     clusterControllerClient match {
       case None => Some(clusterName)
       case Some(ccClient) =>
+        Option(pendingCreations.get(clusterName)) match {
+          case Some(future) =>
+            future.value match {
+              case Some(Success(_)) =>
+                // Compare-and-remove: only clear the entry if it still points to the Future we
+                // observed. A concurrent poll that observed the same completed Future may have
+                // already registered a newer retry via triggerAsyncClusterCreation; a bare
+                // remove(clusterName) would nuke that retry.
+                pendingCreations.remove(clusterName, future)
+              case Some(Failure(cause)) =>
+                pendingCreations.remove(clusterName, future)
+                throw new RuntimeException(
+                  s"Async Dataproc cluster creation failed for $clusterName: ${cause.getMessage}",
+                  cause)
+              case None =>
+                return None
+            }
+          case None => ()
+        }
+
         try {
           val cluster = ccClient.getCluster(projectId, region, clusterName)
           if (cluster == null) {
@@ -764,12 +792,24 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                                           clusterConf: Option[Map[String, String]],
                                           ccClient: ClusterControllerClient)(implicit ec: ExecutionContext): Unit = {
     if (clusterConf.isDefined && clusterConf.get.contains("dataproc.config")) {
-      logger.info(s"Cluster $clusterName not found. Triggering creation asynchronously.")
-      Future {
-        DataprocSubmitter.getOrCreateCluster(clusterName, clusterConf, projectId, region, ccClient)
-      }.recover { case ex: Exception =>
-        logger.error(s"Failed to create cluster $clusterName asynchronously", ex)
-      }
+      // computeIfAbsent makes "start-if-not-already-running" atomic across both entry paths
+      // (getCluster == null and NotFoundException). The Future is retained in the map so a
+      // subsequent ensureClusterReady call can inspect it and surface a permanent failure.
+      pendingCreations.computeIfAbsent(
+        clusterName,
+        (_: String) => {
+          logger.info(s"Cluster $clusterName not found. Triggering creation asynchronously.")
+          val f = Future {
+            DataprocSubmitter.getOrCreateCluster(clusterName, clusterConf, projectId, region, ccClient)
+          }
+          f.onComplete {
+            case Success(_)  => logger.info(s"Async cluster creation succeeded for $clusterName")
+            case Failure(ex) => logger.error(s"Async cluster creation failed for $clusterName", ex)
+          }
+          f
+        }
+      )
+      ()
     } else {
       logger.error(s"Cluster $clusterName does not exist and no cluster configuration provided to create it.")
       throw new IllegalArgumentException(
