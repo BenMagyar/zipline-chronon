@@ -480,7 +480,7 @@ class Fetcher(val kvStore: KVStore,
 
     encoderTry.flatMap { case (valueSchema, valueCodec) =>
       Try {
-        val response = encode(valueSchema, valueCodec, features)
+        val response = encode(valueSchema, Fetcher.codecForCurrentThread(valueCodec), features)
         ctx.distribution("avroconversionbytes.latency.millis", System.currentTimeMillis() - startTime)
         response
       }.recover { case exception =>
@@ -502,7 +502,7 @@ class Fetcher(val kvStore: KVStore,
 
     encoderTry.flatMap { case (valueSchema, valueCodec) =>
       Try {
-        val avroBytes = encode(valueSchema, valueCodec, features)
+        val avroBytes = encode(valueSchema, Fetcher.codecForCurrentThread(valueCodec), features)
         val avroString = java.util.Base64.getEncoder.encodeToString(avroBytes)
         ctx.distribution("avroconversionstring.latency.millis", System.currentTimeMillis() - startTime)
         avroString
@@ -560,7 +560,7 @@ class Fetcher(val kvStore: KVStore,
                                            responseType: ResponseType,
                                            joinCodecsByName: Map[String, Try[JoinCodec]]): Seq[ResponseV2] = {
     val encodersByName = joinCodecsByName.iterator.map { case (joinName, codecTry) =>
-      joinName -> codecTry.map(codec => codec.valueSchema -> Fetcher.codecForCurrentThread(codec.valueCodec))
+      joinName -> codecTry.map(codec => codec.valueSchema -> codec.valueCodec)
     }.toMap
 
     responseType match {
