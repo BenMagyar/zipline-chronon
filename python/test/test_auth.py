@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 from unittest.mock import Mock, patch
@@ -15,6 +16,19 @@ from ai.chronon.repo.auth import (
     get_user_email,
     save_auth_config,
 )
+
+
+def _make_jwt(claims: dict) -> str:
+    """Build a fake (unsigned) JWT whose payload decodes to *claims*.
+
+    Matches what ``decode_jwt_claims`` reads — base64url-encoded JSON payload —
+    so tests can exercise the real claim-decoding path.
+    """
+
+    def b64(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    return f"{b64({'alg': 'HS256', 'typ': 'JWT'})}.{b64(claims)}.sig"
 
 
 @pytest.fixture
@@ -240,15 +254,11 @@ class TestLoginCommand:
             "token_type": "Bearer",
         }
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {
-            "user": {"name": "Jane Doe", "email": "jane@example.com"}
-        }
+        jwt = _make_jwt({"name": "Jane Doe", "email": "jane@example.com"})
 
         with (
             patch("ai.chronon.repo.auth.requests.post", return_value=device_code_resp) as mock_post,
-            patch("ai.chronon.repo.auth.requests.get", return_value=session_resp),
+            patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt) as mock_exchange,
             patch("ai.chronon.repo.auth.webbrowser.open"),
             patch("ai.chronon.repo.auth.time.sleep"),
             patch("ai.chronon.repo.auth.time.time", side_effect=[0, 1]),
@@ -260,6 +270,8 @@ class TestLoginCommand:
 
         assert result.exit_code == 0
         assert "Authentication successful" in result.output
+        # Login verifies the token via the exchange (not /api/auth/get-session).
+        mock_exchange.assert_called_once_with("session-tok-123", "https://hub.example.com")
 
         data = json.loads(auth_file.read_text())
         saved = data["accounts"]["https://hub.example.com"]
@@ -326,13 +338,11 @@ class TestLoginCommand:
         token_resp = Mock()
         token_resp.json.return_value = {"access_token": "tok-b", "token_type": "Bearer"}
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {"user": {"name": "User B", "email": "b@example.com"}}
+        jwt = _make_jwt({"name": "User B", "email": "b@example.com"})
 
         with (
             patch("ai.chronon.repo.auth.requests.post", side_effect=[device_code_resp, token_resp]),
-            patch("ai.chronon.repo.auth.requests.get", return_value=session_resp),
+            patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt),
             patch("ai.chronon.repo.auth.webbrowser.open"),
             patch("ai.chronon.repo.auth.time.sleep"),
             patch("ai.chronon.repo.auth.time.time", side_effect=[0, 1]),
@@ -345,6 +355,42 @@ class TestLoginCommand:
         assert "https://hub-a.example.com" in data["accounts"]
         assert "https://hub-b.example.com" in data["accounts"]
         assert data["default"] == "https://hub-b.example.com"
+
+    def test_login_warns_when_verification_fails(self, auth_dir):
+        """Token is still saved, but a failed exchange surfaces a warning
+        instead of silently reporting success (the perimeter-gateway case)."""
+        _, auth_file = auth_dir
+        runner = CliRunner()
+
+        device_code_resp = Mock()
+        device_code_resp.raise_for_status = Mock()
+        device_code_resp.json.return_value = {
+            "device_code": "dev123",
+            "user_code": "ABCD-1234",
+            "interval": 0,
+            "expires_in": 10,
+        }
+
+        token_resp = Mock()
+        token_resp.json.return_value = {"access_token": "session-tok-123", "token_type": "Bearer"}
+
+        with (
+            patch("ai.chronon.repo.auth.requests.post", side_effect=[device_code_resp, token_resp]),
+            patch(
+                "ai.chronon.repo.auth.exchange_session_for_jwt",
+                side_effect=RuntimeError("Token rejected by auth server (HTTP 401)."),
+            ),
+            patch("ai.chronon.repo.auth.webbrowser.open"),
+            patch("ai.chronon.repo.auth.time.sleep"),
+            patch("ai.chronon.repo.auth.time.time", side_effect=[0, 1]),
+        ):
+            result = runner.invoke(auth, ["login", "--url", "https://hub.example.com", "--no-browser"])
+
+        assert result.exit_code == 0
+        assert "could not be verified" in result.output
+        # Token is still persisted so the user can retry / inspect it.
+        saved = get_auth_config(url="https://hub.example.com")
+        assert saved["access_token"] == "session-tok-123"
 
 
 class TestLogoutCommand:
@@ -395,13 +441,9 @@ class TestStatusCommand:
         save_auth_config(sample_config)
         runner = CliRunner()
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {
-            "user": {"name": "Test User", "email": "test@example.com"}
-        }
+        jwt = _make_jwt({"name": "Test User", "email": "test@example.com"})
 
-        with patch("ai.chronon.repo.auth.requests.get", return_value=session_resp):
+        with patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt):
             result = runner.invoke(auth, ["status"])
 
         assert result.exit_code == 0
@@ -412,38 +454,38 @@ class TestStatusCommand:
         save_auth_config(sample_config)
         runner = CliRunner()
 
-        expired_resp = Mock()
-        expired_resp.ok = False
-        expired_resp.status_code = 401
-
-        with patch("ai.chronon.repo.auth.requests.get", return_value=expired_resp):
+        with patch(
+            "ai.chronon.repo.auth.exchange_session_for_jwt",
+            side_effect=RuntimeError(
+                "Token rejected by auth server (HTTP 401). The token may be expired, "
+                "revoked, or does not belong to this auth server."
+            ),
+        ):
             result = runner.invoke(auth, ["status"])
 
         assert result.exit_code == 0
-        assert "expired or invalid" in result.output
+        assert "expired" in result.output
 
     def test_status_network_error(self, auth_dir, sample_config):
         save_auth_config(sample_config)
         runner = CliRunner()
 
         with patch(
-            "ai.chronon.repo.auth.requests.get",
-            side_effect=requests.ConnectionError("no network"),
+            "ai.chronon.repo.auth.exchange_session_for_jwt",
+            side_effect=RuntimeError("Could not connect to auth server at https://hub.example.com."),
         ):
             result = runner.invoke(auth, ["status"])
 
         assert result.exit_code == 0
-        assert "network error" in result.output
+        assert "Could not connect" in result.output
 
     def test_status_shows_default_label(self, auth_dir, sample_config):
         save_auth_config(sample_config)
         runner = CliRunner()
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {"user": {"name": "Test", "email": "t@e.com"}}
+        jwt = _make_jwt({"name": "Test", "email": "t@e.com"})
 
-        with patch("ai.chronon.repo.auth.requests.get", return_value=session_resp):
+        with patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt):
             result = runner.invoke(auth, ["status"])
 
         assert "(default)" in result.output
@@ -454,11 +496,9 @@ class TestStatusCommand:
 
         runner = CliRunner()
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {"user": {"name": "User A", "email": "a@e.com"}}
+        jwt = _make_jwt({"name": "User A", "email": "a@e.com"})
 
-        with patch("ai.chronon.repo.auth.requests.get", return_value=session_resp):
+        with patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt):
             result = runner.invoke(auth, ["status", "--url", "https://hub-a.example.com"])
 
         assert result.exit_code == 0
@@ -471,11 +511,9 @@ class TestStatusCommand:
 
         runner = CliRunner()
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {"user": {"name": "User", "email": "u@e.com"}}
+        jwt = _make_jwt({"name": "User", "email": "u@e.com"})
 
-        with patch("ai.chronon.repo.auth.requests.get", return_value=session_resp):
+        with patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt):
             result = runner.invoke(auth, ["status"])
 
         assert result.exit_code == 0
@@ -500,11 +538,10 @@ class TestGetAccessTokenCommand:
         save_auth_config(sample_config)
         runner = CliRunner()
 
-        token_resp = Mock()
-        token_resp.ok = True
-        token_resp.json.return_value = {"token": "eyJhbGciOi.payload.signature"}
-
-        with patch("ai.chronon.repo.auth.requests.get", return_value=token_resp):
+        with patch(
+            "ai.chronon.repo.auth.exchange_session_for_jwt",
+            return_value="eyJhbGciOi.payload.signature",
+        ):
             result = runner.invoke(auth, ["get-access-token"])
 
         assert result.exit_code == 0
@@ -521,28 +558,30 @@ class TestGetAccessTokenCommand:
         save_auth_config(sample_config)
         runner = CliRunner()
 
-        expired_resp = Mock()
-        expired_resp.ok = False
-        expired_resp.status_code = 401
-
-        with patch("ai.chronon.repo.auth.requests.get", return_value=expired_resp):
+        with patch(
+            "ai.chronon.repo.auth.exchange_session_for_jwt",
+            side_effect=RuntimeError(
+                "Token rejected by auth server (HTTP 401). The token may be "
+                "expired, revoked, or does not belong to this auth server."
+            ),
+        ):
             result = runner.invoke(auth, ["get-access-token"])
 
         assert result.exit_code != 0
-        assert "expired or invalid" in result.output
+        assert "expired" in result.output
 
     def test_network_error(self, auth_dir, sample_config):
         save_auth_config(sample_config)
         runner = CliRunner()
 
         with patch(
-            "ai.chronon.repo.auth.requests.get",
-            side_effect=requests.ConnectionError("connection refused"),
+            "ai.chronon.repo.auth.exchange_session_for_jwt",
+            side_effect=RuntimeError("Could not connect to auth server at https://hub.example.com."),
         ):
             result = runner.invoke(auth, ["get-access-token"])
 
         assert result.exit_code != 0
-        assert "Failed to fetch access token" in result.output
+        assert "Could not connect" in result.output
 
     def test_get_access_token_for_specific_url(self, auth_dir):
         save_auth_config({"url": "https://hub-a.example.com", "access_token": "tok-a"})
@@ -550,19 +589,15 @@ class TestGetAccessTokenCommand:
 
         runner = CliRunner()
 
-        token_resp = Mock()
-        token_resp.ok = True
-        token_resp.json.return_value = {"token": "jwt-for-a"}
-
-        with patch("ai.chronon.repo.auth.requests.get", return_value=token_resp) as mock_get:
+        with patch(
+            "ai.chronon.repo.auth.exchange_session_for_jwt", return_value="jwt-for-a"
+        ) as mock_exchange:
             result = runner.invoke(auth, ["get-access-token", "--url", "https://hub-a.example.com"])
 
         assert result.exit_code == 0
         assert result.output.strip() == "jwt-for-a"
-        # Verify it called hub-a, not hub-b
-        mock_get.assert_called_once()
-        call_url = mock_get.call_args[0][0]
-        assert "hub-a.example.com" in call_url
+        # Verify it exchanged hub-a's token against hub-a, not hub-b.
+        mock_exchange.assert_called_once_with("tok-a", "https://hub-a.example.com")
 
 
 class TestGetFrontendUrlFromTeams:
@@ -629,16 +664,12 @@ class TestLoginDefaultUrl:
             "token_type": "Bearer",
         }
 
-        session_resp = Mock()
-        session_resp.ok = True
-        session_resp.json.return_value = {
-            "user": {"name": "Jane Doe", "email": "jane@example.com"}
-        }
+        jwt = _make_jwt({"name": "Jane Doe", "email": "jane@example.com"})
 
         with (
             patch("ai.chronon.repo.auth.get_frontend_url_from_teams", return_value="https://zipline.example.com"),
             patch("ai.chronon.repo.auth.requests.post", side_effect=[device_code_resp, token_resp]),
-            patch("ai.chronon.repo.auth.requests.get", return_value=session_resp),
+            patch("ai.chronon.repo.auth.exchange_session_for_jwt", return_value=jwt),
             patch("ai.chronon.repo.auth.webbrowser.open"),
             patch("ai.chronon.repo.auth.time.sleep"),
             patch("ai.chronon.repo.auth.time.time", side_effect=[0, 1]),

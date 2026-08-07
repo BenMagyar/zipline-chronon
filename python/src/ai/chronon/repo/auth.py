@@ -21,6 +21,7 @@ from ai.chronon.cli.theme import (
     print_success,
     print_warning,
 )
+from ai.chronon.repo.token_exchange import decode_jwt_claims, exchange_session_for_jwt
 
 AUTH_DIR = Path.home() / ".zipline"
 AUTH_FILE = AUTH_DIR / "auth.json"
@@ -211,33 +212,41 @@ def login(url, no_browser):
 
         if "access_token" in token_data:
             # Success — save token and user info
+            session_token = token_data["access_token"]
             auth_config = {
                 "url": base_url,
-                "access_token": token_data["access_token"],
+                "access_token": session_token,
                 "token_type": token_data.get("token_type", "Bearer"),
             }
 
-            # Fetch user info to persist and display
+            # Verify the token end-to-end by exchanging it for a JWT — the same
+            # path the CLI uses for every API call — and read the user info from
+            # the JWT claims. Unlike /api/auth/get-session, this carries the
+            # opaque token in the request body, so a JWT-only perimeter gateway
+            # doesn't block it. A failure here means subsequent commands would
+            # fail too, so surface it instead of silently reporting success.
+            verified = False
+            verify_error = None
             try:
-                session_resp = requests.get(
-                    f"{base_url}/api/auth/get-session",
-                    headers={"Authorization": f"Bearer {token_data['access_token']}"},
-                    timeout=10,
-                )
-                if session_resp.ok:
-                    session_data = session_resp.json()
-                    user = session_data.get("user", {})
-                    name = user.get("name", "Unknown")
-                    email = user.get("email", "")
-                    auth_config["name"] = name
-                    auth_config["email"] = email
-            except requests.RequestException:
-                pass
+                jwt = exchange_session_for_jwt(session_token, base_url)
+                claims = decode_jwt_claims(jwt)
+                auth_config["name"] = claims.get("name") or "Unknown"
+                auth_config["email"] = claims.get("email") or ""
+                verified = True
+            except (RuntimeError, ValueError, KeyError, IndexError) as e:
+                verify_error = e
 
             save_auth_config(auth_config)
             print_success("Authentication successful!")
             if auth_config.get("email"):
                 print_key_value("Logged in as", f"{auth_config['name']} ({auth_config['email']})")
+            if not verified:
+                detail = f" ({verify_error})" if verify_error else ""
+                print_warning(
+                    "Signed in, but the token could not be verified against the API"
+                    f"{detail}. Subsequent commands may fail — check that the auth "
+                    "server is reachable and that any API gateway allows this request."
+                )
             return
 
         error = token_data.get("error", "")
@@ -283,20 +292,9 @@ def get_access_token(url):
     base_url = config["url"]
     session_token = config["access_token"]
     try:
-        resp = requests.get(
-            f"{base_url}/api/auth/token",
-            headers={"Authorization": f"Bearer {session_token}"},
-            timeout=10,
-        )
-        if resp.ok:
-            token = resp.json().get("token")
-            if token:
-                click.echo(token)
-                return
-        print_error("Session expired or invalid. Run 'zipline auth login' to re-authenticate.")
-        sys.exit(1)
-    except requests.RequestException as e:
-        print_error(f"Failed to fetch access token: {e}")
+        click.echo(exchange_session_for_jwt(session_token, base_url))
+    except RuntimeError as e:
+        print_error(str(e))
         sys.exit(1)
 
 
@@ -336,19 +334,18 @@ def _print_account_status(config, is_default=False):
 
     token = config.get("access_token")
     if base_url and token:
+        # Verify via the token exchange (body-carried, gateway-safe) rather than
+        # /api/auth/get-session, which presents the opaque token as a bearer and
+        # is blocked by JWT-only perimeter gateways. User info comes from the JWT
+        # claims returned by the exchange.
         try:
-            resp = requests.get(
-                f"{base_url}/api/auth/get-session",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            if resp.ok:
-                user = resp.json().get("user", {})
-                name = user.get("name", "Unknown")
-                email = user.get("email", "")
-                print_key_value("User", f"{name} ({email})")
-                print_key_value("Status", "authenticated")
-            else:
-                print_warning("Token expired or invalid. Run 'zipline auth login' to re-authenticate.")
-        except requests.RequestException:
-            print_warning("Unable to verify token (network error).")
+            jwt = exchange_session_for_jwt(token, base_url)
+            claims = decode_jwt_claims(jwt)
+            name = claims.get("name") or "Unknown"
+            email = claims.get("email") or ""
+            print_key_value("User", f"{name} ({email})")
+            print_key_value("Status", "authenticated")
+        except RuntimeError as e:
+            print_warning(str(e))
+        except (ValueError, KeyError, IndexError):
+            print_warning("Unable to verify token (malformed response from auth server).")

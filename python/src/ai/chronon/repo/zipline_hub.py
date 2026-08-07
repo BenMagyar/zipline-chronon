@@ -208,25 +208,15 @@ class ZiplineHub:
 
     def _get_hub_jwt(self):
         """Fetch a short-lived JWT from Zipline Hub using the stored session token."""
+        from ai.chronon.repo.token_exchange import exchange_session_for_jwt
+
         config = self._hub_auth_config
-        hub_url = config["url"]
-        session_token = config["access_token"]
         try:
-            resp = requests.get(
-                f"{hub_url}/api/auth/token",
-                headers={"Authorization": f"Bearer {session_token}"},
-                timeout=10,
-            )
-            if resp.ok:
-                return resp.json().get("token")
-            else:
-                print_warning(
-                    "Session expired. Run 'zipline auth login' to re-authenticate.",
-                    format=self.format,
-                )
-                return None
-        except requests.RequestException as e:
-            print_warning(f"Failed to fetch JWT from hub: {e}", format=self.format)
+            return exchange_session_for_jwt(config["access_token"], config["url"])
+        except RuntimeError as e:
+            # exchange_session_for_jwt already produces an actionable message
+            # (expired session, connectivity, misconfigured auth server).
+            print_warning(str(e), format=self.format)
             return None
 
     def _get_error_details(self, e: requests.RequestException) -> str:
