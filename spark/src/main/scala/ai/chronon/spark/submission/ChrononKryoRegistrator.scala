@@ -143,8 +143,8 @@ class ChrononKryoRegistrator extends KryoRegistrator {
       "org.apache.iceberg.hadoop.HadoopMetricsContext",
       "org.apache.iceberg.MetadataTableType",
       "org.apache.iceberg.io.ResolvingFileIO",
-      "org.apache.iceberg.spark.source.SerializableTableWithSize",
-      "org.apache.iceberg.spark.source.SerializableTableWithSize$SerializableMetadataTableWithSize",
+      // SerializableTableWithSize payloads are registered with JavaSerializer further below:
+      // they are the Iceberg table broadcast payloads and must survive cyclic object graphs
       "org.apache.iceberg.spark.source.SparkWrite$TaskCommit",
       "org.apache.iceberg.types.Types$DateType",
       "org.apache.iceberg.types.Types$NestedField",
@@ -282,6 +282,30 @@ class ChrononKryoRegistrator extends KryoRegistrator {
     } catch {
       case _: ClassNotFoundException => // Optional GCP class missing
       case _: LinkageError           => // Optional GCP dependency missing
+    }
+
+    // Iceberg broadcasts a serializable snapshot of the table from the DRIVER on every scan and
+    // write (SparkBatch.planInputPartitions / SparkWrite call
+    // sparkContext.broadcast(SerializableTableWithSize.copyOf(table))). Broadcast creation
+    // serializes the payload with spark.serializer, which SparkSessionBuilder forces to Kryo with
+    // spark.kryo.referenceTracking=false. The default FieldSerializer then has no cycle detection,
+    // so any cycle in the wrapped table's object graph (cloud catalog / FileIO / client-factory
+    // back-references) recurses until the driver dies with StackOverflowError - this is what
+    // crashed a Salesforce GroupBy backfill on EMR Serverless (engine 1.19.0) reading a raw
+    // Iceberg source. These payloads are java.io.Serializable by design (Iceberg already
+    // Java-serializes them into tasks), so route them through JavaSerializer, which handles
+    // cycles via handles. Applies on all clouds; the GCSFileIO entry above is GCP-only.
+    Seq(
+      "org.apache.iceberg.spark.source.SerializableTableWithSize",
+      "org.apache.iceberg.spark.source.SerializableTableWithSize$SerializableMetadataTableWithSize",
+      "org.apache.iceberg.SerializableTable"
+    ).foreach { name =>
+      try {
+        kryo.register(Class.forName(name), new JavaSerializer)
+      } catch {
+        case _: ClassNotFoundException => // Optional Iceberg class missing
+        case _: LinkageError           => // Optional Iceberg dependency missing
+      }
     }
 
     kryo.register(classOf[Array[Array[Array[AnyRef]]]])
