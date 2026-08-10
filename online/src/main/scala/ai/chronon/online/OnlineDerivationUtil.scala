@@ -1,6 +1,6 @@
 package ai.chronon.online
 
-import ai.chronon.api.{Derivation, TsUtils}
+import ai.chronon.api.{DataType, Derivation, TsUtils}
 import ai.chronon.api.Extensions.DerivationOps
 import ai.chronon.api.LongType
 import ai.chronon.api.StringType
@@ -39,10 +39,27 @@ object OnlineDerivationUtil {
   }
 
   private def buildDerivationFunctionWithSql(
-      catalystUtil: PooledCatalystUtil
+      catalystUtil: PooledCatalystUtil,
+      keySchema: StructType
   ): DerivationFunc = {
+    val keyFields = keySchema.fields
+
+    def normalizeDeclaredKeys(keys: Map[String, Any]): Map[String, Any] =
+      keyFields.foldLeft(keys) { (normalized, field) =>
+        keys.get(field.name) match {
+          case Some(value) =>
+            val original = value.asInstanceOf[AnyRef]
+            val cast = DataType.castTo(original, field.fieldType)
+            if (cast eq original) normalized
+            else normalized.updated(field.name, cast)
+          case None => normalized
+        }
+      }
+
     { case (keys: Map[String, Any], values: Map[String, Any]) =>
-      reintroduceExceptions(catalystUtil.performSql(keys ++ values).headOption.orNull, values)
+      // GroupBy lookup already casts request keys to its serving schema. Apply the join's key schema here as well so
+      // request keys used by SQL derivations have the same runtime types as the keys used for the preceding lookup.
+      reintroduceExceptions(catalystUtil.performSql(normalizeDeclaredKeys(keys) ++ values).headOption.orNull, values)
     }
   }
 
@@ -64,7 +81,7 @@ object OnlineDerivationUtil {
     } else {
 
       val catalystUtil = buildCatalystUtil(derivationsScala, keySchema, baseValueSchema, setups)
-      buildDerivationFunctionWithSql(catalystUtil)
+      buildDerivationFunctionWithSql(catalystUtil, keySchema)
 
     }
   }
