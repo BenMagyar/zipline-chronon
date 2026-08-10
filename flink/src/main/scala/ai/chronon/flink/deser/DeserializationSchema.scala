@@ -1,6 +1,6 @@
 package ai.chronon.flink.deser
 
-import ai.chronon.api.{DataModel, DataType, Query}
+import ai.chronon.api.{Constants, DataModel, DataType, Query}
 import ai.chronon.flink.SparkExpressionEval
 import ai.chronon.online.serde.{Mutation, SerDe, SparkConversions}
 import ai.chronon.online.{ERROR, INFO, ThrottledLogging}
@@ -107,6 +107,7 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
   @transient private var evaluator: SparkExpressionEval[Row] = _
   @transient private var rowSerializer: ExpressionEncoder.Serializer[Row] = _
   @transient protected var performSqlErrorCounter: Counter = _
+  @transient private[flink] var eventTimeToFlinkIngressTimeHistogram: Histogram = _
 
   override def sourceProjectionEnabled: Boolean = true
 
@@ -125,6 +126,12 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
       .addGroup("feature_group", groupByName)
 
     performSqlErrorCounter = metricsGroup.counter("sql_exec_errors")
+    eventTimeToFlinkIngressTimeHistogram = metricsGroup.histogram(
+      "event_time_to_flink_ingress_time",
+      new DropwizardHistogramWrapper(
+        new com.codahale.metrics.Histogram(new ExponentiallyDecayingReservoir(512, 0.05))
+      )
+    )
 
     // spark expr eval vars
     val eventExprEncoder = sourceEventEncoder.asInstanceOf[ExpressionEncoder[Row]]
@@ -148,6 +155,9 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
       evaluatedRows.foreach { e =>
         if (enableDebug) {
           log(INFO, s"Evaluated row: ${e.mkString(",")}")
+        }
+        e.get(Constants.TimeColumn).foreach { eventTime =>
+          eventTimeToFlinkIngressTimeHistogram.update(startProcessingTimeMillis - eventTime.asInstanceOf[Long])
         }
         out.collect(ProjectedEvent(e, startProcessingTimeMillis))
       }

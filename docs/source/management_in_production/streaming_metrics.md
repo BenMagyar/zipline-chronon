@@ -27,15 +27,32 @@ These metrics track the time it takes for events to flow through the entire pipe
 
 **Metric: `event_created_to_sink_time`**
 - **Type**: Histogram
-- **Description**: Time from when an event was originally created to when it's successfully written to the KV store
-- **Tags**: `groupby`, `team`, `production`, `environment`
+- **Description**: Time from the event's configured time column until its KV write attempt completes
+- **Tags**: `feature_group`, `team`, `production`, `environment`
 - **Use Case**: Monitor end-to-end feature freshness and detect pipeline bottlenecks
+
+**Metric: `event_time_to_flink_ingress_time`**
+- **Type**: Histogram
+- **Description**: Time from the event's configured time column until Flink starts deserializing the event
+- **Tags**: `feature_group`, `team`, `production`, `environment`
+- **Use Case**: Isolate upstream publishing, transport, and source backlog from latency introduced after Flink ingestion
+- **Notes**: Recorded once per accepted projected event. Future-dated event timestamps or clock skew can produce negative values.
 
 **Metric: `flink_processing_time`**
 - **Type**: Histogram  
-- **Description**: Time from when an event is received by the Flink application to when it's successfully written to the KV store
-- **Tags**: `groupby`, `team`, `production`, `environment`
-- **Use Case**: Identify processing bottlenecks within the Flink job itself
+- **Description**: Time from when an event is received by Flink until its KV write attempt completes
+- **Tags**: `feature_group`, `team`, `production`, `environment`
+- **Use Case**: Monitor total elapsed time inside the Flink topology
+- **Notes**: Tiled jobs emit both incremental updates and complete tiles. Complete-tile samples include time retained in window state, so this metric is not isolated active processing time.
+
+**Metric: `flink_ingress_to_tile_emission_time`**
+- **Type**: Histogram
+- **Description**: Time from Flink deserialization start until a tiled aggregation is successfully encoded for downstream Avro conversion
+- **Tags**: `feature_group`, `tile_status`, `team`, `production`, `environment`
+- **Use Case**: Identify processing or windowing delays before Avro conversion and KV writing
+- **Tile Statuses**:
+  - `incremental`: The tile was emitted while its event-time window remained open. This is the actionable series for regular processing latency.
+  - `complete`: The watermark had reached the tile's window end. This series intentionally includes accepted late updates and window cleanup/residence time.
 
 ### 2. Event Processing Metrics
 
@@ -165,9 +182,12 @@ For infrastructure metrics (CPU, memory, restarts) collected by kubelet-level ag
 2. `job_numberOfCompletedCheckpoints` - Exposed by the Flink Job Manager per job. Indicates if checkpoints are succeeding
 
 **Performance:**
-1. `flink_processing_time` (p95, p99) - Processing latency trends
-2. `multiput_time` (median, p95) - KV store performance
-3. `event_created_to_sink_time` - End-to-end freshness
+1. `event_time_to_flink_ingress_time` (p95, p99) - Upstream/pre-Flink feature lag
+2. `flink_ingress_to_tile_emission_time{tile_status="incremental"}` (p95, p99) - Regular Flink processing through tile encoding
+3. `tile_avro_codec_time` (p95, p99) - Tile serialization performance
+4. `multiput_time` (median, p95) - KV store performance
+5. `event_created_to_sink_time` - End-to-end freshness
+6. `flink_processing_time` - Combined ingress-to-write elapsed time, including complete-tile window residence
 
 **Data Quality:**
 1. `tiling.late_events` - Watermark effectiveness and upstream delays

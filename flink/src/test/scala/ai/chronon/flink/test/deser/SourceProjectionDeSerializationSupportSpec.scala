@@ -31,7 +31,8 @@ class SourceProjectionDeSerializationSupportSpec extends AnyFlatSpec {
     deserSchema.deserialize(recordBytes, listCollector)
 
     // sanity check projected schemas is what we expect
-    val projectedSchema = deserSchema.asInstanceOf[SourceProjectionDeserializationSchema].projectedSchema
+    val sourceProjectionDeserSchema = deserSchema.asInstanceOf[SourceProjectionDeserializationSchema]
+    val projectedSchema = sourceProjectionDeserSchema.projectedSchema
     assert(projectedSchema.map(_._1).toSet == Set("id", "username", "isActive", "ts"))
 
     // now check the types of projected data matching up with types in source schems
@@ -50,9 +51,15 @@ class SourceProjectionDeSerializationSupportSpec extends AnyFlatSpec {
 
     // sanity check result data
     assert(resultList.size() == 1)
-    val projectedResult = resultList.toScala.map(_.fields).head
-    assert(projectedResult.nonEmpty)
-    assert(projectedResult("id") == 12345)
+    val projectedEvent = resultList.toScala.head
+    assert(projectedEvent.fields.nonEmpty)
+    assert(projectedEvent.fields("id") == 12345)
+
+    val expectedIngressTime =
+      projectedEvent.startProcessingTimeMillis - projectedEvent.fields("ts").asInstanceOf[Long]
+    val ingressTimeHistogram = sourceProjectionDeserSchema.eventTimeToFlinkIngressTimeHistogram
+    assert(ingressTimeHistogram.getCount == 1)
+    assert(ingressTimeHistogram.getStatistics.getMin == expectedIngressTime)
   }
 
   it should "project and filter avro data" in {
@@ -74,6 +81,11 @@ class SourceProjectionDeSerializationSupportSpec extends AnyFlatSpec {
 
     // sanity check result data
     assert(resultList.isEmpty)
+    assert(
+      deserSchema
+        .asInstanceOf[SourceProjectionDeserializationSchema]
+        .eventTimeToFlinkIngressTimeHistogram
+        .getCount == 0)
   }
 
   it should "skip avro data that can't be deserialized" in {
@@ -99,5 +111,10 @@ class SourceProjectionDeSerializationSupportSpec extends AnyFlatSpec {
 
     deserSchema.deserialize(recordBytes, listCollector)
     assert(resultList.isEmpty)
+    assert(
+      deserSchema
+        .asInstanceOf[SourceProjectionDeserializationSchema]
+        .eventTimeToFlinkIngressTimeHistogram
+        .getCount == 0)
   }
 }

@@ -183,6 +183,8 @@ class FlinkRowAggProcessFunction(
   @transient private var eventProcessingErrorCounter: Counter = _
   @transient private var rowAggrTimeHistogram: Histogram = _
   @transient private var rowTileConvTimeHistogram: Histogram = _
+  @transient private[flink] var incrementalIngressToTileEmissionTimeHistogram: Histogram = _
+  @transient private[flink] var completeIngressToTileEmissionTimeHistogram: Histogram = _
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -205,6 +207,22 @@ class FlinkRowAggProcessFunction(
         new com.codahale.metrics.Histogram(new ExponentiallyDecayingReservoir())
       )
     )
+    incrementalIngressToTileEmissionTimeHistogram = metricsGroup
+      .addGroup("tile_status", "incremental")
+      .histogram(
+        "flink_ingress_to_tile_emission_time",
+        new DropwizardHistogramWrapper(
+          new com.codahale.metrics.Histogram(new ExponentiallyDecayingReservoir(512, 0.05))
+        )
+      )
+    completeIngressToTileEmissionTimeHistogram = metricsGroup
+      .addGroup("tile_status", "complete")
+      .histogram(
+        "flink_ingress_to_tile_emission_time",
+        new DropwizardHistogramWrapper(
+          new com.codahale.metrics.Histogram(new ExponentiallyDecayingReservoir(512, 0.05))
+        )
+      )
   }
 
   /** Process events emitted from the aggregate function.
@@ -249,7 +267,14 @@ class FlinkRowAggProcessFunction(
     tileBytes match {
       case Success(v) => {
         // The timestamp should never be None here.
-        out.collect(new TimestampedTile(keys, v, irEntry.latestTsMillis.get, irEntry.startProcessingTime.get))
+        val startProcessingTime = irEntry.startProcessingTime.get
+        val ingressToTileEmissionTime = System.currentTimeMillis() - startProcessingTime
+        if (isComplete) {
+          completeIngressToTileEmissionTimeHistogram.update(ingressToTileEmissionTime)
+        } else {
+          incrementalIngressToTileEmissionTimeHistogram.update(ingressToTileEmissionTime)
+        }
+        out.collect(new TimestampedTile(keys, v, irEntry.latestTsMillis.get, startProcessingTime))
       }
       case Failure(e) =>
         // To improve availability, we don't rethrow the exception. We just drop the event
