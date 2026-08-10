@@ -261,7 +261,8 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
                        tableProperties: Map[String, String] = null,
                        partitionColumns: List[String] = List(partitionColumn),
                        autoExpand: Boolean = false,
-                       semanticHash: Option[String] = None): Unit = {
+                       semanticHash: Option[String] = None,
+                       writePartitionRange: Option[PartitionRange] = None): Unit = {
 
     // partitions to the last
     val colOrder = df.columns.diff(partitionColumns) ++ partitionColumns
@@ -322,39 +323,87 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
     val hasPartitionSpec =
       isIceberg && Try(Iceberg.partitionColumnNames(tableName)(sparkSession).nonEmpty).getOrElse(false)
     if (isIceberg && partitionColumns.nonEmpty && !hasPartitionSpec) {
-      // Unpartitioned / UC liquid clustering: insertInto() with DYNAMIC mode appends instead of
-      // replacing. Use MERGE INTO with ON FALSE for atomic delete+insert in a single snapshot.
-      // ON FALSE means: no target row matches any source row, so all target rows matching the
-      // delete condition are "not matched by source" (deleted) and all source rows are
-      // "not matched by target" (inserted).
-      //
-      // Delete condition uses per-column IN lists AND'ed together rather than a min/max range.
-      // additionalPartitions can include categorical columns (e.g. `action`) where range
-      // semantics are meaningless; IN-lists stay correct for those. It is slightly over-broad
-      // for multi-column keys (matches cartesian product of distinct values) but safe here —
-      // we only delete rows the upstream job intends to rewrite.
-      val tempView = s"__chronon_insert_${tableName.replace('.', '_')}_${System.nanoTime()}"
-      finalizedDf.createOrReplaceTempView(tempView)
-      val deleteCondition = partitionColumns
-        .map { pc =>
-          val values = finalizedDf.select(col(pc)).distinct().collect().map(row => lit(row.get(0)).expr.sql)
-          s"target.`$pc` IN (${values.mkString(", ")})"
-        }
-        .mkString(" AND ")
-      val mergeSQL =
-        s"""MERGE INTO $tableName AS target
-           |USING $tempView AS source
-           |ON FALSE
-           |WHEN NOT MATCHED BY SOURCE AND $deleteCondition THEN DELETE
-           |WHEN NOT MATCHED THEN INSERT *""".stripMargin
-      sparkSession.sql(mergeSQL)
-      sparkSession.catalog.dropTempView(tempView)
+      icebergAppendIfRangeIsUnwritten(tableName, partitionColumns, writePartitionRange) match {
+        case Some(reason) =>
+          logger.info(s"Appending to unpartitioned Iceberg table $tableName: $reason")
+          finalizedDf.write
+            .mode(SaveMode.Append)
+            .insertInto(tableName)
+        case None =>
+          // Unpartitioned / UC liquid clustering: insertInto() with DYNAMIC mode appends instead of
+          // replacing. Use MERGE INTO with ON FALSE for atomic delete+insert in a single snapshot.
+          // ON FALSE means: no target row matches any source row, so all target rows matching the
+          // delete condition are "not matched by source" (deleted) and all source rows are
+          // "not matched by target" (inserted).
+          //
+          // Delete condition uses per-column IN lists AND'ed together rather than a min/max range.
+          // additionalPartitions can include categorical columns (e.g. `action`) where range
+          // semantics are meaningless; IN-lists stay correct for those. It is slightly over-broad
+          // for multi-column keys (matches cartesian product of distinct values) but safe here —
+          // we only delete rows the upstream job intends to rewrite.
+          val tempView = s"__chronon_insert_${tableName.replace('.', '_')}_${System.nanoTime()}"
+          finalizedDf.createOrReplaceTempView(tempView)
+          val deleteCondition = partitionColumns
+            .map { pc =>
+              val values = finalizedDf.select(col(pc)).distinct().collect().map(row => lit(row.get(0)).expr.sql)
+              s"target.`$pc` IN (${values.mkString(", ")})"
+            }
+            .mkString(" AND ")
+          val mergeSQL =
+            s"""MERGE INTO $tableName AS target
+               |USING $tempView AS source
+               |ON FALSE
+               |WHEN NOT MATCHED BY SOURCE AND $deleteCondition THEN DELETE
+               |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+          sparkSession.sql(mergeSQL)
+          sparkSession.catalog.dropTempView(tempView)
+      }
     } else {
       finalizedDf.write
         .mode(SaveMode.Overwrite)
         .insertInto(tableName)
     }
     logger.info(s"Finished writing to $tableName")
+  }
+
+  private def icebergAppendIfRangeIsUnwritten(tableName: String,
+                                              partitionColumns: List[String],
+                                              writePartitionRange: Option[PartitionRange]): Option[String] = {
+    if (!sparkSession.conf.get(TableUtils.UnpartitionedIcebergAppendEnabledConf, "true").toBoolean) {
+      logger.info(
+        s"Falling back to MERGE for $tableName: append is disabled by ${TableUtils.UnpartitionedIcebergAppendEnabledConf}")
+      return None
+    }
+
+    if (writePartitionRange.isEmpty) {
+      logger.info(s"Falling back to MERGE for $tableName: append requires a known write partition range")
+      return None
+    }
+
+    partitionColumns match {
+      case partitionColumn :: Nil =>
+        val effectivePartitionSpec =
+          if (partitionColumn == partitionSpec.column) partitionSpec
+          else partitionSpec.copy(column = partitionColumn)
+
+        val incomingRange = writePartitionRange.get.translate(effectivePartitionSpec)
+        val incomingStatsRange = StatsDateRange(incomingRange.start, incomingRange.end)
+        Iceberg.statsDateRange(tableName, partitionColumn, effectivePartitionSpec)(sparkSession) match {
+          case Some(existingRange) if !existingRange.overlaps(incomingStatsRange) =>
+            Some(s"$partitionColumn incoming=$incomingStatsRange does not overlap existing=$existingRange")
+          case Some(existingRange) =>
+            logger.info(
+              s"Falling back to MERGE for $tableName: incoming $partitionColumn range $incomingStatsRange overlaps existing $existingRange")
+            None
+          case None =>
+            logger.info(s"Falling back to MERGE for $tableName: no complete file stats for $partitionColumn")
+            None
+        }
+      case _ =>
+        logger.info(
+          s"Falling back to MERGE for $tableName: append requires exactly one partition column, found ${partitionColumns.mkString("[", ", ", "]")}")
+        None
+    }
   }
 
   // retains only the invocations from chronon code.
@@ -773,6 +822,8 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
 }
 
 object TableUtils {
+  val UnpartitionedIcebergAppendEnabledConf: String = "spark.chronon.write.unpartitioned_iceberg_append.enabled"
+
   def apply(sparkSession: SparkSession) = new TableUtils(sparkSession)
 }
 

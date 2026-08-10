@@ -242,7 +242,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
         val table = joinMetaData.outputTable
 
         tableUtils.dropTableOnSchemaChange(table, df)
-        df.save(table, semanticHash = semanticHash)
+        df.save(table, semanticHash = semanticHash, writePartitionRange = Some(range))
 
         tableUtils.loadTable(table, range.whereClauses)
       }
@@ -384,7 +384,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
           logger.info(s"Skipping writing to the output table for range: ${range.toString()}  $progress")
         } else {
 
-          finalDf.get.save(outputTable, tableProps, autoExpand = true)
+          finalDf.get.save(outputTable, tableProps, autoExpand = true, writePartitionRange = Some(range))
           val elapsedMins = (System.currentTimeMillis() - startMillis) / (60 * 1000)
           metrics.gauge(Metrics.Name.LatencyMinutes, elapsedMins)
           metrics.gauge(Metrics.Name.PartitionCount, range.partitions.length)

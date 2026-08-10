@@ -142,14 +142,16 @@ object Extensions {
              tableProperties: Map[String, String] = null,
              partitionColumns: Seq[String] = List(tableUtils.partitionColumn),
              autoExpand: Boolean = false,
-             semanticHash: Option[String] = None): Unit = {
+             semanticHash: Option[String] = None,
+             writePartitionRange: Option[PartitionRange] = None): Unit = {
 
       TableUtils(df.sparkSession).insertPartitions(df,
                                                    tableName,
                                                    tableProperties,
                                                    partitionColumns.toList,
                                                    autoExpand = autoExpand,
-                                                   semanticHash = semanticHash)
+                                                   semanticHash = semanticHash,
+                                                   writePartitionRange = writePartitionRange)
     }
 
     def prefixColumnNames(prefix: String, columns: Seq[String]): DataFrame = {
