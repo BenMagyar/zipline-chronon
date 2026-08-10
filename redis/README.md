@@ -135,6 +135,9 @@ or as matching `-Z` properties. The node runner resolves them in that order, wit
 | `spark.chronon.kv_upload.redis.require_noeviction` | `true` | Require Redis `maxmemory-policy=noeviction` before writing |
 | `spark.chronon.kv_upload.redis.delete_older_versions` | `false` | After publishing a numeric `__N` GroupBy version, retire lower versions found under the same S3 state root |
 
+`CHRONON_METADATA` config records are written through the direct KV path without expiry. They are not governed by the
+batch lease above and remain available until explicitly replaced or deleted.
+
 A state root is the durable identity of one Redis serving target and must not be shared across Redis clusters. A dataset
 lineage must keep the same key prefix. The first admitted generation fixes `state_buckets` for that lineage. A TTL change
 publishes a new generation; a refresh of an existing generation uses the TTL recorded with that generation. TTL may
@@ -274,7 +277,7 @@ DELETE: payload is empty and the value is a tombstone
 Changed values are written with the configured lease. Each newly admitted generation validates unchanged active keys
 against the parent deadline and advances them when the new deadline is later; a TTL decrease never shortens an existing
 key in place. An exact rerun checks the expiry fence but only advances it once half the configured lease has elapsed.
-Serving metadata and the active status mirror receive a lease that expires no later than the earliest entity lease. The
+GroupBy serving metadata and the active status mirror receive a lease that expires no later than the earliest entity lease. The
 batch default is five days, so a missed daily upload still leaves roughly four days after the last successful publication.
 
 The deadline recorded in one generation's `_LEASE` never decreases. A child generation may start with a shorter lease,

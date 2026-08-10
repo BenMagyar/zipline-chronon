@@ -99,8 +99,8 @@ import scala.concurrent.duration._
   * Writing to the same timestamp twice deletes the first value via ZREMRANGEBYSCORE before ZADD.
   * This matches BigTable's deleteCells + setCell pattern.
   *
-  * Direct KV writes use a default TTL of 5 days (matching BigTable). Managed batch publication configures its lease
-  * independently.
+  * Direct KV writes use a default TTL of 5 days (matching BigTable), except Chronon config metadata, which is persistent.
+  * Managed batch publication configures its lease independently.
   */
 class RedisKVStoreImpl(jedisCluster: JedisCluster,
                        conf: Map[String, String] = Map.empty,
@@ -1218,7 +1218,14 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
               // Simple key-value; store timestamp prefix + value to preserve write time
               val timestampBytes = java.nio.ByteBuffer.allocate(8).putLong(timestampInPutRequest).array()
               val storedBytes = timestampBytes ++ request.valueBytes
-              jedisCluster.setex(redisKey.getBytes(StandardCharsets.UTF_8), DataTTLSeconds, storedBytes)
+              val keyBytes = redisKey.getBytes(StandardCharsets.UTF_8)
+              if (request.dataset == MetadataDataset) {
+                // Uploaded Join configs remain addressable until explicitly replaced or deleted.
+                // Plain SET also clears a TTL left by older RedisKVStore versions.
+                jedisCluster.set(keyBytes, storedBytes)
+              } else {
+                jedisCluster.setex(keyBytes, DataTTLSeconds, storedBytes)
+              }
           }
 
           datasetMetricsContext.distribution("multiPut.latency", System.currentTimeMillis() - startTs)

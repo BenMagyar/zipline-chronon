@@ -1,6 +1,6 @@
 package ai.chronon.integrations.redis
 
-import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, GroupByServingInfoKey, JoinFolder, ListEntityType, ListLimit}
+import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, GroupByServingInfoKey, JoinFolder, ListEntityType, ListLimit, MetadataDataset}
 import ai.chronon.api.{PartitionSpec, TilingUtils}
 import ai.chronon.online.KVStore._
 import org.scalatest.BeforeAndAfterAll
@@ -141,6 +141,26 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     val getResultUpdated = Await.result(kvStore.multiGet(Seq(getReq)), 10.seconds)
     getResultUpdated.size shouldBe 1
     validateBlobValueExpectedPayload(getResultUpdated.head, valueUpdated)
+  }
+
+  it should "store Chronon config metadata without expiry" in {
+    val kvStore = new RedisKVStoreImpl(jedisCluster)
+    val key = "joins/example.join__1".getBytes(StandardCharsets.UTF_8)
+    val redisKey = RedisKVStore.buildRedisKey(key.toSeq, MetadataDataset)
+    val redisKeyBytes = redisKey.getBytes(StandardCharsets.UTF_8)
+
+    Await.result(
+      kvStore.multiPut(Seq(PutRequest(key, "first".getBytes(StandardCharsets.UTF_8), MetadataDataset, None))),
+      10.seconds) shouldBe Seq(true)
+    jedisCluster.ttl(redisKeyBytes) shouldBe -1L
+
+    jedisCluster.expire(redisKeyBytes, 60L) shouldBe 1L
+    jedisCluster.ttl(redisKeyBytes) should be > 0L
+
+    Await.result(
+      kvStore.multiPut(Seq(PutRequest(key, "second".getBytes(StandardCharsets.UTF_8), MetadataDataset, None))),
+      10.seconds) shouldBe Seq(true)
+    jedisCluster.ttl(redisKeyBytes) shouldBe -1L
   }
 
   it should "list with pagination" in {
