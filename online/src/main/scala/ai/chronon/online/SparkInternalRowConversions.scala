@@ -33,6 +33,14 @@ object SparkInternalRowConversions {
   // the identity function
   private def id(x: Any): Any = x
 
+  // Jackson decodes small integral values in untyped JSON requests as boxed Integers. Catalyst trusts the declared
+  // schema and calls getLong for a LongType field, so it cannot auto-cast that runtime value. Normalize only this safe
+  // widening conversion; other numeric mismatches remain errors rather than being silently narrowed.
+  private def integerToLong(x: Any): Any = x match {
+    case value: java.lang.Integer => java.lang.Long.valueOf(value.longValue())
+    case value                    => value
+  }
+
   // recursively convert sparks byte array based internal row to chronon's fetcher result type (map[string, any])
   // The purpose of this class is to be used on fetcher output in a fetching context
   // we take a data type and build a function that operates on actual value
@@ -196,6 +204,8 @@ object SparkInternalRowConversions {
         def stringConvertor(x: Any): Any = { UTF8String.fromString(x.asInstanceOf[String]) }
 
         stringConvertor
+      case types.LongType =>
+        integerToLong
       case dt: types.DecimalType =>
         def decimalConverter(x: Any): Any = {
           org.apache.spark.sql.types.Decimal(x.asInstanceOf[java.math.BigDecimal], dt.precision, dt.scale)

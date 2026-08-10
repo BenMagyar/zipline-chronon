@@ -503,6 +503,58 @@ class CatalystUtilTest extends AnyFlatSpec with CatalystUtilTestSparkSQLStructs 
     assertEquals(res.get("a"), 8L)
   }
 
+  it should "normalize integer request values declared as longs in array filters" in {
+    val inputSchema = StructType(
+      "LongFilterInput",
+      Array(
+        StructField("product_id", LongType),
+        StructField("product_ids", ListType(LongType))
+      )
+    )
+    val input = Map[String, Any](
+      "product_id" -> java.lang.Integer.valueOf(2),
+      "product_ids" -> makeArrayList(1L, 2L, 3L)
+    )
+    val cu = new CatalystUtil(
+      inputSchema,
+      Seq("matches" -> "size(filter(product_ids, x -> x = product_id))")
+    )
+
+    assertEquals(cu.performSql(input).head("matches"), 1)
+  }
+
+  it should "normalize integer array elements declared as longs" in {
+    val inputSchema = StructType(
+      "LongArrayInput",
+      Array(StructField("product_ids", ListType(LongType)))
+    )
+    val input = Map[String, Any](
+      "product_ids" -> makeArrayList(
+        java.lang.Integer.valueOf(1),
+        java.lang.Integer.valueOf(2),
+        java.lang.Integer.valueOf(3)
+      )
+    )
+    val cu = new CatalystUtil(
+      inputSchema,
+      Seq("matches" -> "size(filter(product_ids, x -> x = CAST(2 AS BIGINT)))")
+    )
+
+    assertEquals(cu.performSql(input).head("matches"), 1)
+  }
+
+  it should "reject narrowing numeric conversions" in {
+    val inputSchema = StructType(
+      "NumericInput",
+      Array(StructField("int_value", IntType))
+    )
+    val input = Map[String, Any]("int_value" -> java.lang.Double.valueOf(7.5d))
+
+    intercept[ClassCastException] {
+      new CatalystUtil(inputSchema, Seq("int_value" -> "int_value")).performSql(input)
+    }
+  }
+
   it should "functions with list containers should work" in {
 
     val listContainersStruct: StructType = StructType(
