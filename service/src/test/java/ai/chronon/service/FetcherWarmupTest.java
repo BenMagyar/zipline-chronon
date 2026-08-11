@@ -19,6 +19,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.*;
@@ -43,6 +44,11 @@ public class FetcherWarmupTest {
     private JavaResponse successResponse(String joinName) {
         JavaRequest req = new JavaRequest(joinName, Map.of("user_id", "1", "listing_id", 5));
         return new JavaResponse(req, JTry.success(Map.of("feature_1", 1.0)));
+    }
+
+    private JavaResponse codecFailureResponse(String joinName, String message) {
+        JavaRequest req = new JavaRequest(joinName, Map.of("user_id", "1", "listing_id", 5));
+        return new JavaResponse(req, JTry.success(Map.of("join_codec_fetch_exception", message)));
     }
 
     @Before
@@ -232,6 +238,30 @@ public class FetcherWarmupTest {
     }
 
     @Test
+    public void testInvalidRegexSkippedOtherGroupsStillRun(TestContext ctx) {
+        Async async = ctx.async();
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("[invalid", PAYLOAD_USER),
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_adhoc_v2__1", PAYLOAD_LISTING)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList())).thenAnswer(inv -> {
+            List<JavaRequest> reqs = inv.getArgument(0);
+            return CompletableFuture.completedFuture(
+                    Collections.singletonList(successResponse(reqs.get(0).name)));
+        });
+
+        FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(1)).fetchJoin(anyList());
+                    async.complete();
+                });
+    }
+
+    @Test
     public void testFetchJoinFailureDoesNotBlockStartup(TestContext ctx) {
         Async async = ctx.async();
 
@@ -247,8 +277,111 @@ public class FetcherWarmupTest {
         FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
                 .onComplete(ar -> {
                     ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(6)).fetchJoin(anyList());
                     async.complete();
                 });
+    }
+
+    @Test
+    public void testResponseFailureIsRetried(TestContext ctx) {
+        Async async = ctx.async();
+        String joinName = "aws.demo.test_sched_v1__1";
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_sched_v1__1", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList())).thenReturn(
+                CompletableFuture.completedFuture(List.of(codecFailureResponse(joinName, "codec unavailable"))),
+                CompletableFuture.completedFuture(List.of(successResponse(joinName))));
+
+        FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(2)).fetchJoin(anyList());
+                    async.complete();
+                });
+    }
+
+    @Test
+    public void testSynchronousFetchInitiationFailureIsRetried(TestContext ctx) {
+        Async async = ctx.async();
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_sched_v1__1", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList()))
+                .thenThrow(new RuntimeException("synchronous codec failure"))
+                .thenAnswer(inv -> {
+                    List<JavaRequest> reqs = inv.getArgument(0);
+                    return CompletableFuture.completedFuture(
+                            Collections.singletonList(successResponse(reqs.get(0).name)));
+                });
+
+        FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(2)).fetchJoin(anyList());
+                    async.complete();
+                });
+    }
+
+    @Test
+    public void testFetchInitiationRunsOffEventLoop(TestContext ctx) {
+        Async async = ctx.async();
+        AtomicReference<String> initiationThread = new AtomicReference<>();
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_sched_v1__1", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList())).thenAnswer(inv -> {
+            initiationThread.set(Thread.currentThread().getName());
+            List<JavaRequest> reqs = inv.getArgument(0);
+            return CompletableFuture.completedFuture(
+                    Collections.singletonList(successResponse(reqs.get(0).name)));
+        });
+
+        vertx.runOnContext(ignored -> FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    ctx.assertNotNull(initiationThread.get());
+                    ctx.assertTrue(initiationThread.get().contains("worker-thread"));
+                    ctx.assertFalse(initiationThread.get().contains("eventloop-thread"));
+                    async.complete();
+                }));
+    }
+
+    @Test
+    public void testWarmupRequestsRunSequentially(TestContext ctx) {
+        Async async = ctx.async();
+        String joinName = "aws.demo.test_sched_v1__1";
+        CompletableFuture<List<JavaResponse>> firstFetch = new CompletableFuture<>();
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_sched_v1__1", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(2);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList())).thenReturn(
+                firstFetch,
+                CompletableFuture.completedFuture(List.of(successResponse(joinName))));
+
+        io.vertx.core.Future<Void> warmup = FetcherWarmup.run(vertx, mockFetcher, mockCfgStore);
+        verify(mockFetcher, timeout(1000).times(1)).fetchJoin(anyList());
+        verify(mockFetcher, times(1)).fetchJoin(anyList());
+
+        warmup
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(2)).fetchJoin(anyList());
+                    async.complete();
+                });
+        firstFetch.complete(List.of(successResponse(joinName)));
     }
 
     @Test

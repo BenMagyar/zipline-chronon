@@ -3,17 +3,20 @@ package ai.chronon.service;
 import ai.chronon.online.JTry;
 import ai.chronon.online.JavaFetcher;
 import ai.chronon.online.JavaRequest;
+import ai.chronon.online.JavaResponse;
 import ai.chronon.service.handlers.FetchHandler;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 
-import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -23,12 +26,19 @@ public class FetcherWarmup {
     private static final int LIST_JOINS_MAX_RETRIES = 5;
     private static final long LIST_JOINS_RETRY_DELAY_MS = 2000L;
     private static final long LIST_JOINS_TIMEOUT_SECONDS = 5L;
-    // Per-fetch safety net timeout — defense-in-depth on top of any KV store SDK timeout
+    private static final int FETCH_MAX_RETRIES = 5;
+    private static final long FETCH_RETRY_DELAY_MS = 2000L;
+    private static final String FEATURE_EXCEPTION_SUFFIX = "_exception";
+    // Bounds both synchronous fetch initiation and the resulting asynchronous fetch.
     private static final long FETCH_TIMEOUT_SECONDS = 30L;
 
     public static Future<Void> run(Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore) {
         try {
-            return doRun(vertx, fetcher, cfgStore);
+            return doRun(vertx, fetcher, cfgStore)
+                    .recover(error -> {
+                        logger.warn("Warmup stopped early; continuing startup", error);
+                        return Future.succeededFuture();
+                    });
         } catch (Exception e) {
             logger.warn("Warmup encountered an unexpected error, continuing startup", e);
             return Future.succeededFuture();
@@ -48,13 +58,19 @@ public class FetcherWarmup {
         logger.info("Starting warmup: {} group(s), timesPerJoin={}", groups.size(), timesPerJoin);
 
         return listJoinsWithRetry(vertx, fetcher, LIST_JOINS_MAX_RETRIES, LIST_JOINS_RETRY_DELAY_MS, 0)
-                .compose(allJoins -> fireAllGroups(fetcher, allJoins, groups, timesPerJoin, warmupStart));
+                .compose(allJoins -> fireAllGroups(vertx, fetcher, allJoins, groups, timesPerJoin, warmupStart));
     }
 
     // Validates and filters groups — skips any with an invalid payload with a warning.
     private static List<ConfigStore.WarmupGroup> validateGroups(List<ConfigStore.WarmupGroup> groups) {
         List<ConfigStore.WarmupGroup> valid = new ArrayList<>();
         for (ConfigStore.WarmupGroup group : groups) {
+            try {
+                Pattern.compile(group.regex);
+            } catch (RuntimeException error) {
+                logger.warn("Warmup group has invalid regex='{}', skipping: {}", group.regex, error.getMessage());
+                continue;
+            }
             JTry<List<JavaRequest>> check = FetchHandler.parseJavaRequest("__warmup_check__", group.payload);
             if (!check.isSuccess()) {
                 logger.warn("Warmup group regex='{}' has invalid payload JSON, skipping: {}",
@@ -90,26 +106,33 @@ public class FetcherWarmup {
     }
 
     private static Future<Void> fireAllGroups(
+            Vertx vertx,
             JavaFetcher fetcher,
             List<String> allJoins,
             List<ConfigStore.WarmupGroup> groups,
             int timesPerJoin,
             long warmupStart) {
 
-        List<Future<Void>> groupFutures = new ArrayList<>();
+        Future<Void> groupChain = Future.succeededFuture();
         for (ConfigStore.WarmupGroup group : groups) {
-            groupFutures.add(fireWarmupRequests(fetcher, allJoins, group, timesPerJoin));
+            groupChain = groupChain.compose(
+                    ignored -> fireWarmupRequests(vertx, fetcher, allJoins, group, timesPerJoin));
         }
 
-        return Future.all(groupFutures)
+        return groupChain
                 .onComplete(ar -> {
                     long elapsedMs = System.currentTimeMillis() - warmupStart;
-                    logger.info("Warmup complete: {} group(s), {}ms elapsed", groups.size(), elapsedMs);
+                    if (ar.succeeded()) {
+                        logger.info("Warmup complete: {} group(s), {}ms elapsed", groups.size(), elapsedMs);
+                    } else {
+                        logger.warn("Warmup aborted after {}ms: {}", elapsedMs, ar.cause().getMessage());
+                    }
                 })
                 .mapEmpty();
     }
 
     private static Future<Void> fireWarmupRequests(
+            Vertx vertx,
             JavaFetcher fetcher,
             List<String> allJoins,
             ConfigStore.WarmupGroup group,
@@ -128,28 +151,107 @@ public class FetcherWarmup {
 
         logger.info("Warmup: {} joins matched regex '{}': {}", matchingJoins.size(), group.regex, matchingJoins);
 
-        List<Future<Void>> warmupFutures = new ArrayList<>();
+        int totalRequests = matchingJoins.size() * timesPerJoin;
+        logger.info("Warmup: firing {} sequential requests for regex '{}'", totalRequests, group.regex);
+
+        Future<Void> warmupChain = Future.succeededFuture();
         for (String joinName : matchingJoins) {
             List<JavaRequest> requests = FetchHandler.parseJavaRequest(joinName, group.payload).getValue();
             for (int time = 0; time < timesPerJoin; time++) {
                 final int timeNum = time;
-                Future<Void> timeFuture = Future.fromCompletionStage(fetcher.fetchJoin(requests))
-                        .timeout(FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                        .onSuccess(responses ->
-                                logger.debug("Warmup request {}/{} complete for join '{}'", timeNum + 1, timesPerJoin, joinName))
-                        .recover(err -> {
-                            logger.warn("Warmup request {}/{} failed for join '{}': {}",
-                                    timeNum + 1, timesPerJoin, joinName, err.getMessage());
-                            return Future.succeededFuture(null);
-                        })
-                        .mapEmpty();
-                warmupFutures.add(timeFuture);
+                warmupChain = warmupChain.compose(ignored ->
+                        fetchWithRetry(vertx, fetcher, requests, joinName, timeNum, timesPerJoin, 0));
             }
         }
 
-        int totalRequests = matchingJoins.size() * timesPerJoin;
-        logger.info("Warmup: firing {} requests for regex '{}'", totalRequests, group.regex);
+        return warmupChain;
+    }
 
-        return Future.all(warmupFutures).mapEmpty();
+    private static Future<Void> fetchWithRetry(
+            Vertx vertx,
+            JavaFetcher fetcher,
+            List<JavaRequest> requests,
+            String joinName,
+            int timeNum,
+            int timesPerJoin,
+            int attempt) {
+
+        // fetchJoin performs synchronous metadata/codec resolution before returning its
+        // CompletableFuture. Keep that phase off the event loop so this timeout can fire.
+        Future<CompletableFuture<List<JavaResponse>>> fetchInitiation =
+                vertx.executeBlocking(() -> fetcher.fetchJoin(requests), false);
+
+        return fetchInitiation
+                .compose(Future::fromCompletionStage)
+                .timeout(FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .compose(responses -> {
+                    List<String> failures = responseFailures(responses);
+                    return failures.isEmpty()
+                            ? Future.<Void>succeededFuture()
+                            : Future.<Void>failedFuture(String.join("; ", failures));
+                })
+                .onSuccess(ignored -> logger.debug(
+                        "Warmup request {}/{} complete for join '{}'",
+                        timeNum + 1, timesPerJoin, joinName))
+                .recover(error -> {
+                    // A timed-out initiation may still occupy its worker thread. Stop the sequential
+                    // warmup chain so no queued or duplicate cold builds continue after readiness.
+                    if (error instanceof TimeoutException) {
+                        logger.warn(
+                                "Warmup request {}/{} timed out for join '{}'; stopping remaining warmup",
+                                timeNum + 1, timesPerJoin, joinName);
+                        return Future.failedFuture(error);
+                    }
+                    if (attempt >= FETCH_MAX_RETRIES) {
+                        logger.warn(
+                                "Warmup request {}/{} failed for join '{}' after {} attempt(s): {}",
+                                timeNum + 1, timesPerJoin, joinName, attempt + 1, error.getMessage());
+                        return Future.succeededFuture();
+                    }
+
+                    logger.warn(
+                            "Warmup request {}/{} failed for join '{}' ({}), retrying in {}ms",
+                            timeNum + 1, timesPerJoin, joinName, error.getMessage(), FETCH_RETRY_DELAY_MS);
+                    Promise<Void> retryPromise = Promise.promise();
+                    vertx.setTimer(FETCH_RETRY_DELAY_MS, id ->
+                            fetchWithRetry(
+                                    vertx,
+                                    fetcher,
+                                    requests,
+                                    joinName,
+                                    timeNum,
+                                    timesPerJoin,
+                                    attempt + 1)
+                                    .onComplete(retryPromise));
+                    return retryPromise.future();
+                });
+    }
+
+    private static List<String> responseFailures(List<JavaResponse> responses) {
+        List<String> failures = new ArrayList<>();
+        if (responses == null) {
+            failures.add("fetchJoin returned null responses");
+            return failures;
+        }
+        if (responses.isEmpty()) {
+            failures.add("fetchJoin returned no responses");
+            return failures;
+        }
+        for (JavaResponse response : responses) {
+            if (response == null || response.values == null) {
+                failures.add("fetchJoin returned an invalid response");
+            } else if (!response.values.isSuccess()) {
+                Throwable error = response.values.getException();
+                String message = error == null ? null : error.getMessage();
+                failures.add(message == null ? "join response failed" : message);
+            } else if (response.values.getValue() != null) {
+                response.values.getValue().forEach((feature, value) -> {
+                    if (feature.endsWith(FEATURE_EXCEPTION_SUFFIX)) {
+                        failures.add(feature + ": " + String.valueOf(value));
+                    }
+                });
+            }
+        }
+        return failures;
     }
 }
