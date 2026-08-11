@@ -280,4 +280,31 @@ public class FetcherWarmupTest {
                     async.complete();
                 });
     }
+
+    @Test
+    public void testListJoinsTimeoutRetriesAndSucceeds(TestContext ctx) {
+        Async async = ctx.async(10_000);
+
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("rec\\.model.*", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+
+        CompletableFuture<List<String>> neverCompletes = new CompletableFuture<>();
+        when(mockFetcher.listJoins(true))
+                .thenReturn(neverCompletes, CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoin(anyList())).thenAnswer(inv -> {
+            List<JavaRequest> reqs = inv.getArgument(0);
+            return CompletableFuture.completedFuture(
+                    Collections.singletonList(successResponse(reqs.get(0).name)));
+        });
+
+        FetcherWarmup.run(vertx, mockFetcher, mockCfgStore)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    verify(mockFetcher, times(2)).listJoins(true);
+                    verify(mockFetcher, times(1)).fetchJoin(anyList());
+                    async.complete();
+                });
+    }
 }

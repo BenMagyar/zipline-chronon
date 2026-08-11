@@ -22,6 +22,7 @@ public class FetcherWarmup {
     private static final Logger logger = LoggerFactory.getLogger(FetcherWarmup.class);
     private static final int LIST_JOINS_MAX_RETRIES = 5;
     private static final long LIST_JOINS_RETRY_DELAY_MS = 2000L;
+    private static final long LIST_JOINS_TIMEOUT_SECONDS = 5L;
     // Per-fetch safety net timeout — defense-in-depth on top of any KV store SDK timeout
     private static final long FETCH_TIMEOUT_SECONDS = 30L;
 
@@ -71,6 +72,7 @@ public class FetcherWarmup {
             Vertx vertx, JavaFetcher fetcher, int maxRetries, long retryDelayMs, int attempt) {
 
         return Future.<List<String>>fromCompletionStage(fetcher.listJoins(true))
+                .timeout(LIST_JOINS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .recover(err -> {
                     if (attempt >= maxRetries) {
                         logger.warn("Warmup: listJoins failed after {} attempt(s), skipping warmup: {}",
