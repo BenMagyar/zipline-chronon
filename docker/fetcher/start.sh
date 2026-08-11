@@ -114,6 +114,7 @@ if [ -n "$CHRONON_JOIN_CODEC_TTL_MILLIS" ]; then
 fi
 
 WARMUP_OPTS=()
+# Single-group convenience keys
 if [ -n "$WARMUP_JOIN_REGEX" ]; then
   WARMUP_OPTS+=("-Dai.chronon.warmup.join.regex=$WARMUP_JOIN_REGEX")
 fi
@@ -123,6 +124,20 @@ fi
 if [ -n "$WARMUP_TIMES_PER_JOIN" ]; then
   WARMUP_OPTS+=("-Dai.chronon.warmup.times.per.join=$WARMUP_TIMES_PER_JOIN")
 fi
+# Indexed multi-group keys: WARMUP_JOIN_N_REGEX / WARMUP_JOIN_N_PAYLOAD for N = 0, 1, 2, ...
+i=0
+while true; do
+  regex_var="WARMUP_JOIN_${i}_REGEX"
+  payload_var="WARMUP_JOIN_${i}_PAYLOAD"
+  if [ -z "${!regex_var}" ]; then
+    break
+  fi
+  WARMUP_OPTS+=("-Dai.chronon.warmup.join.${i}.regex=${!regex_var}")
+  if [ -n "${!payload_var}" ]; then
+    WARMUP_OPTS+=("-Dai.chronon.warmup.join.${i}.payload=${!payload_var}")
+  fi
+  i=$((i + 1))
+done
 
 echo "Starting Fetcher service with online jar $ONLINE_JAR and online class $ONLINE_CLASS"
 exec java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \

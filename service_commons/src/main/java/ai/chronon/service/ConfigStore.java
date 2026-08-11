@@ -6,7 +6,9 @@ import io.vertx.core.json.JsonObject;
 
 import ai.chronon.online.metrics.TTLCache;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -41,9 +43,24 @@ public class ConfigStore {
     private static final String JOIN_CODEC_TTL_MILLIS = "ai.chronon.join.codec.ttl.millis";
 
     // Warmup configuration
+    // Single-group convenience keys (equivalent to index 0)
     private static final String WARMUP_JOIN_REGEX = "ai.chronon.warmup.join.regex";
     private static final String WARMUP_PAYLOAD = "ai.chronon.warmup.payload";
     private static final String WARMUP_TIMES_PER_JOIN = "ai.chronon.warmup.times.per.join";
+    // Multi-group indexed keys: ai.chronon.warmup.join.N.regex / ai.chronon.warmup.join.N.payload
+    private static final String WARMUP_JOIN_INDEXED_REGEX_FMT = "ai.chronon.warmup.join.%d.regex";
+    private static final String WARMUP_JOIN_INDEXED_PAYLOAD_FMT = "ai.chronon.warmup.join.%d.payload";
+
+    /** A single warmup group: a regex to match join names and the JSON payload to send. */
+    public static class WarmupGroup {
+        public final String regex;
+        public final String payload;
+
+        public WarmupGroup(String regex, String payload) {
+            this.regex = regex;
+            this.payload = payload;
+        }
+    }
 
     private volatile JsonObject jsonConfig;
     private final Object lock = new Object();
@@ -178,19 +195,49 @@ public class ConfigStore {
         validateGcpConfig();
     }
 
-    public Optional<String> getWarmupJoinRegex() {
-        return Optional.ofNullable(jsonConfig.getString(WARMUP_JOIN_REGEX));
+    /**
+     * Returns all configured warmup groups in order.
+     *
+     * Supports two configuration styles that are merged in order:
+     *   1. Single-group convenience: WARMUP_JOIN_REGEX + WARMUP_PAYLOAD (equivalent to index 0)
+     *   2. Indexed multi-group: WARMUP_JOIN_N_REGEX + WARMUP_JOIN_N_PAYLOAD for N = 0, 1, 2, ...
+     *      Scanning stops at the first missing index.
+     *
+     * Groups with a missing or unparseable payload are skipped with a warning.
+     */
+    public List<WarmupGroup> getWarmupGroups() {
+        List<WarmupGroup> groups = new ArrayList<>();
+
+        // Single-group convenience keys
+        String singleRegex = jsonConfig.getString(WARMUP_JOIN_REGEX);
+        String singlePayload = getRawString(WARMUP_PAYLOAD);
+        if (singleRegex != null && singlePayload != null) {
+            groups.add(new WarmupGroup(singleRegex, singlePayload));
+        }
+
+        // Indexed multi-group keys — stop at first missing index
+        for (int i = 0; ; i++) {
+            String regexKey = String.format(WARMUP_JOIN_INDEXED_REGEX_FMT, i);
+            String payloadKey = String.format(WARMUP_JOIN_INDEXED_PAYLOAD_FMT, i);
+            String regex = jsonConfig.getString(regexKey);
+            if (regex == null) break;
+            String payload = getRawString(payloadKey);
+            if (payload == null) {
+                break;
+            }
+            groups.add(new WarmupGroup(regex, payload));
+        }
+
+        return groups;
     }
 
-    public Optional<String> getWarmupPayload() {
-        // Vert.x parses JSON-shaped system property values into JsonArray/JsonObject,
-        // so getString() returns null for array-valued payloads. We re-encode the stored
-        // value to recover the original JSON string regardless of what type it was coerced to.
-        Object value = jsonConfig.getValue(WARMUP_PAYLOAD);
-        if (value == null) {
-            return Optional.empty();
-        }
-        return Optional.of(value instanceof String ? (String) value : value.toString());
+    // Vert.x parses JSON-shaped system property values into JsonArray/JsonObject,
+    // so getString() returns null for array-valued payloads. getValue() + toString()
+    // recovers the original JSON string regardless of what type Vert.x coerced it to.
+    private String getRawString(String key) {
+        Object value = jsonConfig.getValue(key);
+        if (value == null) return null;
+        return value instanceof String ? (String) value : value.toString();
     }
 
     public int getWarmupTimesPerJoin() {
