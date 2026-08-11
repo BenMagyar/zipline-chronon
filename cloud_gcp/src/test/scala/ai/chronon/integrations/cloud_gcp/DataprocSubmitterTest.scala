@@ -1899,4 +1899,80 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
       FlinkApplicationLauncher.parseArgs(args)
     }
   }
+
+  // Helper for the SETUP_DONE / status() tests below. Mocks jobControllerClient.getJob to return a
+  // Job in the requested Dataproc state with (optionally) the "job-type: flink" label. Health check
+  // fn is stubbed to a caller-provided value so we can exercise both the healthy and unhealthy paths.
+  private def submitterReturningJobInState(
+      jobId: String,
+      state: JobStatus.State,
+      isFlinkLabel: Boolean,
+      healthy: Boolean = false
+  ): DataprocSubmitter = {
+    val jobBuilder = Job
+      .newBuilder()
+      .setReference(JobReference.newBuilder().setJobId(jobId))
+      .setStatus(JobStatus.newBuilder().setState(state))
+    // Mark the state's start time so flinkStatusWithGrace can compute the grace window if reached.
+    val historyEntry = JobStatus
+      .newBuilder()
+      .setState(state)
+      .setStateStartTime(com.google.protobuf.Timestamp.newBuilder().setSeconds(1600000000L))
+    jobBuilder.addStatusHistory(historyEntry)
+    if (isFlinkLabel) jobBuilder.putLabels("job-type", "flink")
+    val mockJob = jobBuilder.build()
+
+    val mockJobControllerClient = mock[JobControllerClient]
+    when(mockJobControllerClient.getJob("test-project", "test-region", jobId)).thenReturn(mockJob)
+
+    new DataprocSubmitter(
+      jobControllerClient = mockJobControllerClient,
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      flinkHealthCheckFn = _ => healthy
+    )
+  }
+
+  it should "map Dataproc SETUP_DONE to JobStatusType.PENDING for a Flink job (not RUNNING)" in {
+    val submitter = submitterReturningJobInState("job-flink-setup",
+                                                  JobStatus.State.SETUP_DONE,
+                                                  isFlinkLabel = true)
+    assertEquals(ai.chronon.api.JobStatusType.PENDING, submitter.status("job-flink-setup"))
+  }
+
+  it should "map Dataproc SETUP_DONE to JobStatusType.PENDING for a non-Flink job (not RUNNING)" in {
+    val submitter = submitterReturningJobInState("job-batch-setup",
+                                                  JobStatus.State.SETUP_DONE,
+                                                  isFlinkLabel = false)
+    assertEquals(ai.chronon.api.JobStatusType.PENDING, submitter.status("job-batch-setup"))
+  }
+
+  it should "map Dataproc RUNNING to JobStatusType.RUNNING for a non-Flink job (regression guard)" in {
+    val submitter = submitterReturningJobInState("job-batch-running",
+                                                  JobStatus.State.RUNNING,
+                                                  isFlinkLabel = false)
+    assertEquals(ai.chronon.api.JobStatusType.RUNNING, submitter.status("job-batch-running"))
+  }
+
+  it should "map Dataproc PENDING to JobStatusType.PENDING (unchanged by SETUP_DONE refactor)" in {
+    val submitter = submitterReturningJobInState("job-pending",
+                                                  JobStatus.State.PENDING,
+                                                  isFlinkLabel = true)
+    assertEquals(ai.chronon.api.JobStatusType.PENDING, submitter.status("job-pending"))
+  }
+
+  it should "map Dataproc ATTEMPT_FAILURE to JobStatusType.PENDING for a Flink job (retryable transient state)" in {
+    val submitter = submitterReturningJobInState("job-flink-attempt-failure",
+                                                  JobStatus.State.ATTEMPT_FAILURE,
+                                                  isFlinkLabel = true)
+    assertEquals(ai.chronon.api.JobStatusType.PENDING, submitter.status("job-flink-attempt-failure"))
+  }
+
+  it should "map Dataproc ATTEMPT_FAILURE to JobStatusType.PENDING for a non-Flink job (retryable transient state)" in {
+    val submitter = submitterReturningJobInState("job-batch-attempt-failure",
+                                                  JobStatus.State.ATTEMPT_FAILURE,
+                                                  isFlinkLabel = false)
+    assertEquals(ai.chronon.api.JobStatusType.PENDING, submitter.status("job-batch-attempt-failure"))
+  }
 }

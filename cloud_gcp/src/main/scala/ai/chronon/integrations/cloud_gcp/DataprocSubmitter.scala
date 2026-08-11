@@ -112,7 +112,19 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
         job.getStatus.getState == JobStatus.State.RUNNING && flinkHealthCheckFn(getFlinkUrl(jobId))
 
       val jobStatusType = job.getStatus.getState match {
-        case JobStatus.State.PENDING                                       => JobStatusType.PENDING
+        // SETUP_DONE and ATTEMPT_FAILURE bundle with PENDING as pre-active states.
+        //   - SETUP_DONE: Dataproc has finished setup but the user process hasn't started executing
+        //     yet. For Flink jobs specifically, mapping this to RUNNING was strictly less accurate
+        //     than the RUNNING branch below, because the JM+TMs haven't come up at SETUP_DONE — no
+        //     checkpoints, nothing to health-check. Reporting RUNNING here caused steps to flap
+        //     Running → Submitted when the next poll landed on the real RUNNING state and the
+        //     health check (correctly) said "not yet healthy".
+        //   - ATTEMPT_FAILURE: transient state for restartable jobs; Dataproc moves the job back
+        //     to PENDING when retries remain, or to ERROR when they're exhausted. Mapping to
+        //     PENDING here matches Dataproc's own retry path and avoids reporting UNKNOWN for a
+        //     state we can reason about.
+        case JobStatus.State.PENDING | JobStatus.State.SETUP_DONE | JobStatus.State.ATTEMPT_FAILURE =>
+          JobStatusType.PENDING
         case JobStatus.State.ERROR                                         => JobStatusType.FAILED
         case JobStatus.State.DONE                                          => JobStatusType.SUCCEEDED
         case JobStatus.State.RUNNING if isFlinkJob && isRunningAndHealthy  => JobStatusType.RUNNING
@@ -130,7 +142,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
             DataprocSubmitter.FlinkHealthCheckGracePeriod,
             logger
           )
-        case JobStatus.State.RUNNING | JobStatus.State.SETUP_DONE => JobStatusType.RUNNING
+        case JobStatus.State.RUNNING => JobStatusType.RUNNING
         case JobStatus.State.CANCEL_STARTED | JobStatus.State.CANCEL_PENDING | JobStatus.State.CANCELLED =>
           JobStatusType.FAILED
         case _ => JobStatusType.UNKNOWN
