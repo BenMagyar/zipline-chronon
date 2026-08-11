@@ -42,7 +42,6 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ListBuffer
 import scala.collection.mutable
@@ -225,6 +224,21 @@ class Fetcher(val kvStore: KVStore,
   private def joinConfCacheKey(join: api.Join): JoinConfCacheKey =
     new JoinConfCacheKey(join.metaData.getName, ThriftJsonCodec.md5Digest(join), join)
 
+  private[fetcher] def resolveJoinCodecs(requestNames: Seq[String],
+                                         joinConf: Option[api.Join]): Map[String, Try[JoinCodec]] = {
+    val distinctNames = requestNames.distinct
+    if (distinctNames.isEmpty) {
+      Map.empty
+    } else
+      joinConf match {
+        case Some(join) =>
+          val codecTry = joinConfCodecCache(joinConfCacheKey(join))
+          distinctNames.iterator.map(_ -> codecTry).toMap
+        case None =>
+          distinctNames.iterator.map(name => name -> joinCodecCache(name)).toMap
+      }
+  }
+
   // Generic withTs method that works with any TimestampableResponse
   private[online] def withTs[T <: BaseResponse](responses: Future[Seq[T]]): Future[FetcherResponseWithTs[T]] = {
     responses.map { response =>
@@ -238,15 +252,15 @@ class Fetcher(val kvStore: KVStore,
 
   def fetchJoin(requests: Seq[Request], joinConf: Option[api.Join] = None): Future[Seq[Response]] = {
     val ts = System.currentTimeMillis()
-    val cachedJoinCodecsByName = mutable.Map.empty[String, Try[JoinCodec]]
-    val joinCodecForName: String => Option[Try[JoinCodec]] = joinConf match {
-      case Some(join) =>
-        lazy val codecTry = joinConfCodecCache(joinConfCacheKey(join))
-        _ => Some(codecTry)
-      case None =>
-        joinName => Some(cachedJoinCodecsByName.getOrElseUpdate(joinName, joinCodecCache(joinName)))
-    }
-    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecForName)
+    val joinCodecsByName = resolveJoinCodecs(requests.iterator.map(_.name).toSeq, joinConf)
+    fetchJoinWithCodecs(requests, joinConf, joinCodecsByName, ts)
+  }
+
+  private def fetchJoinWithCodecs(requests: Seq[Request],
+                                  joinConf: Option[api.Join],
+                                  joinCodecsByName: Map[String, Try[JoinCodec]],
+                                  ts: Long): Future[Seq[Response]] = {
+    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecsByName.get)
     val externalResponsesF = fetchExternal(requests)
     val combinedResponsesF =
       internalResponsesF.zip(externalResponsesF).map { case (internalResponses, externalResponses) =>
@@ -281,7 +295,7 @@ class Fetcher(val kvStore: KVStore,
             internalMap
           }
 
-          applyDerivations(ts, internalResponse.request, baseMap)
+          applyDerivations(ts, internalResponse.request, baseMap, joinCodecsByName(internalResponse.request.name))
         }
 
         val ctx = Metrics.Context(Metrics.Environment.JoinFetching)
@@ -290,7 +304,10 @@ class Fetcher(val kvStore: KVStore,
       }
 
     combinedResponsesF
-      .map(_.iterator.map(logResponse(_, ts)).toSeq)
+      .map(
+        _.iterator
+          .map(response => logResponse(response, ts, joinCodecsByName(response.request.name)))
+          .toSeq)
   }
 
   def fetchModelTransforms(requests: scala.Seq[Request],
@@ -367,16 +384,18 @@ class Fetcher(val kvStore: KVStore,
     }
   }
 
+  private type JoinResponseEncoder = (StructType, AvroCodec)
+
   private def convertJoinFeaturesResponseToAvroBytes(features: Map[String, AnyRef],
-                                                     joinName: String): Try[Array[Byte]] = {
+                                                     joinName: String,
+                                                     encoderTry: Try[JoinResponseEncoder]): Try[Array[Byte]] = {
     val startTime = System.currentTimeMillis()
     val ctx =
       Metrics.Context(Metrics.Environment.JoinSchemaFetching, join = joinName)
-    val joinCodecTry = joinCodecCache(joinName)
 
-    joinCodecTry.flatMap { joinCodec =>
+    encoderTry.flatMap { case (valueSchema, valueCodec) =>
       Try {
-        val response = encode(joinCodec.valueSchema, Fetcher.codecForCurrentThread(joinCodec.valueCodec), features)
+        val response = encode(valueSchema, valueCodec, features)
         ctx.distribution("avroconversionbytes.latency.millis", System.currentTimeMillis() - startTime)
         response
       }.recover { case exception =>
@@ -389,15 +408,16 @@ class Fetcher(val kvStore: KVStore,
     }
   }
 
-  private def convertJoinFeaturesResponseToAvroString(features: Map[String, AnyRef], joinName: String): Try[String] = {
+  private def convertJoinFeaturesResponseToAvroString(features: Map[String, AnyRef],
+                                                      joinName: String,
+                                                      encoderTry: Try[JoinResponseEncoder]): Try[String] = {
     val startTime = System.currentTimeMillis()
     val ctx =
       Metrics.Context(Metrics.Environment.JoinSchemaFetching, join = joinName)
-    val joinCodecTry = joinCodecCache(joinName)
 
-    joinCodecTry.flatMap { joinCodec =>
+    encoderTry.flatMap { case (valueSchema, valueCodec) =>
       Try {
-        val avroBytes = encode(joinCodec.valueSchema, Fetcher.codecForCurrentThread(joinCodec.valueCodec), features)
+        val avroBytes = encode(valueSchema, valueCodec, features)
         val avroString = java.util.Base64.getEncoder.encodeToString(avroBytes)
         ctx.distribution("avroconversionstring.latency.millis", System.currentTimeMillis() - startTime)
         avroString
@@ -444,53 +464,70 @@ class Fetcher(val kvStore: KVStore,
   def fetchJoinV2(requests: Seq[Request],
                   joinConf: Option[api.Join] = None,
                   responseType: ResponseType = FeaturesResponseType.Map): Future[Seq[ResponseV2]] = {
-    val rawResponse = fetchJoin(requests, joinConf)
+    val ts = System.currentTimeMillis()
+    val joinCodecsByName = resolveJoinCodecs(requests.iterator.map(_.name).toSeq, joinConf)
+    val rawResponse = fetchJoinWithCodecs(requests, joinConf, joinCodecsByName, ts)
 
+    rawResponse.map(responses => encodeJoinResponses(responses, responseType, joinCodecsByName))
+  }
+
+  private[fetcher] def encodeJoinResponses(responses: Seq[Response],
+                                           responseType: ResponseType,
+                                           joinCodecsByName: Map[String, Try[JoinCodec]]): Seq[ResponseV2] = {
+    val encodersByName = joinCodecsByName.iterator.map { case (joinName, codecTry) =>
+      joinName -> codecTry.map(codec => codec.valueSchema -> Fetcher.codecForCurrentThread(codec.valueCodec))
+    }.toMap
+
+    // Keep response encoding strict so each thread-local codec is fully used on the thread that resolved it.
     responseType match {
       case FeaturesResponseType.AvroBytes => {
-        rawResponse.map(
-          _.iterator
-            .map(r => {
-              val errors = r.values match {
-                case Failure(exception) => Failure(exception)
-                case Success(valueMap) =>
-                  val exceptionMap = FetcherUtil.filterFeatureMapForErrors(valueMap)
-                  if (exceptionMap.nonEmpty) Success(exceptionMap) else Success(Map.empty[String, String])
-              }
-              ResponseV2(r.request,
-                         AvroResponseValue.AvroBytes(r.values.flatMap(v => {
-                           convertJoinFeaturesResponseToAvroBytes(v, r.request.name)
-                         })),
-                         errors)
-            })
-            .toSeq)
+        responses.iterator
+          .map(r => {
+            val errors = r.values match {
+              case Failure(exception) => Failure(exception)
+              case Success(valueMap) =>
+                val exceptionMap = FetcherUtil.filterFeatureMapForErrors(valueMap)
+                if (exceptionMap.nonEmpty) Success(exceptionMap) else Success(Map.empty[String, String])
+            }
+            ResponseV2(
+              r.request,
+              AvroResponseValue.AvroBytes(r.values.flatMap(v => {
+                convertJoinFeaturesResponseToAvroBytes(v, r.request.name, encodersByName(r.request.name))
+              })),
+              errors
+            )
+          })
+          .toVector
       }
       case FeaturesResponseType.AvroString =>
-        rawResponse.map(
-          _.iterator
-            .map(r => {
-              val errors = r.values match {
-                case Failure(exception) => Failure(exception)
-                case Success(valueMap) =>
-                  val exceptionMap = FetcherUtil.filterFeatureMapForErrors(valueMap)
-                  if (exceptionMap.nonEmpty) Success(exceptionMap) else Success(Map.empty[String, String])
-              }
-              ResponseV2(r.request,
-                         AvroResponseValue.AvroString(r.values.flatMap(v => {
-                           convertJoinFeaturesResponseToAvroString(v, r.request.name)
-                         })),
-                         errors)
-            })
-            .toSeq)
+        responses.iterator
+          .map(r => {
+            val errors = r.values match {
+              case Failure(exception) => Failure(exception)
+              case Success(valueMap) =>
+                val exceptionMap = FetcherUtil.filterFeatureMapForErrors(valueMap)
+                if (exceptionMap.nonEmpty) Success(exceptionMap) else Success(Map.empty[String, String])
+            }
+            ResponseV2(
+              r.request,
+              AvroResponseValue.AvroString(r.values.flatMap(v => {
+                convertJoinFeaturesResponseToAvroString(v, r.request.name, encodersByName(r.request.name))
+              })),
+              errors
+            )
+          })
+          .toVector
     }
   }
 
-  private def applyDerivations(ts: Long, request: Request, baseMap: Map[String, AnyRef]): ResponseWithContext = {
+  private def applyDerivations(ts: Long,
+                               request: Request,
+                               baseMap: Map[String, AnyRef],
+                               joinCodecTry: Try[JoinCodec]): ResponseWithContext = {
 
     val derivationStartTs = System.currentTimeMillis()
     val joinName = request.name
     val ctx = Metrics.Context(Metrics.Environment.JoinFetching, join = joinName)
-    val joinCodecTry = joinCodecCache(request.name)
 
     joinCodecTry match {
       case Success(joinCodec) =>
@@ -556,38 +593,14 @@ class Fetcher(val kvStore: KVStore,
     }
   }
 
-  private def encode(schema: StructType,
-                     codec: AvroCodec,
-                     dataMap: Map[String, AnyRef],
-                     cast: Boolean = false,
-                     tries: Int = 3): Array[Byte] = {
-    def encodeOnce(schema: StructType,
-                   codec: AvroCodec,
-                   dataMap: Map[String, AnyRef],
-                   cast: Boolean = false): Array[Byte] = {
-      val data = schema.castArr(dataMap)
-      val avroRecord =
-        AvroConversions.fromChrononRow(data, schema, codec.schema).asInstanceOf[GenericRecord]
-      codec.encodeBinary(avroRecord)
-    }
-
-    @tailrec
-    def tryOnce(lastTry: Try[Array[Byte]], tries: Int): Try[Array[Byte]] = {
-
-      if (tries == 0 || (lastTry != null && lastTry.isSuccess))
-        return lastTry
-
-      val binary = encodeOnce(schema, codec, dataMap, cast)
-
-      tryOnce(Try(codec.decodeRow(binary)).map(_ => binary), tries - 1)
-    }
-
-    tryOnce(null, tries).get
+  private[fetcher] def encode(schema: StructType, codec: AvroCodec, dataMap: Map[String, AnyRef]): Array[Byte] = {
+    val data = schema.castArr(dataMap)
+    val avroRecord =
+      AvroConversions.fromChrononRow(data, schema, codec.schema).asInstanceOf[GenericRecord]
+    codec.encodeBinary(avroRecord)
   }
 
-  private def logResponse(resp: ResponseWithContext, ts: Long): Response = {
-
-    val joinCodecTry = joinCodecCache(resp.request.name)
+  private def logResponse(resp: ResponseWithContext, ts: Long, joinCodecTry: Try[JoinCodec]): Response = {
 
     val loggingTry: Try[Unit] = joinCodecTry
       .map(codec => {
@@ -623,7 +636,7 @@ class Fetcher(val kvStore: KVStore,
     val loggingTs = resp.request.atMillis.getOrElse(ts)
 
     val keyBytes =
-      encode(codec.keySchema, Fetcher.codecForCurrentThread(codec.keyCodec), resp.request.keys, cast = true)
+      encode(codec.keySchema, Fetcher.codecForCurrentThread(codec.keyCodec), resp.request.keys)
 
     val hash = if (samplePercent > 0) {
       Math.abs(HashUtils.md5Long(keyBytes))

@@ -5,6 +5,9 @@ import ai.chronon.online.GroupByServingInfoParsed
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.{Executors, TimeUnit => JavaTimeUnit}
+
 class GroupByServingInfoParsedTest extends AnyFlatSpec with Matchers {
 
   private def utc(s: String): Long = java.time.Instant.parse(s).toEpochMilli
@@ -33,5 +36,25 @@ class GroupByServingInfoParsedTest extends AnyFlatSpec with Matchers {
       .setPartitionInterval(new Window(3, TimeUnit.HOURS))
       .setPartitionOffset(new Window(1, TimeUnit.HOURS))
     new GroupByServingInfoParsed(subDaily).batchEndTsMillis should be(utc("2026-06-03T04:00:00Z"))
+  }
+
+  "codec accessors" should "reuse a codec on one thread without sharing mutable codec state across threads" in {
+    val parsed = GroupByDerivationsTest.makeTestGroupByServingInfoParsed()
+    val currentThreadCodec = parsed.keyCodec
+
+    (parsed.keyCodec eq currentThreadCodec) shouldBe true
+
+    val otherThreadCodec = new AtomicReference[ai.chronon.online.serde.AvroCodec]()
+    val executor = Executors.newSingleThreadExecutor()
+    try {
+      executor.submit(new Runnable {
+        override def run(): Unit = otherThreadCodec.set(parsed.keyCodec)
+      }).get(10, JavaTimeUnit.SECONDS)
+    } finally {
+      executor.shutdownNow()
+    }
+
+    otherThreadCodec.get() should not be theSameInstanceAs(currentThreadCodec)
+    otherThreadCodec.get().schemaStr shouldBe currentThreadCodec.schemaStr
   }
 }

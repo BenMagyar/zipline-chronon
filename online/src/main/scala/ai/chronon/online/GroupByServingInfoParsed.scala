@@ -71,7 +71,11 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
 
   val smallestTailHopMillis: Long = ResolutionUtils.getSmallestTailHopMillis(groupByServingInfo.groupBy)
 
-  def keyCodec: AvroCodec = AvroCodec.of(keyAvroSchema)
+  // AvroCodec instances are intentionally thread-local because their encoders and decoders are mutable. Cache the
+  // ThreadLocal handle on serving metadata so every feature request only pays ThreadLocal.get(), rather than repeating
+  // the global schema-keyed ConcurrentHashMap lookup in AvroCodec.ofThreaded.
+  @transient private lazy val keyCodecs = AvroCodec.ofThreaded(keyAvroSchema)
+  def keyCodec: AvroCodec = keyCodecs.get()
   @transient lazy val keyChrononSchema: StructType =
     AvroConversions.toChrononSchema(keyCodec.schema).asInstanceOf[StructType]
 
@@ -85,15 +89,19 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
     AvroConversions.fromChrononSchema(valueChrononSchema).toString()
   }
 
-  def valueAvroCodec: serde.AvroCodec = serde.AvroCodec.of(valueAvroSchema)
-  def selectedCodec: serde.AvroCodec = serde.AvroCodec.of(selectedAvroSchema)
+  @transient private lazy val valueAvroCodecs = serde.AvroCodec.ofThreaded(valueAvroSchema)
+  def valueAvroCodec: serde.AvroCodec = valueAvroCodecs.get()
+  @transient private lazy val selectedCodecs = serde.AvroCodec.ofThreaded(selectedAvroSchema)
+  def selectedCodec: serde.AvroCodec = selectedCodecs.get()
 
   @transient lazy val irAvroToChrononRowConverter: Any => Array[Any] =
     AvroConversions.genericRecordToChrononRowConverter(irChrononSchema)
   lazy val irAvroSchema: String = AvroConversions.fromChrononSchema(irChrononSchema).toString()
 
-  def irCodec: serde.AvroCodec = serde.AvroCodec.of(irAvroSchema)
-  def outputCodec: serde.AvroCodec = serde.AvroCodec.of(outputAvroSchema)
+  @transient private lazy val irCodecs = serde.AvroCodec.ofThreaded(irAvroSchema)
+  def irCodec: serde.AvroCodec = irCodecs.get()
+  @transient private lazy val outputCodecs = serde.AvroCodec.ofThreaded(outputAvroSchema)
+  def outputCodec: serde.AvroCodec = outputCodecs.get()
 
   // Start tiling specific variables
 
@@ -149,7 +157,8 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
     AvroConversions.toChrononSchema(parser.parse(mutationValueAvroSchema)).asInstanceOf[StructType]
   }
 
-  def mutationValueAvroCodec: serde.AvroCodec = serde.AvroCodec.of(mutationValueAvroSchema)
+  @transient private lazy val mutationValueAvroCodecs = serde.AvroCodec.ofThreaded(mutationValueAvroSchema)
+  def mutationValueAvroCodec: serde.AvroCodec = mutationValueAvroCodecs.get()
 
   // Schema for data consumed by the streaming job.
   // Needs consistency with mutationDf Schema for backfill group by. (Shared queries)
