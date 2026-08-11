@@ -88,6 +88,10 @@ public class ConfigStore {
         }
     }
 
+    ConfigStore(JsonObject jsonConfig) {
+        this.jsonConfig = jsonConfig.copy();
+    }
+
     public int getServerPort() {
         return jsonConfig.getInteger(SERVER_PORT, DEFAULT_PORT);
     }
@@ -241,7 +245,7 @@ public class ConfigStore {
     }
 
     public int getWarmupTimesPerJoin() {
-        int value = jsonConfig.getInteger(WARMUP_TIMES_PER_JOIN, 100);
+        int value = jsonConfig.getInteger(WARMUP_TIMES_PER_JOIN, 1);
         if (value <= 0) {
             throw new IllegalArgumentException("WARMUP_TIMES_PER_JOIN must be a positive integer, got: " + value);
         }
@@ -257,9 +261,12 @@ public class ConfigStore {
     }
 
     public String encodeConfig() {
-        // Redact WARMUP_PAYLOAD — it may contain entity keys that should not be exposed via /config
-        JsonObject redacted = new JsonObject(jsonConfig.getMap());
-        redacted.remove(WARMUP_PAYLOAD);
+        // Warmup payloads may contain entity keys that should not be exposed via /config.
+        JsonObject redacted = jsonConfig.copy();
+        new ArrayList<>(redacted.fieldNames()).stream()
+                .filter(key -> key.equals(WARMUP_PAYLOAD)
+                        || (key.startsWith("ai.chronon.warmup.join.") && key.endsWith(".payload")))
+                .forEach(redacted::remove);
         return redacted.encodePrettily();
     }
 }
