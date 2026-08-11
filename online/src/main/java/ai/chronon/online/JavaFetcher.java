@@ -26,13 +26,19 @@ import ai.chronon.online.metrics.Metrics;
 import ai.chronon.online.metrics.TTLCache;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 public class JavaFetcher {
   Fetcher fetcher;
+  private final MetricsInstrumenter metricsInstrumenter = new MetricsInstrumenter();
 
   public JavaFetcher(KVStore kvStore, String metaDataSet, Long timeoutMillis, Consumer<LoggableResponse> logFunc, ExternalSourceRegistry registry, String callerName, Boolean disableErrorThrows) {
     this.fetcher = new Fetcher(kvStore, metaDataSet, timeoutMillis, logFunc, false, registry, null, callerName, null, disableErrorThrows, null, TTLCache.DefaultTtlMillis(), TTLCache.DefaultTtlMillis());
@@ -141,10 +147,12 @@ public class JavaFetcher {
 
   private List<Fetcher.Request> toScalaRequests(List<JavaRequest> requests, boolean isGroupBy, long startTs) {
     List<Fetcher.Request> scalaRequests = new ArrayList<>();
+    Set<String> requestNames = new LinkedHashSet<>();
     for (JavaRequest request : requests) {
       scalaRequests.add(request.toScalaRequest());
+      requestNames.add(request.name);
     }
-    instrument(requests.stream().map(jReq -> jReq.name).collect(Collectors.toList()), isGroupBy, "java.request_conversion.latency.millis", startTs);
+    metricsInstrumenter.instrument(requestNames, isGroupBy, "java.request_conversion.latency.millis", startTs);
     return scalaRequests;
   }
 
@@ -157,9 +165,11 @@ public class JavaFetcher {
         List<JavaResponse> jResps = responses.stream()
             .map(JavaResponse::new)
             .collect(Collectors.toList());
-        List<String> names = jResps.stream().map(r -> r.request.name).collect(Collectors.toList());
-        instrument(names, isGroupBy, "java.response_conversion.latency.millis", conversionStartTs);
-        instrument(names, isGroupBy, "java.overall.latency.millis", startTs);
+        Set<String> names = jResps.stream()
+            .map(r -> r.request.name)
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        metricsInstrumenter.instrument(names, isGroupBy, "java.response_conversion.latency.millis", conversionStartTs);
+        metricsInstrumenter.instrument(names, isGroupBy, "java.overall.latency.millis", startTs);
         return jResps;
     });
   }
@@ -207,24 +217,86 @@ public class JavaFetcher {
     return JTry.fromScala(scalaResponse).map(JavaGroupByStatusResponse::new);
   }
 
-  private void instrument(List<String> requestNames, boolean isGroupBy, String metricName, Long startTs) {
-    long endTs = System.currentTimeMillis();
-    for (String s : requestNames) {
-      Metrics.Context ctx;
-      if (isGroupBy) {
-        ctx = getGroupByContext(s);
-      } else {
-        ctx = getJoinContext(s);
-      }
-      ctx.distribution(metricName, endTs - startTs);
+  @FunctionalInterface
+  interface DistributionRecorder {
+    void record(Metrics.Context context, String metricName, long value);
+  }
+
+  static final class MetricsInstrumenter {
+    static final int MAX_CONTEXT_CACHE_ENTRIES = 4096;
+
+    private final ConcurrentMap<String, Metrics.Context> joinContexts = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Metrics.Context> groupByContexts = new ConcurrentHashMap<>();
+    private final DistributionRecorder distributionRecorder;
+
+    MetricsInstrumenter() {
+      this((context, metricName, value) -> context.distribution(metricName, value));
     }
-  }
 
-  private Metrics.Context getJoinContext(String joinName) {
-    return new Metrics.Context("join.fetch", joinName, null, null, false, null, null, null, null, null, null, null);
-  }
+    MetricsInstrumenter(DistributionRecorder distributionRecorder) {
+      this.distributionRecorder = distributionRecorder;
+    }
 
-  private Metrics.Context getGroupByContext(String groupByName) {
-    return new Metrics.Context("group_by.fetch", null, groupByName, null, false, null, null, null, null, null, null, null);
+    void instrument(Collection<String> requestNames, boolean isGroupBy, String metricName, long startTs) {
+      long value = System.currentTimeMillis() - startTs;
+      Collection<String> distinctRequestNames = requestNames instanceof Set<?>
+          ? requestNames
+          : new LinkedHashSet<>(requestNames);
+      for (String requestName : distinctRequestNames) {
+        Metrics.Context context = isGroupBy ? getGroupByContext(requestName) : getJoinContext(requestName);
+        distributionRecorder.record(context, metricName, value);
+      }
+    }
+
+    private Metrics.Context getJoinContext(String joinName) {
+      if (joinName == null) {
+        return newJoinContext(null);
+      }
+      return getOrCreateContext(joinContexts, joinName, false);
+    }
+
+    private Metrics.Context getGroupByContext(String groupByName) {
+      if (groupByName == null) {
+        return newGroupByContext(null);
+      }
+      return getOrCreateContext(groupByContexts, groupByName, true);
+    }
+
+    private Metrics.Context getOrCreateContext(ConcurrentMap<String, Metrics.Context> contexts,
+                                               String requestName,
+                                               boolean isGroupBy) {
+      Metrics.Context existing = contexts.get(requestName);
+      if (existing != null) {
+        return existing;
+      }
+
+      synchronized (contexts) {
+        Metrics.Context raced = contexts.get(requestName);
+        if (raced != null) {
+          return raced;
+        }
+        Metrics.Context created = isGroupBy ? newGroupByContext(requestName) : newJoinContext(requestName);
+        if (contexts.size() < MAX_CONTEXT_CACHE_ENTRIES) {
+          contexts.put(requestName, created);
+        }
+        return created;
+      }
+    }
+
+    int cachedJoinContextCount() {
+      return joinContexts.size();
+    }
+
+    int cachedGroupByContextCount() {
+      return groupByContexts.size();
+    }
+
+    private Metrics.Context newJoinContext(String joinName) {
+      return new Metrics.Context("join.fetch", joinName, null, null, false, null, null, null, null, null, null, null);
+    }
+
+    private Metrics.Context newGroupByContext(String groupByName) {
+      return new Metrics.Context("group_by.fetch", null, groupByName, null, false, null, null, null, null, null, null, null);
+    }
   }
 }
