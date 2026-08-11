@@ -194,7 +194,11 @@ public class ConfigStore {
     }
 
     public int getWarmupTimesPerJoin() {
-        return jsonConfig.getInteger(WARMUP_TIMES_PER_JOIN, 100);
+        int value = jsonConfig.getInteger(WARMUP_TIMES_PER_JOIN, 100);
+        if (value <= 0) {
+            throw new IllegalArgumentException("WARMUP_TIMES_PER_JOIN must be a positive integer, got: " + value);
+        }
+        return Math.min(value, 1000);
     }
 
     public long getJoinConfTtlMillis() {
@@ -206,6 +210,9 @@ public class ConfigStore {
     }
 
     public String encodeConfig() {
-        return jsonConfig.encodePrettily();
+        // Redact WARMUP_PAYLOAD — it may contain entity keys that should not be exposed via /config
+        JsonObject redacted = new JsonObject(jsonConfig.getMap());
+        redacted.remove(WARMUP_PAYLOAD);
+        return redacted.encodePrettily();
     }
 }

@@ -7,6 +7,8 @@ import ai.chronon.service.handlers.FetchHandler;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
+
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,6 +23,8 @@ public class FetcherWarmup {
     private static final Logger logger = LoggerFactory.getLogger(FetcherWarmup.class);
     private static final int LIST_JOINS_MAX_RETRIES = 5;
     private static final long LIST_JOINS_RETRY_DELAY_MS = 2000L;
+    // Per-fetch safety net timeout — defense-in-depth on top of any KV store SDK timeout
+    private static final long FETCH_TIMEOUT_SECONDS = 30L;
 
     public static Future<Void> run(Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore) {
         try {
@@ -112,6 +116,7 @@ public class FetcherWarmup {
             for (int time = 0; time < timesPerJoin; time++) {
                 final int timeNum = time;
                 Future<Void> timeFuture = Future.fromCompletionStage(fetcher.fetchJoin(requests))
+                        .timeout(FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                         .onSuccess(responses ->
                                 logger.debug("Warmup request {}/{} complete for join '{}'", timeNum + 1, timesPerJoin, joinName))
                         .recover(err -> {
