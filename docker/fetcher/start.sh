@@ -113,6 +113,17 @@ if [ -n "$CHRONON_JOIN_CODEC_TTL_MILLIS" ]; then
   TTL_OPTS="$TTL_OPTS -Dai.chronon.join.codec.ttl.millis=$CHRONON_JOIN_CODEC_TTL_MILLIS"
 fi
 
+WARMUP_OPTS=()
+if [ -n "$WARMUP_JOIN_REGEX" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.join.regex=$WARMUP_JOIN_REGEX")
+fi
+if [ -n "$WARMUP_PAYLOAD" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.payload=$WARMUP_PAYLOAD")
+fi
+if [ -n "$WARMUP_TIMES_PER_JOIN" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.times.per.join=$WARMUP_TIMES_PER_JOIN")
+fi
+
 echo "Starting Fetcher service with online jar $ONLINE_JAR and online class $ONLINE_CLASS"
 exec java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
   run ai.chronon.service.FetcherVerticle \
@@ -120,4 +131,5 @@ exec java $JVM_OPTS $LOGGING_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.
   -Donline.jar=$ONLINE_JAR \
   -Donline.api.props='{"kv.tablePrefix":"'"$KV_TABLE_PREFIX"'"}' \
   $TTL_OPTS \
+  "${WARMUP_OPTS[@]}" \
   -Donline.class=$ONLINE_CLASS

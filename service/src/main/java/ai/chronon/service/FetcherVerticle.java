@@ -69,13 +69,16 @@ public class FetcherVerticle extends AbstractVerticle {
             return api.buildJavaFetcher("feature-service", false, joinConfTtl, joinCodecTtl);
         })
         .onSuccess(fetcher -> {
-            try {
-                // This code runs back on the event loop when the blocking operation completes
-                startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
-            } catch (Exception e) {
-                closeFetchWorkerExecutor();
-                startPromise.fail(e);
-            }
+            // Run warmup before opening the HTTP server to traffic — always completes successfully
+            FetcherWarmup.run(vertx, fetcher, cfgStore)
+                .onComplete(ar -> {
+                    try {
+                        startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
+                    } catch (Exception e) {
+                        closeFetchWorkerExecutor();
+                        startPromise.fail(e);
+                    }
+                });
         })
         .onFailure(startPromise::fail);
     }

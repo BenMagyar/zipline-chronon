@@ -40,6 +40,11 @@ public class ConfigStore {
     private static final String JOIN_CONF_TTL_MILLIS = "ai.chronon.join.conf.ttl.millis";
     private static final String JOIN_CODEC_TTL_MILLIS = "ai.chronon.join.codec.ttl.millis";
 
+    // Warmup configuration
+    private static final String WARMUP_JOIN_REGEX = "ai.chronon.warmup.join.regex";
+    private static final String WARMUP_PAYLOAD = "ai.chronon.warmup.payload";
+    private static final String WARMUP_TIMES_PER_JOIN = "ai.chronon.warmup.times.per.join";
+
     private volatile JsonObject jsonConfig;
     private final Object lock = new Object();
 
@@ -171,6 +176,25 @@ public class ConfigStore {
     public void validateAllConfig() {
         validateDatabaseConfig();
         validateGcpConfig();
+    }
+
+    public Optional<String> getWarmupJoinRegex() {
+        return Optional.ofNullable(jsonConfig.getString(WARMUP_JOIN_REGEX));
+    }
+
+    public Optional<String> getWarmupPayload() {
+        // Vert.x parses JSON-shaped system property values into JsonArray/JsonObject,
+        // so getString() returns null for array-valued payloads. We re-encode the stored
+        // value to recover the original JSON string regardless of what type it was coerced to.
+        Object value = jsonConfig.getValue(WARMUP_PAYLOAD);
+        if (value == null) {
+            return Optional.empty();
+        }
+        return Optional.of(value instanceof String ? (String) value : value.toString());
+    }
+
+    public int getWarmupTimesPerJoin() {
+        return jsonConfig.getInteger(WARMUP_TIMES_PER_JOIN, 100);
     }
 
     public long getJoinConfTtlMillis() {
