@@ -95,6 +95,12 @@ object Constants {
   // List entity type
   val ListEntityType: String = "entity_type"
 
+  // Optional list filters/capabilities. Implementations that do not recognize these
+  // continue to return full values and omit ListValuesAreKeysOnly.
+  val ListEntityOnline: String = "entity_online"
+  val ListKeysOnly: String = "keys_only"
+  val ListValuesAreKeysOnly: String = "values_are_keys_only"
+
   val DefaultPercentiles: Seq[String] = Seq("p5", "p50", "p95")
 
   val archiveReuseTableSuffix: String = "_archive_reuse"

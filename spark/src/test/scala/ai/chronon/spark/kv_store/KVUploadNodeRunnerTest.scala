@@ -17,7 +17,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 
 trait MockitoHelper extends MockitoSugar {
   def doReturn(toBeReturned: Any): Stubber = {
@@ -49,6 +49,7 @@ class KVUploadNodeRunnerTest
     metadataStore = mock[MetadataStore]
 
     when(kvStore.executionContext).thenReturn(ExecutionContext.global)
+    when(kvStore.put(any[KVStore.PutRequest])).thenReturn(Future.successful(true))
     when(api.genKvStore).thenReturn(kvStore)
     when(fetchContext.kvStore).thenReturn(kvStore)
     when(fetchContext.metadataDataset).thenReturn(MetadataDataset)
@@ -130,6 +131,19 @@ class KVUploadNodeRunnerTest
     verify(fetchContext).kvStore
     // MetadataStore.putJoinConf calls metadataDataset twice, so we expect at least one call
     verify(fetchContext, times(2)).metadataDataset
+  }
+
+  it should "fail JOIN_METADATA_UPLOAD when the KV store rejects it" in {
+    when(kvStore.put(any[KVStore.PutRequest])).thenReturn(Future.successful(false))
+
+    val join = new Join().setMetaData(new MetaData().setName("test_join").setTeam("test_team"))
+    val nodeContent = new NodeContent()
+    nodeContent.setJoinMetadataUpload(new JoinMetadataUpload().setJoin(join))
+
+    val exception = intercept[IllegalArgumentException] {
+      runner.run(new MetaData(), nodeContent, None)
+    }
+    exception.getMessage should include("KV store rejected Join metadata upload for test_join")
   }
 
   it should "handle MODEL_TRANSFORMS_UPLOAD successfully" in {

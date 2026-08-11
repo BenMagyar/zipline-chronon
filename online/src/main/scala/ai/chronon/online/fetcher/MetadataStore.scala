@@ -212,13 +212,22 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
     val startTimeMs = System.currentTimeMillis()
 
     def parseJoins(response: ListResponse): Seq[String] = {
+      val valuesAreKeysOnly = response.resultProps.get(ListValuesAreKeysOnly).exists {
+        case value: Boolean => value
+        case value: String  => value.toBoolean
+        case _              => false
+      }
       val result = response.values
         .map { seqListValues =>
-          seqListValues
-            .map(kv => new String(kv.valueBytes, StandardCharsets.UTF_8))
-            .map(v => ThriftJsonCodec.fromJsonStr[Join](v, check = false, classOf[Join]))
-            .filter(_.join.metaData.online == isOnline)
-            .map(_.metaData.name)
+          if (valuesAreKeysOnly) {
+            seqListValues.map(kv => new String(kv.keyBytes, StandardCharsets.UTF_8))
+          } else {
+            seqListValues
+              .map(kv => new String(kv.valueBytes, StandardCharsets.UTF_8))
+              .map(v => ThriftJsonCodec.fromJsonStr[Join](v, check = false, classOf[Join]))
+              .filter(_.join.metaData.online == isOnline)
+              .map(_.metaData.name)
+          }
 
         }
         .recover { case e: Exception =>
@@ -234,9 +243,14 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
     def doRetrieveAllListConfs(acc: mutable.ArrayBuffer[String],
                                paginationKey: Option[Any] = None): Future[Seq[String]] = {
       val propsMap = {
+        val baseProps = if (isOnline) {
+          Map(ListEntityType -> JoinFolder, ListEntityOnline -> true, ListKeysOnly -> true)
+        } else {
+          Map(ListEntityType -> JoinFolder)
+        }
         paginationKey match {
-          case Some(key) => Map(ListEntityType -> JoinFolder, ContinuationKey -> key)
-          case None      => Map(ListEntityType -> JoinFolder)
+          case Some(key) => baseProps + (ContinuationKey -> key)
+          case None      => baseProps
         }
       }
 

@@ -1,7 +1,16 @@
 package ai.chronon.integrations.redis
 
-import ai.chronon.api.Constants.{ContinuationKey, ListEntityType, ListLimit, MetadataDataset}
-import ai.chronon.api.{GroupBy, MetaData, PartitionSpec, TilingUtils}
+import ai.chronon.api.Constants.{
+  ContinuationKey,
+  JoinFolder,
+  ListEntityOnline,
+  ListEntityType,
+  ListKeysOnly,
+  ListLimit,
+  ListValuesAreKeysOnly,
+  MetadataDataset
+}
+import ai.chronon.api.{GroupBy, Join, MetaData, PartitionSpec, ThriftJsonCodec, TilingUtils}
 import ai.chronon.api.Extensions.{GroupByOps, WindowUtils}
 import ai.chronon.integrations.redis.GlideReadCommand.{
   Get => GlideGet,
@@ -29,7 +38,7 @@ import redis.clients.jedis.exceptions.{
   JedisRedirectionException
 }
 import redis.clients.jedis.{ClusterPipeline, ConnectionPool, Jedis, JedisCluster, Response}
-import redis.clients.jedis.params.ScanParams
+import redis.clients.jedis.params.{ScanParams, ZAddParams}
 import redis.clients.jedis.resps.ScanResult
 import redis.clients.jedis.util.JedisClusterCRC16
 
@@ -124,6 +133,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
 
   // Configurable key prefix (can be empty for dedicated Redis deployments)
   private val keyPrefix: String = RedisKVStoreFactory.keyPrefix(conf)
+  private val onlineJoinNamesIndexKey = RedisKVStore.onlineJoinNamesIndexKey(keyPrefix)
   private val keyHashTagMode: String =
     conf.getOrElse("redis.key.hash.tag.mode", RedisKVStore.DatasetAndEntityHashTagMode)
   private val recordReadMetrics: Boolean =
@@ -1011,6 +1021,10 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
       metricsContext.copy(dataset = request.dataset)
     )
 
+    if (isOnlineJoinNamesRequest(request)) {
+      return listOnlineJoinNames(request, listLimit, datasetMetricsContext)
+    }
+
     Future {
       try {
         val startTs = System.currentTimeMillis()
@@ -1068,6 +1082,85 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
           logger.error("Error listing values from Redis Cluster", e)
           datasetMetricsContext.increment("list.redis_errors", Map("exception" -> e.getClass.getName))
           ListResponse(request, Failure(e), Map.empty)
+      }
+    }
+  }
+
+  private def isOnlineJoinNamesRequest(request: ListRequest): Boolean =
+    request.dataset == MetadataDataset &&
+      request.props.get(ListEntityType).exists(_.toString == JoinFolder) &&
+      listBooleanProp(request, ListEntityOnline) &&
+      listBooleanProp(request, ListKeysOnly)
+
+  private def listBooleanProp(request: ListRequest, key: String): Boolean =
+    request.props.get(key).exists {
+      case value: Boolean => value
+      case value: String  => value.toBoolean
+      case _              => false
+    }
+
+  private def listOnlineJoinNames(request: ListRequest,
+                                  listLimit: Int,
+                                  datasetMetricsContext: Metrics.Context): Future[ListResponse] =
+    Future {
+      try {
+        val startTs = System.currentTimeMillis()
+        val offset = decodeOnlineJoinNamesOffset(request.props.get(ContinuationKey))
+        val names = jedisCluster
+          .zrange(onlineJoinNamesIndexKey, offset, offset + listLimit - 1L)
+          .asScala
+          .toSeq
+        val nextOffset = offset + names.size
+        val total = jedisCluster.zcard(onlineJoinNamesIndexKey)
+        val resultProps =
+          if (nextOffset < total)
+            Map[String, Any](ListValuesAreKeysOnly -> true, ContinuationKey -> nextOffset)
+          else Map[String, Any](ListValuesAreKeysOnly -> true)
+
+        datasetMetricsContext.distribution("list.latency", System.currentTimeMillis() - startTs)
+        datasetMetricsContext.increment("list.successes")
+        ListResponse(
+          request,
+          Success(names.map(name => ListValue(name.getBytes(StandardCharsets.UTF_8), Array.emptyByteArray))),
+          resultProps
+        )
+      } catch {
+        case e: Exception =>
+          logger.error("Error listing online joins from the Redis index", e)
+          datasetMetricsContext.increment("list.redis_errors", Map("exception" -> e.getClass.getName))
+          ListResponse(request, Failure(e), Map.empty)
+      }
+    }
+
+  private def decodeOnlineJoinNamesOffset(value: Option[Any]): Long = value match {
+    case None                     => 0L
+    case Some(value: String)      => value.toLong
+    case Some(value: Int)         => value.toLong
+    case Some(value: Long)        => value
+    case Some(value: Array[Byte]) => new String(value, StandardCharsets.UTF_8).toLong
+    case Some(other) =>
+      throw new IllegalArgumentException(s"Unsupported online join index continuation type: ${other.getClass.getName}")
+  }
+
+  private def addOnlineJoinNameIfNeeded(request: PutRequest, uploadedAtMillis: Long): Unit = {
+    val logicalKey = new String(request.keyBytes, StandardCharsets.UTF_8)
+    if (logicalKey.startsWith(s"$JoinFolder/")) {
+      val join = ThriftJsonCodec.fromJsonStr[Join](
+        new String(request.valueBytes, StandardCharsets.UTF_8),
+        check = false,
+        classOf[Join]
+      )
+      require(join.getMetaData != null, "Join metadata is required for the online join index")
+      if (join.getMetaData.isOnline) {
+        val name = join.getMetaData.getName
+        require(name != null && name.nonEmpty, "Join name is required for the online join index")
+        // Keep the newest upload time so a later ZREMRANGEBYSCORE can retire stale versions safely.
+        jedisCluster.zadd(
+          onlineJoinNamesIndexKey,
+          uploadedAtMillis.toDouble,
+          name,
+          ZAddParams.zAddParams().gt()
+        )
       }
     }
   }
@@ -1223,6 +1316,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
                 // Uploaded Join configs remain addressable until explicitly replaced or deleted.
                 // Plain SET also clears a TTL left by older RedisKVStore versions.
                 jedisCluster.set(keyBytes, storedBytes)
+                addOnlineJoinNameIfNeeded(request, timestampInPutRequest)
               } else {
                 jedisCluster.setex(keyBytes, DataTTLSeconds, storedBytes)
               }
@@ -1476,11 +1570,17 @@ private[redis] object RedisKVStoreImpl {
 object RedisKVStore {
   val DatasetAndEntityHashTagMode = "dataset_and_entity"
   val EntityHashTagMode = "entity"
+  private[redis] val OnlineJoinNamesIndexSuffix = "__chronon_online_joins"
   private[redis] val BatchStatusCacheMillis = 5000L
   private[redis] val MissingBatchStatusCacheMillis = 250L
   private[redis] val AheadBatchStatusRefreshBackoffMillis = 250L
   private[redis] val BatchStatusCacheMaxEntries = 4096
   private[redis] val BatchStatusLockStripes = 1024
+
+  private[redis] def onlineJoinNamesIndexKey(keyPrefix: String): String = {
+    val prefix = if (keyPrefix.isEmpty) "" else s"$keyPrefix$KeySeparator"
+    s"$prefix{$MetadataDataset}$KeySeparator$OnlineJoinNamesIndexSuffix"
+  }
 
   private[redis] case class CachedBatchStatus(status: Option[RedisBatchUpload.BatchStatus],
                                               expiresAtMillis: Long,

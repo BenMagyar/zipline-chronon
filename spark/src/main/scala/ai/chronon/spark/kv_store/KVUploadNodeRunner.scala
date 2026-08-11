@@ -52,7 +52,8 @@ class KVUploadNodeRunner(api: Api) extends NodeRunner {
       val fetchContext = createFetchContext()
       val metadataStore = new MetadataStore(fetchContext)
       val putRequest = metadataStore.putJoinConf(join)
-      Await.result(putRequest, 1.hour)
+      val uploaded = Await.result(putRequest, 1.hour)
+      require(uploaded, s"KV store rejected Join metadata upload for $joinName")
       val duration = (System.currentTimeMillis() - startTime) / 1000
       logger.info(s"Successfully uploaded Join metadata for Join: $joinName in $duration seconds")
 

@@ -1,7 +1,18 @@
 package ai.chronon.integrations.redis
 
-import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, GroupByServingInfoKey, JoinFolder, ListEntityType, ListLimit, MetadataDataset}
-import ai.chronon.api.{PartitionSpec, TilingUtils}
+import ai.chronon.api.Constants.{
+  ContinuationKey,
+  GroupByFolder,
+  GroupByServingInfoKey,
+  JoinFolder,
+  ListEntityOnline,
+  ListEntityType,
+  ListKeysOnly,
+  ListLimit,
+  ListValuesAreKeysOnly,
+  MetadataDataset
+}
+import ai.chronon.api.{Join, MetaData, PartitionSpec, ThriftJsonCodec, TilingUtils}
 import ai.chronon.online.KVStore._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -27,6 +38,16 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
 
   private def leaseDeadlineBytes(seconds: Int = 300): Array[Byte] =
     (System.currentTimeMillis() + seconds * 1000L).toString.getBytes(StandardCharsets.UTF_8)
+
+  private def joinPut(name: String, online: Boolean, timestamp: Option[Long] = None): PutRequest = {
+    val join = new Join().setMetaData(new MetaData().setName(name).setOnline(online))
+    PutRequest(
+      s"$JoinFolder/$name".getBytes(StandardCharsets.UTF_8),
+      ThriftJsonCodec.toJsonStr(join).getBytes(StandardCharsets.UTF_8),
+      MetadataDataset,
+      timestamp
+    )
+  }
 
   private def listAll(kvStore: RedisKVStoreImpl,
                       dataset: String,
@@ -145,12 +166,13 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
 
   it should "store Chronon config metadata without expiry" in {
     val kvStore = new RedisKVStoreImpl(jedisCluster)
-    val key = "joins/example.join__1".getBytes(StandardCharsets.UTF_8)
+    val firstPut = joinPut("example.join__1", online = true)
+    val key = firstPut.keyBytes
     val redisKey = RedisKVStore.buildRedisKey(key.toSeq, MetadataDataset)
     val redisKeyBytes = redisKey.getBytes(StandardCharsets.UTF_8)
 
     Await.result(
-      kvStore.multiPut(Seq(PutRequest(key, "first".getBytes(StandardCharsets.UTF_8), MetadataDataset, None))),
+      kvStore.multiPut(Seq(firstPut)),
       10.seconds) shouldBe Seq(true)
     jedisCluster.ttl(redisKeyBytes) shouldBe -1L
 
@@ -158,9 +180,88 @@ class RedisKVStoreTest extends AnyFlatSpec with BeforeAndAfterAll with Matchers 
     jedisCluster.ttl(redisKeyBytes) should be > 0L
 
     Await.result(
-      kvStore.multiPut(Seq(PutRequest(key, "second".getBytes(StandardCharsets.UTF_8), MetadataDataset, None))),
+      kvStore.multiPut(Seq(joinPut("example.join__1", online = false))),
       10.seconds) shouldBe Seq(true)
     jedisCluster.ttl(redisKeyBytes) shouldBe -1L
+  }
+
+  it should "index uploaded online join versions by upload time without removing old entries" in {
+    val keyPrefix = "join-set-test"
+    val kvStore = new RedisKVStoreImpl(
+      jedisCluster,
+      Map(RedisKVStoreConstants.PropRedisKeyPrefix -> keyPrefix)
+    )
+    val indexKey = RedisKVStore.onlineJoinNamesIndexKey(keyPrefix)
+    val request = ListRequest(
+      MetadataDataset,
+      Map(ListEntityType -> JoinFolder, ListEntityOnline -> true, ListKeysOnly -> true)
+    )
+
+    Await.result(
+      kvStore.multiPut(
+        Seq(
+          joinPut("ranking.search.attempt__50", online = true, Some(1000L)),
+          joinPut("ranking.search.attempt__51", online = true, Some(2000L)),
+          joinPut("ranking.search.attempt__51", online = true, Some(3000L)),
+          joinPut("ranking.search.offline__1", online = false, Some(4000L))
+        )),
+      10.seconds
+    ) shouldBe Seq(true, true, true, true)
+
+    jedisCluster.zrange(indexKey, 0, -1).asScala.toSet shouldBe
+      Set("ranking.search.attempt__50", "ranking.search.attempt__51")
+    jedisCluster.zcard(indexKey) shouldBe 2L
+    jedisCluster.zscore(indexKey, "ranking.search.attempt__50") shouldBe 1000.0
+    jedisCluster.zscore(indexKey, "ranking.search.attempt__51") shouldBe 3000.0
+    jedisCluster.ttl(indexKey) shouldBe -1L
+
+    Await.result(
+      kvStore.multiPut(Seq(joinPut("ranking.search.attempt__51", online = true, Some(2500L)))),
+      10.seconds
+    ) shouldBe Seq(true)
+    jedisCluster.zscore(indexKey, "ranking.search.attempt__51") shouldBe 3000.0
+
+    val initial = Await.result(kvStore.list(request), 10.seconds)
+    initial.values.get.map(value => new String(value.keyBytes, StandardCharsets.UTF_8)).toSet shouldBe
+      Set("ranking.search.attempt__50", "ranking.search.attempt__51")
+    initial.values.get.foreach(_.valueBytes shouldBe empty)
+    initial.resultProps.get(ListValuesAreKeysOnly) shouldBe Some(true)
+
+    // Re-uploading an existing version as offline does not remove it from the append-only index.
+    Await.result(
+      kvStore.multiPut(Seq(joinPut("ranking.search.attempt__50", online = false, Some(5000L)))),
+      10.seconds
+    ) shouldBe Seq(true)
+    jedisCluster.zrange(indexKey, 0, -1).asScala.toSet shouldBe
+      Set("ranking.search.attempt__50", "ranking.search.attempt__51")
+    jedisCluster.zscore(indexKey, "ranking.search.attempt__50") shouldBe 1000.0
+  }
+
+  it should "paginate the online join index" in {
+    val kvStore = new RedisKVStoreImpl(jedisCluster)
+    val names = (0 until 25).map(index => f"ranking.search.join__$index%02d")
+    Await.result(kvStore.multiPut(names.map(name => joinPut(name, online = true))), 10.seconds).foreach(_ shouldBe true)
+
+    val listed = listAll(
+      kvStore,
+      MetadataDataset,
+      limit = 7,
+      props = Map(ListEntityType -> JoinFolder, ListEntityOnline -> true, ListKeysOnly -> true)
+    )
+    listed.map(value => new String(value.keyBytes, StandardCharsets.UTF_8)).toSet shouldBe names.toSet
+    listed.foreach(_.valueBytes shouldBe empty)
+  }
+
+  it should "fail a join metadata upload when its index cannot be updated" in {
+    val keyPrefix = "join-set-failure-test"
+    val kvStore = new RedisKVStoreImpl(
+      jedisCluster,
+      Map(RedisKVStoreConstants.PropRedisKeyPrefix -> keyPrefix)
+    )
+    jedisCluster.set(RedisKVStore.onlineJoinNamesIndexKey(keyPrefix), "wrong-type")
+
+    Await.result(kvStore.multiPut(Seq(joinPut("ranking.search.failed__1", online = true))), 10.seconds) shouldBe
+      Seq(false)
   }
 
   it should "list with pagination" in {
