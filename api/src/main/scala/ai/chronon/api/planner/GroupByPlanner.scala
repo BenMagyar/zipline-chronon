@@ -1,6 +1,6 @@
 package ai.chronon.api.planner
 
-import ai.chronon.api.{DataModel, GroupBy, PartitionSpec, Source, TableDependency, TableInfo}
+import ai.chronon.api.{DataModel, GroupBy, PartitionSpec, Source, TableDependency, TableInfo, ThriftJsonCodec}
 import ai.chronon.api.Extensions._
 import ai.chronon.planner.{
   ConfPlan,
@@ -75,7 +75,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
 
     val node = new GroupByBackfillNode().setGroupBy(eraseExecutionInfo)
 
-    toNode(metaData, _.setGroupByBackfill(node), semanticGroupBy(groupBy))
+    toGroupByNode(metaData, _.setGroupByBackfill(node))
   }
 
   private def semanticGroupBy(groupBy: GroupBy): GroupBy = {
@@ -95,6 +95,18 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
     semanticGroupBy
   }
 
+  private lazy val hashableGroupBy: GroupBy = semanticGroupBy(groupBy)
+  private lazy val naturalSemanticHashBase: String = ThriftJsonCodec.hexDigest(hashableGroupBy)
+  private lazy val semanticHashBaseOverride: Option[String] =
+    GroupByPlanner.semanticHashBaseOverride(groupBy, naturalSemanticHashBase)
+
+  private def toGroupByNode(metaData: ai.chronon.api.MetaData,
+                            contentSetter: ai.chronon.planner.NodeContent => Unit): Node = {
+    val node = toNode(metaData, contentSetter, hashableGroupBy)
+    semanticHashBaseOverride.foreach(replacementBase => node.setSemanticHash(metaData.mixGridToken(replacementBase)))
+    node
+  }
+
   def uploadNode: Node = {
     val stepDays = 1 // GBUs write out data per day
     val metaData =
@@ -105,7 +117,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
                           Some(stepDays))(confOutputPartitionSpec)
 
     val node = new GroupByUploadNode().setGroupBy(eraseExecutionInfo)
-    toNode(metaData, _.setGroupByUpload(node), semanticGroupBy(groupBy))
+    toGroupByNode(metaData, _.setGroupByUpload(node))
   }
 
   def uploadToKVNode: Node = {
@@ -128,7 +140,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
       )(confOutputPartitionSpec)
 
     val node = new GroupByUploadToKVNode().setGroupBy(eraseExecutionInfo)
-    toNode(metaData, _.setGroupByUploadToKV(node), semanticGroupBy(groupBy))
+    toGroupByNode(metaData, _.setGroupByUploadToKV(node))
   }
 
   def streamingNode: Option[Node] = {
@@ -156,7 +168,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
         )(confOutputPartitionSpec)
 
       val node = new GroupByStreamingNode().setGroupBy(eraseExecutionInfo)
-      toNode(metaData, _.setGroupByStreaming(node), semanticGroupBy(groupBy))
+      toGroupByNode(metaData, _.setGroupByStreaming(node))
     }
   }
 
@@ -187,4 +199,63 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
 object GroupByPlanner {
   val Streaming = "streaming"
   val UploadToKV = "uploadToKV"
+  val SemanticHashBaseOverride = "spark.chronon.planner.group_by.semantic_hash_base_override"
+
+  private val SemanticHashBaseOverridePattern = "^([^=]+)=([0-9a-f]{6})->([0-9a-f]{6})$".r
+  private val logger = org.slf4j.LoggerFactory.getLogger(getClass)
+
+  private def semanticHashBaseOverride(groupBy: GroupBy, naturalBase: String): Option[String] = {
+    val config = for {
+      metaData <- Option(groupBy.metaData)
+      executionInfo <- Option(metaData.executionInfo)
+      conf <- Option(executionInfo.conf)
+    } yield conf
+
+    config.flatMap { conf =>
+      val commonValue = Option(conf.common)
+        .filter(_.containsKey(SemanticHashBaseOverride))
+        .map(_.get(SemanticHashBaseOverride))
+      val modeValues = Option(conf.modeConfigs)
+        .toSeq
+        .flatMap(_.asScala.toSeq)
+        .flatMap { case (mode, values) =>
+          Option(values)
+            .filter(_.containsKey(SemanticHashBaseOverride))
+            .map(mode -> _.get(SemanticHashBaseOverride))
+        }
+
+      require(
+        commonValue.nonEmpty || modeValues.isEmpty,
+        s"$SemanticHashBaseOverride must be set in common config for GroupBy ${groupBy.metaData.name}; mode-only overrides are not allowed"
+      )
+
+      commonValue.foreach { common =>
+        val conflictingModes = modeValues.collect { case (mode, value) if value != common => mode }.sorted
+        require(
+          conflictingModes.isEmpty,
+          s"$SemanticHashBaseOverride must have the same value in common config and all mode configs for GroupBy ${groupBy.metaData.name}; conflicting modes: ${conflictingModes.mkString(", ")}"
+        )
+      }
+
+      commonValue.map {
+        case SemanticHashBaseOverridePattern(configuredName, expectedBase, replacementBase) =>
+          require(
+            configuredName == groupBy.metaData.name,
+            s"$SemanticHashBaseOverride targets GroupBy $configuredName but is configured on ${groupBy.metaData.name}"
+          )
+          require(
+            expectedBase == naturalBase,
+            s"$SemanticHashBaseOverride expected natural base $expectedBase for GroupBy $configuredName, but planner computed $naturalBase"
+          )
+          logger.warn(
+            s"Applying guarded semantic hash base override for GroupBy $configuredName: $naturalBase -> $replacementBase"
+          )
+          replacementBase
+        case value =>
+          throw new IllegalArgumentException(
+            s"Invalid $SemanticHashBaseOverride value '$value'; expected <fully-qualified-versioned-name>=<expected-natural-6hex>-><replacement-6hex>"
+          )
+      }
+    }
+  }
 }

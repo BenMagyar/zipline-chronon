@@ -1,6 +1,17 @@
 package ai.chronon.api.test.planner
 
-import ai.chronon.api.{Accuracy, Aggregation, Builders, EnvironmentVariables, GroupBy, Operation, PartitionSpec, TableInfo}
+import ai.chronon.api.{
+  Accuracy,
+  Aggregation,
+  Builders,
+  ConfigProperties,
+  EnvironmentVariables,
+  GroupBy,
+  Operation,
+  PartitionSpec,
+  TableInfo,
+  ThriftJsonCodec
+}
 import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, WindowUtils}
 import ai.chronon.api.planner.{GroupByPlanner, LocalRunner}
 import ai.chronon.api.test.planner.GroupByPlannerTest.buildGroupBy
@@ -44,6 +55,41 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     query.setPartitionInterval(WindowUtils.fromMillis(spec.spanMillis))
     if (spec.offsetMillis != 0) query.setPartitionOffset(WindowUtils.fromMillis(spec.offsetMillis))
     groupBy.setSources(Seq(Builders.Source.events(query, table = "my_user_events")).asJava)
+    groupBy
+  }
+
+  private def naturalSemanticHashBase(groupBy: GroupBy): String = {
+    val hashable = groupBy.deepCopy()
+    hashable.unsetMetaData()
+    Option(hashable.sources).foreach { sources =>
+      sources.forEach { source =>
+        if (source.isSetEvents) source.getEvents.unsetTopic()
+        else if (source.isSetEntities) source.getEntities.unsetMutationTopic()
+      }
+    }
+    hashable.unsetKeyFiltersRecursively()
+    ThriftJsonCodec.hexDigest(hashable)
+  }
+
+  private def withSemanticHashBaseOverride(groupBy: GroupBy,
+                                           expectedBase: String,
+                                           replacementBase: String,
+                                           common: Boolean = true,
+                                           modeValues: Map[String, String] = Map.empty): GroupBy = {
+    val value = s"${groupBy.metaData.name}=$expectedBase->$replacementBase"
+    val conf = Option(groupBy.metaData.executionInfo.conf).map(_.deepCopy()).getOrElse(new ConfigProperties())
+    if (common) {
+      val commonConf = Option(conf.common).map(_.asScala.toMap).getOrElse(Map.empty)
+      conf.setCommon((commonConf + (GroupByPlanner.SemanticHashBaseOverride -> value)).asJava)
+    }
+    if (modeValues.nonEmpty) {
+      conf.setModeConfigs(
+        modeValues.map { case (mode, modeValue) =>
+          mode -> Map(GroupByPlanner.SemanticHashBaseOverride -> modeValue).asJava
+        }.asJava
+      )
+    }
+    groupBy.metaData.executionInfo.setConf(conf)
     groupBy
   }
 
@@ -326,6 +372,97 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     val firstSemanticHashes = firstPlan.nodes.asScala.map(_.semanticHash)
     val secondSemanticHashes = secondPlan.nodes.asScala.map(_.semanticHash)
     firstSemanticHashes should equal(secondSemanticHashes)
+  }
+
+  it should "apply a guarded semantic hash base override to all GroupBy nodes before grid mixing" in {
+    val gb = withOutputSpec(withEventSourceSpec(buildGroupBy(), offsetDailySpec), offsetDailySpec)
+    gb.sources.get(0).getEvents.setTopic("my_user_events_topic")
+    val plain = gb.deepCopy()
+    val naturalBase = naturalSemanticHashBase(gb)
+    withSemanticHashBaseOverride(gb, naturalBase, "9d3e13")
+
+    val plan = GroupByPlanner(gb).buildPlan
+    val groupByNodes = plan.nodes.asScala.filterNot(_.content.isSetExternalSourceSensor)
+
+    groupByNodes should have size 4
+    all(groupByNodes.map(_.semanticHash)) should equal("D2eCB7fUa_s")
+    gb.semanticHash should equal(plain.semanticHash)
+
+    val priceEscape = plain.deepCopy()
+    withSemanticHashBaseOverride(priceEscape, naturalSemanticHashBase(priceEscape), "8816ce")
+    val priceNodes = GroupByPlanner(priceEscape).buildPlan.nodes.asScala.filterNot(_.content.isSetExternalSourceSensor)
+    all(priceNodes.map(_.semanticHash)) should equal("vrDqVPO_sP4")
+  }
+
+  it should "leave sensors and GroupBy nodes without an override unchanged" in {
+    val plain = buildGroupBy(includeTopic = true)
+    val overridden = plain.deepCopy()
+    val naturalBase = naturalSemanticHashBase(overridden)
+    withSemanticHashBaseOverride(overridden, naturalBase, "9d3e13")
+
+    val plainPlan = GroupByPlanner(plain).buildPlan
+    val overriddenPlan = GroupByPlanner(overridden).buildPlan
+    val plainSensors = plainPlan.nodes.asScala.filter(_.content.isSetExternalSourceSensor).map(_.semanticHash)
+    val overriddenSensors = overriddenPlan.nodes.asScala.filter(_.content.isSetExternalSourceSensor).map(_.semanticHash)
+    val plainGroupByHashes = plainPlan.nodes.asScala.filterNot(_.content.isSetExternalSourceSensor).map(_.semanticHash)
+
+    plainSensors should equal(overriddenSensors)
+    all(plainGroupByHashes) should equal(naturalBase)
+  }
+
+  it should "accept identical compiler-propagated mode copies" in {
+    val gb = buildGroupBy(includeTopic = true)
+    val naturalBase = naturalSemanticHashBase(gb)
+    val value = s"${gb.metaData.name}=$naturalBase->9d3e13"
+    withSemanticHashBaseOverride(
+      gb,
+      naturalBase,
+      "9d3e13",
+      modeValues = Map("group_by" -> value, "upload" -> value, "upload-to-kv" -> value, "streaming" -> value)
+    )
+
+    noException should be thrownBy GroupByPlanner(gb).buildPlan
+  }
+
+  it should "reject malformed, mis-targeted, and stale semantic hash base overrides" in {
+    def overridden(value: String): GroupBy = {
+      val gb = buildGroupBy()
+      gb.metaData.executionInfo.setConf(
+        new ConfigProperties().setCommon(Map(GroupByPlanner.SemanticHashBaseOverride -> value).asJava))
+      gb
+    }
+
+    val naturalBase = naturalSemanticHashBase(buildGroupBy())
+    val cases = Seq(
+      "not-an-override" -> "Invalid",
+      s"some_other_group_by=$naturalBase->9d3e13" -> "targets GroupBy",
+      "user_charges=abcdef->9d3e13" -> "planner computed",
+      s"user_charges=${naturalBase.toUpperCase}->9d3e13" -> "Invalid"
+    )
+
+    cases.foreach { case (value, message) =>
+      val error = the[IllegalArgumentException] thrownBy GroupByPlanner(overridden(value)).buildPlan
+      error.getMessage should include(message)
+    }
+  }
+
+  it should "reject mode-only and conflicting mode semantic hash base overrides" in {
+    val modeOnly = buildGroupBy()
+    val naturalBase = naturalSemanticHashBase(modeOnly)
+    val value = s"${modeOnly.metaData.name}=$naturalBase->9d3e13"
+    withSemanticHashBaseOverride(modeOnly, naturalBase, "9d3e13", common = false, modeValues = Map("upload" -> value))
+    val modeOnlyError = the[IllegalArgumentException] thrownBy GroupByPlanner(modeOnly).buildPlan
+    modeOnlyError.getMessage should include("mode-only overrides are not allowed")
+
+    val conflicting = buildGroupBy()
+    withSemanticHashBaseOverride(
+      conflicting,
+      naturalSemanticHashBase(conflicting),
+      "9d3e13",
+      modeValues = Map("streaming" -> s"${conflicting.metaData.name}=${naturalSemanticHashBase(conflicting)}->8816ce")
+    )
+    val conflictError = the[IllegalArgumentException] thrownBy GroupByPlanner(conflicting).buildPlan
+    conflictError.getMessage should include("conflicting modes: streaming")
   }
 
   it should "GB planner uploadToKV node should have correct table dependencies" in {
