@@ -52,6 +52,11 @@ object CatalystUtil {
       // The default doesn't seem to be set properly in the scala 2.13 version of spark
       // running into this issue https://github.com/dotnet/spark/issues/435
       .config("spark.driver.bindAddress", "127.0.0.1")
+      // advertise the same address we bind: with bindAddress alone the session
+      // advertises the machine hostname, and when another local[*] test session
+      // reuses this one via getOrCreate in an environment where the hostname does
+      // not resolve to loopback (CI containers), shuffles fail to connect
+      .config("spark.driver.host", "127.0.0.1")
       .config(SQLConf.DATETIME_JAVA8API_ENABLED.key, true)
       .config(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, false)
       // required for Hive UDF support

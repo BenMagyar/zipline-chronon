@@ -386,6 +386,15 @@ trait BaseTestModule extends ScalaModule with TestModule.ScalaTest {
 
   // Enable parallel test execution using Mill's testParallelism
   def testParallelism = true
+
+  // Suites whose class name contains any of these run in their own forked JVM.
+  // Used to isolate suites that own a process-wide SparkSession from suites that
+  // would otherwise inherit it via getOrCreate (order-dependent contamination).
+  def isolatedTestSuites: Seq[String] = Seq.empty
+  override def testForkGrouping = Task {
+    val (isolated, rest) = discoveredTestClasses().partition(c => isolatedTestSuites.exists(c.contains))
+    isolated.map(Seq(_)) ++ (if (rest.nonEmpty) Seq(rest) else Seq.empty)
+  }
 }
 
 // JUnit 5 test module configuration (for Java tests)
