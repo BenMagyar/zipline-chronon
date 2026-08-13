@@ -26,6 +26,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,6 +53,7 @@ public class FetcherVerticle extends AbstractVerticle {
 
     private HttpServer server;
     private WorkerExecutor fetchWorkerExecutor;
+    private OnlineJoinWarmupMonitor onlineJoinWarmupMonitor;
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
@@ -79,14 +81,23 @@ public class FetcherVerticle extends AbstractVerticle {
                 // or timed-out warmup is discarded before fail-open readiness.
                 FetcherWarmup.runForWorkerReuse(vertx, fetcher, cfgStore, warmupWorkerExecutor)
                     .onComplete(ar -> {
+                        Set<String> startupWarmedJoinNames = Set.of();
                         if (ar.succeeded()) {
                             fetchWorkerExecutor = executorToClose;
+                            startupWarmedJoinNames = ar.result().warmedJoinNames();
                         } else {
                             logger.warn("Warmup stopped early; continuing startup with a fresh initiation pool", ar.cause());
                             executorToClose.close();
                         }
                         try {
-                            startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
+                            startHttpServer(
+                                    cfgStore.getServerPort(),
+                                    cfgStore.encodeConfig(),
+                                    api,
+                                    fetcher,
+                                    startPromise,
+                                    cfgStore.getWarmupGroups(),
+                                    startupWarmedJoinNames);
                         } catch (Exception e) {
                             closeFetchWorkerExecutor();
                             startPromise.fail(e);
@@ -201,7 +212,14 @@ public class FetcherVerticle extends AbstractVerticle {
         return parseWarmupJars(configured);
     }
 
-    protected void startHttpServer(int port, String configJsonString, Api api, JavaFetcher fetcher, Promise<Void> startPromise) throws Exception {
+    protected void startHttpServer(
+            int port,
+            String configJsonString,
+            Api api,
+            JavaFetcher fetcher,
+            Promise<Void> startPromise,
+            List<ConfigStore.WarmupGroup> warmupGroups,
+            Set<String> startupWarmedJoinNames) throws Exception {
         Router router = Router.router(vertx);
         createFetchWorkerExecutor();
 
@@ -261,6 +279,13 @@ public class FetcherVerticle extends AbstractVerticle {
                 .listen(port)
                 .onSuccess(server -> {
                     logger.info("HTTP server started on port {}", server.actualPort());
+                    try {
+                        onlineJoinWarmupMonitor = OnlineJoinWarmupMonitor.startIfEnabled(
+                                vertx, fetcher, warmupGroups, startupWarmedJoinNames);
+                    } catch (Exception error) {
+                        // Discovery is an optimization for future Join publications; it must not affect readiness.
+                        logger.warn("Unable to start online Join warmup discovery; continuing without it", error);
+                    }
                     startPromise.complete();
                 })
                 .onFailure(err -> {
@@ -305,9 +330,17 @@ public class FetcherVerticle extends AbstractVerticle {
         }
     }
 
+    private void closeOnlineJoinWarmupMonitor() {
+        if (onlineJoinWarmupMonitor != null) {
+            onlineJoinWarmupMonitor.close();
+            onlineJoinWarmupMonitor = null;
+        }
+    }
+
     @Override
     public void stop(Promise<Void> stopPromise) {
         logger.info("Stopping HTTP server...");
+        closeOnlineJoinWarmupMonitor();
         if (server != null) {
             server.close()
                     .onSuccess(v -> {

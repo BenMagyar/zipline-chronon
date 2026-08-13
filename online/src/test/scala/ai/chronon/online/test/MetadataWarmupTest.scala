@@ -3,12 +3,13 @@ package ai.chronon.online.test
 import ai.chronon.api.Extensions.{GroupByOps, JoinOps}
 import ai.chronon.api.{Builders, Constants, GroupBy, MetaData, ThriftJsonCodec}
 import ai.chronon.online.KVStore.{GetRequest, GetResponse, PutRequest}
-import ai.chronon.online.fetcher.{FetchContext, MetadataStore}
+import ai.chronon.online.fetcher.{FetchContext, Fetcher, MetadataStore}
 import ai.chronon.online.InMemoryKvStore
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.Collections
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, Future}
@@ -102,5 +103,46 @@ class MetadataWarmupTest extends AnyFlatSpec with Matchers {
     (0 until 100).foreach(_ => metadata.getGroupByServingInfo("unit.metadata.missing").isFailure shouldBe true)
     metadata.buildJoinCodec(join, refreshOnFail = true).hasPartialFailure shouldBe true
     kv.multiGetCalls.get() shouldBe callsAfterWarmup
+  }
+
+  it should "leave an incompletely published online join retryable for background schema preparation" in {
+    val kv = new CountingKvStore()
+    kv.create(Constants.MetadataDataset)
+
+    val servingInfo = GroupByDerivationsTest.makeTestGroupByServingInfoParsed().groupByServingInfo
+    servingInfo.groupBy.metaData.setName("unit.metadata.late")
+    val groupBy = servingInfo.groupBy
+    val join = Builders.Join(
+      metaData = Builders.MetaData(name = "unit.metadata.new_join", online = true),
+      left = Builders.Source.events(Builders.Query(), "unit.requests"),
+      joinParts = Seq(Builders.JoinPart(groupBy))
+    )
+    put(
+      kv,
+      PutRequest(
+        new JoinOps(join).keyNameForKvStore.getBytes(Constants.UTF8),
+        ThriftJsonCodec.toJsonStr(join).getBytes(Constants.UTF8),
+        Constants.MetadataDataset
+      )
+    )
+
+    val fetcher = new Fetcher(kv, Constants.MetadataDataset, timeoutMillis = 1000L)
+    an[IllegalStateException] should be thrownBy
+      fetcher.prepareJoinFastSerdeBackground(Collections.singletonList(join.metaData.name), 5000L)
+
+    val dataset = new GroupByOps(groupBy).batchDataset
+    kv.create(dataset)
+    put(
+      kv,
+      PutRequest(
+        Constants.GroupByServingInfoKey.getBytes(Constants.UTF8),
+        ThriftJsonCodec.toJsonStr(servingInfo).getBytes(Constants.UTF8),
+        dataset
+      )
+    )
+
+    noException should be thrownBy
+      fetcher.prepareJoinFastSerdeBackground(Collections.singletonList(join.metaData.name), 30000L)
+    fetcher.joinCodecCache(join.metaData.name).get.hasPartialFailure shouldBe false
   }
 }

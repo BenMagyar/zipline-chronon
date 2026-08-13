@@ -310,7 +310,17 @@ class Fetcher(val kvStore: KVStore,
   )
 
   /** Compile serving readers, key writers, and V2 response writers before accepting production traffic. */
-  def prepareJoinFastSerde(joinNames: java.util.List[String], timeoutMillis: Long): Unit = {
+  def prepareJoinFastSerde(joinNames: java.util.List[String], timeoutMillis: Long): Unit =
+    prepareJoinFastSerde(joinNames, timeoutMillis, prepareWorkerCodecs = true, requireCompleteMetadata = false)
+
+  /** Prepare a newly published Join after readiness without occupying every live fetch worker at a startup barrier. */
+  def prepareJoinFastSerdeBackground(joinNames: java.util.List[String], timeoutMillis: Long): Unit =
+    prepareJoinFastSerde(joinNames, timeoutMillis, prepareWorkerCodecs = false, requireCompleteMetadata = true)
+
+  private def prepareJoinFastSerde(joinNames: java.util.List[String],
+                                   timeoutMillis: Long,
+                                   prepareWorkerCodecs: Boolean,
+                                   requireCompleteMetadata: Boolean): Unit = {
     require(timeoutMillis > 0L, s"Fetcher warmup timeout must be positive, got $timeoutMillis")
     val startedAt = System.currentTimeMillis()
     val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
@@ -332,6 +342,15 @@ class Fetcher(val kvStore: KVStore,
         s"Metadata warmup completed with ${metadataWarmup.failures.size} failure(s): " +
           metadataWarmup.failures.mkString("; ")
       )
+    }
+    val metadataMissing = metadataWarmup.missingJoinNames.size + metadataWarmup.missingGroupByNames.size
+    if (requireCompleteMetadata && (metadataMissing > 0 || metadataWarmup.failures.nonEmpty)) {
+      // Do not construct and cache a partial JoinCodec while an online publication is still becoming visible. The
+      // discovery monitor leaves this name retryable; once all serving metadata exists, its next pass builds the
+      // complete codec directly instead of first having to replace a partial one.
+      throw new IllegalStateException(
+        s"Background Join preparation incomplete: metadataMissing=$metadataMissing, " +
+          s"metadataFailures=${metadataWarmup.failures.size}")
     }
 
     val codecResults = distinctJoinNames.map { name =>
@@ -360,8 +379,10 @@ class Fetcher(val kvStore: KVStore,
         codecs.flatMap { case (_, codec) => Seq(codec.keyCodec.schemaStr, codec.valueCodec.schemaStr) }
 
     val result = AvroCodec.prepareFastSerde(readerSchemas, writerSchemas, remainingMillis())
-    val preparedWorkerCount = prepareWorkerFastSerde(readerSchemas, writerSchemas, deadlineNanos)
+    val preparedWorkerCount =
+      if (prepareWorkerCodecs) prepareWorkerFastSerde(readerSchemas, writerSchemas, deadlineNanos) else 0
     val codecFailureCount = codecResults.count(_._2.isFailure)
+    val partialCodecNames = codecs.collect { case (name, codec) if codec.hasPartialFailure => name }
     logger.info(
       s"FastSerde preparation complete for ${codecs.size}/${distinctJoinNames.size} join(s) and " +
         s"${servingInfosByName.size}/${metadataWarmup.groupByNames.size} GroupBy(s): " +
@@ -371,6 +392,18 @@ class Fetcher(val kvStore: KVStore,
         s"metadataFailures=${metadataWarmup.failures.size}, codecFailures=$codecFailureCount, " +
         s"preparedWorkers=$preparedWorkerCount, " +
         s"elapsedMs=${System.currentTimeMillis() - startedAt}")
+
+    if (requireCompleteMetadata) {
+      // A Join can be indexed online before every referenced GroupBy serving-info value is visible. A partial codec is
+      // useful to fail open for live traffic, but it is not a completed background warmup. Trigger its normal cache
+      // rebuild after the metadata bulk-prime and leave the name retryable for the next discovery pass.
+      partialCodecNames.foreach(joinCodecCache.force)
+      if (codecFailureCount > 0 || partialCodecNames.nonEmpty) {
+        throw new IllegalStateException(
+          s"Background Join preparation incomplete: codecFailures=$codecFailureCount, " +
+            s"partialCodecs=${partialCodecNames.mkString(",")}")
+      }
+    }
   }
 
   /** Initialize every production fetcher's thread-local codec objects after generated classes are ready.

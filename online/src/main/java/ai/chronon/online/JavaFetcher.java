@@ -224,6 +224,10 @@ public class JavaFetcher {
     this.fetcher.prepareJoinFastSerde(joinNames, timeoutMillis);
   }
 
+  public void prepareJoinFastSerdeBackground(List<String> joinNames, long timeoutMillis) {
+    this.fetcher.prepareJoinFastSerdeBackground(joinNames, timeoutMillis);
+  }
+
   public CompletableFuture<List<JavaResponse>> fetchModelTransforms(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
     return wrapResponses(this.fetcher.fetchModelTransforms(toScalaRequests(requests, false, startTs)), false, startTs);

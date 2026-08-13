@@ -21,6 +21,7 @@ import org.mockito.MockitoAnnotations;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -241,6 +242,26 @@ public class FetcherWarmupTest {
                     ctx.assertTrue(ar.failed());
                     ctx.assertEquals("compiler unavailable", ar.cause().getMessage());
                     verify(mockFetcher, never()).fetchJoinBase64Avro(anyList());
+                    async.complete();
+                });
+    }
+
+    @Test
+    public void testWorkerReuseReportsOnlyMatchedWarmedJoins(TestContext ctx) {
+        Async async = ctx.async();
+        String joinName = "aws.demo.test_sched_v1__1";
+        when(mockCfgStore.getWarmupGroups()).thenReturn(List.of(
+                new ConfigStore.WarmupGroup("aws\\.demo\\.test_sched_v1__1", PAYLOAD_USER)
+        ));
+        when(mockCfgStore.getWarmupTimesPerJoin()).thenReturn(1);
+        when(mockFetcher.listJoins(true)).thenReturn(CompletableFuture.completedFuture(ALL_JOINS));
+        when(mockFetcher.fetchJoinBase64Avro(anyList())).thenReturn(
+                CompletableFuture.completedFuture(List.of(successResponse(joinName))));
+
+        FetcherWarmup.runForWorkerReuse(vertx, mockFetcher, mockCfgStore, null)
+                .onComplete(ar -> {
+                    ctx.assertTrue(ar.succeeded());
+                    ctx.assertEquals(Set.of(joinName), ar.result().warmedJoinNames());
                     async.complete();
                 });
     }
@@ -546,7 +567,9 @@ public class FetcherWarmupTest {
         verify(mockFetcher, never()).fetchJoinBase64AvroWarmup(anyList(), eq(true));
         verify(mockFetcher, never()).fetchJoinBase64Avro(anyList());
         verify(mockFetcher, times(2)).fetchJoinBase64AvroWarmup(argThat(requests ->
-                requests.size() == 50 && requests.stream().map(request -> request.atMillis).distinct().count() == 50),
+                requests.size() == 50
+                        && requests.stream().allMatch(request -> request.atMillis == null)
+                        && requests.stream().map(request -> request.keys).distinct().count() == 1),
                 eq(false));
 
         warmup.onComplete(ar -> {

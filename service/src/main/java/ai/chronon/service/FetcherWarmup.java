@@ -14,7 +14,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -33,6 +36,18 @@ public class FetcherWarmup {
     private static final long FETCH_TIMEOUT_SECONDS = 30L;
     private static final long FAST_SERDE_PREPARATION_TIMEOUT_SECONDS = 60L;
 
+    static final class Result {
+        private final Set<String> warmedJoinNames;
+
+        Result(Collection<String> warmedJoinNames) {
+            this.warmedJoinNames = Set.copyOf(new LinkedHashSet<>(warmedJoinNames));
+        }
+
+        Set<String> warmedJoinNames() {
+            return warmedJoinNames;
+        }
+    }
+
     public static Future<Void> run(Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore) {
         return run(vertx, fetcher, cfgStore, null);
     }
@@ -40,10 +55,12 @@ public class FetcherWarmup {
     public static Future<Void> run(
             Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
         try {
-            return doRun(vertx, fetcher, cfgStore, fetchWorkerExecutor)
+            Future<Void> completed = doRun(vertx, fetcher, cfgStore, fetchWorkerExecutor)
+                    .map(ignored -> (Void) null);
+            return completed
                     .recover(error -> {
                         logger.warn("Warmup stopped early; continuing startup", error);
-                        return Future.succeededFuture();
+                        return Future.<Void>succeededFuture();
                     });
         } catch (Exception e) {
             logger.warn("Warmup encountered an unexpected error, continuing startup", e);
@@ -52,7 +69,7 @@ public class FetcherWarmup {
     }
 
     /** Raw warmup outcome for lifecycle owners that must decide whether a worker pool is safe to reuse. */
-    static Future<Void> runForWorkerReuse(
+    static Future<Result> runForWorkerReuse(
             Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
         try {
             return doRun(vertx, fetcher, cfgStore, fetchWorkerExecutor);
@@ -61,12 +78,12 @@ public class FetcherWarmup {
         }
     }
 
-    private static Future<Void> doRun(
+    private static Future<Result> doRun(
             Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
         List<ConfigStore.WarmupGroup> groups = validateGroups(cfgStore.getWarmupGroups());
         if (groups.isEmpty()) {
             logger.info("No warmup groups configured, skipping warmup");
-            return Future.succeededFuture();
+            return Future.succeededFuture(new Result(List.of()));
         }
 
         int configuredTimesPerJoin = cfgStore.getWarmupTimesPerJoin();
@@ -83,20 +100,22 @@ public class FetcherWarmup {
                 groups.size(), configuredTimesPerJoin, timesPerJoin, concurrency, requestBatchSize);
 
         return listJoinsWithRetry(vertx, fetcher, LIST_JOINS_MAX_RETRIES, LIST_JOINS_RETRY_DELAY_MS, 0)
-                .compose(allJoins -> prepareFastSerde(
-                                vertx, fetchWorkerExecutor, fetcher, matchingJoins(allJoins, groups))
-                        .map(allJoins))
-                .compose(allJoins -> fireAllGroups(
-                        vertx,
-                        fetchWorkerExecutor,
-                        fetcher,
-                        allJoins,
-                        groups,
-                        timesPerJoin,
-                        concurrency,
-                        requestBatchSize,
-                        runRedisWarmupPhases,
-                        warmupStart));
+                .compose(allJoins -> {
+                    List<String> matchedJoins = matchingJoins(allJoins, groups);
+                    return prepareFastSerde(vertx, fetchWorkerExecutor, fetcher, matchedJoins)
+                            .compose(ignored -> fireAllGroups(
+                                    vertx,
+                                    fetchWorkerExecutor,
+                                    fetcher,
+                                    allJoins,
+                                    groups,
+                                    timesPerJoin,
+                                    concurrency,
+                                    requestBatchSize,
+                                    runRedisWarmupPhases,
+                                    warmupStart))
+                            .map(new Result(matchedJoins));
+                });
     }
 
     private static List<String> matchingJoins(List<String> allJoins, List<ConfigStore.WarmupGroup> groups) {
@@ -128,7 +147,7 @@ public class FetcherWarmup {
     }
 
     // Validates and filters groups — skips any with an invalid payload with a warning.
-    private static List<ConfigStore.WarmupGroup> validateGroups(List<ConfigStore.WarmupGroup> groups) {
+    static List<ConfigStore.WarmupGroup> validateGroups(List<ConfigStore.WarmupGroup> groups) {
         List<ConfigStore.WarmupGroup> valid = new ArrayList<>();
         for (ConfigStore.WarmupGroup group : groups) {
             try {
@@ -296,14 +315,12 @@ public class FetcherWarmup {
             return requests;
         }
         List<JavaRequest> expanded = new ArrayList<>(minimumSize);
-        long baseTimestamp = requests.get(0).atMillis == null
-                ? System.currentTimeMillis()
-                : requests.get(0).atMillis;
         for (int index = 0; index < minimumSize; index++) {
-            // Keep configured entity keys exact; unique, adjacent timestamps prevent response fan-out from collapsing
-            // the repeated rows while avoiding fabricated entity IDs and deliberate Redis misses.
+            // Keep every authored key and timestamp exact. Repeating the outer rows exercises 50-row response fan-out
+            // and V2 encoding, while normal JoinPart deduplication prevents one representative entity from becoming
+            // 50 independent GroupBy/Redis reads. Multiple authored rows remain independently represented.
             JavaRequest template = requests.get(index % requests.size());
-            expanded.add(new JavaRequest(template.name, template.keys, baseTimestamp - index));
+            expanded.add(new JavaRequest(template.name, template.keys, template.atMillis));
         }
         return expanded;
     }

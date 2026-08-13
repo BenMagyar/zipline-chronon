@@ -299,13 +299,13 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
 
     val groupByRequests: Seq[Request] =
       if (deduplicateGroupByRequests) {
-        // One representative request per unique (name, keys, atMillis) — first occurrence wins.
+        // One representative request per unique (name, keys, atMillis) — first occurrence wins. Startup repeats outer
+        // rows to exercise response fan-out but retains authored timestamps, so its normal dedup also lands here.
         val uniqueGroupByRequests = mutable.LinkedHashMap.empty[GroupByKey, Request]
         allGroupByRequests.foreach(request => uniqueGroupByRequests.getOrElseUpdate(groupByKey(request), request))
         uniqueGroupByRequests.values.toSeq
       } else {
-        // Startup warmup uses the real configured keys but retains every outer row so GLIDE command planning,
-        // response decoding, fan-out, and V2 encoding see a production-sized batch before readiness.
+        // Retain this explicit opt-out for separately compiled callers; the fetcher warmup does not use it.
         allGroupByRequests.toVector
       }
 
