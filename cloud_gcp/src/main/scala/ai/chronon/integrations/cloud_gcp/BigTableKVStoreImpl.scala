@@ -373,10 +373,10 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
         val timestampInPutRequest = request.tsMillis.getOrElse(System.currentTimeMillis())
 
         val (rowKey, timestamp) = (request.tsMillis, tableType) match {
-          case (Some(ts), StreamingTable) =>
+          case (Some(_), StreamingTable) =>
             val tileKey = TilingUtils.deserializeTileKey(request.keyBytes)
             val baseKeyBytes = tileKey.keyBytes.asScala.map(_.toByte).toSeq
-            (buildTiledRowKey(baseKeyBytes, request.dataset, ts, tileKey.tileSizeMillis),
+            (buildTiledRowKey(baseKeyBytes, request.dataset, tileKey.tileStartTimestampMillis, tileKey.tileSizeMillis),
              tileKey.tileStartTimestampMillis)
           case _ =>
             (buildRowKey(request.keyBytes, request.dataset), timestampInPutRequest)

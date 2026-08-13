@@ -348,6 +348,35 @@ class BigTableKVStoreTest extends AnyFlatSpec with BeforeAndAfter {
     validateTimeSeriesValueExpectedPayload(getResult1.head, expectedTiles, expectedPayload)
   }
 
+  it should "keep updates to an offset daily tile in one bucket across midnight" in {
+    val dataset = "GROUPBY_STREAMING"
+    val kvStore = new BigTableKVStoreImpl(dataClient, adminClient)
+    kvStore.create(dataset)
+
+    val tileStart = java.time.Instant.parse("2024-10-04T01:00:00Z").toEpochMilli
+    val beforeMidnight = java.time.Instant.parse("2024-10-04T23:30:00Z").toEpochMilli
+    val afterMidnight = java.time.Instant.parse("2024-10-05T00:30:00Z").toEpochMilli
+    val tileKey = TilingUtils.buildTileKey(dataset, "my_key".getBytes, Some(1.day.toMillis), Some(tileStart))
+    val tileKeyBytes = TilingUtils.serializeTileKey(tileKey)
+
+    Await.result(kvStore.multiPut(Seq(PutRequest(tileKeyBytes, "before".getBytes, dataset, Some(beforeMidnight)))),
+                 1.second) shouldBe Seq(true)
+    Await.result(kvStore.multiPut(Seq(PutRequest(tileKeyBytes, "after".getBytes, dataset, Some(afterMidnight)))),
+                 1.second) shouldBe Seq(true)
+
+    val readTileKey = TilingUtils.buildTileKey(dataset, "my_key".getBytes, Some(1.day.toMillis), None)
+    val request = GetRequest(
+      TilingUtils.serializeTileKey(readTileKey),
+      dataset,
+      Some(tileStart),
+      Some(tileStart + 1.day.toMillis)
+    )
+    val values = Await.result(kvStore.multiGet(Seq(request)), 1.second).head.values.get
+
+    values.map(_.millis) shouldBe Seq(tileStart)
+    new String(values.head.bytes, StandardCharsets.UTF_8) shouldBe "after"
+  }
+
   // Test write and query of a simple tiled dataset across multiple days
   it should "streaming tiled query_multiple days" in {
     val dataset = "GROUPBY_STREAMING"

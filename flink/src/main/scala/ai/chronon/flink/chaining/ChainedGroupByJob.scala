@@ -1,6 +1,5 @@
 package ai.chronon.flink.chaining
 
-import ai.chronon.aggregator.windowing.ResolutionUtils
 import ai.chronon.api.Extensions.GroupByOps
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api._
@@ -165,12 +164,12 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
     val postTransformationSchema = computePostTransformationSchemaWithCatalyst(joinSource, inputSchema)
 
     // Calculate tiling window size based on the GroupBy configuration
-    val tilingWindowSizeInMillis: Long =
-      ResolutionUtils.getSmallestTailHopMillis(groupByServingInfoParsed.groupBy)
+    val tilingWindowGrid = groupByServingInfoParsed.streamingTileGrid
+    val tilingWindowSizeInMillis = tilingWindowGrid.spanMillis
 
     // Configure tumbling window for tiled aggregations
     val window = TumblingEventTimeWindows
-      .of(Time.milliseconds(tilingWindowSizeInMillis))
+      .of(Time.milliseconds(tilingWindowSizeInMillis), Time.milliseconds(tilingWindowGrid.offsetMillis))
       .asInstanceOf[WindowAssigner[ProjectedEvent, TimeWindow]]
 
     // Configure trigger (default to always fire on element)

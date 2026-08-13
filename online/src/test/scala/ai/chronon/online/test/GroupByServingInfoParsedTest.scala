@@ -1,6 +1,8 @@
 package ai.chronon.online.test
 
-import ai.chronon.api.{GroupBy, GroupByServingInfo, TimeUnit, Window}
+import ai.chronon.api.Extensions.WindowOps
+import ai.chronon.api.ScalaJavaConversions._
+import ai.chronon.api.{Builders, GroupBy, GroupByServingInfo, Operation, TimeUnit, Window}
 import ai.chronon.online.GroupByServingInfoParsed
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -36,6 +38,29 @@ class GroupByServingInfoParsedTest extends AnyFlatSpec with Matchers {
       .setPartitionInterval(new Window(3, TimeUnit.HOURS))
       .setPartitionOffset(new Window(1, TimeUnit.HOURS))
     new GroupByServingInfoParsed(subDaily).batchEndTsMillis should be(utc("2026-06-03T04:00:00Z"))
+  }
+
+  "streamingTileGrid" should "keep the native tile size and align daily tiles to the partition offset" in {
+    val daily = new GroupByServingInfoParsed(
+      servingInfo
+        .setPartitionInterval(new Window(1, TimeUnit.DAYS))
+        .setPartitionOffset(new Window(1, TimeUnit.HOURS)))
+
+    daily.streamingTileGrid.spanMillis should be(new Window(1, TimeUnit.DAYS).millis)
+    daily.streamingTileGrid.offsetMillis should be(new Window(1, TimeUnit.HOURS).millis)
+    daily.streamingTileGrid.leftBound(utc("2026-06-03T00:30:00Z")) should be(utc("2026-06-02T01:00:00Z"))
+    daily.streamingTileGrid.leftBound(utc("2026-06-03T01:30:00Z")) should be(utc("2026-06-03T01:00:00Z"))
+
+    val hourlyGroupBy = new GroupBy().setAggregations(
+      Seq(Builders.Aggregation(Operation.SUM, "value", Seq(new Window(1, TimeUnit.DAYS)))).toJava)
+    val hourly = new GroupByServingInfoParsed(
+      new GroupByServingInfo()
+        .setGroupBy(hourlyGroupBy)
+        .setPartitionInterval(new Window(1, TimeUnit.DAYS))
+        .setPartitionOffset(new Window(1, TimeUnit.HOURS)))
+
+    hourly.streamingTileGrid.spanMillis should be(new Window(1, TimeUnit.HOURS).millis)
+    hourly.streamingTileGrid.offsetMillis should be(0L)
   }
 
   "codec accessors" should "reuse a codec on one thread without sharing mutable codec state across threads" in {

@@ -55,7 +55,11 @@ class ChainedGroupByJobIntegrationTest extends AnyFlatSpec with BeforeAndAfter w
     val testApi = new TestApi()
 
     val groupBy = buildJoinSourceTerminalGroupBy()
-    val (joinSourceJob, _) = buildFlinkJoinSourceJob(groupBy, elements, testApi)
+    groupBy.getAggregations.get(0).setWindows(Seq(new Window(365, TimeUnit.DAYS)).toJava)
+    val (joinSourceJob, servingInfo) = buildFlinkJoinSourceJob(groupBy, elements, testApi)
+    servingInfo.groupByServingInfo
+      .setPartitionInterval(WindowUtils.Day)
+      .setPartitionOffset(WindowUtils.Hour)
 
     // Run the actual FlinkJoinSourceJob pipeline with our test implementations
     val jobDataStream = joinSourceJob.runTiledGroupByJob(env)
@@ -80,6 +84,12 @@ class ChainedGroupByJobIntegrationTest extends AnyFlatSpec with BeforeAndAfter w
       response.valueBytes.length should be > 0
       response.status should be (true)
       response.dataset should not be null
+    }
+
+    val tileKeys = outputs.map(response => TilingUtils.deserializeTileKey(response.keyBytes))
+    tileKeys.map(_.getTileSizeMillis).toSet shouldBe Set(WindowUtils.Day.millis)
+    tileKeys.foreach { tileKey =>
+      Math.floorMod(tileKey.getTileStartTimestampMillis - WindowUtils.Hour.millis, WindowUtils.Day.millis) shouldBe 0L
     }
 
     // check that the timestamps of the written out events match the input events

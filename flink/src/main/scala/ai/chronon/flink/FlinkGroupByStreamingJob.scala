@@ -1,6 +1,5 @@
 package ai.chronon.flink
 
-import ai.chronon.aggregator.windowing.ResolutionUtils
 import ai.chronon.api.DataModel
 import ai.chronon.api.Extensions.{GroupByOps, SourceOps}
 import ai.chronon.api.DataType
@@ -134,8 +133,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
       f"Running Flink job for groupByName=${groupByName}, Topic=${topic}. " +
         "Tiling is enabled.")
 
-    val tilingWindowSizeInMillis: Long =
-      ResolutionUtils.getSmallestTailHopMillis(groupByServingInfoParsed.groupBy)
+    val tilingWindowGrid = groupByServingInfoParsed.streamingTileGrid
+    val tilingWindowSizeInMillis = tilingWindowGrid.spanMillis
 
     // we expect parallelism on the source stream to be set by the source provider
     val sourceSparkProjectedStream: DataStream[ProjectedEvent] =
@@ -151,7 +150,7 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
       .setParallelism(sourceSparkProjectedStream.getParallelism)
 
     val window = TumblingEventTimeWindows
-      .of(Time.milliseconds(tilingWindowSizeInMillis))
+      .of(Time.milliseconds(tilingWindowSizeInMillis), Time.milliseconds(tilingWindowGrid.offsetMillis))
       .asInstanceOf[WindowAssigner[ProjectedEvent, TimeWindow]]
 
     // We default to the AlwaysFireOnElementTrigger which will cause the window to "FIRE" on every element.

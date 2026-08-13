@@ -1,6 +1,6 @@
 package ai.chronon.flink.test
 
-import ai.chronon.api.Extensions.GroupByOps
+import ai.chronon.api.Extensions.{GroupByOps, WindowOps, WindowUtils}
 import ai.chronon.api.{GroupBy, TilingUtils}
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.flink.{FlinkGroupByStreamingJob, SparkExpressionEval, SparkExpressionEvalFn}
@@ -153,6 +153,44 @@ class FlinkJobEventIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     )
 
     expectedFinalIRsPerKey shouldBe finalIRsPerKey
+  }
+
+  it should "align a native daily tile with an offset daily batch boundary" in {
+    implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+
+    val beforeBoundary = java.time.Instant.parse("2026-06-03T00:30:00Z").toEpochMilli
+    val afterBoundary = java.time.Instant.parse("2026-06-03T01:30:00Z").toEpochMilli
+    val elements = Seq(
+      E2ETestEvent(id = "id1", int_val = 1, double_val = 1.5, created = beforeBoundary),
+      E2ETestEvent(id = "id1", int_val = 1, double_val = 2.5, created = afterBoundary)
+    )
+
+    val groupBy = FlinkTestUtils.makeGroupBy(Seq("id"))
+    groupBy.getAggregations.get(0).unsetWindows()
+    val (job, servingInfo) = buildFlinkJob(groupBy, elements)
+    servingInfo.groupByServingInfo
+      .setPartitionInterval(WindowUtils.Day)
+      .setPartitionOffset(WindowUtils.Hour)
+
+    job.runTiledGroupByJob(env).addSink(new CollectSink)
+    env.execute("OffsetDailyTiledFlinkJobIntegrationTest")
+
+    val finalIrByTile = CollectSink.values.toScala
+      .groupBy { write =>
+        val tileKey = TilingUtils.deserializeTileKey(write.keyBytes)
+        (tileKey.getTileStartTimestampMillis, tileKey.getTileSizeMillis)
+      }
+      .map { case (tileKey, writes) =>
+        val latestWrite = writes.maxBy(_.tsMillis)
+        val tile = avroConvertPutRequestToTimestampedTile(latestWrite, servingInfo)
+        val ir = avroConvertTimestampedTileToTimestampedIR(tile, servingInfo)
+        tileKey -> ir.ir.toList
+      }
+
+    finalIrByTile shouldBe Map(
+      (java.time.Instant.parse("2026-06-02T01:00:00Z").toEpochMilli, WindowUtils.Day.millis) -> List(1.5),
+      (java.time.Instant.parse("2026-06-03T01:00:00Z").toEpochMilli, WindowUtils.Day.millis) -> List(2.5)
+    )
   }
 
   private def buildFlinkJob(groupBy: GroupBy, elements: Seq[E2ETestEvent]): (FlinkGroupByStreamingJob, GroupByServingInfoParsed) = {

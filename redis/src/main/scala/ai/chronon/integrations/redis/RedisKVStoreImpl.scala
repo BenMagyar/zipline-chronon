@@ -350,10 +350,14 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster, conf: Map[String, String] = M
         try {
           val startTs = System.currentTimeMillis()
           val (redisKey, timestamp) = (request.tsMillis, tableType) match {
-            case (Some(ts), StreamingTable) =>
+            case (Some(_), StreamingTable) =>
               val tileKey = TilingUtils.deserializeTileKey(request.keyBytes)
               val baseKeyBytes = tileKey.keyBytes.asScala.map(_.toByte).toSeq
-              (buildTiledRedisKey(baseKeyBytes, request.dataset, ts, tileKey.tileSizeMillis, keyPrefix),
+              (buildTiledRedisKey(baseKeyBytes,
+                                  request.dataset,
+                                  tileKey.tileStartTimestampMillis,
+                                  tileKey.tileSizeMillis,
+                                  keyPrefix),
                tileKey.tileStartTimestampMillis)
             case _ =>
               (buildRedisKey(request.keyBytes, request.dataset, keyPrefix = keyPrefix), timestampInPutRequest)

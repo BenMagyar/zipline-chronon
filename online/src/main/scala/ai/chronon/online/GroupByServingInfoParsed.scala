@@ -71,6 +71,15 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
 
   val smallestTailHopMillis: Long = ResolutionUtils.getSmallestTailHopMillis(groupByServingInfo.groupBy)
 
+  /** Keep streaming tiles at their native aggregation resolution, but align their boundaries with the batch upload grid.
+    * For example, a daily tile for a daily partition starting at 01:00 covers [01:00, next-day 01:00), so the first
+    * post-upload tile is visible to a fetch beginning at the 01:00 batch watermark.
+    */
+  lazy val streamingTileGrid: PartitionGrid = {
+    val partitionOffsetMillis = Option(groupByServingInfo.partitionOffset).map(_.millis).getOrElse(0L)
+    PartitionGrid(smallestTailHopMillis, Math.floorMod(partitionOffsetMillis, smallestTailHopMillis))
+  }
+
   // AvroCodec instances are intentionally thread-local because their encoders and decoders are mutable. Cache the
   // ThreadLocal handle on serving metadata so every feature request only pays ThreadLocal.get(), rather than repeating
   // the global schema-keyed ConcurrentHashMap lookup in AvroCodec.ofThreaded.

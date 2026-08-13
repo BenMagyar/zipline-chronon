@@ -2,7 +2,6 @@ package ai.chronon.flink
 
 import ai.chronon.api.DataModel
 import ai.chronon.api.Extensions.GroupByOps
-import ai.chronon.api.Extensions.WindowUtils
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api.TilingUtils
 import ai.chronon.api.{StructType => ChrononStructType}
@@ -16,6 +15,7 @@ import org.apache.flink.api.common.functions.RichFlatMapFunction
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper
 import org.apache.flink.metrics.{Counter, Histogram}
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow
 import org.apache.flink.util.Collector
 
 /** Base class for the Avro conversion Flink operator.
@@ -147,7 +147,11 @@ case class TiledAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParsed,
     val keys: Map[String, AnyRef] = keyColumns.zip(in.keys.toScala.map(_.asInstanceOf[AnyRef])).toMap
     val entityKeyBytes = keyToBytes(in.keys.toArray)
 
-    val tileStart = WindowUtils.windowStartMillis(tsMills, tilingWindowSizeMs)
+    val tileStart = TimeWindow.getWindowStartWithOffset(
+      tsMills,
+      groupByServingInfoParsed.streamingTileGrid.offsetMillis,
+      tilingWindowSizeMs
+    )
     val tileKey = TilingUtils.buildTileKey(streamingDataset, entityKeyBytes, Some(tilingWindowSizeMs), Some(tileStart))
 
     val valueBytes = in.tileBytes
