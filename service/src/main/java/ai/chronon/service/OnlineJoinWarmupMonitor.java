@@ -23,8 +23,8 @@ import java.util.stream.Collectors;
 /** Best-effort preparation of configured Joins that become online after this fetcher has started. */
 final class OnlineJoinWarmupMonitor implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(OnlineJoinWarmupMonitor.class);
-    private static final long MIN_DISCOVERY_DELAY_MILLIS = 15_000L;
-    private static final long MAX_DISCOVERY_DELAY_MILLIS = 30_000L;
+    private static final long MIN_DISCOVERY_DELAY_MILLIS = TimeUnit.MINUTES.toMillis(4);
+    private static final long MAX_DISCOVERY_DELAY_MILLIS = TimeUnit.MINUTES.toMillis(6);
     private static final long LIST_TIMEOUT_SECONDS = 5L;
     private static final long PREPARATION_TIMEOUT_MILLIS = 60_000L;
 
