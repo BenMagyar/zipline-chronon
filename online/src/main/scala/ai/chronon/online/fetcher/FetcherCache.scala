@@ -70,8 +70,16 @@ trait FetcherCache {
                                                       batchBytes: Array[Byte],
                                                       decodingFunction: Array[Byte] => Map[String, AnyRef],
                                                       servingInfo: GroupByServingInfoParsed,
-                                                      keys: Map[String, Any]): Map[String, AnyRef] = {
-    if (!isCachingEnabled(servingInfo.groupBy)) return decodingFunction(batchBytes)
+                                                      keys: Map[String, Any]): Map[String, AnyRef] =
+    getMapResponseFromBatchResponse(batchResponses, batchBytes, decodingFunction, servingInfo, keys, allowCache = true)
+
+  private[online] def getMapResponseFromBatchResponse(batchResponses: BatchResponses,
+                                                      batchBytes: Array[Byte],
+                                                      decodingFunction: Array[Byte] => Map[String, AnyRef],
+                                                      servingInfo: GroupByServingInfoParsed,
+                                                      keys: Map[String, Any],
+                                                      allowCache: Boolean): Map[String, AnyRef] = {
+    if (!allowCache || !isCachingEnabled(servingInfo.groupBy)) return decodingFunction(batchBytes)
 
     batchResponses match {
       case _: KvStoreBatchResponse =>
@@ -105,8 +113,17 @@ trait FetcherCache {
       batchBytes: Array[Byte],
       servingInfo: GroupByServingInfoParsed,
       decodingFunction: (Array[Byte], GroupByServingInfoParsed) => FinalBatchIr,
-      keys: Map[String, Any]): FinalBatchIr = {
-    if (!isCachingEnabled(servingInfo.groupBy)) return decodingFunction(batchBytes, servingInfo)
+      keys: Map[String, Any]): FinalBatchIr =
+    getBatchIrFromBatchResponse(batchResponses, batchBytes, servingInfo, decodingFunction, keys, allowCache = true)
+
+  private[online] def getBatchIrFromBatchResponse(
+      batchResponses: BatchResponses,
+      batchBytes: Array[Byte],
+      servingInfo: GroupByServingInfoParsed,
+      decodingFunction: (Array[Byte], GroupByServingInfoParsed) => FinalBatchIr,
+      keys: Map[String, Any],
+      allowCache: Boolean): FinalBatchIr = {
+    if (!allowCache || !isCachingEnabled(servingInfo.groupBy)) return decodingFunction(batchBytes, servingInfo)
 
     batchResponses match {
       case _: KvStoreBatchResponse =>
@@ -127,11 +144,15 @@ trait FetcherCache {
   /** Given a list of GetRequests, return a map of GetRequests to cached FinalBatchIrs.
     */
   def getCachedRequests(
-      groupByRequestToKvRequest: Seq[(Fetcher.Request, Try[LambdaKvRequest])]): Map[GetRequest, CachedBatchResponse] = {
+      groupByRequestToKvRequest: Seq[(Fetcher.Request, Try[LambdaKvRequest])]): Map[GetRequest, CachedBatchResponse] =
+    getCachedRequests(groupByRequestToKvRequest, allowCache = true)
+
+  def getCachedRequests(groupByRequestToKvRequest: Seq[(Fetcher.Request, Try[LambdaKvRequest])],
+                        allowCache: Boolean): Map[GetRequest, CachedBatchResponse] = {
 
     val empty = Map.empty[GetRequest, CachedBatchResponse]
 
-    if (!isCacheSizeConfigured) return empty
+    if (!allowCache || !isCacheSizeConfigured) return empty
 
     val cachedRequests = Map.newBuilder[GetRequest, CachedBatchResponse]
     val metricCountsByContext = mutable.HashMap.empty[Metrics.Context, CacheMetricCounts]

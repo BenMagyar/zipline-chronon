@@ -72,7 +72,7 @@ class JavaStatsService(api: Api,
       )
 
       val responses = Await.result(
-        kvStore.multiGet(requests),
+        kvStore.controlMultiGet(requests),
         Duration(10L, TimeUnit.SECONDS)
       )
 

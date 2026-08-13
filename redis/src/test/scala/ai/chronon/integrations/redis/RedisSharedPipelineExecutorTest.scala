@@ -2,9 +2,12 @@ package ai.chronon.integrations.redis
 
 import ai.chronon.integrations.redis.RedisKVStoreConstants.{
   ConfigPipelineSyncThreads,
+  DefaultGlideStartupWarmupMinimumRequestsPerJoin,
+  DefaultGlideStartupWarmupRequestBatchSize,
   DefaultPipelineSyncThreads,
   EnvRedisClusterNodes,
-  EnvRedisPipelineSyncThreads
+  EnvRedisPipelineSyncThreads,
+  PropRedisReadMaxInflightBatches
 }
 import ai.chronon.online.KVStore.GetRequest
 import org.mockito.ArgumentMatchers.{any, same}
@@ -118,6 +121,27 @@ class RedisSharedPipelineExecutorTest extends AnyFlatSpec with Matchers {
     )
 
     kvStore.pipelineSyncExecutor shouldBe None
+  }
+
+  it should "recommend a bounded startup warmup only for GLIDE ClusterBatch reads" in {
+    val glideClient = mock(classOf[GlideRedisReadClient])
+    when(glideClient.usesClusterBatch).thenReturn(true)
+    val glideStore = new RedisKVStoreImpl(
+      mock(classOf[JedisCluster]),
+      Map(ConfigPipelineSyncThreads -> "0", PropRedisReadMaxInflightBatches -> "16"),
+      glideReadClient = Some(glideClient)
+    )
+    val jedisStore = new RedisKVStoreImpl(
+      mock(classOf[JedisCluster]),
+      Map(ConfigPipelineSyncThreads -> "0")
+    )
+
+    glideStore.startupWarmupMinimumRequestsPerJoin shouldBe DefaultGlideStartupWarmupMinimumRequestsPerJoin
+    glideStore.startupWarmupConcurrency shouldBe 16
+    glideStore.startupWarmupRequestBatchSize shouldBe DefaultGlideStartupWarmupRequestBatchSize
+    jedisStore.startupWarmupMinimumRequestsPerJoin shouldBe 0
+    jedisStore.startupWarmupConcurrency shouldBe 1
+    jedisStore.startupWarmupRequestBatchSize shouldBe 1
   }
 
   it should "reject a negative pipeline executor size" in {

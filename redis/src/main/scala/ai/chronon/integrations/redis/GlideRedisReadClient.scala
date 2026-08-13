@@ -61,6 +61,8 @@ private[redis] final class GlideRedisReadClient private (
     directMaxPending: Int,
     directQueueTimeoutMs: Int,
     directCommandRunnerOverride: Option[GlideReadCommand => CompletableFuture[Try[GlideReadResult]]],
+    clusterBatchRunnerOverride: Option[
+      IndexedSeq[GlideReadCommand] => CompletableFuture[IndexedSeq[Try[GlideReadResult]]]],
     closeAction: () => Unit)
     extends AutoCloseable {
 
@@ -69,7 +71,14 @@ private[redis] final class GlideRedisReadClient private (
                           directMaxInflight: Int,
                           directMaxPending: Int,
                           directQueueTimeoutMs: Int) =
-    this(client, executionMode, directMaxInflight, directMaxPending, directQueueTimeoutMs, None, () => client.close())
+    this(client,
+         executionMode,
+         directMaxInflight,
+         directMaxPending,
+         directQueueTimeoutMs,
+         None,
+         None,
+         () => client.close())
 
   private[redis] def this(executionMode: String,
                           directMaxInflight: Int,
@@ -83,7 +92,13 @@ private[redis] final class GlideRedisReadClient private (
          directMaxPending,
          directQueueTimeoutMs,
          Some(directCommandRunner),
+         None,
          closeAction)
+
+  private[redis] def this(
+      clusterBatchRunner: IndexedSeq[GlideReadCommand] => CompletableFuture[IndexedSeq[Try[GlideReadResult]]],
+      closeAction: () => Unit) =
+    this(null, GlideExecutionClusterBatch, 1, 1, 1, None, Some(clusterBatchRunner), closeAction)
 
   require(executionMode == GlideExecutionDirect || executionMode == GlideExecutionClusterBatch,
           s"Unsupported GLIDE execution mode: $executionMode")
@@ -96,6 +111,10 @@ private[redis] final class GlideRedisReadClient private (
   require(
     directCommandRunnerOverride.isEmpty || executionMode == GlideExecutionDirect,
     "A GLIDE direct command runner can only be injected in direct execution mode"
+  )
+  require(
+    clusterBatchRunnerOverride.isEmpty || executionMode == GlideExecutionClusterBatch,
+    "A GLIDE cluster-batch runner can only be injected in cluster-batch execution mode"
   )
 
   private final class PendingDirectCommand(val command: GlideReadCommand,
@@ -120,6 +139,8 @@ private[redis] final class GlideRedisReadClient private (
   private var scheduledQueueHead: PendingDirectCommand = null
   private var scheduledQueueTimeout: ScheduledFuture[_] = null
   @volatile private var closed = false
+
+  private[redis] def usesClusterBatch: Boolean = executionMode == GlideExecutionClusterBatch
 
   private val clusterBatchOptions = ClusterBatchOptions
     .builder()
@@ -303,6 +324,17 @@ private[redis] final class GlideRedisReadClient private (
     }
 
   private def executeClusterBatch(
+      commands: IndexedSeq[GlideReadCommand]): CompletableFuture[IndexedSeq[Try[GlideReadResult]]] =
+    clusterBatchRunnerOverride match {
+      case Some(runner) =>
+        try runner(commands)
+        catch {
+          case NonFatal(error) => completedFailures(commands.size, error)
+        }
+      case None => executeNativeClusterBatch(commands)
+    }
+
+  private def executeNativeClusterBatch(
       commands: IndexedSeq[GlideReadCommand]): CompletableFuture[IndexedSeq[Try[GlideReadResult]]] =
     try {
       val batch = new ClusterBatch(false).withBinaryOutput()

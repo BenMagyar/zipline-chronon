@@ -53,6 +53,7 @@ object RedisKVStoreFactory {
                           conditionalObjectWriter: ConditionalObjectWriter,
                           requireBatchStatus: Boolean): RedisKVStoreImpl = {
     val clientSettings = settings(conf)
+    val admissionSettings = readAdmissionSettings(conf, sys.env)
     val jedisCluster = createClient(clientSettings)
     var glideReadClient = Option.empty[GlideRedisReadClient]
     try {
@@ -61,7 +62,10 @@ object RedisKVStoreFactory {
       val effectiveConf = conf ++ Map(
         ConfigPipelineSyncThreads -> clientSettings.pipelineSyncThreads.toString,
         PropRedisClient -> clientSettings.client,
-        PropRedisReadFrom -> clientSettings.readFrom
+        PropRedisReadFrom -> clientSettings.readFrom,
+        PropRedisReadMaxInflightBatches -> admissionSettings.maxInflightBatches.toString,
+        PropRedisReadMaxQueuedBatches -> admissionSettings.maxQueuedBatches.toString,
+        PropRedisReadQueueTimeoutMs -> admissionSettings.queueTimeoutMs.toString
       ) ++ clientSettings.clientAz.map(PropRedisClientAz -> _)
       val kvStore =
         new RedisKVStoreImpl(jedisCluster, effectiveConf, conditionalObjectWriter, requireBatchStatus, glideReadClient)
@@ -104,6 +108,8 @@ object RedisKVStoreFactory {
     def bulkWriter: ClientSettings =
       copy(maxConnections = 2, minIdleConnections = 0, maxIdleConnections = 1, validateConnections = false)
   }
+
+  private[redis] case class ReadAdmissionSettings(maxInflightBatches: Int, maxQueuedBatches: Int, queueTimeoutMs: Int)
 
   def settings(conf: Map[String, String], env: Map[String, String] = sys.env): ClientSettings =
     settings(conf, env, () => projectedClientAz())
@@ -163,6 +169,9 @@ object RedisKVStoreFactory {
       s"A projected client availability zone at $DefaultRedisClientAzPath or $PropRedisClientAz is required when " +
         s"$EnvRedisReadFrom/$PropRedisReadFrom=$RedisReadFromAzAffinityReplicasAndPrimary"
     )
+    // Parse and validate admission independently of ClientSettings. Keeping these implementation-only controls out of
+    // the public case-class constructor preserves its historical Product17 binary contract.
+    readAdmissionSettings(conf, env)
 
     ClientSettings(
       nodes = getOrElseThrow(EnvRedisClusterNodes, PropRedisClusterNodes, conf, env),
@@ -181,6 +190,47 @@ object RedisKVStoreFactory {
       readFrom = readFrom,
       clientAz = clientAz
     )
+  }
+
+  private[redis] def readAdmissionSettings(conf: Map[String, String],
+                                           env: Map[String, String]): ReadAdmissionSettings = {
+    val maxInflightBatches = intSetting(
+      EnvRedisReadMaxInflightBatches,
+      PropRedisReadMaxInflightBatches,
+      DefaultRedisReadMaxInflightBatches,
+      conf,
+      env
+    )
+    val maxQueuedBatches = intSetting(
+      EnvRedisReadMaxQueuedBatches,
+      PropRedisReadMaxQueuedBatches,
+      DefaultRedisReadMaxQueuedBatches,
+      conf,
+      env
+    )
+    val queueTimeoutMs = intSetting(
+      EnvRedisReadQueueTimeoutMs,
+      PropRedisReadQueueTimeoutMs,
+      DefaultRedisReadQueueTimeoutMs,
+      conf,
+      env
+    )
+    require(
+      maxInflightBatches > 0,
+      s"$EnvRedisReadMaxInflightBatches/$PropRedisReadMaxInflightBatches must be positive, got " +
+        s"$maxInflightBatches"
+    )
+    require(
+      maxQueuedBatches >= 0,
+      s"$EnvRedisReadMaxQueuedBatches/$PropRedisReadMaxQueuedBatches must be non-negative, got " +
+        s"$maxQueuedBatches"
+    )
+    require(
+      queueTimeoutMs > 0,
+      s"$EnvRedisReadQueueTimeoutMs/$PropRedisReadQueueTimeoutMs must be positive, got " +
+        s"$queueTimeoutMs"
+    )
+    ReadAdmissionSettings(maxInflightBatches, maxQueuedBatches, queueTimeoutMs)
   }
 
   private[redis] def createClient(settings: ClientSettings): JedisCluster = {

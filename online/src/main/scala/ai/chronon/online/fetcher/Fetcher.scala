@@ -34,13 +34,14 @@ import ai.chronon.online.fetcher.Fetcher.{
   ResponseWithContext
 }
 import ai.chronon.online.fetcher.FeaturesResponseType.ResponseType
-import ai.chronon.online.metrics.{Metrics, TTLCache}
+import ai.chronon.online.metrics.{FlexibleExecutionContext, Metrics, TTLCache}
 import ai.chronon.online.serde._
 import com.google.gson.Gson
 import org.apache.avro.generic.GenericRecord
 import org.slf4j.{Logger, LoggerFactory}
 
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.{CompletableFuture, CountDownLatch, TimeUnit, TimeoutException}
 import java.util.function.Consumer
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ListBuffer
@@ -69,6 +70,24 @@ object Fetcher {
       Success(Map.empty)
     } else {
       Try(fallback)
+    }
+  }
+
+  private[fetcher] def fastSerdeReaderSchemas(servingInfo: GroupByServingInfoParsed,
+                                              tilingEnabled: Boolean): Seq[String] = {
+    val groupBy = servingInfo.groupBy
+    if (groupBy.aggregations == null || servingInfo.groupByOps.inferredAccuracy != Accuracy.TEMPORAL) {
+      Seq(servingInfo.outputAvroSchema)
+    } else {
+      val streamingSchemas = servingInfo.groupByOps.streamingSource.toSeq.map { _ =>
+        if (tilingEnabled) servingInfo.tiledCodec.tileAvroSchema
+        else
+          servingInfo.groupByOps.dataModel match {
+            case DataModel.EVENTS   => servingInfo.valueAvroSchema
+            case DataModel.ENTITIES => servingInfo.mutationValueAvroSchema
+          }
+      }
+      servingInfo.irAvroSchema +: streamingSchemas
     }
   }
 
@@ -290,6 +309,141 @@ class Fetcher(val kvStore: KVStore,
     Some(logControlEvent)
   )
 
+  /** Compile serving readers, key writers, and V2 response writers before accepting production traffic. */
+  def prepareJoinFastSerde(joinNames: java.util.List[String], timeoutMillis: Long): Unit = {
+    require(timeoutMillis > 0L, s"Fetcher warmup timeout must be positive, got $timeoutMillis")
+    val startedAt = System.currentTimeMillis()
+    val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+    def remainingMillis(): Long = {
+      val remainingNanos = deadlineNanos - System.nanoTime()
+      if (remainingNanos <= 0L) throw new TimeoutException("Fetcher metadata/FastSerde warmup deadline elapsed")
+      math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
+    }
+
+    val distinctJoinNames = joinNames.asScala.distinct.toSeq
+    val metadataWarmup = metadataStore.warmJoinMetadata(distinctJoinNames, remainingMillis())
+    if (metadataWarmup.missingJoinNames.nonEmpty || metadataWarmup.missingGroupByNames.nonEmpty) {
+      logger.warn(
+        s"Metadata warmup found ${metadataWarmup.missingJoinNames.size} missing Join and " +
+          s"${metadataWarmup.missingGroupByNames.size} missing GroupBy serving-info value(s)")
+    }
+    if (metadataWarmup.failures.nonEmpty) {
+      logger.warn(
+        s"Metadata warmup completed with ${metadataWarmup.failures.size} failure(s): " +
+          metadataWarmup.failures.mkString("; ")
+      )
+    }
+
+    val codecResults = distinctJoinNames.map { name =>
+      name -> Try(remainingMillis()).flatMap(_ => Try(joinCodecCache(name)).flatten)
+    }
+    val codecs = codecResults.collect { case (name, Success(codec)) => name -> codec }
+    val servingInfosByName = mutable.LinkedHashMap.empty[String, GroupByServingInfoParsed]
+
+    codecs.foreach { case (_, codec) =>
+      codec.conf.joinPartOps.foreach { part =>
+        val groupByName = part.groupBy.metaData.getName
+        if (!servingInfosByName.contains(groupByName) && System.nanoTime() < deadlineNanos) {
+          metadataStore.getGroupByServingInfo(groupByName).foreach { info =>
+            servingInfosByName.put(groupByName, info)
+          }
+        }
+      }
+    }
+
+    val readerSchemas = servingInfosByName.valuesIterator
+      .flatMap(info => Fetcher.fastSerdeReaderSchemas(info, fetchContext.isTilingEnabled))
+      .map(schema => schema -> Option.empty[String])
+      .toSeq
+    val writerSchemas =
+      servingInfosByName.valuesIterator.map(_.keyAvroSchema).toSeq ++
+        codecs.flatMap { case (_, codec) => Seq(codec.keyCodec.schemaStr, codec.valueCodec.schemaStr) }
+
+    val result = AvroCodec.prepareFastSerde(readerSchemas, writerSchemas, remainingMillis())
+    val preparedWorkerCount = prepareWorkerFastSerde(readerSchemas, writerSchemas, deadlineNanos)
+    val codecFailureCount = codecResults.count(_._2.isFailure)
+    logger.info(
+      s"FastSerde preparation complete for ${codecs.size}/${distinctJoinNames.size} join(s) and " +
+        s"${servingInfosByName.size}/${metadataWarmup.groupByNames.size} GroupBy(s): " +
+        s"readers=${result.readerCount}, writers=${result.writerCount}, " +
+        s"fallbackReaders=${result.fallbackReaderCount}, fallbackWriters=${result.fallbackWriterCount}, " +
+        s"metadataMissing=${metadataWarmup.missingJoinNames.size + metadataWarmup.missingGroupByNames.size}, " +
+        s"metadataFailures=${metadataWarmup.failures.size}, codecFailures=$codecFailureCount, " +
+        s"preparedWorkers=$preparedWorkerCount, " +
+        s"elapsedMs=${System.currentTimeMillis() - startedAt}")
+  }
+
+  /** Initialize every production fetcher's thread-local codec objects after generated classes are ready.
+    *
+    * The default Fetcher execution context is backed by a fixed ThreadPoolExecutor. Submitting one blocking task per
+    * core worker and holding them at a barrier guarantees that each task occupies a distinct worker. Custom execution
+    * contexts have no portable way to expose their capacity, so they retain the process-global preparation only.
+    */
+  private def prepareWorkerFastSerde(readerSchemas: Seq[(String, Option[String])],
+                                     writerSchemas: Seq[String],
+                                     deadlineNanos: Long): Int = {
+    if (fetchContext.executionContextOverride != null) return 0
+
+    val workerExecutor = FlexibleExecutionContext.buildExecutor
+    val workerCount = workerExecutor.getCorePoolSize
+    if (workerCount <= 0 || (readerSchemas.isEmpty && writerSchemas.isEmpty)) return 0
+
+    def remainingNanos(): Long = {
+      val remaining = deadlineNanos - System.nanoTime()
+      if (remaining <= 0L) throw new TimeoutException("Timed out preparing fetcher worker codecs")
+      remaining
+    }
+
+    val ready = new CountDownLatch(workerCount)
+    val start = new CountDownLatch(1)
+    val done = new CountDownLatch(workerCount)
+    val cancelled = new AtomicBoolean(false)
+    val firstFailure = new AtomicReference[Throwable]()
+    val submissions = mutable.ArrayBuffer.empty[java.util.concurrent.Future[_]]
+    try {
+      val allReady =
+        try {
+          (0 until workerCount).foreach { _ =>
+            submissions += workerExecutor.submit(new Runnable {
+              override def run(): Unit = {
+                ready.countDown()
+                try {
+                  start.await()
+                  readerSchemas.iterator.takeWhile(_ => !cancelled.get()).foreach { case (readerSchema, writerSchema) =>
+                    val codec = AvroCodec.ofThreaded(readerSchema, writerSchema).get()
+                    codec.prepareForRead()
+                    codec.exerciseForRead(writerSchema.getOrElse(readerSchema))
+                  }
+                  writerSchemas.iterator.takeWhile(_ => !cancelled.get()).foreach { schema =>
+                    val codec = AvroCodec.ofThreaded(schema).get()
+                    codec.prepareForWrite()
+                    codec.exerciseForWrite()
+                  }
+                } catch {
+                  case error: Throwable => firstFailure.compareAndSet(null, error)
+                } finally {
+                  done.countDown()
+                }
+              }
+            })
+          }
+          ready.await(remainingNanos(), TimeUnit.NANOSECONDS)
+        } finally start.countDown()
+      if (!allReady) throw new TimeoutException(s"Timed out starting $workerCount fetcher worker codec preparations")
+      if (!done.await(remainingNanos(), TimeUnit.NANOSECONDS))
+        throw new TimeoutException(s"Timed out completing $workerCount fetcher worker codec preparations")
+      Option(firstFailure.get()).foreach(throw _)
+      workerCount
+    } catch {
+      case error: Throwable =>
+        // A best-effort preparation failure must not leave barrier waiters or codec work consuming live fetcher
+        // workers after startup continues.
+        cancelled.set(true)
+        submissions.foreach(_.cancel(true))
+        throw error
+    } finally start.countDown()
+  }
+
   private class JoinConfCacheKey(val joinName: String, val confHash: String, val join: api.Join) {
     override def equals(obj: Any): Boolean = obj match {
       case other: JoinConfCacheKey => joinName == other.joinName && confHash == other.confHash
@@ -344,9 +498,21 @@ class Fetcher(val kvStore: KVStore,
   private def fetchJoinWithCodecs(requests: Seq[Request],
                                   joinConf: Option[api.Join],
                                   joinCodecsByName: Map[String, Try[JoinCodec]],
-                                  ts: Long): Future[Seq[Response]] = {
-    val internalResponsesF = joinPartFetcher.fetchJoins(requests, joinConf, joinCodecsByName.get)
-    val externalResponsesF = fetchExternal(requests, joinConf)
+                                  ts: Long,
+                                  allowBatchIrCache: Boolean = true,
+                                  deduplicateGroupByRequests: Boolean = true,
+                                  includeExternalFeatures: Boolean = true): Future[Seq[Response]] = {
+    val internalResponsesF =
+      joinPartFetcher.fetchJoins(requests,
+                                 joinConf,
+                                 joinCodecsByName.get,
+                                 allowBatchIrCache,
+                                 deduplicateGroupByRequests)
+    // Startup may deliberately repeat a representative request many times. Never amplify calls to independently
+    // owned external feature providers; the startup work here is specifically for the Redis/GLIDE/decode path.
+    val externalResponsesF =
+      if (includeExternalFeatures) fetchExternal(requests, joinConf)
+      else Future.successful[Seq[Response]](null)
     val combinedResponsesF =
       internalResponsesF.zip(externalResponsesF).map { case (internalResponses, externalResponses) =>
         val zipped = if (externalResponses == null) {
@@ -543,6 +709,15 @@ class Fetcher(val kvStore: KVStore,
                   responseType: ResponseType): CompletableFuture[java.util.List[ResponseV2]] =
     toCompletableFuture(fetchJoinV2(requests.asScala.toSeq, None, responseType).map(_.asJava))
 
+  def fetchJoinV2Warmup(requests: java.util.List[Request],
+                        responseType: ResponseType): CompletableFuture[java.util.List[ResponseV2]] =
+    fetchJoinV2Warmup(requests, responseType, allowBatchIrCache = false)
+
+  def fetchJoinV2Warmup(requests: java.util.List[Request],
+                        responseType: ResponseType,
+                        allowBatchIrCache: Boolean): CompletableFuture[java.util.List[ResponseV2]] =
+    toCompletableFuture(fetchJoinV2Warmup(requests.asScala.toSeq, responseType, allowBatchIrCache).map(_.asJava))
+
   def fetchModelTransforms(requests: java.util.List[Request]): CompletableFuture[java.util.List[Response]] =
     toCompletableFuture(fetchModelTransforms(requests.asScala.toSeq, None).map(_.asJava))
 
@@ -555,6 +730,33 @@ class Fetcher(val kvStore: KVStore,
 
     rawResponse.map(responses => encodeJoinResponses(responses, responseType, joinCodecsByName))
   }
+
+  /** Startup-only V2 path. It suppresses external feature calls while exercising the normal internal path. Redis
+    * startup runs it once without Caffeine to force KV/decode work, then once with normal cache/dedup behavior.
+    */
+  def fetchJoinV2Warmup(requests: Seq[Request], responseType: ResponseType): Future[Seq[ResponseV2]] = {
+    fetchJoinV2Warmup(requests, responseType, allowBatchIrCache = false)
+  }
+
+  private def fetchJoinV2Warmup(requests: Seq[Request],
+                                responseType: ResponseType,
+                                allowBatchIrCache: Boolean): Future[Seq[ResponseV2]] = {
+    val ts = System.currentTimeMillis()
+    val joinCodecsByName = resolveJoinCodecs(requests.iterator.map(_.name).toSeq, None)
+    val rawResponse = fetchJoinWithCodecs(requests,
+                                          None,
+                                          joinCodecsByName,
+                                          ts,
+                                          allowBatchIrCache = allowBatchIrCache,
+                                          deduplicateGroupByRequests = true,
+                                          includeExternalFeatures = false)
+    rawResponse.map(responses => encodeJoinResponses(responses, responseType, joinCodecsByName))
+  }
+
+  def startupWarmupMinimumRequestsPerJoin: Int = kvStore.startupWarmupMinimumRequestsPerJoin
+  def startupWarmupConcurrency: Int = kvStore.startupWarmupConcurrency
+  def startupWarmupRequestBatchSize: Int = kvStore.startupWarmupRequestBatchSize
+  def startupWarmupDegradedReadCount: Long = kvStore.startupWarmupDegradedReadCount
 
   private[fetcher] def encodeJoinResponses(responses: Seq[Response],
                                            responseType: ResponseType,

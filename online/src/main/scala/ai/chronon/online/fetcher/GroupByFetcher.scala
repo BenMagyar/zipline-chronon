@@ -158,7 +158,10 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
   // 2. encodes keys as keyAvroSchema
   // 3. Based on accuracy, fetches streaming + batch data and aggregates further.
   // 4. Finally converted to outputSchema
-  def fetchGroupBys(requests: Seq[Fetcher.Request]): Future[Seq[Fetcher.Response]] = {
+  def fetchGroupBys(requests: Seq[Fetcher.Request]): Future[Seq[Fetcher.Response]] =
+    fetchGroupBys(requests, allowBatchIrCache = true)
+
+  def fetchGroupBys(requests: Seq[Fetcher.Request], allowBatchIrCache: Boolean): Future[Seq[Fetcher.Response]] = {
 
     // Counters are additive, so equal metric contexts can share one reporter call without changing the emitted sum.
     val requestCountByContext = mutable.LinkedHashMap.empty[metrics.Metrics.Context, Long]
@@ -187,7 +190,8 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
     // If caching is enabled, we check if any of the GetRequests are already cached. If so, we store them in a Map
     // and avoid the work of re-fetching them. It is mainly for batch data requests.
-    val cachedRequests: Map[GetRequest, CachedBatchResponse] = getCachedRequests(groupByRequestToKvRequest)
+    val cachedRequests: Map[GetRequest, CachedBatchResponse] =
+      getCachedRequests(groupByRequestToKvRequest, allowBatchIrCache)
     // Collect cache metrics once per fetchGroupBys call; Caffeine metrics aren't tagged by groupBy
     maybeBatchIrCache.foreach(cache =>
       LRUCache.collectCaffeineCacheMetrics(caffeineMetricsContext, cache.cache, cache.cacheName))
@@ -201,18 +205,8 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
     }.toVector
 
     val startTimeMs = System.currentTimeMillis()
-    val kvResponseFuture: Future[Seq[GetResponse]] = if (allRequestsToFetch.nonEmpty) {
-      val rawFuture = fetchContext.kvStore.multiGet(allRequestsToFetch)
-      if (fetchContext.kvTimeoutMillis > 0)
-        FetcherTimeout.withTimeout(rawFuture, fetchContext.kvTimeoutMillis)
-      else
-        rawFuture
-    } else {
-      Future(Seq.empty[GetResponse])
-    }
-
-    kvResponseFuture
-      .map { kvResponses: Seq[GetResponse] =>
+    def consumeKvResponses(kvResponseFuture: Future[Seq[GetResponse]]): Future[Seq[Response]] =
+      kvResponseFuture.map { kvResponses: Seq[GetResponse] =>
         val multiGetMillis = System.currentTimeMillis() - startTimeMs
         val degradedCounter = new BatchedMetricsCounter("group_by.degraded_counter.count")
 
@@ -279,6 +273,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
             val requestContext =
               RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)
                 .withInstrumentation(degradedCounter, metrics.HotPathMetricsSampler.global.shouldSample())
+            if (!allowBatchIrCache) requestContext.withoutBatchIrCache
 
             val groupByResponse: Map[String, AnyRef] =
               try {
@@ -312,6 +307,19 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
         degradedCounter.flush()
         responses
       }
+
+    if (allRequestsToFetch.nonEmpty) {
+      fetchContext.kvStore.scopedMultiGet(allRequestsToFetch) { rawFuture =>
+        val kvResponseFuture =
+          if (fetchContext.kvTimeoutMillis > 0)
+            FetcherTimeout.withTimeout(rawFuture, fetchContext.kvTimeoutMillis)
+          else
+            rawFuture
+        consumeKvResponses(kvResponseFuture)
+      }
+    } else {
+      consumeKvResponses(Future(Seq.empty[GetResponse]))
+    }
   }
 
   /** Fetch method to simulate a random access interface for Chronon

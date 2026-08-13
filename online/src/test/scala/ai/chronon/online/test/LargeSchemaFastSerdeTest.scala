@@ -4,9 +4,11 @@ import ai.chronon.api._
 import ai.chronon.online.serde.{AvroCodec, AvroConversions}
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericData
-import com.linkedin.avro.fastserde.FastGenericDatumReader
+import com.linkedin.avro.fastserde.{FastGenericDatumReader, FastSerdeCache}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+
+import java.util.concurrent.TimeUnit
 
 class LargeSchemaFastSerdeTest extends AnyFlatSpec with Matchers {
 
@@ -28,11 +30,25 @@ class LargeSchemaFastSerdeTest extends AnyFlatSpec with Matchers {
     val outerSchema = StructType("LargeTestSchema", chrononFields)
     val avroSchema = AvroConversions.fromChrononSchema(outerSchema)
 
-    // This is the line that fails without the constructor splitting fix —
-    // fastserde generates a Java class whose constructor exceeds 64KB.
-    val reader = new FastGenericDatumReader[GenericData.Record](avroSchema)
+    // Preparation uses the same process-global cache as every thread-local AvroCodec and must not return while this
+    // large reader or writer is still compiling.
+    val preparation = AvroCodec.prepareFastSerde(
+      Seq(avroSchema.toString -> Option.empty[String]),
+      Seq(avroSchema.toString),
+      TimeUnit.MINUTES.toMillis(2L))
+    preparation.readerCount shouldBe 1
+    preparation.writerCount shouldBe 1
+    preparation.fallbackReaderCount shouldBe 0
+    preparation.fallbackWriterCount shouldBe 0
 
-    // Verify round-trip through AvroCodec (which uses FastGenericDatumReader/Writer)
+    // This is the line that fails without the constructor splitting fix — FastSerde generates a Java class whose
+    // constructor exceeds 64KB. It must now observe the generated implementation immediately.
+    val reader = new FastGenericDatumReader[GenericData.Record](avroSchema)
+    val generatedReader = reader.getFastDeserializer.get(2L, TimeUnit.MINUTES)
+    generatedReader.hasDynamicClassGenerationDone() shouldBe true
+    generatedReader.isBackedByGeneratedClass() shouldBe true
+
+    // Verify round-trip through AvroCodec and that both sides use generated implementations.
     val codec = new AvroCodec(avroSchema.toString)
     val record = new GenericData.Record(avroSchema)
     (0 until n).foreach { i =>
@@ -51,5 +67,16 @@ class LargeSchemaFastSerdeTest extends AnyFlatSpec with Matchers {
     inner0.get("sub_0").toString shouldBe "val_0_0"
     val inner999 = decoded.get("field_999").asInstanceOf[GenericData.Record]
     inner999.get("sub_4").toString shouldBe "val_999_4"
+
+    val cache = FastSerdeCache.getDefaultInstance
+    var serializer = cache.getFastGenericSerializer(avroSchema)
+    val deadlineNanos = System.nanoTime() + TimeUnit.MINUTES.toNanos(2L)
+    while (!serializer.hasDynamicClassGenerationDone() && System.nanoTime() < deadlineNanos) {
+      Thread.sleep(10L)
+      serializer = cache.getFastGenericSerializer(avroSchema)
+    }
+
+    serializer.hasDynamicClassGenerationDone() shouldBe true
+    serializer.isBackedByGeneratedClass() shouldBe true
   }
 }

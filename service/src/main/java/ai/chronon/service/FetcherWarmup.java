@@ -8,6 +8,7 @@ import ai.chronon.service.handlers.FetchHandler;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
+import io.vertx.core.WorkerExecutor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,13 +29,18 @@ public class FetcherWarmup {
     private static final long LIST_JOINS_TIMEOUT_SECONDS = 5L;
     private static final int FETCH_MAX_RETRIES = 5;
     private static final long FETCH_RETRY_DELAY_MS = 2000L;
-    private static final String FEATURE_EXCEPTION_SUFFIX = "_exception";
     // Bounds both synchronous fetch initiation and the resulting asynchronous fetch.
     private static final long FETCH_TIMEOUT_SECONDS = 30L;
+    private static final long FAST_SERDE_PREPARATION_TIMEOUT_SECONDS = 60L;
 
     public static Future<Void> run(Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore) {
+        return run(vertx, fetcher, cfgStore, null);
+    }
+
+    public static Future<Void> run(
+            Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
         try {
-            return doRun(vertx, fetcher, cfgStore)
+            return doRun(vertx, fetcher, cfgStore, fetchWorkerExecutor)
                     .recover(error -> {
                         logger.warn("Warmup stopped early; continuing startup", error);
                         return Future.succeededFuture();
@@ -45,20 +51,80 @@ public class FetcherWarmup {
         }
     }
 
-    private static Future<Void> doRun(Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore) {
+    /** Raw warmup outcome for lifecycle owners that must decide whether a worker pool is safe to reuse. */
+    static Future<Void> runForWorkerReuse(
+            Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
+        try {
+            return doRun(vertx, fetcher, cfgStore, fetchWorkerExecutor);
+        } catch (Exception error) {
+            return Future.failedFuture(error);
+        }
+    }
+
+    private static Future<Void> doRun(
+            Vertx vertx, JavaFetcher fetcher, ConfigStore cfgStore, WorkerExecutor fetchWorkerExecutor) {
         List<ConfigStore.WarmupGroup> groups = validateGroups(cfgStore.getWarmupGroups());
         if (groups.isEmpty()) {
             logger.info("No warmup groups configured, skipping warmup");
             return Future.succeededFuture();
         }
 
-        int timesPerJoin = cfgStore.getWarmupTimesPerJoin();
+        int configuredTimesPerJoin = cfgStore.getWarmupTimesPerJoin();
+        int minimumTimesPerJoin = Math.max(0, fetcher.startupWarmupMinimumRequestsPerJoin());
+        int timesPerJoin = Math.max(configuredTimesPerJoin, minimumTimesPerJoin);
+        int concurrency = Math.max(1, Math.min(timesPerJoin, fetcher.startupWarmupConcurrency()));
+        int requestBatchSize = Math.max(1, fetcher.startupWarmupRequestBatchSize());
+        boolean runRedisWarmupPhases = minimumTimesPerJoin > 0;
         long warmupStart = System.currentTimeMillis();
 
-        logger.info("Starting warmup: {} group(s), timesPerJoin={}", groups.size(), timesPerJoin);
+        logger.info(
+                "Starting warmup: {} group(s), configuredTimesPerJoin={}, effectiveTimesPerJoin={}, concurrency={}, " +
+                        "requestBatchSize={}",
+                groups.size(), configuredTimesPerJoin, timesPerJoin, concurrency, requestBatchSize);
 
         return listJoinsWithRetry(vertx, fetcher, LIST_JOINS_MAX_RETRIES, LIST_JOINS_RETRY_DELAY_MS, 0)
-                .compose(allJoins -> fireAllGroups(vertx, fetcher, allJoins, groups, timesPerJoin, warmupStart));
+                .compose(allJoins -> prepareFastSerde(
+                                vertx, fetchWorkerExecutor, fetcher, matchingJoins(allJoins, groups))
+                        .map(allJoins))
+                .compose(allJoins -> fireAllGroups(
+                        vertx,
+                        fetchWorkerExecutor,
+                        fetcher,
+                        allJoins,
+                        groups,
+                        timesPerJoin,
+                        concurrency,
+                        requestBatchSize,
+                        runRedisWarmupPhases,
+                        warmupStart));
+    }
+
+    private static List<String> matchingJoins(List<String> allJoins, List<ConfigStore.WarmupGroup> groups) {
+        return allJoins.stream()
+                .filter(join -> groups.stream().anyMatch(group -> Pattern.matches(group.regex, join)))
+                .distinct()
+                .collect(Collectors.toList());
+    }
+
+    private static Future<Void> prepareFastSerde(
+            Vertx vertx,
+            WorkerExecutor fetchWorkerExecutor,
+            JavaFetcher fetcher,
+            List<String> matchingJoins) {
+        if (matchingJoins.isEmpty()) {
+            return Future.succeededFuture();
+        }
+
+        logger.info("Warmup: preparing FastSerde for {} join(s): {}", matchingJoins.size(), matchingJoins);
+        return executeBlocking(vertx, fetchWorkerExecutor, () -> {
+                    fetcher.prepareJoinFastSerde(
+                            matchingJoins, TimeUnit.SECONDS.toMillis(FAST_SERDE_PREPARATION_TIMEOUT_SECONDS));
+                    return null;
+                }, false)
+                // The inner deadline makes schema generation cooperative; this outer bound also covers synchronous
+                // metadata/codec construction that cannot observe it. Warmup is best-effort, so readiness continues.
+                .timeout(FAST_SERDE_PREPARATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .mapEmpty();
     }
 
     // Validates and filters groups — skips any with an invalid payload with a warning.
@@ -84,10 +150,17 @@ public class FetcherWarmup {
 
     // Retries fetcher.listJoins() up to maxRetries times with a fixed delay between attempts,
     // using Vert.x timers so we don't block any thread during the wait.
-    private static Future<List<String>> listJoinsWithRetry(
+    static Future<List<String>> listJoinsWithRetry(
             Vertx vertx, JavaFetcher fetcher, int maxRetries, long retryDelayMs, int attempt) {
 
-        return Future.<List<String>>fromCompletionStage(fetcher.listJoins(true))
+        Future<List<String>> listAttempt;
+        try {
+            listAttempt = Future.fromCompletionStage(fetcher.listJoins(true));
+        } catch (Exception error) {
+            listAttempt = Future.failedFuture(error);
+        }
+
+        return listAttempt
                 .timeout(LIST_JOINS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .recover(err -> {
                     if (attempt >= maxRetries) {
@@ -107,16 +180,29 @@ public class FetcherWarmup {
 
     private static Future<Void> fireAllGroups(
             Vertx vertx,
+            WorkerExecutor fetchWorkerExecutor,
             JavaFetcher fetcher,
             List<String> allJoins,
             List<ConfigStore.WarmupGroup> groups,
             int timesPerJoin,
+            int concurrency,
+            int requestBatchSize,
+            boolean runRedisWarmupPhases,
             long warmupStart) {
 
         Future<Void> groupChain = Future.succeededFuture();
         for (ConfigStore.WarmupGroup group : groups) {
             groupChain = groupChain.compose(
-                    ignored -> fireWarmupRequests(vertx, fetcher, allJoins, group, timesPerJoin));
+                    ignored -> fireWarmupRequests(
+                            vertx,
+                            fetchWorkerExecutor,
+                            fetcher,
+                            allJoins,
+                            group,
+                            timesPerJoin,
+                            concurrency,
+                            requestBatchSize,
+                            runRedisWarmupPhases));
         }
 
         return groupChain
@@ -127,16 +213,19 @@ public class FetcherWarmup {
                     } else {
                         logger.warn("Warmup aborted after {}ms: {}", elapsedMs, ar.cause().getMessage());
                     }
-                })
-                .mapEmpty();
+                });
     }
 
     private static Future<Void> fireWarmupRequests(
             Vertx vertx,
+            WorkerExecutor fetchWorkerExecutor,
             JavaFetcher fetcher,
             List<String> allJoins,
             ConfigStore.WarmupGroup group,
-            int timesPerJoin) {
+            int timesPerJoin,
+            int concurrency,
+            int requestBatchSize,
+            boolean runRedisWarmupPhases) {
 
         Pattern pattern = Pattern.compile(group.regex);
         List<String> matchingJoins = allJoins.stream()
@@ -151,35 +240,95 @@ public class FetcherWarmup {
 
         logger.info("Warmup: {} joins matched regex '{}': {}", matchingJoins.size(), group.regex, matchingJoins);
 
-        int totalRequests = matchingJoins.size() * timesPerJoin;
-        logger.info("Warmup: firing {} sequential requests for regex '{}'", totalRequests, group.regex);
+        int phasesPerJoin = runRedisWarmupPhases ? 2 : 1;
+        int totalRequests = matchingJoins.size() * timesPerJoin * phasesPerJoin;
+        logger.info(
+                "Warmup: firing {} requests across {} phase(s) for regex '{}' at concurrency {}",
+                totalRequests, phasesPerJoin, group.regex, concurrency);
+
+        long degradedReadsBefore = fetcher.startupWarmupDegradedReadCount();
 
         Future<Void> warmupChain = Future.succeededFuture();
         for (String joinName : matchingJoins) {
-            List<JavaRequest> requests = FetchHandler.parseJavaRequest(joinName, group.payload).getValue();
-            for (int time = 0; time < timesPerJoin; time++) {
-                final int timeNum = time;
-                warmupChain = warmupChain.compose(ignored ->
-                        fetchWithRetry(vertx, fetcher, requests, joinName, timeNum, timesPerJoin, 0));
+            List<JavaRequest> requests = ensureMinimumBatchSize(
+                    FetchHandler.parseJavaRequest(joinName, group.payload).getValue(), requestBatchSize);
+            List<Boolean> cacheModes = runRedisWarmupPhases ? List.of(false, true) : List.of(true);
+            for (boolean allowBatchIrCache : cacheModes) {
+                for (int windowStart = 0; windowStart < timesPerJoin; windowStart += concurrency) {
+                    int firstRequest = windowStart;
+                    int windowSize = Math.min(concurrency, timesPerJoin - windowStart);
+                    warmupChain = warmupChain.compose(ignored -> {
+                        List<Future<?>> window = new ArrayList<>(windowSize);
+                        for (int offset = 0; offset < windowSize; offset++) {
+                            int timeNum = firstRequest + offset;
+                            window.add(fetchWithRetry(
+                                    vertx,
+                                    fetchWorkerExecutor,
+                                    fetcher,
+                                    requests,
+                                    joinName,
+                                    timeNum,
+                                    timesPerJoin,
+                                    runRedisWarmupPhases,
+                                    allowBatchIrCache,
+                                    0));
+                        }
+                        // Wait for every started request before failing the window. Future.all fails fast, which could
+                        // let readiness open while sibling GLIDE/decode work from the warmup was still running.
+                        return Future.join(window).compose(results -> {
+                            long degradedReads = fetcher.startupWarmupDegradedReadCount() - degradedReadsBefore;
+                            return degradedReads > 0
+                                    ? Future.failedFuture(
+                                            "Warmup was degraded by " + degradedReads +
+                                                    " Redis failed/admission/timeout read(s)")
+                                    : Future.succeededFuture();
+                        });
+                    });
+                }
             }
         }
 
         return warmupChain;
     }
 
+    private static List<JavaRequest> ensureMinimumBatchSize(List<JavaRequest> requests, int minimumSize) {
+        if (requests.isEmpty() || requests.size() >= minimumSize) {
+            return requests;
+        }
+        List<JavaRequest> expanded = new ArrayList<>(minimumSize);
+        long baseTimestamp = requests.get(0).atMillis == null
+                ? System.currentTimeMillis()
+                : requests.get(0).atMillis;
+        for (int index = 0; index < minimumSize; index++) {
+            // Keep configured entity keys exact; unique, adjacent timestamps prevent response fan-out from collapsing
+            // the repeated rows while avoiding fabricated entity IDs and deliberate Redis misses.
+            JavaRequest template = requests.get(index % requests.size());
+            expanded.add(new JavaRequest(template.name, template.keys, baseTimestamp - index));
+        }
+        return expanded;
+    }
+
     private static Future<Void> fetchWithRetry(
             Vertx vertx,
+            WorkerExecutor fetchWorkerExecutor,
             JavaFetcher fetcher,
             List<JavaRequest> requests,
             String joinName,
             int timeNum,
             int timesPerJoin,
+            boolean redisWarmupPath,
+            boolean allowBatchIrCache,
             int attempt) {
 
         // fetchJoin performs synchronous metadata/codec resolution before returning its
         // CompletableFuture. Keep that phase off the event loop so this timeout can fire.
-        Future<CompletableFuture<List<JavaResponse>>> fetchInitiation =
-                vertx.executeBlocking(() -> fetcher.fetchJoin(requests), false);
+        Future<CompletableFuture<List<JavaResponse>>> fetchInitiation = executeBlocking(
+                vertx,
+                fetchWorkerExecutor,
+                () -> redisWarmupPath
+                        ? fetcher.fetchJoinBase64AvroWarmup(requests, allowBatchIrCache)
+                        : fetcher.fetchJoinBase64Avro(requests),
+                false);
 
         return fetchInitiation
                 .compose(Future::fromCompletionStage)
@@ -204,9 +353,10 @@ public class FetcherWarmup {
                     }
                     if (attempt >= FETCH_MAX_RETRIES) {
                         logger.warn(
-                                "Warmup request {}/{} failed for join '{}' after {} attempt(s): {}",
+                                "Warmup request {}/{} failed for join '{}' after {} attempt(s); " +
+                                        "stopping remaining warmup: {}",
                                 timeNum + 1, timesPerJoin, joinName, attempt + 1, error.getMessage());
-                        return Future.succeededFuture();
+                        return Future.failedFuture(error);
                     }
 
                     logger.warn(
@@ -216,15 +366,28 @@ public class FetcherWarmup {
                     vertx.setTimer(FETCH_RETRY_DELAY_MS, id ->
                             fetchWithRetry(
                                     vertx,
+                                    fetchWorkerExecutor,
                                     fetcher,
                                     requests,
                                     joinName,
                                     timeNum,
                                     timesPerJoin,
+                                    redisWarmupPath,
+                                    allowBatchIrCache,
                                     attempt + 1)
                                     .onComplete(retryPromise));
                     return retryPromise.future();
                 });
+    }
+
+    private static <T> Future<T> executeBlocking(
+            Vertx vertx,
+            WorkerExecutor fetchWorkerExecutor,
+            java.util.concurrent.Callable<T> task,
+            boolean ordered) {
+        return fetchWorkerExecutor == null
+                ? vertx.executeBlocking(task, ordered)
+                : fetchWorkerExecutor.executeBlocking(task, ordered);
     }
 
     private static List<String> responseFailures(List<JavaResponse> responses) {
@@ -238,18 +401,23 @@ public class FetcherWarmup {
             return failures;
         }
         for (JavaResponse response : responses) {
-            if (response == null || response.values == null) {
+            if (response == null || response.valuesAvroString == null || response.errorsV2 == null) {
                 failures.add("fetchJoin returned an invalid response");
-            } else if (!response.values.isSuccess()) {
-                Throwable error = response.values.getException();
+            } else if (!response.valuesAvroString.isSuccess()) {
+                Throwable error = response.valuesAvroString.getException();
                 String message = error == null ? null : error.getMessage();
                 failures.add(message == null ? "join response failed" : message);
-            } else if (response.values.getValue() != null) {
-                response.values.getValue().forEach((feature, value) -> {
-                    if (feature.endsWith(FEATURE_EXCEPTION_SUFFIX)) {
-                        failures.add(feature + ": " + String.valueOf(value));
-                    }
-                });
+            } else if (response.valuesAvroString.getValue() == null) {
+                failures.add("fetchJoin returned no Avro response");
+            } else if (!response.errorsV2.isSuccess()) {
+                Throwable error = response.errorsV2.getException();
+                String message = error == null ? null : error.getMessage();
+                failures.add(message == null ? "join response errors failed" : message);
+            } else if (response.errorsV2.getValue() == null) {
+                failures.add("fetchJoin returned no error map");
+            } else {
+                response.errorsV2.getValue().forEach(
+                        (feature, error) -> failures.add(feature + ": " + error));
             }
         }
         return failures;

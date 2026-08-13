@@ -120,6 +120,35 @@ class JoinPartFetcherDeduplicationTest
     captor.getValue.asInstanceOf[Seq[Request]].length shouldBe 6
   }
 
+  it should "retain repeated GroupBy work only for explicit startup warmup" in {
+    doAnswer(new Answer[Future[Seq[Response]]] {
+      override def answer(invocation: InvocationOnMock): Future[Seq[Response]] = {
+        val requests = invocation.getArgument(0).asInstanceOf[Seq[Request]]
+        Future.successful(requests.map(request => Response(request, Success(Map("feature" -> "value")))))
+      }
+    }).when(joinPartFetcher).fetchGroupBys(any(), org.mockito.ArgumentMatchers.eq(false))
+
+    val repeated = Request(
+      testJoin.metaData.name,
+      Map("user_id" -> "u1".asInstanceOf[AnyRef], "product_id" -> "p1".asInstanceOf[AnyRef]))
+    val responses = Await.result(
+      joinPartFetcher.fetchJoins(
+        Seq.fill(3)(repeated),
+        Some(testJoin),
+        _ => None,
+        allowBatchIrCache = false,
+        deduplicateGroupByRequests = false),
+      1.second)
+
+    responses should have size 3
+    val captor = ArgumentCaptor.forClass(classOf[Seq[_]])
+    verify(joinPartFetcher).fetchGroupBys(
+      captor.capture().asInstanceOf[Seq[Request]],
+      org.mockito.ArgumentMatchers.eq(false))
+    // Two JoinParts for each of the three identical outer rows. Normal requests still use the deduplicating default.
+    captor.getValue.asInstanceOf[Seq[Request]] should have size 6
+  }
+
   it should "resolve one join configuration per name for a request batch" in {
     stubFetchGroupBys()
     val joinConfCache = mock[TTLCache[String, Try[JoinOps]]]

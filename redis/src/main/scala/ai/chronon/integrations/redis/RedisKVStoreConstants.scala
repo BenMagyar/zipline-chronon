@@ -36,6 +36,25 @@ object RedisKVStoreConstants {
   val DefaultRedisReadFrom = RedisReadFromPrimary
   val DefaultRedisClientAzPath = "/etc/podinfo/availability-zone"
 
+  // GLIDE ClusterBatch read admission. One Chronon multiGet fans out one sub-pipeline to each touched Redis node;
+  // staying below GLIDE's 50-message per-connection queue prevents Java timeouts from continually replacing native
+  // work that is still draining. Control reads share that total and are queued with priority, so they cannot push a
+  // full feature workload past GLIDE's bound. The real startup metadata set is bulked into one or two outer batches,
+  // not one admission slot per key. Queue capacity bounds the caller continuations and encoded request graphs they
+  // retain; native GLIDE command/response trees are not created until admission.
+  val DefaultRedisReadMaxInflightBatches = 48
+  val DefaultRedisReadMaxQueuedBatches = 16
+  val DefaultRedisReadQueueTimeoutMs = 200
+  val DefaultRedisReadMaxQueuedControlBatches = 128
+  val DefaultRedisReadControlQueueTimeoutMs = 2000
+  val RedisReadTimeoutCooldownMs = 5000L
+
+  // After deterministic process-global and per-worker codec preparation, representative V2 traffic compiles the
+  // GLIDE response/decode/fan-out hot path. Run it at the same concurrency enforced by admission, without queueing.
+  val DefaultGlideStartupWarmupMinimumRequestsPerJoin = 1000
+  val DefaultGlideStartupWarmupConcurrency = DefaultRedisReadMaxInflightBatches
+  val DefaultGlideStartupWarmupRequestBatchSize = 50
+
   // Incremental batch upload defaults. Absolute expirations fence rollback without reading unchanged value payloads;
   // the five-day lease leaves several missed daily uploads of recovery margin.
   val DefaultBulkUploadBatchSize = 1000
@@ -66,6 +85,9 @@ object RedisKVStoreConstants {
   val EnvRedisPipelineSyncThreads = "REDIS_PIPELINE_SYNC_THREADS"
   val EnvRedisClient = "REDIS_CLIENT"
   val EnvRedisReadFrom = "REDIS_READ_FROM"
+  val EnvRedisReadMaxInflightBatches = "REDIS_READ_MAX_INFLIGHT_BATCHES"
+  val EnvRedisReadMaxQueuedBatches = "REDIS_READ_MAX_QUEUED_BATCHES"
+  val EnvRedisReadQueueTimeoutMs = "REDIS_READ_QUEUE_TIMEOUT_MS"
 
   // RedisKVStoreImpl configuration keys
   val ConfigPipelineSyncThreads = "redis.pipeline.sync.threads"
@@ -85,6 +107,9 @@ object RedisKVStoreConstants {
   val PropRedisClient = "redis.client"
   val PropRedisReadFrom = "redis.read.from"
   val PropRedisClientAz = "redis.client.az"
+  val PropRedisReadMaxInflightBatches = "redis.read.max.inflight.batches"
+  val PropRedisReadMaxQueuedBatches = "redis.read.max.queued.batches"
+  val PropRedisReadQueueTimeoutMs = "redis.read.queue.timeout.ms"
 
   val PropRedisBulkUploadStateRoot = "spark.chronon.kv_upload.redis.state_root"
   val PropRedisBulkUploadBatchSize = "spark.chronon.kv_upload.redis.batch_size"

@@ -20,6 +20,7 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap, RejectedExecutionException, ThreadFactory, TimeUnit}
 import java.util.function
 
@@ -75,6 +76,8 @@ class TTLCache[I, O](f: I => O,
                      // the backing store when they refresh.
                      refreshJitterRatio: Double = 0.1) {
 
+  private val refreshJitterSalt = ThreadLocalRandom.current().nextInt()
+
   // Fail fast on a misconfigured ratio: >= 1.0 would jitter away the whole interval (refresh on every read).
   // The range check also rejects NaN/Infinity, since any comparison with NaN is false and the infinities fall
   // outside [0, 1). Reject at construction rather than silently degrading.
@@ -89,7 +92,11 @@ class TTLCache[I, O](f: I => O,
     result
   }
 
-  case class Entry(value: O, updatedAtMillis: Long, var markedForUpdate: AtomicBoolean = new AtomicBoolean(false))
+  // Keep the case-class product at its original three fields for binary compatibility with callers compiled against
+  // older online jars. Retry state is an implementation detail, not part of Entry's public constructor/extractor.
+  case class Entry(value: O, updatedAtMillis: Long, var markedForUpdate: AtomicBoolean = new AtomicBoolean(false)) {
+    @volatile private[TTLCache] var retryAfterMillis: Long = 0L
+  }
   @transient implicit lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   private val updateWhenNull =
@@ -98,11 +105,9 @@ class TTLCache[I, O](f: I => O,
         val now = nowFunc()
         if (u == null) {
           val result = wrappedCreator(t)
-          // A failed cold load is stamped as already-expired (ts = 0) so the next read re-attempts it at the
-          // refresh cadence instead of caching the failure for the full ttl (potentially hours). Once it loads
-          // successfully it is stamped normally and cached for ttl.
-          val ts = if (isValid(result)) now else 0L
-          Entry(result, ts)
+          // Keep failed cold loads logically expired, but do not let every caller immediately retry the same key.
+          if (isValid(result)) Entry(result, now)
+          else entryWithRetry(result, retryDeadline(t, now))
         } else {
           u
         }
@@ -117,12 +122,30 @@ class TTLCache[I, O](f: I => O,
   private def effectiveInterval(i: I, intervalMillis: Long): Long = {
     val jitterWindow = (intervalMillis * refreshJitterRatio).toLong
     if (jitterWindow <= 0 || jitterWindow >= intervalMillis) intervalMillis
-    else intervalMillis - Math.floorMod(i.hashCode.toLong, jitterWindow)
+    else intervalMillis - Math.floorMod((i.hashCode ^ refreshJitterSalt).toLong, jitterWindow)
+  }
+
+  private def retryDeadline(i: I, now: Long): Long = {
+    val delay = effectiveInterval(i, refreshIntervalMillis)
+    if (delay >= Long.MaxValue - now) Long.MaxValue else now + delay
+  }
+
+  private def entryWithRetry(value: O, retryAfterMillis: Long): Entry = {
+    val entry = Entry(value, 0L)
+    entry.retryAfterMillis = retryAfterMillis
+    entry
+  }
+
+  private def releaseAfterFailedRefresh(i: I, entry: Entry): Unit = {
+    // Publish the retry deadline before releasing the refresh mark so the next reader cannot immediately stampede the
+    // backing store. If a successful refresh replaced this entry meanwhile, mutating the old object is harmless.
+    entry.retryAfterMillis = retryDeadline(i, nowFunc())
+    entry.markedForUpdate.compareAndSet(true, false)
   }
 
   // use the fact that cache update is not immediately necessary during regular reads
   // sync update would block the calling threads on every update
-  private def asyncUpdateOnExpiry(i: I, intervalMillis: Long): O = {
+  private def asyncUpdateOnExpiry(i: I, intervalMillis: Long, ignoreRetryBackoff: Boolean = false): O = {
     val entry = cMap.get(i)
     if (entry == null) {
       // block all concurrent callers of this key only on the very first read
@@ -132,6 +155,7 @@ class TTLCache[I, O](f: I => O,
     } else {
       if (
         (nowFunc() - entry.updatedAtMillis > effectiveInterval(i, intervalMillis)) &&
+        (ignoreRetryBackoff || nowFunc() >= entry.retryAfterMillis) &&
         // CAS so that update is enqueued only once per expired entry
         entry.markedForUpdate.compareAndSet(false, true)
       ) {
@@ -147,13 +171,13 @@ class TTLCache[I, O](f: I => O,
                 } else {
                   // refresh produced an invalid value (e.g. a Failure): keep the last-known-good entry and let a
                   // later read re-enqueue the refresh once the interval elapses again.
-                  cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                  releaseAfterFailedRefresh(i, entry)
                   contextBuilder(i).increment("cache.refresh_failure")
                 }
               } catch {
                 case ex: Exception =>
                   // creator threw: keep serving the stale value, reset the mark so another read can retry
-                  cMap.get(i).markedForUpdate.compareAndSet(true, false)
+                  releaseAfterFailedRefresh(i, entry)
                   contextBuilder(i).increment("cache.refresh_failure")
                   contextBuilder(i).incrementException(ex)
               }
@@ -163,7 +187,7 @@ class TTLCache[I, O](f: I => O,
           case _: RejectedExecutionException =>
             // Never move refresh back onto the calling request thread. Keep serving stale and allow a later read to
             // retry once the bounded refresh queue has capacity.
-            entry.markedForUpdate.compareAndSet(true, false)
+            releaseAfterFailedRefresh(i, entry)
             contextBuilder(i).increment("cache.refresh_rejected")
         }
       }
@@ -172,7 +196,23 @@ class TTLCache[I, O](f: I => O,
   }
 
   def apply(i: I): O = asyncUpdateOnExpiry(i, ttlMillis)
+
+  /** Seed a value fetched in bulk without invoking the per-key blocking creator. Existing valid entries win. */
+  def prime(i: I, value: O): O = {
+    val now = nowFunc()
+    val seeded =
+      if (isValid(value)) Entry(value, now)
+      else entryWithRetry(value, retryDeadline(i, now))
+    val entry = cMap.compute(
+      i,
+      new function.BiFunction[I, Entry, Entry] {
+        override def apply(key: I, existing: Entry): Entry =
+          if (existing == null || !isValid(existing.value)) seeded else existing
+      }
+    )
+    entry.value
+  }
   // manually refresh entry with a lower interval
   def refresh(i: I): O = asyncUpdateOnExpiry(i, refreshIntervalMillis)
-  def force(i: I): O = asyncUpdateOnExpiry(i, 0)
+  def force(i: I): O = asyncUpdateOnExpiry(i, 0, ignoreRetryBackoff = true)
 }

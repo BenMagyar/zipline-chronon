@@ -147,6 +147,60 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
     settings.readFrom shouldBe RedisReadFromPrimary
   }
 
+  it should "default and configure GLIDE ClusterBatch read admission" in {
+    val defaults = RedisKVStoreFactory.readAdmissionSettings(
+      Map(PropRedisClusterNodes -> "localhost:6379"),
+      env = Map.empty
+    )
+    defaults.maxInflightBatches shouldBe DefaultRedisReadMaxInflightBatches
+    defaults.maxQueuedBatches shouldBe DefaultRedisReadMaxQueuedBatches
+    defaults.queueTimeoutMs shouldBe DefaultRedisReadQueueTimeoutMs
+
+    val properties = RedisKVStoreFactory.readAdmissionSettings(
+      Map(
+        PropRedisClusterNodes -> "localhost:6379",
+        PropRedisReadMaxInflightBatches -> "40",
+        PropRedisReadMaxQueuedBatches -> "12",
+        PropRedisReadQueueTimeoutMs -> "150"
+      ),
+      env = Map.empty
+    )
+    properties.maxInflightBatches shouldBe 40
+    properties.maxQueuedBatches shouldBe 12
+    properties.queueTimeoutMs shouldBe 150
+
+    val environment = RedisKVStoreFactory.readAdmissionSettings(
+      Map(
+        PropRedisClusterNodes -> "localhost:6379",
+        PropRedisReadMaxInflightBatches -> "40",
+        PropRedisReadMaxQueuedBatches -> "12",
+        PropRedisReadQueueTimeoutMs -> "150"
+      ),
+      env = Map(
+        EnvRedisReadMaxInflightBatches -> "36",
+        EnvRedisReadMaxQueuedBatches -> "8",
+        EnvRedisReadQueueTimeoutMs -> "100"
+      )
+    )
+    environment.maxInflightBatches shouldBe 36
+    environment.maxQueuedBatches shouldBe 8
+    environment.queueTimeoutMs shouldBe 100
+  }
+
+  it should "reject invalid GLIDE ClusterBatch read admission settings" in {
+    Seq(
+      Map(PropRedisReadMaxInflightBatches -> "0"),
+      Map(PropRedisReadMaxQueuedBatches -> "-1"),
+      Map(PropRedisReadQueueTimeoutMs -> "0"),
+      Map(PropRedisReadMaxInflightBatches -> "many")
+    ).foreach { invalid =>
+      an[IllegalArgumentException] should be thrownBy RedisKVStoreFactory.settings(
+        Map(PropRedisClusterNodes -> "localhost:6379") ++ invalid,
+        env = Map.empty
+      )
+    }
+  }
+
   it should "give process environment values precedence over submitted properties" in {
     val settings = RedisKVStoreFactory.settings(
       Map(

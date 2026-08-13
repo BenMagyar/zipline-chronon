@@ -28,6 +28,7 @@ import ai.chronon.online.KVStore.{GetRequest, GetResponse, ListRequest, ListResp
 import ai.chronon.online.fetcher.LRUCache
 import ai.chronon.online.metrics.Metrics
 import ai.chronon.spark.submission.SparkSessionBuilder
+import glide.api.models.exceptions.{TimeoutException => GlideTimeoutException}
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.SparkSession
 import org.slf4j.{Logger, LoggerFactory}
@@ -165,16 +166,83 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
   private val batchStatusLocks = Array.fill[AnyRef](RedisKVStore.BatchStatusLockStripes)(new AnyRef)
   private val batchStatusRefreshes = new TrieMap[String, CompletableFuture[RedisKVStore.CachedBatchStatus]]()
   private val batchStatusRefreshVersions = new AtomicLong()
+  private[redis] val readAdmissionController: Option[RedisReadAdmissionController] =
+    glideReadClient.filter(_.usesClusterBatch).map { _ =>
+      val maxInflightBatches = configuredPositiveInt(
+        PropRedisReadMaxInflightBatches,
+        DefaultRedisReadMaxInflightBatches
+      )
+      new RedisReadAdmissionController(
+        RedisReadAdmissionConfig(
+          maxInflightBatches = maxInflightBatches,
+          maxQueuedBatches = configuredNonNegativeInt(
+            PropRedisReadMaxQueuedBatches,
+            DefaultRedisReadMaxQueuedBatches
+          ),
+          queueTimeoutMillis = configuredPositiveInt(
+            PropRedisReadQueueTimeoutMs,
+            DefaultRedisReadQueueTimeoutMs
+          ).toLong,
+          maxQueuedControlBatches = DefaultRedisReadMaxQueuedControlBatches,
+          controlQueueTimeoutMillis = DefaultRedisReadControlQueueTimeoutMs
+        ))
+    }
+
+  override val startupWarmupMinimumRequestsPerJoin: Int =
+    if (glideReadClient.exists(_.usesClusterBatch)) DefaultGlideStartupWarmupMinimumRequestsPerJoin else 0
+
+  override val startupWarmupConcurrency: Int =
+    if (glideReadClient.exists(_.usesClusterBatch)) {
+      math.min(
+        DefaultGlideStartupWarmupConcurrency,
+        configuredPositiveInt(PropRedisReadMaxInflightBatches, DefaultRedisReadMaxInflightBatches)
+      )
+    } else 1
+
+  override val startupWarmupRequestBatchSize: Int =
+    if (glideReadClient.exists(_.usesClusterBatch)) DefaultGlideStartupWarmupRequestBatchSize else 1
+
+  private val degradedFeatureReadCount = new java.util.concurrent.atomic.AtomicLong()
+  override def startupWarmupDegradedReadCount: Long = degradedFeatureReadCount.get()
 
   // Resolved lazily so direct store construction only needs client configuration when bulk upload is used.
   private lazy val clientSettings: RedisKVStoreFactory.ClientSettings = RedisKVStoreFactory.settings(conf)
+
+  private def configuredPositiveInt(key: String, default: Int): Int = {
+    val configured = configuredInt(key, default)
+    require(configured > 0, s"$key must be positive, got $configured")
+    configured
+  }
+
+  private def configuredNonNegativeInt(key: String, default: Int): Int = {
+    val configured = configuredInt(key, default)
+    require(configured >= 0, s"$key must be non-negative, got $configured")
+    configured
+  }
+
+  private def configuredInt(key: String, default: Int): Int =
+    conf.get(key) match {
+      case None => default
+      case Some(value) =>
+        Try(value.toInt).getOrElse(throw new IllegalArgumentException(s"$key must be an integer, got '$value'"))
+    }
 
   override def create(dataset: String): Unit = {
     logger.info(s"Dataset $dataset ready for use (Redis doesn't require explicit table creation)")
     metricsContext.increment("create.successes")
   }
 
-  override def multiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = {
+  override def multiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] =
+    multiGetByClass(requests, RedisReadClass.Feature)
+
+  override def controlMultiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] =
+    multiGetByClass(requests, RedisReadClass.Control)
+
+  // Redis has no separate client-side read cache to bypass. Keep fresh metadata reads on the prioritized control
+  // admission path while the KVStore default continues to preserve other stores' implementation-specific getFresh.
+  override def getFreshControl(request: GetRequest): Future[GetResponse] = getControl(request)
+
+  private def multiGetByClass(requests: Seq[GetRequest], readClass: RedisReadClass): Future[Seq[GetResponse]] = {
     logger.debug(s"Performing multi-get for ${requests.size} requests")
     if (requests.isEmpty) {
       Future.successful(Seq.empty)
@@ -200,20 +268,77 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
             }
           }
         case Some(_) =>
-          multiGetWithGlide(requests)
+          multiGetWithGlide(requests, readAdmissionController, readClass)(identity)
       }
     }
   }
 
+  override def scopedMultiGet[T](requests: Seq[GetRequest])(consume: Future[Seq[GetResponse]] => Future[T]): Future[T] =
+    if (
+      requests.nonEmpty && glideReadClient.exists(_.usesClusterBatch) && requests.exists(_.dataset != MetadataDataset)
+    )
+      multiGetWithGlide(requests, readAdmissionController, RedisReadClass.Feature)(consume)
+    else
+      super.scopedMultiGet(requests)(consume)
+
   private def buildReadResponses(plans: Seq[PlannedRead], redisResults: Seq[Try[Seq[TimedValue]]]): Seq[GetResponse] = {
     val results = redisResults.iterator
-    val responses = plans.map {
+    // Seq permits lazy implementations (notably Stream in Scala 2.12). Materialize before checking the result
+    // iterator; otherwise a lazy map has consumed nothing yet and falsely reports every Redis result as extra.
+    val responses = plans.iterator.map {
       case ImmediateReadPlan(request, values) => GetResponse(request, values)
       case plan: RedisReadPlan                => GetResponse(plan.request, results.next())
-    }
+    }.toVector
     require(!results.hasNext, s"Read client returned more results than the ${plans.size} planned reads")
     responses
   }
+
+  private def bestEffortReadMetrics(record: => Unit): Unit =
+    try record
+    catch {
+      // Metrics are observability only. They must never gate admission state transitions or read completion.
+      case NonFatal(_) => ()
+    }
+
+  private def recordAdmissionRejection(error: RedisReadAdmissionRejectedException, readClass: RedisReadClass): Unit =
+    bestEffortReadMetrics {
+      if (recordReadMetrics) {
+        metricsContext.increment(
+          "multiGet.glide.admission.rejected",
+          redisReadMetricTags + ("reason" -> error.reason) + ("read_class" -> readClass.metricName)
+        )
+        readAdmissionController.foreach(controller => recordAdmissionInflight(controller.snapshot))
+      }
+    }
+
+  private def recordAdmissionInflight(snapshot: RedisReadAdmissionSnapshot): Unit =
+    bestEffortReadMetrics {
+      if (recordReadMetrics) {
+        metricsContext.distribution(
+          "multiGet.glide.admission.inflight",
+          snapshot.inflightBatches.toLong,
+          redisReadMetricTags
+        )
+        metricsContext.distribution(
+          "multiGet.glide.admission.queued_depth",
+          snapshot.queuedBatches.toLong,
+          redisReadMetricTags
+        )
+      }
+    }
+
+  private def recordAdmissionCooldown(cooldown: RedisReadAdmissionCooldown): Unit =
+    bestEffortReadMetrics {
+      if (recordReadMetrics) {
+        metricsContext.increment("multiGet.glide.admission.cooldown.opened", redisReadMetricTags)
+        metricsContext.distribution(
+          "multiGet.glide.admission.cooldown.flushed",
+          cooldown.flushedBatches.toLong,
+          redisReadMetricTags
+        )
+        recordAdmissionInflight(cooldown.snapshot)
+      }
+    }
 
   private final class PreparedGlideReads(val commands: IndexedSeq[GlideReadCommand],
                                          val commandRanges: Array[Range],
@@ -223,38 +348,121 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
     *   1. Chronon read planning, GLIDE command planning, and native submission;
     *   2. native-result decoding, response construction, metrics, and promise completion.
     *
-    * The native future waits on GLIDE's own event loop. Its callback only timestamps completion and submits task 2, so
-    * no chronon-fetcher worker is occupied while Redis is in flight.
+    * The native future waits on GLIDE's own event loop. Its callback submits task 2 for response decoding, so no
+    * chronon-fetcher worker is occupied while Redis is in flight. Timeout fail-open completes there without decoding.
     */
-  private def multiGetWithGlide(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = {
+  private def multiGetWithGlide[T](requests: Seq[GetRequest],
+                                   admissionController: Option[RedisReadAdmissionController],
+                                   readClass: RedisReadClass)(
+      consume: Future[Seq[GetResponse]] => Future[T]): Future[T] = {
     val startedAt = System.currentTimeMillis()
-    val responsePromise = Promise[Seq[GetResponse]]()
+    val rawResponsePromise = Promise[Seq[GetResponse]]()
 
-    def completeSuccess(responses: Seq[GetResponse]): Unit = responsePromise.synchronized {
-      if (!responsePromise.isCompleted) {
+    def releasePermit(permit: RedisReadAdmissionPermit): Unit =
+      if (permit != null)
+        permit.release().foreach(recordAdmissionInflight)
+
+    // The caller's consumer may time out independently of the native read. Retain the permit until both terminate so
+    // a Java-side timeout cannot admit replacement work while GLIDE is still draining, and so GroupBy FastSerde
+    // decoding remains inside the same bounded lifecycle.
+    final class ScopedReadLifecycle {
+      private var permit: RedisReadAdmissionPermit = null
+      private var rawSettled = false
+      private var consumerSettled = false
+      private var released = false
+
+      def installPermit(acquired: RedisReadAdmissionPermit): Unit = {
+        val toRelease = synchronized {
+          require(permit == null, "Redis read admission lifecycle received more than one permit")
+          permit = acquired
+          permitToReleaseUnsafe()
+        }
+        releasePermit(toRelease)
+      }
+
+      def markRawSettled(): Unit = {
+        val toRelease = synchronized {
+          rawSettled = true
+          permitToReleaseUnsafe()
+        }
+        releasePermit(toRelease)
+      }
+
+      def markConsumerSettled(): Unit = {
+        val toRelease = synchronized {
+          consumerSettled = true
+          permitToReleaseUnsafe()
+        }
+        releasePermit(toRelease)
+      }
+
+      private def permitToReleaseUnsafe(): RedisReadAdmissionPermit =
+        if (!released && permit != null && rawSettled && consumerSettled) {
+          released = true
+          permit
+        } else null
+    }
+
+    val lifecycle = new ScopedReadLifecycle
+    val consumedFuture =
+      try {
+        val future = consume(rawResponsePromise.future)
+        if (future == null) Future.failed(new NullPointerException("scopedMultiGet consumer returned null")) else future
+      } catch {
+        case NonFatal(error) => Future.failed(error)
+      }
+    consumedFuture.onComplete(_ => lifecycle.markConsumerSettled())(InlineLifecycleExecutionContext)
+
+    def completeRaw(result: Try[Seq[GetResponse]]): Unit = {
+      rawResponsePromise.tryComplete(result)
+      lifecycle.markRawSettled()
+    }
+
+    def completeSuccess(responses: Seq[GetResponse]): Unit = {
+      if (readClass == RedisReadClass.Feature && responses.exists(_.values.isFailure))
+        degradedFeatureReadCount.incrementAndGet()
+      completeRaw(Success(responses))
+      bestEffortReadMetrics {
         if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
-        responsePromise.success(responses)
       }
     }
 
-    def completeFailure(error: Exception): Unit = responsePromise.synchronized {
-      if (!responsePromise.isCompleted) {
-        try {
-          logger.error("Error getting values from Redis Cluster", error)
-          val responses = requests.map(request => GetResponse(request, Failure(error)))
+    def completeFailure(error: Exception): Unit =
+      try {
+        logger.error("Error getting values from Redis Cluster", error)
+        if (readClass == RedisReadClass.Feature) degradedFeatureReadCount.incrementAndGet()
+        val responses = requests.map(request => GetResponse(request, Failure(error)))
+        completeRaw(Success(responses))
+        bestEffortReadMetrics {
           if (recordReadMetrics) recordMultiGetMetrics(responses, System.currentTimeMillis() - startedAt)
-          responsePromise.success(responses)
-        } catch {
-          case completionError: Throwable =>
-            responsePromise.tryFailure(completionError)
-            if (!NonFatal(completionError)) throw completionError
+        }
+      } catch {
+        case completionError: Throwable =>
+          completeRaw(Failure(completionError))
+          if (!NonFatal(completionError)) throw completionError
+      }
+
+    def completeAdmissionRejection(error: RedisReadAdmissionRejectedException): Unit = {
+      if (readClass == RedisReadClass.Feature) {
+        degradedFeatureReadCount.incrementAndGet()
+        completeRaw(Success(requests.map(request => GetResponse(request, Success(Seq.empty)))))
+      } else
+        completeRaw(Success(requests.map(request => GetResponse(request, Failure(error)))))
+      recordAdmissionRejection(error, readClass)
+      bestEffortReadMetrics {
+        if (recordReadMetrics) {
+          if (error.reason == "timeout_cooldown")
+            metricsContext.increment("multiGet.glide.admission.cooldown.shed", redisReadMetricTags)
+          metricsContext.distribution(
+            "multiGet.glide.admission.shed.latency",
+            System.currentTimeMillis() - startedAt,
+            redisReadMetricTags + ("reason" -> error.reason) + ("read_class" -> readClass.metricName)
+          )
         }
       }
     }
 
-    def failOuter(error: Throwable): Unit = responsePromise.synchronized {
-      if (!responsePromise.isCompleted) responsePromise.failure(error)
-    }
+    def failOuter(error: Throwable): Unit = completeRaw(Failure(error))
 
     def completeAsyncFailure(error: Throwable): Unit = error match {
       case exception: Exception => completeFailure(exception)
@@ -274,57 +482,126 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
         case error: Throwable => completeThrown(error)
       }
 
-    submit(
-      new Runnable {
-        override def run(): Unit = {
-          try {
-            val plans = recordReadPhase("multiGet.plan.latency") {
-              val defaultEndTs = System.currentTimeMillis()
-              val batchStatuses = snapshotBatchStatuses(requests)
-              requests.map(request => planRead(request, defaultEndTs, batchStatuses))
-            }
-            val redisPlans = plans.collect { case plan: RedisReadPlan => plan }.toIndexedSeq
-            val prepared = prepareGlideReads(redisPlans)
-            val nativeStartedAtNanos = System.nanoTime()
-            val nativeFuture = glideReadClient.get.execute(prepared.commands)
+    // Completing the raw future is constant-size work. Any GroupBy response decoding remains on its existing Future
+    // execution context, so overload shedding itself must not wait behind the saturated shared executor.
+    def submitShed(error: RedisReadAdmissionRejectedException): Unit = completeAdmissionRejection(error)
 
-            nativeFuture.whenComplete(new BiConsumer[IndexedSeq[Try[GlideReadResult]], Throwable] {
-              override def accept(commandResults: IndexedSeq[Try[GlideReadResult]], nativeError: Throwable): Unit = {
-                val nativeCompletedAtNanos = System.nanoTime()
-                val completionTask = new Runnable {
-                  override def run(): Unit = {
-                    try {
-                      if (nativeError != null) {
-                        completeAsyncFailure(unwrapCompletionError(nativeError))
-                      } else {
-                        val decodeStartedAtNanos = System.nanoTime()
-                        recordReadDuration("multiGet.glide.completion_queue.latency",
-                                           nativeCompletedAtNanos,
-                                           decodeStartedAtNanos)
-                        val redisResults = decodeGlideReads(redisPlans, prepared, commandResults, decodeStartedAtNanos)
-                        val responses = buildReadResponses(plans, redisResults)
-                        completeSuccess(responses)
+    def start(): Unit =
+      submit(
+        new Runnable {
+          override def run(): Unit = {
+            try {
+              val plans = recordReadPhase("multiGet.plan.latency") {
+                val defaultEndTs = System.currentTimeMillis()
+                val batchStatuses = snapshotBatchStatuses(requests)
+                requests.map(request => planRead(request, defaultEndTs, batchStatuses))
+              }
+              val redisPlans = plans.collect { case plan: RedisReadPlan => plan }.toIndexedSeq
+              val prepared = prepareGlideReads(redisPlans)
+              val nativeStartedAtNanos = System.nanoTime()
+              val nativeFuture = glideReadClient.get.execute(prepared.commands)
+
+              nativeFuture.whenComplete(new BiConsumer[IndexedSeq[Try[GlideReadResult]], Throwable] {
+                override def accept(commandResults: IndexedSeq[Try[GlideReadResult]], nativeError: Throwable): Unit = {
+                  val nativeCompletedAtNanos = System.nanoTime()
+                  val outerTimeout = Option(nativeError).exists(isGlideTimeout)
+                  val commandTimeout = Option(commandResults).exists(_.exists {
+                    case Failure(error) => isGlideTimeout(error)
+                    case Success(_)     => false
+                  })
+                  val timeout = outerTimeout || commandTimeout
+                  val cooldown =
+                    if (timeout && readClass == RedisReadClass.Feature)
+                      admissionController.map(_.openCooldown(RedisReadTimeoutCooldownMs))
+                    else None
+                  if (outerTimeout || (commandTimeout && readClass == RedisReadClass.Feature)) {
+                    // This path does not decode a native response. Complete it on the callback thread so fail-open
+                    // cannot wait behind the saturated shared executor that triggered the timeout.
+                    completeAdmissionRejection(
+                      new RedisReadGlideTimeoutException("GLIDE ClusterBatch timed out")
+                    )
+                  } else {
+                    // Control batches retain per-command outcomes. A timeout for one metadata key must not discard
+                    // successful results for the other keys in the same bulk warmup/refresh batch.
+                    val completionTask = new Runnable {
+                      override def run(): Unit = {
+                        try {
+                          if (nativeError != null) {
+                            completeAsyncFailure(unwrapCompletionError(nativeError))
+                          } else {
+                            val decodeStartedAtNanos = System.nanoTime()
+                            bestEffortReadMetrics(
+                              recordReadDuration("multiGet.glide.completion_queue.latency",
+                                                 nativeCompletedAtNanos,
+                                                 decodeStartedAtNanos))
+                            val redisResults =
+                              decodeGlideReads(redisPlans, prepared, commandResults, decodeStartedAtNanos)
+                            val responses = buildReadResponses(plans, redisResults)
+                            completeSuccess(responses)
+                          }
+                        } catch {
+                          case error: Throwable => completeThrown(error)
+                        }
                       }
-                    } catch {
-                      case error: Throwable => completeThrown(error)
+                    }
+
+                    submit(completionTask)
+                  }
+                  // Report callback-thread metrics after completing or submitting the response path.
+                  cooldown.foreach(recordAdmissionCooldown)
+                  bestEffortReadMetrics(
+                    recordReadDuration("multiGet.glide.native.latency", nativeStartedAtNanos, nativeCompletedAtNanos))
+                }
+              })
+            } catch {
+              case error: Throwable => completeThrown(error)
+            }
+          }
+        }
+      )
+
+    admissionController match {
+      case None => start()
+      case Some(controller) =>
+        controller.acquire(readClass) match {
+          case Left(error) => submitShed(error)
+          case Right(admission) =>
+            admission.future.whenComplete(new BiConsumer[RedisReadAdmissionPermit, Throwable] {
+              override def accept(permit: RedisReadAdmissionPermit, error: Throwable): Unit =
+                if (error != null) {
+                  unwrapCompletionError(error) match {
+                    case rejection: RedisReadAdmissionRejectedException => submitShed(rejection)
+                    case other                                          => failOuter(other)
+                  }
+                } else {
+                  lifecycle.installPermit(permit)
+                  start()
+                  bestEffortReadMetrics {
+                    if (recordReadMetrics) {
+                      val admissionTags = redisReadMetricTags + ("read_class" -> readClass.metricName)
+                      metricsContext.increment("multiGet.glide.admission.admitted", admissionTags)
+                      if (permit.wasQueued)
+                        metricsContext.distribution(
+                          "multiGet.glide.admission.queue_wait",
+                          permit.queueWaitMillis,
+                          admissionTags
+                        )
+                      recordAdmissionInflight(controller.snapshot)
                     }
                   }
                 }
-
-                submit(completionTask)
-                // Submit the completion task first so metric reporting on GLIDE's callback thread is not counted as
-                // shared-executor completion-queue latency.
-                recordReadDuration("multiGet.glide.native.latency", nativeStartedAtNanos, nativeCompletedAtNanos)
-              }
             })
-          } catch {
-            case error: Throwable => completeThrown(error)
-          }
+            bestEffortReadMetrics {
+              if (admission.queued && recordReadMetrics)
+                metricsContext.increment(
+                  "multiGet.glide.admission.queued",
+                  redisReadMetricTags + ("read_class" -> readClass.metricName)
+                )
+            }
         }
-      }
-    )
+    }
 
-    responsePromise.future
+    consumedFuture
   }
 
   private def prepareGlideReads(plans: IndexedSeq[RedisReadPlan]): PreparedGlideReads = {
@@ -375,8 +652,10 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
       }
     }
 
-    if (recordReadMetrics)
-      metricsContext.distribution("multiGet.glide.command_count", commands.size.toLong, redisReadMetricTags)
+    bestEffortReadMetrics {
+      if (recordReadMetrics)
+        metricsContext.distribution("multiGet.glide.command_count", commands.size.toLong, redisReadMetricTags)
+    }
     new PreparedGlideReads(commands.toIndexedSeq, commandRanges, mgetValueIndexes)
   }
 
@@ -398,7 +677,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
           decodeGlideRead(plan, commandResults.slice(range.start, range.end))
       }
     }
-    recordReadDuration("multiGet.glide.decode.latency", decodeStartedAtNanos, System.nanoTime())
+    bestEffortReadMetrics(recordReadDuration("multiGet.glide.decode.latency", decodeStartedAtNanos, System.nanoTime()))
     decoded
   }
 
@@ -439,6 +718,12 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
     case wrapper: CompletionException if wrapper.getCause != null => unwrapCompletionError(wrapper.getCause)
     case wrapper: ExecutionException if wrapper.getCause != null  => unwrapCompletionError(wrapper.getCause)
     case other                                                    => other
+  }
+
+  private def isGlideTimeout(error: Throwable): Boolean = unwrapCompletionError(error) match {
+    case _: GlideTimeoutException                 => true
+    case _: java.util.concurrent.TimeoutException => true
+    case _                                        => false
   }
 
   private def planRead(request: GetRequest,
@@ -992,7 +1277,7 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
   private def recordReadPhase[A](metric: String)(body: => A): A = {
     val startedAtNanos = System.nanoTime()
     try body
-    finally recordReadDuration(metric, startedAtNanos, System.nanoTime())
+    finally bestEffortReadMetrics(recordReadDuration(metric, startedAtNanos, System.nanoTime()))
   }
 
   private def recordReadDuration(metric: String, startedAtNanos: Long, completedAtNanos: Long): Unit =
@@ -1436,33 +1721,34 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
   override def init(props: Map[String, Any]): Unit = {
     super.init(props)
 
-    val warmupLengthMillis: Long = 5000L
-    // Perform some dummy operations to warm up the connection pool
-    // This can help reduce latency for the first real operations.
-    // Intentionally getting non-existent keys below to warm up.
-    val testKey = "warmup_key"
-    logger.info(s"Warming up Redis KVStore with key prefix $testKey")
-    try {
-      val getFutures = this.multiGet(
-        // create 100 requests to simulate load
-        (1 to 100)
-          .map(i =>
-            GetRequest(
-              keyBytes = s"${testKey}_$i".getBytes,
-              dataset = MetadataDataset
-            ))
-          .toSeq
-      )
-      // Wait for the future to complete with a timeout
+    if (glideReadClient.isDefined) {
+      // GLIDE creates its connections and discovers cluster topology before createClient completes. Fake misses do
+      // not warm Chronon's metadata caches and only add a startup ClusterBatch, so real fetcher warmup owns that work.
+      logger.info("GLIDE Redis client initialized; skipping synthetic missing-key warm-up")
+    } else {
+      val warmupLengthMillis: Long = 5000L
+      val testKey = "warmup_key"
+      logger.info(s"Warming up the Jedis Redis connection pool with key prefix $testKey")
       try {
-        Await.result(getFutures, warmupLengthMillis.milliseconds)
+        val getFutures = this.multiGet(
+          (1 to 100)
+            .map(i =>
+              GetRequest(
+                keyBytes = s"${testKey}_$i".getBytes,
+                dataset = MetadataDataset
+              ))
+            .toSeq
+        )
+        try {
+          Await.result(getFutures, warmupLengthMillis.milliseconds)
+        } catch {
+          case _: Exception => // best-effort pool warmup
+        }
+        logger.info("Jedis Redis connection-pool warm-up completed")
       } catch {
-        case _: Exception => // swallow exception
+        case e: Exception =>
+          logger.warn("Jedis connection-pool warm-up failed", e)
       }
-      logger.info("Redis KVStore warm-up completed successfully")
-    } catch {
-      case e: Exception =>
-        logger.warn("Warm-up operations failed", e)
     }
   }
 
@@ -1490,7 +1776,16 @@ class RedisKVStoreImpl(jedisCluster: JedisCluster,
       }
     }
 
+  private[redis] def shutdownReadAdmissionController(): Unit =
+    readAdmissionController.foreach { controller =>
+      try controller.close()
+      catch {
+        case e: Exception => logger.warn("Failed to close GLIDE Redis read admission controller", e)
+      }
+    }
+
   override def close(): Unit = {
+    shutdownReadAdmissionController()
     shutdownPipelineSyncExecutor()
     shutdownGlideReadClient()
     jedisCluster.close()
@@ -1501,6 +1796,10 @@ private[redis] object RedisKVStoreImpl {
   private val PipelineResponseUnsetMessage = "Please close pipeline or multi block before calling this method."
   private val PipelineExecutorShutdownTimeoutSeconds = 5L
   private val PipelineExecutorIds = new AtomicInteger()
+  private val InlineLifecycleExecutionContext = new scala.concurrent.ExecutionContext {
+    override def execute(runnable: Runnable): Unit = runnable.run()
+    override def reportFailure(cause: Throwable): Unit = ()
+  }
   private val ListCursorMagic = 0x43524c43 // CRLC
   private val ListCursorVersion = 1
   private val MaxListCursorPendingKeys = 100000

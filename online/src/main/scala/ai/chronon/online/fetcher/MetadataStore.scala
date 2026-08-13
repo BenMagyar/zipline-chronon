@@ -29,15 +29,25 @@ import ai.chronon.online.metrics.{Metrics, TTLCache}
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.{TimeUnit, TimeoutException}
 import java.util.function.BiFunction
 import scala.collection.immutable.SortedMap
 import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.reflect.ClassTag
 import scala.util.{Failure, Success, Try}
 
 // [timestamp -> {metric name -> metric value}]
 case class DataMetrics(series: Seq[(Long, SortedMap[String, Any])])
+
+case class MetadataWarmupResult(joinNames: Seq[String],
+                                groupByNames: Seq[String],
+                                loadedJoinCount: Int,
+                                loadedGroupByCount: Int,
+                                missingJoinNames: Seq[String],
+                                missingGroupByNames: Seq[String],
+                                failures: Seq[String])
 
 case class ConfPathOrName(confPath: Option[String] = None, confName: Option[String] = None) {
 
@@ -64,6 +74,17 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
 
   private final class CachedGroupByServingInfo(val rawMetadata: String, val parsed: GroupByServingInfoParsed)
   private val ParsedGroupByServingInfoCacheMaxEntries = 4096
+
+  // GetRequest is a case class containing Array[Byte], whose generated equality is reference-based for the key.
+  // Metadata stores are free to return bulk responses in a different order, so use a content-based identity when
+  // matching each response back to its request.
+  private final case class MetadataReadKey(dataset: String,
+                                           keyBytes: Vector[Byte],
+                                           startTsMillis: Option[Long],
+                                           endTsMillis: Option[Long])
+
+  private def metadataReadKey(request: KVStore.GetRequest): MetadataReadKey =
+    MetadataReadKey(request.dataset, request.keyBytes.toVector, request.startTsMillis, request.endTsMillis)
 
   // The hot path intentionally checks batch serving metadata every few seconds so a newly published batch becomes
   // visible even when every feature value is served from Caffeine. Most checks return byte-for-byte identical JSON.
@@ -204,6 +225,114 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
       metrics.Metrics.Context(environment = "model_transforms.meta.fetch", modelTransforms = modelTransforms)
     }
   )
+
+  /** Bulk-prime the exact Join and GroupBy serving metadata needed by the configured startup joins.
+    *
+    * Reads are chunked and sequential, so a large join produces a few control-plane ClusterBatches instead of one
+    * independently submitted ClusterBatch per GroupBy. Both valid and missing serving-info entries are primed; a
+    * missing entry observes the normal retry backoff rather than starting a refresh storm as HTTP comes online.
+    */
+  def warmJoinMetadata(names: Seq[String], timeoutMillis: Long): MetadataWarmupResult = {
+    require(timeoutMillis > 0L, s"Metadata warmup timeout must be positive, got $timeoutMillis")
+    val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+    val joinNames = names.iterator.toVector.distinct
+    val joinRequests = joinNames.map { name =>
+      KVStore.GetRequest(s"$JoinFolder/$name".getBytes(Constants.UTF8), fetchContext.metadataDataset)
+    }
+    val joinReads = bulkReadStrings(joinRequests, deadlineNanos)
+    val parsedJoins = joinNames.zip(joinReads).map { case (name, read) =>
+      name -> read.map(raw => new JoinOps(ThriftJsonCodec.fromJsonStr[Join](raw, false, classOf[Join])))
+    }
+    parsedJoins.foreach { case (name, parsed) => parsed.foreach(value => getJoinConf.prime(name, Success(value))) }
+
+    val groupByNames = parsedJoins.iterator
+      .flatMap(_._2.toOption)
+      .flatMap(_.joinPartOps.iterator.map(_.groupBy.metaData.getName))
+      .toVector
+      .distinct
+    val groupByRequests = groupByNames.map { name =>
+      val dataset = s"${name.sanitize.toUpperCase()}_BATCH"
+      KVStore.GetRequest(Constants.GroupByServingInfoKey.getBytes(Constants.UTF8), dataset)
+    }
+    val groupByReads = bulkReadStrings(groupByRequests, deadlineNanos)
+    val parsedGroupBys = groupByNames.zip(groupByRequests).zip(groupByReads).map { case ((name, request), read) =>
+      name -> read.map(raw => parseOrReuseGroupByServingInfo(request.dataset, raw))
+    }
+    val missingJoinNames = joinNames
+      .zip(joinReads)
+      .collect { case (name, Failure(_: NoSuchElementException)) =>
+        name
+      }
+      .toVector
+    val missingGroupByNames = groupByNames
+      .zip(groupByReads)
+      .collect { case (name, Failure(_: NoSuchElementException)) =>
+        name
+      }
+      .toVector
+    val missingGroupBySet = missingGroupByNames.toSet
+
+    // Cache successful metadata and genuine Redis misses. Transient admission, timeout, and parsing failures remain
+    // uncached so the first live request can retry them through the prioritized control path.
+    parsedGroupBys.foreach {
+      case (name, parsed @ Success(_))                            => getGroupByServingInfo.prime(name, parsed)
+      case (name, parsed @ Failure(_)) if missingGroupBySet(name) => getGroupByServingInfo.prime(name, parsed)
+      case _                                                      => ()
+    }
+
+    val failures =
+      parsedJoins.collect {
+        case (name, Failure(error)) if !missingJoinNames.contains(name) => s"join $name: ${error.getMessage}"
+      } ++ parsedGroupBys.collect {
+        case (name, Failure(error)) if !missingGroupBySet(name) => s"groupBy $name: ${error.getMessage}"
+      }
+    MetadataWarmupResult(
+      joinNames,
+      groupByNames,
+      parsedJoins.count(_._2.isSuccess),
+      parsedGroupBys.count(_._2.isSuccess),
+      missingJoinNames,
+      missingGroupByNames,
+      failures
+    )
+  }
+
+  private def bulkReadStrings(requests: Seq[KVStore.GetRequest], deadlineNanos: Long): Seq[Try[String]] =
+    requests
+      .grouped(CONF_BATCH_SIZE)
+      .flatMap { batch =>
+        val read = Try {
+          val remainingNanos = deadlineNanos - System.nanoTime()
+          if (remainingNanos <= 0L) throw new TimeoutException("Metadata warmup deadline elapsed")
+          val remainingMillis = math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
+          val readTimeoutMillis = math.min(fetchContext.timeoutMillis, remainingMillis)
+          Await.result(fetchContext.kvStore.controlMultiGet(batch), Duration(readTimeoutMillis, "millis"))
+        }
+        read
+          .map { responses =>
+            val responsesByKey = mutable.HashMap.empty[MetadataReadKey, KVStore.GetResponse]
+            responses.foreach { response =>
+              val key = metadataReadKey(response.request)
+              require(!responsesByKey.contains(key), s"Metadata warmup received a duplicate response for $key")
+              responsesByKey.put(key, response)
+            }
+            require(
+              responsesByKey.size == batch.iterator.map(metadataReadKey).toSet.size,
+              s"Metadata warmup received ${responsesByKey.size} distinct responses for ${batch.size} requests"
+            )
+            batch.map { request =>
+              responsesByKey
+                .getOrElse(metadataReadKey(request),
+                           throw new IllegalStateException(
+                             s"Metadata warmup received no response for dataset ${request.dataset}"))
+                .latest
+                .map(value => new String(value.bytes, Constants.UTF8))
+            }
+          }
+          .recover { case error => batch.map(_ => Failure(error)) }
+          .get
+      }
+      .toVector
 
   def listJoins(isOnline: Boolean = true): Future[Seq[String]] = {
     import ai.chronon.online.metrics
@@ -529,7 +658,11 @@ class MetadataStore(fetchContext: FetchContext) extends ThrottledLogging {
       // Serve stale on refresh failure: this loader returns Failure (rather than throwing) on a KV miss/timeout,
       // so without this a transient BigTable blip during refresh would poison a previously-good entry and every
       // subsequent request for the join would fail until a refresh finally succeeded.
-      isValid = (servingInfo: Try[GroupByServingInfoParsed]) => servingInfo.isSuccess
+      isValid = (servingInfo: Try[GroupByServingInfoParsed]) => servingInfo.isSuccess,
+      // Batch uploads are daily. A 15-30 second retry window is still effectively immediate while avoiding the
+      // synchronized 8-second refresh wave produced by priming dozens of entries at once on every new pod.
+      refreshIntervalMillis = 30 * 1000,
+      refreshJitterRatio = 0.5
     )
 
   /** Bypass serving-info and KV implementation caches for low-volume callers that require current metadata. */

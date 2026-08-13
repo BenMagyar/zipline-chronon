@@ -18,7 +18,8 @@ package ai.chronon.spark.other
 
 import ai.chronon.api.Constants.MetadataDataset
 import ai.chronon.api._
-import ai.chronon.online.FetcherUtil
+import ai.chronon.online.{ExternalSourceHandler, FetcherUtil}
+import ai.chronon.online.fetcher.{FeaturesResponseType, Fetcher}
 import ai.chronon.online.fetcher.Fetcher.Request
 import ai.chronon.spark.LoggingSchema
 import ai.chronon.spark.utils.{MockApi, OnlineUtils}
@@ -27,7 +28,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 
 import java.util.Base64
 import scala.collection.mutable
-import scala.concurrent.Await
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.SECONDS
 
@@ -167,5 +168,22 @@ class ExternalSourcesTest extends AnyFlatSpec {
     assertEquals(expectedKeys, emptyResponseMap.keySet)
     assertEquals(null, emptyResponseMap("ext_contextual_context_1"))
     assertEquals(null, emptyResponseMap("ext_contextual_context_2"))
+
+    var externalCalls = 0
+    fetcher.externalSourceRegistry.handlerMap.update(
+      "plus_one",
+      new ExternalSourceHandler {
+        override def fetch(requests: Seq[Fetcher.Request]): Future[Seq[Fetcher.Response]] = {
+          externalCalls += 1
+          Future.failed(new AssertionError("startup warmup invoked an external feature provider"))
+        }
+      })
+    val warmupResponses = Await.result(
+      fetcher.fetchJoinV2Warmup(requests, FeaturesResponseType.AvroString),
+      Duration(10, SECONDS))
+    assertEquals(requests.size, warmupResponses.size)
+    assertTrue(warmupResponses.forall(_.valuesAvroString.isSuccess))
+    assertTrue(warmupResponses.forall(response => response.errors.isSuccess && response.errors.get.isEmpty))
+    assertEquals(0, externalCalls)
   }
 }

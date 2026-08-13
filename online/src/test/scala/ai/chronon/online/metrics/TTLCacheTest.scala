@@ -48,6 +48,7 @@ class TTLCacheTest extends AnyFlatSpec with Matchers {
       contextBuilder = _ => testContext,
       ttlMillis = 100L,
       nowFunc = () => now.get(),
+      refreshIntervalMillis = 100L,
       // jitter off so expiry is exactly ttlMillis and timing is deterministic in the test
       refreshJitterRatio = 0.0,
       isValid = (t: Try[String]) => t.isSuccess
@@ -105,19 +106,44 @@ class TTLCacheTest extends AnyFlatSpec with Matchers {
     cache("cold").isFailure shouldBe true
   }
 
-  it should "retry a failed cold load at the refresh cadence instead of caching it for the full ttl" in {
-    // now starts well past ttl so a ts=0 (failed cold) entry reads as already-expired, mirroring wall-clock time.
+  it should "retry a failed cold load at the refresh cadence without retrying on every request" in {
     val now = new AtomicLong(1000L)
     val calls = new AtomicInteger(0)
     val result = new AtomicReference[Try[String]](Failure(new RuntimeException("cold boom")))
     val cache = controllableCache(now, calls, result)
 
-    cache("k").isFailure shouldBe true // cold load fails; stamped as already-expired (ts = 0), not cached for ttl
+    cache("k").isFailure shouldBe true
+    val loadsAfterColdStart = calls.get()
 
-    // backing store recovers; because the failed cold entry is stamped ts=0 it is eligible for re-fetch right away
-    // via the normal apply() path, without waiting the full ttl.
+    // Repeated requests during the retry interval do not generate a backing-store storm.
     result.set(Success("good"))
+    (0 until 100).foreach(_ => cache("k"))
+    Thread.sleep(50)
+    calls.get() shouldBe loadsAfterColdStart
+
+    now.set(1101L)
     awaitCond()(cache("k") == Success("good")) shouldBe true
+  }
+
+  it should "back off a failed stale refresh while continuing to serve the last-known-good value" in {
+    val now = new AtomicLong(0L)
+    val calls = new AtomicInteger(0)
+    val result = new AtomicReference[Try[String]](Success("good"))
+    val cache = controllableCache(now, calls, result)
+
+    cache("k") shouldBe Success("good")
+    result.set(Failure(new RuntimeException("down")))
+    now.set(101L)
+    cache("k") shouldBe Success("good")
+    awaitCond()(calls.get() == 2) shouldBe true
+
+    (0 until 100).foreach(_ => cache("k"))
+    Thread.sleep(50)
+    calls.get() shouldBe 2
+
+    now.set(202L)
+    cache("k") shouldBe Success("good")
+    awaitCond()(calls.get() == 3) shouldBe true
   }
 
   it should "leave a shared fetcher worker available for a Future awaited by the refresh creator" in {

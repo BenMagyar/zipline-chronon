@@ -76,6 +76,27 @@ trait KVStore {
 
   def multiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]]
 
+  /** Control-plane reads share the backing store but may receive queue priority in overloaded implementations. */
+  def controlMultiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = multiGet(requests)
+
+  /** Lets a store retain implementation-specific lifecycle resources while a caller consumes a read future.
+    *
+    * The default is exactly the normal multiGet lifecycle. Stores with asynchronous native work may override this to
+    * wait for both the raw read and the consumer future before releasing scoped resources.
+    */
+  def scopedMultiGet[T](requests: Seq[GetRequest])(consume: Future[Seq[GetResponse]] => Future[T]): Future[T] =
+    consume(multiGet(requests))
+
+  /** Optional store-specific startup work. The service only applies these recommendations when request warmup is
+    * configured; stores that do not need an amplified warmup retain the authored request count and serial execution.
+    */
+  def startupWarmupMinimumRequestsPerJoin: Int = 0
+  def startupWarmupConcurrency: Int = 1
+  def startupWarmupRequestBatchSize: Int = 1
+
+  /** Monotonic count of feature batches failed or deliberately degraded by an implementation's read path. */
+  def startupWarmupDegradedReadCount: Long = 0L
+
   def multiPut(keyValueDatasets: Seq[PutRequest]): Future[Seq[Boolean]]
 
   def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit
@@ -84,18 +105,18 @@ trait KVStore {
 
   // helper method to blocking read a string - used for fetching metadata & not in hotpath.
   def getString(key: String, dataset: String, timeoutMillis: Long): Try[String] = {
-    val bytesTry = getResponse(key, dataset, timeoutMillis, get)
+    val bytesTry = getResponse(key, dataset, timeoutMillis, getControl)
     bytesTry.map(bytes => new String(bytes, Constants.UTF8))
   }
 
   /** Blocking metadata read that bypasses implementation-specific read caches when supported. */
   def getStringFresh(key: String, dataset: String, timeoutMillis: Long): Try[String] = {
-    val bytesTry = getResponse(key, dataset, timeoutMillis, getFresh)
+    val bytesTry = getResponse(key, dataset, timeoutMillis, getFreshControl)
     bytesTry.map(bytes => new String(bytes, Constants.UTF8))
   }
 
   def getStringArray(key: String, dataset: String, timeoutMillis: Long): Try[Seq[String]] = {
-    val bytesTry = getResponse(key, dataset, timeoutMillis, get)
+    val bytesTry = getResponse(key, dataset, timeoutMillis, getControl)
     bytesTry.map(bytes => StringArrayConverter.bytesToStrings(bytes))
   }
 
@@ -130,8 +151,25 @@ trait KVStore {
       }
   }
 
+  def getControl(request: GetRequest): Future[GetResponse] = {
+    controlMultiGet(Seq(request))
+      .map(_.head)
+      .recover { case e: java.util.NoSuchElementException =>
+        logger.error(s"Failed control request against ${request.dataset}; check the related metadata or schema upload")
+        throw e
+      }
+  }
+
   /** Exact read path for callers that require implementation-specific caches to be bypassed. */
   def getFresh(request: GetRequest): Future[GetResponse] = get(request)
+
+  /** Exact control-plane read path for callers that require implementation-specific caches to be bypassed.
+    *
+    * Preserve each store's existing fresh-read semantics by default (for example DynamoDB's strongly-consistent
+    * lookup and batch-table-registry bypass). Stores with a distinct control admission class can override this
+    * method without changing other backends.
+    */
+  def getFreshControl(request: GetRequest): Future[GetResponse] = getFresh(request)
 
   // Method for taking the set of keys and constructing the byte array sent to the KVStore
   def createKeyBytes(keys: Map[String, AnyRef],

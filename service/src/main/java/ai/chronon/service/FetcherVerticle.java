@@ -69,16 +69,36 @@ public class FetcherVerticle extends AbstractVerticle {
             return api.buildJavaFetcher("feature-service", false, joinConfTtl, joinCodecTtl);
         })
         .onSuccess(fetcher -> {
-            // Run warmup before opening the HTTP server to traffic — always completes successfully
-            FetcherWarmup.run(vertx, fetcher, cfgStore)
-                .onComplete(ar -> {
-                    try {
-                        startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
-                    } catch (Exception e) {
-                        closeFetchWorkerExecutor();
-                        startPromise.fail(e);
-                    }
-                });
+            WorkerExecutor warmupWorkerExecutor = null;
+            try {
+                int warmupWorkerPoolSize = fetchWorkerPoolSize();
+                warmupWorkerExecutor = vertx.createSharedWorkerExecutor("chronon-fetch-init", warmupWorkerPoolSize);
+                logger.info("Fetcher warmup worker pool size: {}", warmupWorkerPoolSize);
+                WorkerExecutor executorToClose = warmupWorkerExecutor;
+                // Preserve the raw outcome here: a clean pool retains its warm thread-local state, while any failed
+                // or timed-out warmup is discarded before fail-open readiness.
+                FetcherWarmup.runForWorkerReuse(vertx, fetcher, cfgStore, warmupWorkerExecutor)
+                    .onComplete(ar -> {
+                        if (ar.succeeded()) {
+                            fetchWorkerExecutor = executorToClose;
+                        } else {
+                            logger.warn("Warmup stopped early; continuing startup with a fresh initiation pool", ar.cause());
+                            executorToClose.close();
+                        }
+                        try {
+                            startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
+                        } catch (Exception e) {
+                            closeFetchWorkerExecutor();
+                            startPromise.fail(e);
+                        }
+                    });
+            } catch (Exception e) {
+                if (warmupWorkerExecutor != null) {
+                    warmupWorkerExecutor.close();
+                }
+                closeFetchWorkerExecutor();
+                startPromise.fail(e);
+            }
         })
         .onFailure(startPromise::fail);
     }
@@ -183,9 +203,7 @@ public class FetcherVerticle extends AbstractVerticle {
 
     protected void startHttpServer(int port, String configJsonString, Api api, JavaFetcher fetcher, Promise<Void> startPromise) throws Exception {
         Router router = Router.router(vertx);
-        int fetchWorkerPoolSize = fetchWorkerPoolSize();
-        fetchWorkerExecutor = vertx.createSharedWorkerExecutor("chronon-fetch-init", fetchWorkerPoolSize);
-        logger.info("Fetcher initiation worker pool size: {}", fetchWorkerPoolSize);
+        createFetchWorkerExecutor();
 
         // Define routes
 
@@ -269,6 +287,14 @@ public class FetcherVerticle extends AbstractVerticle {
             return poolSize;
         } catch (NumberFormatException exception) {
             throw new IllegalArgumentException("Invalid fetcher worker pool size: " + configured, exception);
+        }
+    }
+
+    private void createFetchWorkerExecutor() {
+        if (fetchWorkerExecutor == null) {
+            int fetchWorkerPoolSize = fetchWorkerPoolSize();
+            fetchWorkerExecutor = vertx.createSharedWorkerExecutor("chronon-fetch-init", fetchWorkerPoolSize);
+            logger.info("Fetcher initiation worker pool size: {}", fetchWorkerPoolSize);
         }
     }
 

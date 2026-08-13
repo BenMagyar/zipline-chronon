@@ -150,8 +150,11 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
     }
   }
 
-  def fetchGroupBys(requests: Seq[Request]): Future[Seq[Response]] = {
-    groupByFetcher.fetchGroupBys(requests)
+  def fetchGroupBys(requests: Seq[Request]): Future[Seq[Response]] =
+    fetchGroupBys(requests, allowBatchIrCache = true)
+
+  def fetchGroupBys(requests: Seq[Request], allowBatchIrCache: Boolean): Future[Seq[Response]] = {
+    groupByFetcher.fetchGroupBys(requests, allowBatchIrCache)
   }
 
   // ----- START -----
@@ -173,7 +176,14 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
   // used in stream-enrichment and in staging testing
   def fetchJoins(requests: Seq[Request],
                  joinConf: Option[Join] = None,
-                 joinCodecForName: String => Option[Try[JoinCodec]] = _ => None): Future[Seq[Response]] = {
+                 joinCodecForName: String => Option[Try[JoinCodec]] = _ => None): Future[Seq[Response]] =
+    fetchJoins(requests, joinConf, joinCodecForName, allowBatchIrCache = true, deduplicateGroupByRequests = true)
+
+  def fetchJoins(requests: Seq[Request],
+                 joinConf: Option[Join],
+                 joinCodecForName: String => Option[Try[JoinCodec]],
+                 allowBatchIrCache: Boolean,
+                 deduplicateGroupByRequests: Boolean): Future[Seq[Response]] = {
     val startTimeMs = System.currentTimeMillis()
     val overrideJoinOps = joinConf.map { join =>
       logger.debug(s"Using passed in join configuration: ${join.metaData.getName}")
@@ -287,12 +297,21 @@ class JoinPartFetcher(fetchContext: FetchContext, metadataStore: MetadataStore) 
       }
     }
 
-    // One representative request per unique (name, keys, atMillis) — first occurrence wins.
-    val uniqueGroupByRequests = mutable.LinkedHashMap.empty[GroupByKey, Request]
-    allGroupByRequests.foreach(request => uniqueGroupByRequests.getOrElseUpdate(groupByKey(request), request))
-    val groupByRequests: Seq[Request] = uniqueGroupByRequests.values.toSeq
+    val groupByRequests: Seq[Request] =
+      if (deduplicateGroupByRequests) {
+        // One representative request per unique (name, keys, atMillis) — first occurrence wins.
+        val uniqueGroupByRequests = mutable.LinkedHashMap.empty[GroupByKey, Request]
+        allGroupByRequests.foreach(request => uniqueGroupByRequests.getOrElseUpdate(groupByKey(request), request))
+        uniqueGroupByRequests.values.toSeq
+      } else {
+        // Startup warmup uses the real configured keys but retains every outer row so GLIDE command planning,
+        // response decoding, fan-out, and V2 encoding see a production-sized batch before readiness.
+        allGroupByRequests.toVector
+      }
 
-    val groupByResponsesFuture = fetchGroupBys(groupByRequests)
+    val groupByResponsesFuture =
+      if (allowBatchIrCache) fetchGroupBys(groupByRequests)
+      else fetchGroupBys(groupByRequests, allowBatchIrCache = false)
 
     // re-attach groupBy responses to join
     groupByResponsesFuture

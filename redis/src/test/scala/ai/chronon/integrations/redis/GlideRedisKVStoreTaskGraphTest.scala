@@ -1,8 +1,16 @@
 package ai.chronon.integrations.redis
 
 import ai.chronon.integrations.redis.GlideReadResult.Value
-import ai.chronon.integrations.redis.RedisKVStoreConstants.{ConfigPipelineSyncThreads, GlideExecutionDirect}
+import ai.chronon.api.Constants.MetadataDataset
+import ai.chronon.integrations.redis.RedisKVStoreConstants.{
+  ConfigPipelineSyncThreads,
+  GlideExecutionDirect,
+  PropRedisReadMaxInflightBatches,
+  PropRedisReadMaxQueuedBatches,
+  PropRedisReadQueueTimeoutMs
+}
 import ai.chronon.online.KVStore.GetRequest
+import glide.api.models.exceptions.{TimeoutException => GlideTimeoutException}
 import org.slf4j.{Logger, LoggerFactory}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -13,6 +21,7 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.{
   CompletableFuture,
+  ConcurrentLinkedQueue,
   CountDownLatch,
   ExecutionException,
   LinkedBlockingQueue,
@@ -133,6 +142,234 @@ class GlideRedisKVStoreTaskGraphTest extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "gate ClusterBatch before planning and hold its permit through scoped consumer decoding" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(runner, executionContext) { store =>
+      val firstRequest = GetRequest("first".getBytes(StandardCharsets.UTF_8), "ADMISSION_BATCH")
+      val secondRequest = GetRequest("second".getBytes(StandardCharsets.UTF_8), "ADMISSION_BATCH")
+      var snapshotDuringConsumer: RedisReadAdmissionSnapshot = null
+      val first = store.scopedMultiGet(Seq(firstRequest)) { rawFuture =>
+        rawFuture.map { responses =>
+          snapshotDuringConsumer = store.readAdmissionController.get.snapshot
+          new String(responses.head.values.get.head.bytes, StandardCharsets.UTF_8)
+        }(executionContext)
+      }
+      executionContext.pending shouldBe 1
+
+      executionContext.runNext()
+      runner.submittedCount shouldBe 1
+      executionContext.pending shouldBe 0
+
+      val second = store.multiGet(Seq(secondRequest))
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+      // The queued request has not reached planning, the shared executor, or GLIDE.
+      executionContext.pending shouldBe 0
+      runner.submittedCount shouldBe 1
+
+      runner.completeNext(storedResult("first-value", 1L))
+      executionContext.pending shouldBe 1
+      // Native completion alone does not release admission; task 2 still owns Redis response decoding.
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+
+      executionContext.runNext()
+      first.isCompleted shouldBe false
+      // The raw Redis response is complete, but the scoped GroupBy/FastSerde consumer has not run yet.
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+      executionContext.pending shouldBe 1
+
+      executionContext.runNext()
+      Await.result(first, 2.seconds) shouldBe "first-value"
+      snapshotDuringConsumer shouldBe RedisReadAdmissionSnapshot(1, 1)
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 0)
+      executionContext.pending shouldBe 1
+
+      executionContext.runNext()
+      runner.submittedCount shouldBe 2
+      runner.completeNext(storedResult("second-value", 2L))
+      executionContext.runNext()
+      readValue(second) shouldBe "second-value"
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(0, 0)
+    }
+  }
+
+  it should "open cooldown on a GLIDE timeout and fail active queued and new batches open" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(runner, executionContext) { store =>
+      val activeRequest = GetRequest("active".getBytes(StandardCharsets.UTF_8), "TIMEOUT_BATCH")
+      val queuedRequest = GetRequest("queued".getBytes(StandardCharsets.UTF_8), "TIMEOUT_BATCH")
+      val cooldownRequest = GetRequest("cooldown".getBytes(StandardCharsets.UTF_8), "TIMEOUT_BATCH")
+
+      val active = store.multiGet(Seq(activeRequest))
+      executionContext.runNext()
+      runner.submittedCount shouldBe 1
+
+      val queued = store.multiGet(Seq(queuedRequest))
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+
+      runner.completeNext(Vector(Failure(new GlideTimeoutException("native request timed out"))))
+      // Timeout fail-open must not wait behind the shared executor's completion queue.
+      missingValue(active, activeRequest)
+      missingValue(queued, queuedRequest)
+      executionContext.pending shouldBe 0
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(0, 0)
+
+      val cooldown = store.multiGet(Seq(cooldownRequest))
+      runner.submittedCount shouldBe 1
+      missingValue(cooldown, cooldownRequest)
+      runner.submittedCount shouldBe 1
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(0, 0)
+    }
+  }
+
+  it should "retain a scoped permit when the consumer times out before the raw GLIDE read settles" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(runner, executionContext) { store =>
+      val activeRequest = GetRequest("active".getBytes(StandardCharsets.UTF_8), "CONSUMER_TIMEOUT_BATCH")
+      val queuedRequest = GetRequest("queued".getBytes(StandardCharsets.UTF_8), "CONSUMER_TIMEOUT_BATCH")
+      val consumerPromise = scala.concurrent.Promise[String]()
+
+      val active = store.scopedMultiGet(Seq(activeRequest))(_ => consumerPromise.future)
+      executionContext.runNext()
+      runner.submittedCount shouldBe 1
+      val queued = store.multiGet(Seq(queuedRequest))
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+
+      consumerPromise.failure(new java.util.concurrent.TimeoutException("consumer timed out"))
+      intercept[java.util.concurrent.TimeoutException](Await.result(active, 2.seconds))
+      // The caller has stopped waiting, but GLIDE still owns the active lifecycle; no replacement is admitted.
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 1)
+      runner.submittedCount shouldBe 1
+
+      runner.completeNext(storedResult("ignored", 1L))
+      executionContext.runNext()
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 0)
+      executionContext.runNext()
+      runner.submittedCount shouldBe 2
+
+      runner.completeNext(storedResult("queued-value", 2L))
+      executionContext.runNext()
+      readValue(queued) shouldBe "queued-value"
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(0, 0)
+    }
+  }
+
+  it should "fail queue-full and queue-timeout batches open as missing values" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(
+      runner,
+      executionContext,
+      Map(PropRedisReadQueueTimeoutMs -> "25")
+    ) { store =>
+      val activeRequest = GetRequest("active".getBytes(StandardCharsets.UTF_8), "SHED_BATCH")
+      val timeoutRequest = GetRequest("timeout".getBytes(StandardCharsets.UTF_8), "SHED_BATCH")
+      val fullRequest = GetRequest("full".getBytes(StandardCharsets.UTF_8), "SHED_BATCH")
+
+      val active = store.multiGet(Seq(activeRequest))
+      val timedOut = store.multiGet(Seq(timeoutRequest))
+      val full = store.multiGet(Seq(fullRequest))
+
+      val fullResponse = Await.result(full, 2.seconds).head
+      fullResponse.request shouldBe fullRequest
+      fullResponse.values shouldBe Success(Seq.empty)
+      store.startupWarmupDegradedReadCount shouldBe 1L
+      executionContext.pending shouldBe 1
+
+      val timeoutResponse = Await.result(timedOut, 2.seconds).head
+      timeoutResponse.request shouldBe timeoutRequest
+      timeoutResponse.values shouldBe Success(Seq.empty)
+      store.startupWarmupDegradedReadCount shouldBe 2L
+      executionContext.pending shouldBe 1
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(1, 0)
+
+      executionContext.runNext()
+      runner.completeNext(storedResult("active-value", 1L))
+      executionContext.runNext()
+      readValue(active) shouldBe "active-value"
+    }
+  }
+
+  it should "admit metadata within the same total ClusterBatch bound" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(
+      runner,
+      executionContext,
+      Map(
+        PropRedisReadMaxInflightBatches -> "2",
+        PropRedisReadMaxQueuedBatches -> "0"
+      )
+    ) { store =>
+      val feature = store.multiGet(Seq(GetRequest("feature".getBytes(StandardCharsets.UTF_8), "FEATURE_BATCH")))
+      val metadataRequest = GetRequest("metadata".getBytes(StandardCharsets.UTF_8), MetadataDataset)
+      val metadata = store.controlMultiGet(Seq(metadataRequest))
+
+      store.readAdmissionController.get.snapshot shouldBe RedisReadAdmissionSnapshot(2, 0)
+      executionContext.pending shouldBe 2
+
+      executionContext.runNext()
+      executionContext.runNext()
+      runner.submittedCount shouldBe 2
+      runner.completeNext(storedResult("feature-value", 1L))
+      runner.completeNext(storedResult("metadata-value", 2L))
+      executionContext.runNext()
+      executionContext.runNext()
+
+      readValue(feature) shouldBe "feature-value"
+      val metadataResponse = Await.result(metadata, 2.seconds).head
+      metadataResponse.request shouldBe metadataRequest
+      new String(metadataResponse.values.get.head.bytes, StandardCharsets.UTF_8) shouldBe "metadata-value"
+    }
+  }
+
+  it should "preserve partial control results when one GLIDE command times out" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(runner, executionContext) { store =>
+      val first = GetRequest("first".getBytes(StandardCharsets.UTF_8), "FIRST_BATCH")
+      val second = GetRequest("second".getBytes(StandardCharsets.UTF_8), "SECOND_BATCH")
+      val result = store.controlMultiGet(Seq(first, second))
+
+      executionContext.runNext()
+      runner.submittedCount shouldBe 1
+      runner.completeNext(
+        Vector(
+          storedResult("first-value", 1L).head,
+          Failure(new GlideTimeoutException("one command timed out"))
+        ))
+      executionContext.runNext()
+
+      val responses = Await.result(result, 2.seconds)
+      new String(responses.head.values.get.head.bytes, StandardCharsets.UTF_8) shouldBe "first-value"
+      responses(1).values.failed.get shouldBe a[GlideTimeoutException]
+    }
+  }
+
+  it should "materialize responses before validating results for a lazy request sequence" in {
+    val runner = new ControlledBatchRunner
+    val executionContext = new ManualExecutionContext
+    withClusterBatchStore(runner, executionContext) { store =>
+      val request = GetRequest("metadata".getBytes(StandardCharsets.UTF_8), MetadataDataset)
+      val result = store.controlMultiGet(Stream(request))
+
+      executionContext.runNext()
+      runner.completeNext(storedResult("metadata-value", 1L))
+      executionContext.runNext()
+
+      readValue(result) shouldBe "metadata-value"
+    }
+  }
+
+  it should "leave direct-mode GLIDE reads outside the ClusterBatch bulkhead" in {
+    val runner = new ControlledRunner
+    withExecutionContext(runner, new ManualExecutionContext) { store =>
+      store.readAdmissionController shouldBe None
+    }
+  }
+
   private def withStore(testRunner: ControlledRunner)(test: (TaskGraphStore, ThreadPoolExecutor) => Unit): Unit = {
     val executor = singleThreadExecutor()
     try {
@@ -161,8 +398,44 @@ class GlideRedisKVStoreTaskGraphTest extends AnyFlatSpec with Matchers {
     val store = new TaskGraphStore(null, glideClient, executionContext, testLogger)
     try test(store)
     finally {
+      store.shutdownReadAdmissionController()
       store.shutdownGlideReadClient()
     }
+  }
+
+  private def withClusterBatchStore(testRunner: ControlledBatchRunner,
+                                    executionContext: ManualExecutionContext,
+                                    additionalConf: Map[String, String] = Map.empty)(
+      test: TaskGraphStore => Unit): Unit = {
+    val glideClient = new GlideRedisReadClient(testRunner.run, () => ())
+    val conf = Map(
+      PropRedisReadMaxInflightBatches -> "1",
+      PropRedisReadMaxQueuedBatches -> "1",
+      PropRedisReadQueueTimeoutMs -> "10000"
+    ) ++ additionalConf
+    val store = new TaskGraphStore(null, glideClient, executionContext, null, conf)
+    try test(store)
+    finally {
+      store.shutdownReadAdmissionController()
+      store.shutdownGlideReadClient()
+    }
+  }
+
+  private def storedResult(value: String, millis: Long): IndexedSeq[Try[GlideReadResult]] = {
+    val payload = value.getBytes(StandardCharsets.UTF_8)
+    Vector(Success(Value(Some(RedisBatchUpload.encodeValue(RedisBatchUpload.Upsert, millis, payload)))))
+  }
+
+  private def readValue(result: scala.concurrent.Future[Seq[ai.chronon.online.KVStore.GetResponse]]): String = {
+    val response = Await.result(result, 2.seconds).head
+    new String(response.values.get.head.bytes, StandardCharsets.UTF_8)
+  }
+
+  private def missingValue(result: scala.concurrent.Future[Seq[ai.chronon.online.KVStore.GetResponse]],
+                           request: GetRequest): Unit = {
+    val response = Await.result(result, 2.seconds).head
+    response.request shouldBe request
+    response.values shouldBe Success(Seq.empty)
   }
 
   private def singleThreadExecutor(): ThreadPoolExecutor =
@@ -226,6 +499,44 @@ class GlideRedisKVStoreTaskGraphTest extends AnyFlatSpec with Matchers {
       result.get().complete(value) shouldBe true
   }
 
+  private final class ControlledBatchRunner {
+    private val results = new ConcurrentLinkedQueue[CompletableFuture[IndexedSeq[Try[GlideReadResult]]]]()
+    private val submissions = new AtomicInteger()
+
+    def run(_commands: IndexedSeq[GlideReadCommand]): CompletableFuture[IndexedSeq[Try[GlideReadResult]]] = {
+      val result = new CompletableFuture[IndexedSeq[Try[GlideReadResult]]]()
+      results.add(result)
+      submissions.incrementAndGet()
+      result
+    }
+
+    def submittedCount: Int = submissions.get()
+
+    def completeNext(value: IndexedSeq[Try[GlideReadResult]]): Unit = {
+      val next = results.poll()
+      next should not be null
+      next.complete(value) shouldBe true
+    }
+  }
+
+  private final class ManualExecutionContext extends ExecutionContext {
+    private val tasks = new ConcurrentLinkedQueue[Runnable]()
+
+    override def execute(runnable: Runnable): Unit = tasks.add(runnable)
+    override def reportFailure(cause: Throwable): Unit = throw cause
+
+    def pending: Int = tasks.size()
+
+    def runNext(): Unit = {
+      val next = tasks.poll()
+      next should not be null
+      next.run()
+    }
+
+    def runAll(): Unit =
+      while (pending > 0) runNext()
+  }
+
   private final class RejectingExecutionContext(error: Throwable) extends ExecutionContext {
     override def execute(runnable: Runnable): Unit = throw error
 
@@ -247,10 +558,11 @@ class GlideRedisKVStoreTaskGraphTest extends AnyFlatSpec with Matchers {
   private final class TaskGraphStore(client: JedisCluster,
                                      glideClient: GlideRedisReadClient,
                                      override implicit val executionContext: ExecutionContext,
-                                     testLogger: Logger)
+                                     testLogger: Logger,
+                                     additionalConf: Map[String, String] = Map.empty)
       extends RedisKVStoreImpl(
         client,
-        Map("redis.read.metrics.enabled" -> "false", ConfigPipelineSyncThreads -> "0"),
+        Map("redis.read.metrics.enabled" -> "false", ConfigPipelineSyncThreads -> "0") ++ additionalConf,
         glideReadClient = Some(glideClient)
       ) {
     @transient override lazy val logger: Logger =

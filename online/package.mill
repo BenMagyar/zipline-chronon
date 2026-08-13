@@ -32,7 +32,7 @@ trait OnlineModule extends Cross.Module[String] with build.BaseModule {
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
     // Transitive deps for vendored avro-fastserde jar
-    mvn"com.linkedin.avroutil1:helper-all:0.4.25",
+    mvn"com.linkedin.avroutil1:helper-all:0.4.39",
     mvn"com.sun.codemodel:codemodel:2.6",
     mvn"org.apache.commons:commons-lang3:3.4",
     mvn"org.rogach::scallop:5.1.0",

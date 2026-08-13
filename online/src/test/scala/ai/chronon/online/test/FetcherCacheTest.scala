@@ -139,6 +139,44 @@ class FetcherCacheTest extends AnyFlatSpec with MockitoHelper {
     assert(cachedRequestsAfterAddingItem.head._2 == finalBatchIr)
   }
 
+  it should "bypass cache lookups and population for startup decoding" in {
+    val batchIrCache = new BatchIrCache("test", batchIrCacheMaximumSize)
+    val fetcherCache = new TestableFetcherCache(Some(batchIrCache)) {
+      override def isCachingEnabled(groupBy: GroupBy) = true
+    }
+    val servingInfo = mock[GroupByServingInfoParsed]
+    val groupByOps = mock[GroupByOps]
+    when(servingInfo.groupByOps).thenReturn(groupByOps)
+    when(groupByOps.batchDataset).thenReturn("TEST_GROUPBY_BATCH")
+    when(servingInfo.batchEndTsMillis).thenReturn(1000L)
+
+    val keys = Map("key" -> "value")
+    val request = Request("req_name", keys)
+    val getRequest = KVStore.GetRequest("key".getBytes, "TEST_GROUPBY_BATCH")
+    val lambdaRequest = LambdaKvRequest(servingInfo, request, getRequest, None, None, mock[metrics.Metrics.Context])
+    val cacheKey = BatchIrCache.Key(getRequest.dataset, keys, 1000L)
+    batchIrCache.cache.put(cacheKey, CachedMapBatchResponse(Map("cached" -> "value")))
+
+    assert(fetcherCache.getCachedRequests(Seq(request -> Success(lambdaRequest)), allowCache = false).isEmpty)
+
+    var decodeCount = 0
+    val decoded = fetcherCache.getMapResponseFromBatchResponse(
+      BatchResponses(Success(Seq(TimedValue(Array[Byte](1), 1000L)))),
+      Array[Byte](1),
+      _ => {
+        decodeCount += 1
+        Map("decoded" -> "value")
+      },
+      servingInfo,
+      keys,
+      allowCache = false
+    )
+
+    assertEquals(Map("decoded" -> "value"), decoded)
+    assertEquals(1, decodeCount)
+    assertEquals(CachedMapBatchResponse(Map("cached" -> "value")), batchIrCache.cache.getIfPresent(cacheKey))
+  }
+
   it should "aggregate cache metrics by context" in {
     val testCache = new BatchIrCache("test", batchIrCacheMaximumSize)
     val fetcherCache = new TestableFetcherCache(Some(testCache)) {

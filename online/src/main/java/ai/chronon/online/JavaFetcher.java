@@ -191,6 +191,39 @@ public class JavaFetcher {
         false, startTs);
   }
 
+  public CompletableFuture<List<JavaResponse>> fetchJoinBase64AvroWarmup(List<JavaRequest> requests) {
+    return fetchJoinBase64AvroWarmup(requests, false);
+  }
+
+  public CompletableFuture<List<JavaResponse>> fetchJoinBase64AvroWarmup(
+      List<JavaRequest> requests, boolean allowBatchIrCache) {
+    long startTs = System.currentTimeMillis();
+    return wrapResponses(
+        this.fetcher.fetchJoinV2Warmup(
+            toScalaRequests(requests, false, startTs), FeaturesResponseType.AvroString(), allowBatchIrCache),
+        false, startTs);
+  }
+
+  public int startupWarmupMinimumRequestsPerJoin() {
+    return this.fetcher.startupWarmupMinimumRequestsPerJoin();
+  }
+
+  public int startupWarmupConcurrency() {
+    return this.fetcher.startupWarmupConcurrency();
+  }
+
+  public int startupWarmupRequestBatchSize() {
+    return this.fetcher.startupWarmupRequestBatchSize();
+  }
+
+  public long startupWarmupDegradedReadCount() {
+    return this.fetcher.startupWarmupDegradedReadCount();
+  }
+
+  public void prepareJoinFastSerde(List<String> joinNames, long timeoutMillis) {
+    this.fetcher.prepareJoinFastSerde(joinNames, timeoutMillis);
+  }
+
   public CompletableFuture<List<JavaResponse>> fetchModelTransforms(List<JavaRequest> requests) {
     long startTs = System.currentTimeMillis();
     return wrapResponses(this.fetcher.fetchModelTransforms(toScalaRequests(requests, false, startTs)), false, startTs);

@@ -34,9 +34,11 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     // Product5 ABI remain unchanged. Fetcher initialization attaches this state before the context is published.
     private var attachedDegradedCounter: BatchedMetricsCounter = null
     private var attachedRecordDetailedMetrics: Boolean = true
+    private var attachedAllowBatchIrCache: Boolean = true
 
     private[fetcher] def degradedCounter: BatchedMetricsCounter = attachedDegradedCounter
     private[fetcher] def recordDetailedMetrics: Boolean = attachedRecordDetailedMetrics
+    private[fetcher] def allowBatchIrCache: Boolean = attachedAllowBatchIrCache
 
     private[fetcher] def withInstrumentation(degradedCounter: BatchedMetricsCounter,
                                              recordDetailedMetrics: Boolean): RequestContext = {
@@ -45,8 +47,17 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
       this
     }
 
-    private[fetcher] def withServingInfo(updatedServingInfo: GroupByServingInfoParsed): RequestContext =
-      copy(servingInfo = updatedServingInfo).withInstrumentation(attachedDegradedCounter, attachedRecordDetailedMetrics)
+    private[fetcher] def withoutBatchIrCache: RequestContext = {
+      attachedAllowBatchIrCache = false
+      this
+    }
+
+    private[fetcher] def withServingInfo(updatedServingInfo: GroupByServingInfoParsed): RequestContext = {
+      val updated =
+        copy(servingInfo = updatedServingInfo)
+          .withInstrumentation(attachedDegradedCounter, attachedRecordDetailedMetrics)
+      if (!attachedAllowBatchIrCache) updated.withoutBatchIrCache else updated
+    }
   }
 
   def decodeAndMerge(batchResponses: BatchResponses,
@@ -78,7 +89,8 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                                                        batchBytes,
                                                        newServingInfo.outputCodec.decodeMap,
                                                        newServingInfo,
-                                                       requestContext.keys)
+                                                       requestContext.keys,
+                                                       requestContext.allowBatchIrCache)
         if (requestContext.recordDetailedMetrics)
           requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
                                                      System.currentTimeMillis() - batchResponseDecodeStartTime)
@@ -145,7 +157,12 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     val batchIrDecodeStartTime =
       if (requestContext.recordDetailedMetrics) System.currentTimeMillis() else 0L
     val batchIr: FinalBatchIr =
-      getBatchIrFromBatchResponse(batchResponses, batchBytes, servingInfo, toBatchIr, requestContext.keys)
+      getBatchIrFromBatchResponse(batchResponses,
+                                  batchBytes,
+                                  servingInfo,
+                                  toBatchIr,
+                                  requestContext.keys,
+                                  requestContext.allowBatchIrCache)
     if (requestContext.recordDetailedMetrics)
       requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
                                                  System.currentTimeMillis() - batchIrDecodeStartTime)
