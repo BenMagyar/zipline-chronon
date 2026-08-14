@@ -449,10 +449,11 @@ object GroupByUpload {
     result
   }
 
-  // Scans the keyFilter source at the upload date's partition (never the shifted range - that
-  // partition doesn't exist yet when the upload for endDs runs) and returns the distinct key
-  // tuples to semi-join the aggregated output against. Fails hard when no keys are found - an
-  // empty filter would produce an empty upload and wipe the batch data in the KV store.
+  // Scans the keyFilter source at the latest snapshot partition intersecting the upload date
+  // (never the temporal aggregation's shifted range - that partition doesn't exist yet when the
+  // upload for endDs runs).
+  // Fails hard when no keys are found - an empty filter would produce an empty upload and wipe the
+  // batch data in the KV store.
   private[spark] def keyFilterKeysDf(groupByConf: api.GroupBy,
                                      endDs: String,
                                      tableUtils: TableUtils): Option[DataFrame] = {
@@ -464,7 +465,8 @@ object GroupByUpload {
       )
       val filterTable = filterSource.getSnapshotTable.cleanSpec
       val filterSpec = filterSource.getQuery.partitionSpec(tableUtils.partitionSpec)
-      val filterRange = PartitionRange(endDs, endDs).translate(filterSpec)
+      val intersectingFilterRange = PartitionRange(endDs, endDs).intersectingRange(filterSpec)
+      val filterRange = PartitionRange(intersectingFilterRange.end, intersectingFilterRange.end)(filterSpec)
       val scanned = tableUtils.scanDf(filterSource.getQuery,
                                       filterTable,
                                       fallbackSelects = Some(Map(filterSpec.column -> null)),
@@ -485,7 +487,8 @@ object GroupByUpload {
       )
       logger.info(
         s"keyFilter for ${groupByConf.metaData.name}: restricting upload input to keys of " +
-          s"$filterTable @ $filterRange on columns [${filterKeyColumns.mkString(", ")}]")
+          s"$filterTable @ $filterRange (latest of intersecting range $intersectingFilterRange) " +
+          s"on columns [${filterKeyColumns.mkString(", ")}]")
       keysDf
     }
   }

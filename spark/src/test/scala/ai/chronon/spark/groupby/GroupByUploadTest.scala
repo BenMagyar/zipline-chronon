@@ -1088,6 +1088,45 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     joined.where($"f.value_bytes" === $"u.value_bytes").count() shouldBe keptUsers.length
   }
 
+  it should "use the latest keyFilter snapshot intersecting a coarser upload partition" in {
+    val namespace = testNamespace("key_filter_latest_snapshot")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+    import spark.implicits._
+
+    val dailySpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", WindowUtils.Day.millis, WindowUtils.Hour.millis)
+    val threeHourSpec =
+      PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * WindowUtils.Hour.millis, WindowUtils.Hour.millis)
+    val uploadDs = "2024-01-02-01-00"
+    val filterTable = s"$namespace.key_filter_snapshots"
+
+    Seq(
+      ("early_user", "2024-01-02-01-00"),
+      ("middle_user", "2024-01-02-13-00"),
+      ("latest_user", "2024-01-02-22-00"),
+      ("next_user", "2024-01-03-01-00")
+    ).toDF("user", "ds").save(filterTable)
+
+    val dailyTableUtils = new TableUtils(spark, Some(dailySpec))
+
+    val filterQuery = Builders
+      .Query(selects = Builders.Selects("user"))
+      .setPartitionColumn(threeHourSpec.column)
+      .setPartitionFormat(threeHourSpec.format)
+      .setPartitionInterval(threeHourSpec.intervalWindow)
+      .setPartitionOffset(WindowUtils.fromMillis(threeHourSpec.offsetMillis))
+    val keyFilter = Builders.Source.entities(filterQuery, snapshotTable = filterTable).getEntities
+    val groupByConf = buildKeyFilterTestConf(namespace, "unused_events", "latest_key_filter_snapshot", Some(keyFilter))
+
+    GroupByUpload
+      .keyFilterKeysDf(groupByConf, uploadDs, dailyTableUtils)
+      .get
+      .select("user")
+      .as[String]
+      .collect()
+      .toSet shouldBe Set("latest_user")
+  }
+
   it should "restrict temporal upload to keys present in the keyFilter source" in {
     val namespace = testNamespace("key_filter_temporal")
     val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
