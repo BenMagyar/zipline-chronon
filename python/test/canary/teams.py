@@ -91,7 +91,7 @@ gcp = Team(
             "spark.sql.shuffle.partitions": "10",
             "spark.driver.memory": "512m",
             "spark.driver.cores": "1",
-            "spark.executor.memory": "512m",
+            "spark.executor.memory": "2g",
             "spark.executor.cores": "1",
 
             # Chronon OTel metrics. Default off + HTTP to localhost:4318. The canary cluster's
