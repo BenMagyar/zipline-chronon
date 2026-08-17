@@ -68,7 +68,59 @@ object Constants {
   val jacksonVersion = "2.18.9"
 
   // log4j-1.2-api is the Log4j 1.x bridge bundled with Spark; pin to fix GHSA-h383-gmxw-35v2.
-  val log4jVersion = "2.25.4"
+  val log4jVersion = "2.25.5"
+
+  // Iceberg 1.10.0 shades HttpComponents Client 5.5 / Core 5.3.4 into its runtime jar.
+  // These versions are vulnerable to GHSA-hjcp-jmpx-g3qm, GHSA-hf6x-8p5f-cgmf,
+  // and GHSA-v3jc-474w-2wm6. Keep Iceberg stable while replacing only its shaded
+  // HTTP stack with the patched, binary-compatible releases during cloud assembly.
+  val httpClient5Version = "5.6.3"
+  val httpCore5Version = "5.4.3"
+
+  def icebergHttpPatchAssemblyRules = Seq(
+    Assembly.Rule.Relocate(
+      "ai.zipline.iceberg.http.patch.**",
+      "org.apache.iceberg.shaded.org.apache.hc.@1"
+    ),
+    // Remove classes that existed in Iceberg's 5.5 / 5.3.4 copies but were removed
+    // from the patched releases. Without these rules assembly would retain a union
+    // of both versions after the replacement classes win duplicate resolution.
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/client5/http/impl/compat/(AbstractSharedBuffer|ClassicToAsyncRequestProducer(\\$IORunnable|\\$InternalOutputStream)?|ClassicToAsyncResponseConsumer(\\$IncomingHttpEntity|\\$InternalInputStream|\\$ResponseData)?|ClassicToAsyncSupport|IOCallback|ProtocolException|SharedInputBuffer|SharedOutputBuffer|TransportException)\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http/impl/bootstrap/HttpAsyncRequester\\$4\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http/impl/io/IncomingHttpEntity\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http/impl/routing/RequestRouter\\$NoAuthorityResolver\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http/nio/AsyncClientEndpoint\\$1\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http2/impl/nio/AbstractH2StreamMultiplexer\\$H2Stream\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/http2/impl/nio/bootstrap/H2MultiplexingRequester\\$2\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/reactor/AbstractIOSessionPool\\$1\\$1\\.class"
+    ),
+    Assembly.Rule.ExcludePattern(
+      "org/apache/iceberg/shaded/org/apache/hc/core5/reactor/IOWorkers.*"
+    ),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.httpcomponents\\.client5/.*"),
+    Assembly.Rule.ExcludePattern("META-INF/maven/org\\.apache\\.httpcomponents\\.core5/.*"),
+  )
+
+  def icebergHttpPatchedMetadata = Seq(
+    ("org.apache.httpcomponents.client5", "httpclient5", httpClient5Version),
+    ("org.apache.httpcomponents.core5", "httpcore5", httpCore5Version),
+    ("org.apache.httpcomponents.core5", "httpcore5-h2", httpCore5Version),
+  )
 
   def utilityDeps = Seq(
     mvn"com.fasterxml.jackson.core:jackson-core:$jacksonVersion".forceVersion(),
@@ -427,6 +479,27 @@ trait BaseJUnit4TestModule extends JavaModule with TestModule.Junit4 {
 
   // Enable parallel test execution using Mill's testParallelism
   def testParallelism = true
+}
+
+// Builds a small, pre-relocated patch jar for Iceberg's shaded HTTP stack. The cloud
+// assemblies remove Iceberg's vulnerable copies and relocate this temporary namespace
+// into Iceberg's private namespace, without changing unshaded clients such as Azure.
+object icebergHttpPatch extends JavaModule {
+  def jvmId = Constants.jvmId
+  def repositoriesTask = Task.Anon { super.repositoriesTask() ++ Constants.repositories }
+  def mvnDeps = Seq(
+    mvn"org.apache.httpcomponents.client5:httpclient5:${Constants.httpClient5Version}"
+      .exclude("org.slf4j" -> "slf4j-api"),
+    mvn"org.apache.httpcomponents.core5:httpcore5:${Constants.httpCore5Version}",
+    mvn"org.apache.httpcomponents.core5:httpcore5-h2:${Constants.httpCore5Version}",
+  ).map(_.forceVersion())
+
+  override def assemblyRules = Assembly.defaultRules ++ Seq(
+    Assembly.Rule.Relocate(
+      "org.apache.hc.**",
+      "ai.zipline.iceberg.http.patch.@1"
+    )
+  )
 }
 
 // Aggregate target: builds all deploy assemblies in parallel via Mill's task graph.

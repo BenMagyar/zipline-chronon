@@ -37,7 +37,13 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
   def deltaSparkJarFile = Task.Source(moduleDir / "delta-spark_2.12-3.3.2.jar")
 
   override def unmanagedClasspath = Task {
-    super.unmanagedClasspath() ++ Seq(ucSparkJarFile(), ucClientJarFile(), ucHadoopJarFile(), deltaSparkJarFile())
+    super.unmanagedClasspath() ++ Seq(
+      ucSparkJarFile(),
+      ucClientJarFile(),
+      ucHadoopJarFile(),
+      deltaSparkJarFile(),
+      build.icebergHttpPatch.assembly(),
+    )
   }
 
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps  ++ Seq(
@@ -108,7 +114,7 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
     // iceberg-spark-runtime shades aircompressor but leaves the original pom metadata,
     // which grype flags as vulnerable. Strip it since the code is shaded.
     Assembly.Rule.ExcludePattern("META-INF/maven/io\\.airlift/aircompressor/.*"),
-  )
+  ) ++ build.Constants.icebergHttpPatchAssemblyRules
 
   // Uber-jars embed stale pom.properties that win the assembly merge. assemblyRules
   // strips all copies; this method patches the correct versions back so grype/SBOM
@@ -119,7 +125,7 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
     ("org.eclipse.jetty", "jetty-http", jettyVersion),
     ("com.nimbusds", "nimbus-jose-jwt", nimbusJoseJwtVersion),
     ("com.google.protobuf", "protobuf-java", "3.25.5"),
-  )
+  ) ++ build.Constants.icebergHttpPatchedMetadata
 
   private def patchAssemblyMetadata(jar: os.Path): Unit = {
     val uri = java.net.URI.create("jar:" + jar.toIO.toURI)

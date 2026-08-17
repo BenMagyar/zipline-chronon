@@ -31,6 +31,10 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
       .exclude("com.fasterxml.jackson.module" -> "jackson-module-scala_2.13")
   }
 
+  override def unmanagedClasspath = Task {
+    super.unmanagedClasspath() ++ Seq(build.icebergHttpPatch.assembly())
+  }
+
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps ++ build.Constants.sparkDeps
     .map(_
       .exclude("org.apache.hive" -> "hive-exec")
@@ -93,6 +97,11 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
     mvn"net.minidev:json-smart:2.5.2",
+    // Patch Iceberg Azure's unshaded HTTP stack; its shaded runtime copy is replaced
+    // separately by icebergHttpPatch during assembly.
+    mvn"org.apache.httpcomponents.client5:httpclient5:${build.Constants.httpClient5Version}",
+    mvn"org.apache.httpcomponents.core5:httpcore5:${build.Constants.httpCore5Version}",
+    mvn"org.apache.httpcomponents.core5:httpcore5-h2:${build.Constants.httpCore5Version}",
   ).map(_.forceVersion())
 
   override def assemblyRules = Seq(
@@ -141,7 +150,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
     // hadoop-client-runtime shades jline but leaves stale 3.9.0 pom metadata
     // (GHSA-2r2c-cx56-8933, GHSA-47qp-hqvx-6r3f). Strip since code is shaded.
     Assembly.Rule.ExcludePattern("META-INF/maven/org\\.jline/.*"),
-  )
+  ) ++ build.Constants.icebergHttpPatchAssemblyRules
 
   // Uber-jars (spark-core, hadoop-client-runtime, iceberg-spark-runtime) embed stale
   // pom.properties that win the assembly merge. assemblyRules strips all copies;
@@ -153,7 +162,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
     ("org.apache.avro", "avro", avroVersion),
     ("com.nimbusds", "nimbus-jose-jwt", nimbusJoseJwtVersion),
     ("org.apache.commons", "commons-configuration2", commonsConfiguration2Version),
-  )
+  ) ++ build.Constants.icebergHttpPatchedMetadata
 
   private def patchAssemblyMetadata(jar: os.Path): Unit = {
     val uri = java.net.URI.create("jar:" + jar.toIO.toURI)

@@ -47,7 +47,7 @@ trait OnlineModule extends Cross.Module[String] with build.BaseModule {
     mvn"io.opentelemetry:opentelemetry-exporter-otlp:1.49.0",
     mvn"org.apache.spark::spark-sql-api:${build.Constants.sparkVersion}"
       .exclude("org.apache.logging.log4j" -> "log4j-core"),
-    mvn"org.apache.logging.log4j:log4j-core:2.25.4",
+    mvn"org.apache.logging.log4j:log4j-core:${build.Constants.log4jVersion}",
     // Additional from Bazel
     mvn"net.jodah:typetools:0.6.3",
     // Protobuf support for ProtobufSerDe

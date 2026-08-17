@@ -39,10 +39,10 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
     // iceberg-spark-runtime shades aircompressor but leaves the original pom metadata,
     // which grype flags as vulnerable. Strip it since the code is shaded.
     Assembly.Rule.ExcludePattern("META-INF/maven/io\\.airlift/aircompressor/.*"),
-  )
+  ) ++ build.Constants.icebergHttpPatchAssemblyRules
 
   override def unmanagedClasspath = Task {
-    super.unmanagedClasspath() ++ Seq(bigqueryJarFile())
+    super.unmanagedClasspath() ++ Seq(bigqueryJarFile(), build.icebergHttpPatch.assembly())
   }
 
   // Uber-jars (iceberg-spark-runtime) embed stale pom.properties that win the assembly
@@ -50,7 +50,7 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
   // back so grype/SBOM tools see the actual versions on the classpath.
   private val patchedMetadata: Seq[(String, String, String)] = Seq(
     ("org.apache.avro", "avro", avroVersion),
-  )
+  ) ++ build.Constants.icebergHttpPatchedMetadata
 
   private def patchAssemblyMetadata(jar: os.Path): Unit = {
     val uri = java.net.URI.create("jar:" + jar.toIO.toURI)

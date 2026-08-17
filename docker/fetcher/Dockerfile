@@ -4,6 +4,7 @@ FROM debian:trixie-slim
 # We can't use newer JDKs as we need to have HADOOP-19212 fixed (and Spark pick it up) to not break
 # Catalyst util
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y curl gnupg ca-certificates procps && \
     curl -fsSL https://apt.corretto.aws/corretto.key | gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main" > /etc/apt/sources.list.d/corretto.list && \
