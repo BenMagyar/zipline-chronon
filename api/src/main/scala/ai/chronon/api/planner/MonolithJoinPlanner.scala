@@ -58,13 +58,6 @@ case class MonolithJoinPlanner(join: Join)(implicit outputPartitionSpec: Partiti
 
   private def semanticMonolithJoin(join: Join): Join = {
     val semanticJoin = join.deepCopy()
-    semanticJoin.unsetMetaData()
-    Option(semanticJoin.joinParts).map(_.asScala).foreach { parts =>
-      parts.foreach(joinPart => joinPart.groupBy.unsetMetaData())
-    }
-    Option(semanticJoin.bootstrapParts).map(_.asScala).foreach { bootstrapParts =>
-      bootstrapParts.foreach(bootstrapPart => bootstrapPart.unsetMetaData())
-    }
     semanticJoin.unsetOnlineExternalParts()
     // keyFilter is an upload-only concern - embedded groupBys' filters must not affect join hashes
     semanticJoin.unsetKeyFiltersRecursively()
@@ -171,8 +164,7 @@ case class MonolithJoinPlanner(join: Join)(implicit outputPartitionSpec: Partiti
 
     val sensorNodes = ExternalSourceSensorUtil
       .sensorNodes(backfill.metaData)(confOutputPartitionSpec)
-      .map((es) =>
-        toNode(es.metaData, _.setExternalSourceSensor(es), ExternalSourceSensorUtil.semanticExternalSourceSensor(es)))
+      .map((es) => toNode(es.metaData, _.setExternalSourceSensor(es), es))
 
     val (allNodes, terminalNodeNames) = if (enableStatsCompute) {
       val statsCompute = statsComputeNode

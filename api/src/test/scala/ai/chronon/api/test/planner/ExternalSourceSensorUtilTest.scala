@@ -13,24 +13,16 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
 
   private implicit val testPartitionSpec: PartitionSpec = PartitionSpec.daily
 
-  "semanticExternalSourceSensor" should "create a sensor node without metadata" in {
-    val originalMetaData = new MetaData()
-      .setName("test_sensor")
-      .setTeam("test_team")
-      .setVersion("1")
+  // sensors used to be hashed through a metaData-erasing copy; the digest strips metaData itself
+  // now, so the property to hold is the hash, not the shape of some intermediate copy
+  "a sensor node's semantic hash" should "not depend on its metaData" in {
+    def sensorNode(name: String, team: String): ExternalSourceSensorNode =
+      new ExternalSourceSensorNode()
+        .setSourceTableDependency(new TableDependency().setTableInfo(new TableInfo().setTable("test_table")))
+        .setMetaData(new MetaData().setName(name).setTeam(team).setVersion("1"))
 
-    val td = new TableDependency()
-      .setTableInfo(new TableInfo().setTable("test_table"))
-
-    val sensorNode = new ExternalSourceSensorNode()
-      .setSourceTableDependency(td)
-      .setMetaData(originalMetaData)
-
-    val semanticSensor = ExternalSourceSensorUtil.semanticExternalSourceSensor(sensorNode)
-
-    semanticSensor.sourceTableDependency.tableInfo.table should equal("test_table")
-    semanticSensor.metaData should be(null)
-    semanticSensor should not be theSameInstanceAs(sensorNode)
+    ThriftJsonCodec.semanticHexDigest(sensorNode("renamed_sensor", "other_team")) should equal(
+      ThriftJsonCodec.semanticHexDigest(sensorNode("test_sensor", "test_team")))
   }
 
   "sensorNodes" should "create sensor nodes for each table dependency" in {

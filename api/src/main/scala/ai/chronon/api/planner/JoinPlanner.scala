@@ -60,13 +60,9 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       )
     }
 
+  // keyFilter is an upload-only concern - embedded groupBys' filters must not affect join hashes
   // will mutate the join in place - use on deepCopy-ied objects only
-  private def joinWithoutMetadata(join: Join): Unit = {
-    join.unsetMetaData()
-    Option(join.joinParts).foreach(_.iterator().toScala.foreach(_.groupBy.unsetMetaData()))
-    // keyFilter is an upload-only concern - embedded groupBys' filters must not affect join hashes
-    join.unsetKeyFiltersRecursively()
-  }
+  private def joinWithoutKeyFilters(join: Join): Unit = join.unsetKeyFiltersRecursively()
 
   private def joinWithoutExecutionInfo: Join = {
     val copied = join.deepCopy()
@@ -89,7 +85,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
         source.getJoinSource.getJoin.unsetKeyFiltersRecursively()
     }
 
-    val leftSourceHash = ThriftJsonCodec.hexDigest(hashable)
+    val leftSourceHash = ThriftJsonCodec.semanticHexDigest(hashable)
     val leftSourceTable = left.table.replace(".", "__").sanitize // source_namespace.table -> source_namespace__table
     val outputTableName =
       leftSourceTable + "__" + leftSourceHash + "__source" // source__<source_namespace>__<table>__<hash>
@@ -129,7 +125,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
     content.setJoinBootstrap(result)
 
     val copy = result.deepCopy()
-    joinWithoutMetadata(copy.join)
+    joinWithoutKeyFilters(copy.join)
 
     toNode(metaData, _.setJoinBootstrap(result), copy)
   }
@@ -182,7 +178,6 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
     metaData.executionInfo.outputTableInfo.withSpec(joinPartitionSpec)
 
     val copy = result.deepCopy()
-    copy.joinPart.groupBy.unsetMetaData()
     copy.joinPart.groupBy.unsetKeyFiltersRecursively()
 
     toNode(metaData, _.setJoinPart(result), copy)
@@ -228,7 +223,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       )(joinPartitionSpec)
 
     val copy = result.deepCopy()
-    joinWithoutMetadata(copy.join)
+    joinWithoutKeyFilters(copy.join)
     copy.join.unsetDerivations()
 
     toNode(metaData, _.setJoinMerge(result), copy)
@@ -251,7 +246,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       )(joinPartitionSpec)
 
     val copy = result.deepCopy()
-    joinWithoutMetadata(copy.join)
+    joinWithoutKeyFilters(copy.join)
 
     toNode(metaData, _.setJoinDerivation(result), copy)
   }
@@ -287,7 +282,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
           )(joinPartitionSpec)
 
         val copy = result.deepCopy()
-        joinWithoutMetadata(copy.join)
+        joinWithoutKeyFilters(copy.join)
 
         toNode(metaData, _.setJoinStatsCompute(result), copy)
       }
@@ -351,7 +346,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
     val node = new JoinMetadataUpload().setJoin(joinWithoutExecutionInfo)
 
     val copy = joinWithoutExecutionInfo.deepCopy()
-    joinWithoutMetadata(copy)
+    joinWithoutKeyFilters(copy)
 
     toNode(metaData, _.setJoinMetadataUpload(node), copy)
   }
@@ -369,7 +364,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
     )(joinPartitionSpec)
 
     val copy = result.deepCopy()
-    joinWithoutMetadata(copy.join)
+    joinWithoutKeyFilters(copy.join)
 
     toNode(metaData, _.setUnionJoin(result), copy)
   }
@@ -388,8 +383,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       val unionNode = unionJoinNode
       val sensorNodes = ExternalSourceSensorUtil
         .sensorNodes(unionNode.metaData)(joinPartitionSpec)
-        .map((es) =>
-          toNode(es.metaData, _.setExternalSourceSensor(es), ExternalSourceSensorUtil.semanticExternalSourceSensor(es)))
+        .map((es) => toNode(es.metaData, _.setExternalSourceSensor(es), es))
 
       val metadataUpload = metadataUploadNode
 
@@ -411,8 +405,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
       // Get sensor nodes for the backfill terminal node
       val sensorNodes = ExternalSourceSensorUtil
         .sensorNodes(backfillTerminalNode.metaData)(joinPartitionSpec)
-        .map((es) =>
-          toNode(es.metaData, _.setExternalSourceSensor(es), ExternalSourceSensorUtil.semanticExternalSourceSensor(es)))
+        .map((es) => toNode(es.metaData, _.setExternalSourceSensor(es), es))
 
       val metadataUpload = metadataUploadNode
 
@@ -469,14 +462,6 @@ object JoinPlanner {
         }
       }
     }
-  }
-
-  // will mutate the join in place - use on deepCopy-ied objects only
-  private def unsetNestedMetadata(join: Join): Unit = {
-    join.unsetMetaData()
-    Option(join.joinParts).foreach(_.iterator().toScala.foreach(_.groupBy.unsetMetaData()))
-    // Keep onlineExternalParts as they affect output schema and are needed for bootstrap/merge/derivation
-    // join.unsetOnlineExternalParts()
   }
 
 }

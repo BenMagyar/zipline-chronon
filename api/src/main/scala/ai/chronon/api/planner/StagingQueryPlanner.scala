@@ -12,12 +12,6 @@ case class StagingQueryPlanner(stagingQuery: StagingQuery)(implicit outputPartit
   private val confOutputPartitionSpec: PartitionSpec =
     stagingQuery.partitionSpec(outputPartitionSpec)
 
-  private def semanticStagingQuery(stagingQuery: StagingQuery): StagingQuery = {
-    val semanticStagingQuery = stagingQuery.deepCopy()
-    semanticStagingQuery.unsetMetaData()
-    semanticStagingQuery
-  }
-
   override def buildPlan: ConfPlan = {
     val tableDependencies = PartitionSpecResolver.validateAndResolveDependencies(
       stagingQuery.metaData.name,
@@ -36,11 +30,10 @@ case class StagingQueryPlanner(stagingQuery: StagingQuery)(implicit outputPartit
     )(confOutputPartitionSpec)
 
     val node = new StagingQueryNode().setStagingQuery(stagingQuery)
-    val finalNode = toNode(metaData, _.setStagingQuery(node), semanticStagingQuery(stagingQuery))
+    val finalNode = toNode(metaData, _.setStagingQuery(node), stagingQuery)
     val externalSensorNodes = ExternalSourceSensorUtil
       .sensorNodes(finalNode.metaData)(confOutputPartitionSpec)
-      .map((es) =>
-        toNode(es.metaData, _.setExternalSourceSensor(es), ExternalSourceSensorUtil.semanticExternalSourceSensor(es)))
+      .map((es) => toNode(es.metaData, _.setExternalSourceSensor(es), es))
 
     val terminalNodeNames = Map(
       ai.chronon.planner.Mode.BACKFILL -> finalNode.metaData.name

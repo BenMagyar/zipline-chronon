@@ -90,6 +90,72 @@ object ThriftJsonCodec {
       .prettyInline
   }
 
+  /** MetaData is execution and bookkeeping state - name, version, team, tags, schedule - and never
+    * describes what a conf computes, so semantic hashes must exclude it wherever it appears. Callers
+    * used to unset it field by field, which reached the top-level conf and joinParts' groupBys but
+    * not confs embedded through a joinSource: a chained conf inherited its upstream's bookkeeping,
+    * and editing a tag upstream churned every downstream hash and node name. Stripping the field
+    * recursively from the serialized tree covers every nesting path, including ones added later.
+    *
+    * ExternalSource spells the field `metadata`, every other struct `metaData`, so the match is
+    * case-insensitive.
+    */
+  private val MetaDataFieldNames = Seq("metaData", "metadata")
+
+  private def isMetaDataField(fieldName: String): Boolean =
+    MetaDataFieldNames.exists(_.equalsIgnoreCase(fieldName))
+
+  private[api] def withoutMetaData(node: JsonNode): JsonNode = {
+    if (node.isObject) {
+      val stripped = mapper.createObjectNode()
+      node.fieldNames().forEachRemaining { fieldName =>
+        if (!isMetaDataField(fieldName)) stripped.set(fieldName, withoutMetaData(node.get(fieldName)))
+      }
+      stripped
+    } else if (node.isArray) {
+      val stripped = mapper.createArrayNode()
+      node.elements().forEachRemaining(element => stripped.add(withoutMetaData(element)))
+      stripped
+    } else {
+      node
+    }
+  }
+
+  /** Guards the invariant, and deliberately does not re-implement [[withoutMetaData]]'s traversal:
+    * a guard that repeats the walk it checks shares that walk's blind spots, so a nesting the strip
+    * skips would be a nesting the guard skips too. Jackson's findValues does the descent instead -
+    * one library call, nothing here to get wrong - and the two agree only if the strip is right.
+    */
+  private[api] def requireNoMetaData(node: JsonNode): Unit = {
+    val leaked = MetaDataFieldNames.filter(fieldName => !node.findValues(fieldName).isEmpty)
+    require(
+      leaked.isEmpty,
+      s"Semantic hash input still carries ${leaked.mkString(" and ")}. " +
+        "Semantic hashes must not depend on bookkeeping fields."
+    )
+  }
+
+  private def semanticJsonStr[T <: TBase[_, _]: Manifest](obj: T): String = {
+    val stripped = withoutMetaData(toJsonNode(obj))
+    requireNoMetaData(stripped)
+    mapper.writeValueAsString(stripped)
+  }
+
+  /** [[md5Digest]] over the conf with metaData stripped at every depth. */
+  def semanticMd5Digest[T <: TBase[_, _]: Manifest](obj: T): String =
+    HashUtils.md5Base64(semanticJsonStr(obj).getBytes(Constants.UTF8))
+
+  def semanticMd5Digest[T <: TBase[_, _]: Manifest](obj: util.List[T]): String = {
+    val json = if (obj == null) "" else obj.toScala.map(semanticJsonStr(_)).prettyInline
+    HashUtils.md5Base64(json.getBytes(Constants.UTF8))
+  }
+
+  /** [[hexDigest]] over the conf with metaData stripped at every depth. */
+  def semanticHexDigest[T <: TBase[_, _]: Manifest](obj: T, length: Int = 6): String = {
+    val canonicalBytes = semanticJsonStr(obj).getBytes(Constants.UTF8)
+    md5Bytes(canonicalBytes).map("%02x".format(_)).mkString.take(length)
+  }
+
   def toCompactBase64[T <: TBase[_, _]: Manifest](obj: T): String = {
     val compactSerializer = new TSerializer(new TCompactProtocol.Factory())
     Base64.getEncoder.encodeToString(compactSerializer.serialize(obj))

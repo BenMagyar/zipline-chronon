@@ -35,12 +35,6 @@ class ModelPlanner(model: Model)(implicit outputPartitionSpec: PartitionSpec)
     result
   }
 
-  private def semanticModel(model: Model): Model = {
-    val semantic = model.deepCopy()
-    semantic.unsetMetaData()
-    semantic
-  }
-
   private def createTrainNode: Option[Node] = {
     val result = for {
       trainingConf <- Option(model.trainingConf)
@@ -57,8 +51,7 @@ class ModelPlanner(model: Model)(implicit outputPartitionSpec: PartitionSpec)
           None
         )(confOutputPartitionSpec)
       val node = new TrainModelNode().setModel(eraseExecutionInfo)
-      val copy = semanticModel(model)
-      toNode(metaData, _.setTrainModel(node), copy)
+      toNode(metaData, _.setTrainModel(node), model)
     }
     result
   }
@@ -88,9 +81,7 @@ class ModelPlanner(model: Model)(implicit outputPartitionSpec: PartitionSpec)
 
     val node = new CreateModelEndpointNode().setModel(eraseExecutionInfo)
 
-    val copy = semanticModel(model)
-
-    toNode(metaData, _.setCreateModelEndpoint(node), copy)
+    toNode(metaData, _.setCreateModelEndpoint(node), model)
   }
 
   def deployModelNode: Node = {
@@ -117,9 +108,7 @@ class ModelPlanner(model: Model)(implicit outputPartitionSpec: PartitionSpec)
 
     val node = new DeployModelNode().setModel(eraseExecutionInfo)
 
-    val copy = semanticModel(model)
-
-    toNode(metaData, _.setDeployModel(node), copy)
+    toNode(metaData, _.setDeployModel(node), model)
   }
 
   override def buildPlan: ConfPlan = {

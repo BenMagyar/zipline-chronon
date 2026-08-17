@@ -618,9 +618,8 @@ object Extensions {
 
     def semanticHash: String = {
       val newGroupBy = groupBy.deepCopy()
-      newGroupBy.unsetMetaData()
       newGroupBy.unsetKeyFiltersRecursively()
-      val base = ThriftJsonCodec.md5Digest(newGroupBy)
+      val base = ThriftJsonCodec.semanticMd5Digest(newGroupBy)
       Option(groupBy.metaData).map(_.mixGridToken(base)).getOrElse(base)
     }
 
@@ -894,11 +893,7 @@ object Extensions {
     lazy val rightToLeft: Map[String, String] = KeyMappingHelper.flip(externalPart.keyMapping)
     private lazy val keyNames = externalPart.source.keyNames
 
-    def semanticHash: String = {
-      val newExternalPart = externalPart.deepCopy()
-      newExternalPart.source.unsetMetadata()
-      ThriftJsonCodec.md5Digest(newExternalPart)
-    }
+    def semanticHash: String = ThriftJsonCodec.semanticMd5Digest(externalPart)
 
     lazy val keySchemaFull: Array[StructField] = externalPart.source.keyFields.map(field =>
       StructField(externalPart.rightToLeft.getOrElse(field.name, field.name), field.fieldType))
@@ -958,11 +953,7 @@ object Extensions {
     /** Compress the info such that the hash can be stored at record and
       * used to track which records are populated by which bootstrap tables
       */
-    def semanticHash: String = {
-      val newPart = bootstrapPart.deepCopy()
-      bootstrapPart.unsetMetaData()
-      ThriftJsonCodec.md5Digest(newPart)
-    }
+    def semanticHash: String = ThriftJsonCodec.semanticMd5Digest(bootstrapPart)
 
     def keys(join: Join, partitionColumn: String): Seq[String] = {
       val definedKeys = if (bootstrapPart.isSetKeyColumns) {
@@ -1064,7 +1055,7 @@ object Extensions {
       val leftForHash = join.left.deepCopy()
       if (leftForHash.isSetJoinSource && leftForHash.getJoinSource.isSetJoin)
         leftForHash.getJoinSource.getJoin.unsetKeyFiltersRecursively()
-      val baseLeftHash = ThriftJsonCodec.md5Digest(leftForHash)
+      val baseLeftHash = ThriftJsonCodec.semanticMd5Digest(leftForHash)
       val leftHash = Option(join.metaData).map(_.mixGridToken(baseLeftHash)).getOrElse(baseLeftHash)
       logger.info(s"Join Left Hash: $leftHash")
       logger.info(s"Join Left Object: ${ThriftJsonCodec.toJsonStr(join.left)}")
@@ -1076,7 +1067,7 @@ object Extensions {
           Map(derivedKey -> derivedHash)
         }
         .getOrElse(Map.empty)
-      val bootstrapHash = ThriftJsonCodec.md5Digest(join.bootstrapParts)
+      val bootstrapHash = ThriftJsonCodec.semanticMd5Digest(join.bootstrapParts)
       partHashes ++ Map(leftSourceKey -> leftHash, join.metaData.bootstrapTable -> bootstrapHash) ++ derivedHashMap
     }
 

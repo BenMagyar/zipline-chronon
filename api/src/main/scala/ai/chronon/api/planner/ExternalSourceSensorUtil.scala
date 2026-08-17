@@ -24,12 +24,6 @@ object ExternalSourceSensorUtil {
     "spark.sql.shuffle.partitions" -> "2"
   )
 
-  def semanticExternalSourceSensor(sensorNode: ExternalSourceSensorNode): ExternalSourceSensorNode = {
-    val semanticSensor = sensorNode.deepCopy()
-    semanticSensor.unsetMetaData()
-    semanticSensor
-  }
-
   // Sensor node names must be unique per (table, dependency grid): two confs watching the same
   // table on different grids (e.g. a 3h@1h staging query and a 1d@1h groupBy) would otherwise
   // emit sensors with the same name, and the hub keys nodes by name per branch — one grid

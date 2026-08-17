@@ -43,12 +43,6 @@ class ModelTransformsPlanner(modelTransforms: ModelTransforms)(implicit outputPa
     result
   }
 
-  private def semanticModelTransforms(modelTransforms: ModelTransforms): ModelTransforms = {
-    val semantic = modelTransforms.deepCopy()
-    semantic.unsetMetaData()
-    semantic
-  }
-
   def backfillNode: Node = {
     // A ModelTransform is a 1:1 row-level transform, not an aggregation, so its input
     // dependency is day-for-day. TableDependencies.fromSource, called with no maxWindow,
@@ -94,9 +88,7 @@ class ModelTransformsPlanner(modelTransforms: ModelTransforms)(implicit outputPa
 
     val node = new ModelTransformsBackfillNode().setModelTransforms(modelTransforms)
 
-    val copy = semanticModelTransforms(modelTransforms)
-
-    toNode(metaData, _.setModelTransformsBackfill(node), copy)
+    toNode(metaData, _.setModelTransformsBackfill(node), modelTransforms)
   }
 
   def uploadNode: Node = {
@@ -116,9 +108,7 @@ class ModelTransformsPlanner(modelTransforms: ModelTransforms)(implicit outputPa
 
     val node = new ModelTransformsUploadNode().setModelTransforms(eraseExecutionInfo)
 
-    val copy = semanticModelTransforms(modelTransforms)
-
-    toNode(metaData, _.setModelTransformsUpload(node), copy)
+    toNode(metaData, _.setModelTransformsUpload(node), modelTransforms)
   }
 
   override def buildPlan: ConfPlan = {

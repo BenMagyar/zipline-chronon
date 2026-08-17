@@ -19,7 +19,7 @@ abstract class ConfPlanner[T](conf: T)(implicit outputPartitionSpec: PartitionSp
   def toNode[T <: TBase[_, _]: Manifest](metaData: MetaData,
                                          contentSetter: NodeContent => Unit,
                                          hashableNode: T): Node = {
-    val baseHash = ThriftJsonCodec.hexDigest(hashableNode)
+    val baseHash = ThriftJsonCodec.semanticHexDigest(hashableNode)
     val hash = Option(metaData).map(_.mixGridToken(baseHash)).getOrElse(baseHash)
 
     val content = new NodeContent()
