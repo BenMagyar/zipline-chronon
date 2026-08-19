@@ -94,6 +94,11 @@ ADD_OPENS_OPTS="
 
 JVM_OPTS="$JVM_OPTS $GC_OPTS $ADD_OPENS_OPTS -XX:MaxMetaspaceSize=1g -XX:MaxRAMPercentage=70.0 -XX:MinRAMPercentage=70.0 -XX:InitialRAMPercentage=70.0 -XX:MaxHeapFreeRatio=100 -XX:MinHeapFreeRatio=0"
 
+# Batch IR cache toggle. When DISABLE_FETCHER_BATCH_IR_CACHE=true, disables the fetcher's in-memory batch IR cache.
+if [ "$DISABLE_FETCHER_BATCH_IR_CACHE" = "true" ]; then
+  JVM_OPTS="$JVM_OPTS -Dai.chronon.fetcher.batch_ir_cache_disabled=true"
+fi
+
 # TTL cache configuration
 TTL_OPTS=""
 if [ -n "$CHRONON_JOIN_CONF_TTL_MILLIS" ]; then

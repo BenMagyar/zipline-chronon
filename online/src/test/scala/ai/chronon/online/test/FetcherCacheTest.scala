@@ -39,6 +39,37 @@ class FetcherCacheTest extends AnyFlatSpec with MockitoHelper {
   }
   val batchIrCacheMaximumSize = 50
 
+  it should "disable batch ir cache when disable system property is set" in {
+    val disableProp = "ai.chronon.fetcher.batch_ir_cache_disabled"
+    val originalValue = Option(System.getProperty(disableProp))
+    try {
+      System.setProperty(disableProp, "true")
+      val instance = new fetcher.FetcherCache {}
+      assertEquals(false, instance.isCacheSizeConfigured)
+      assertEquals(None, instance.configuredBatchIrCacheSize)
+      assertEquals(None, instance.maybeBatchIrCache)
+    } finally {
+      originalValue match {
+        case Some(v) => System.setProperty(disableProp, v)
+        case None    => System.clearProperty(disableProp)
+      }
+    }
+  }
+
+  it should "enable batch ir cache by default when disable system property is unset" in {
+    val disableProp = "ai.chronon.fetcher.batch_ir_cache_disabled"
+    val originalValue = Option(System.getProperty(disableProp))
+    try {
+      System.clearProperty(disableProp)
+      val instance = new fetcher.FetcherCache {}
+      assertEquals(true, instance.isCacheSizeConfigured)
+      assert(instance.configuredBatchIrCacheSize.exists(_ > 0))
+      assert(instance.maybeBatchIrCache.isDefined)
+    } finally {
+      originalValue.foreach(v => System.setProperty(disableProp, v))
+    }
+  }
+
   it should "batch ir cache correctly caches batch irs" in {
     val cacheName = "test"
     val batchIrCache = new BatchIrCache(cacheName, batchIrCacheMaximumSize)

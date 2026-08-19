@@ -21,6 +21,9 @@ import scala.util.{Success, Try}
  * small number (e.g. 1,000) and measure how much memory it uses, then adjust accordingly.
  *  2. Enable caching for a specific GroupBy by overriding `isCachingEnabled` and returning `true` for that GroupBy.
  * FetcherBase already provides an implementation of `isCachingEnabled` that uses the FlagStore.
+ *
+ * To disable caching globally regardless of size configuration, set the system property
+ * `ai.chronon.fetcher.batch_ir_cache_disabled` to `true`. This takes precedence over the size setting.
  * */
 trait FetcherCache {
   @transient private lazy val logger: Logger = LoggerFactory.getLogger(getClass)
@@ -28,11 +31,17 @@ trait FetcherCache {
   val batchIrCacheName = "batch_cache"
   val defaultBatchIrCacheSize = "10000"
 
+  val batchIrCacheDisabled: Boolean =
+    Option(System.getProperty("ai.chronon.fetcher.batch_ir_cache_disabled"))
+      .exists(_.toBoolean)
+
   val configuredBatchIrCacheSize: Option[Int] =
-    Option(System.getProperty("ai.chronon.fetcher.batch_ir_cache_size_elements"))
-      .orElse(Some(defaultBatchIrCacheSize))
-      .map(_.toInt)
-      .filter(_ > 0)
+    if (batchIrCacheDisabled) None
+    else
+      Option(System.getProperty("ai.chronon.fetcher.batch_ir_cache_size_elements"))
+        .orElse(Some(defaultBatchIrCacheSize))
+        .map(_.toInt)
+        .filter(_ > 0)
 
   val maybeBatchIrCache: Option[BatchIrCache] =
     configuredBatchIrCacheSize
