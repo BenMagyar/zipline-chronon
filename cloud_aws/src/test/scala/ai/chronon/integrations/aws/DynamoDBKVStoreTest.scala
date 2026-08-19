@@ -625,6 +625,49 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     ttlDesc.timeToLiveStatus() shouldBe software.amazon.awssdk.services.dynamodb.model.TimeToLiveStatus.DISABLED
   }
 
+  it should "multiPut stamps ttl anchored to write time on streaming and non-streaming tables" in {
+    val streamingDataset = "TTL_BUDGET_KEY_STREAMING"
+    val nonStreamingDataset = "TTL_BUDGET_KEY_BATCH_TABLE"
+    val streamingStore = new DynamoDBKVStoreImpl(client)
+    streamingStore.create(streamingDataset)
+
+    val nonStreamingStore = new DynamoDBKVStoreImpl(client)
+    nonStreamingStore.create(nonStreamingDataset, Map(isTimedSorted -> "false"))
+
+    val entityKeyBytes = "test_entity".getBytes(StandardCharsets.UTF_8)
+    val tileSizeMillis = 1.hour.toMillis
+    val tileStart = 1728000000000L
+    val streamingPut = {
+      val tileKey = TilingUtils.buildTileKey(streamingDataset, entityKeyBytes, Some(tileSizeMillis), Some(tileStart))
+      val tileKeyBytes = TilingUtils.serializeTileKey(tileKey)
+      PutRequest(tileKeyBytes, "value".getBytes(StandardCharsets.UTF_8), streamingDataset, Some(tileStart))
+    }
+    val nonStreamingPut = PutRequest("ttl_probe_key".getBytes(StandardCharsets.UTF_8),
+                                     "batch_ttl_val".getBytes(StandardCharsets.UTF_8),
+                                     nonStreamingDataset,
+                                     None)
+
+    val nowSeconds = System.currentTimeMillis() / 1000L
+    Await.result(streamingStore.multiPut(Seq(streamingPut)), 1.minute) shouldBe Seq(true)
+    Await.result(nonStreamingStore.multiPut(Seq(nonStreamingPut)), 1.minute) shouldBe Seq(true)
+
+    // Scan both tables and pull the ttl attribute off the (single) item we wrote.
+    def readTtl(table: String): Long = {
+      val items = client
+        .scan(software.amazon.awssdk.services.dynamodb.model.ScanRequest.builder().tableName(table).build())
+        .join()
+        .items()
+      items.size() shouldBe 1
+      items.get(0).get("ttl").n().toLong
+    }
+
+    // Slack absorbs the delta between the write's now() and the assertion's nowSeconds.
+    val slack = 60L
+    val expected = nowSeconds + DataTTLSeconds
+    readTtl(streamingDataset) shouldBe expected +- slack
+    readTtl(nonStreamingDataset) shouldBe expected +- slack
+  }
+
   it should "configure DynamoDB import timeout from kv upload timeout millis" in {
     val defaultStore = new DynamoDBKVStoreImpl(client)
     defaultStore.configuredImportTimeout shouldBe Duration.ofMinutes(60)

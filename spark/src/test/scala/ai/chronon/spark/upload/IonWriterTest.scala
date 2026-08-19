@@ -82,6 +82,43 @@ class IonWriterTest extends SparkTestBase with Matchers {
     parsed.flatMap(_._3).foreach(_.bigDecimalValue().longValueExact() shouldBe tsValueMillis)
   }
 
+  it should "stamp ttl on every ion row for DynamoDB TTL expiry" in {
+    val partitionValue = "2025-10-17"
+    val rootPath = Some(tmpDir.toURI.toString)
+    val dataSetName = "ion-output-ttl"
+
+    val schema = StructType(
+      Seq(
+        StructField("key_bytes", BinaryType, nullable = true),
+        StructField("value_bytes", BinaryType, nullable = true),
+        StructField("ds", DateType, nullable = false)
+      )
+    )
+    val rows = Seq(
+      Row("k1".getBytes("UTF-8"), "v1".getBytes("UTF-8"), LocalDate.parse(partitionValue)),
+      Row("k2".getBytes("UTF-8"), "v2".getBytes("UTF-8"), LocalDate.parse(partitionValue))
+    )
+    val nowSeconds = System.currentTimeMillis() / 1000L
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(rows, numSlices = 2), schema)
+    IonWriter.write(df, dataSetName, "ds", partitionValue, rootPath)
+
+    val partitionPath = IonWriter.resolvePartitionPath(dataSetName, "ds", partitionValue, rootPath)
+    val ionFiles = new File(partitionPath.toUri).listFiles().filter(_.getName.endsWith(".ion"))
+    val ion = IonSystemBuilder.standard().build()
+    val ttls = ionFiles.flatMap { file =>
+      val datagram = Using.resource(new FileInputStream(file))(in => ion.getLoader.load(in))
+      datagram.iterator().asScala.map { value =>
+        val struct = value.asInstanceOf[IonStruct].get("Item").asInstanceOf[IonStruct]
+        struct.get("ttl").asInstanceOf[IonDecimal].bigDecimalValue().longValueExact()
+      }
+    }
+    ttls.length shouldBe rows.size
+    // ttl must be a future epoch-second ~ now + DataTtlSeconds; allow generous slack for CI drift.
+    val expected = nowSeconds + IonWriter.DataTtlSeconds
+    all(ttls) should be >= (expected - 60L)
+    all(ttls) should be <= (expected + 60L)
+  }
+
   it should "honor upload bucket when provided" in {
     val partitionValue = "2025-10-18"
     val dataSetName = "ion-output-bucket"

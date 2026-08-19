@@ -12,6 +12,7 @@ import java.math.BigDecimal
 import java.sql.{Date, Timestamp}
 import java.time.{Instant, LocalDate, ZoneOffset}
 import java.util.UUID
+import scala.concurrent.duration._
 import scala.util.control.NonFatal
 
 /** Configuration keys used for Ion upload paths. */
@@ -32,6 +33,12 @@ case class IonWriteResult(
 
 object IonWriter {
   private val logger = LoggerFactory.getLogger(getClass)
+
+  // Stamped into each Ion row as `ttl` (epoch seconds). DynamoDB's ImportTable can't set TTL
+  // at import time, so we bake it into the imported items themselves. Must match
+  // DynamoDBKVStoreConstants.DataTTLSeconds — kept separate to avoid a spark -> cloud_aws
+  // dependency (spark is upstream of cloud_aws).
+  val DataTtlSeconds: Long = 5.days.toSeconds
 
   def write(df: DataFrame,
             dataSetName: String,
@@ -78,6 +85,10 @@ object IonWriter {
           var keyBytesTotal = 0L
           var valueBytesTotal = 0L
 
+          // Single ttl value per Ion file — expiry is anchored to write time, not read time,
+          // so all rows in one write share it.
+          val ttlEpochSeconds = System.currentTimeMillis() / 1000L + DataTtlSeconds
+
           try {
             iter.foreach { row =>
               writer.stepIn(IonType.STRUCT)
@@ -100,6 +111,10 @@ object IonWriter {
                 val millis = toMillis(row.get(tsIdx))
                 writer.writeDecimal(millis)
               }
+              writer.setFieldName("ttl")
+              // Ion int is rejected by DynamoDB ImportTable (supports: string, decimal, bool, blob, null, list, struct).
+              // Decimal maps to DynamoDB's Number type and satisfies TTL's epoch-seconds expectation.
+              writer.writeDecimal(BigDecimal.valueOf(ttlEpochSeconds))
               writer.stepOut()
               writer.stepOut()
               rowCount += 1
