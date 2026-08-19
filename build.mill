@@ -175,8 +175,9 @@ object Constants {
   val protobufVersion = "3.25.5"
   // 12.0.36 fixes GHSA-f4v5-65jj-pcr2 and GHSA-7p3p-8qv8-m2vh.
   val jettyVersion = "12.0.36"
-  // GHSA-vhch-2wf3-m8rp (High): netty-codec-stomp heap buffer overflow, fixed in 4.1.136.Final
-  val nettyVersion = "4.1.136.Final"
+  // GHSA-2qj4-mmr9-4v2f (High) / GHSA-8c42-7qj2-3j46 (Medium): netty-transport-sctp and
+  // netty-codec-http vulnerabilities, fixed in 4.1.137.Final
+  val nettyVersion = "4.1.137.Final"
   
   // Common JVM arguments for all test modules
   def commonTestForkArgs = Seq(
