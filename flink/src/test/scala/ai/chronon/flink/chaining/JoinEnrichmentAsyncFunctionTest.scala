@@ -101,6 +101,47 @@ class JoinEnrichmentAsyncFunctionTest extends AnyFlatSpec with Matchers with Moc
     verify(mockFetcher).fetchJoin(any(), any())
   }
 
+  it should "prefer a derived join response value over a same-named left-source value" in {
+    val mockApi = mock[Api]
+    val mockFetcher = mock[Fetcher]
+    when(mockApi.buildFetcher(debug = enableDebug)).thenReturn(mockFetcher)
+
+    val joinResponse = Fetcher.Response(
+      Fetcher.Request(joinRequestName, Map("transition_from" -> "raw_left")),
+      scala.util.Success(Map("transition_from" -> "derived_contextual").asInstanceOf[Map[String, AnyRef]])
+    )
+    val joinFuture = Promise[Seq[Fetcher.Response]]()
+    joinFuture.success(Seq(joinResponse))
+    when(mockFetcher.fetchJoin(any(), any())).thenReturn(joinFuture.future)
+
+    val function = new JoinEnrichmentAsyncFunction(joinRequestName, "testGB", mockApi, enableDebug)
+    setupFunctionWithMockedMetrics(function)
+    function.open(new Configuration())
+
+    val event = ProjectedEvent(
+      Map("user_id" -> "123", "transition_from" -> "raw_left", Constants.TimeColumn -> 1000L),
+      500L
+    )
+    val latch = new CountDownLatch(1)
+    var result: ProjectedEvent = null
+    val resultFuture = new ResultFuture[ProjectedEvent] {
+      override def complete(results: java.util.Collection[ProjectedEvent]): Unit = {
+        result = results.iterator().next()
+        latch.countDown()
+      }
+      override def completeExceptionally(throwable: Throwable): Unit = {
+        throwable.printStackTrace()
+        latch.countDown()
+      }
+    }
+
+    function.asyncInvoke(event, resultFuture)
+
+    latch.await(5, TimeUnit.SECONDS) shouldBe true
+    result should not be null
+    result.fields("transition_from") shouldBe "derived_contextual"
+  }
+
   it should "handle join timeout gracefully" in {
     val mockApi = mock[Api]
     val mockFetcher = mock[Fetcher]

@@ -141,8 +141,10 @@ object JoinSourceQueryFunction {
     JoinSourceQueryResult(catalystUtil, joinSchema, outputSchema)
   }
 
-  /** Build the join schema following JoinSourceRunner.buildSchemas approach:
-    * joinSchema = leftSourceSchema ++ joinCodec.valueSchema
+  /** Build the join schema following JoinSourceRunner.buildSchemas approach.
+    *
+    * Join response fields replace same-named left-source fields, matching the right-biased runtime
+    * merge in [[JoinEnrichmentAsyncFunction]].
     */
   def buildJoinSchema(
       inputSchema: Seq[(String, DataType)],
@@ -162,9 +164,12 @@ object JoinSourceQueryFunction {
       .metadataStore
       .buildJoinCodec(joinSource.getJoin, refreshOnFail = false)
 
-    // joinSchema = leftSourceSchema ++ joinCodec.valueSchema
-    val joinFields = leftSourceSchema.fields ++ joinCodec.valueSchema.fields
-    val joinSchema = StructType("join_enriched", joinFields)
+    // Join response fields are authoritative on collision. Keeping both fields would make
+    // Catalyst references ambiguous even though the runtime map contains only the response value.
+    val joinValueFields = joinCodec.valueSchema.fields
+    val joinValueFieldNames = joinValueFields.iterator.map(_.name).toSet
+    val joinFields = leftSourceSchema.fields.filterNot(field => joinValueFieldNames.contains(field.name)) ++
+      joinValueFields
 
     logger.info(s"""
          |Schema building for join source query:
@@ -176,6 +181,6 @@ object JoinSourceQueryFunction {
          |  ${joinFields.map(f => s"${f.name}: ${f.fieldType}").mkString(", ")}
          |""".stripMargin)
 
-    joinSchema
+    StructType("join_enriched", joinFields)
   }
 }

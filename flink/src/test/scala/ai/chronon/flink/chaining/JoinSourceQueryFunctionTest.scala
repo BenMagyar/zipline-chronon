@@ -300,6 +300,44 @@ class JoinSourceQueryFunctionTest extends AnyFlatSpec with Matchers with Mockito
     verify(mockJoinCodec, org.mockito.Mockito.atLeast(1)).valueSchema // Should have accessed the join schema
   }
 
+  it should "keep only the join response schema field when it shadows a left-source field" in {
+    val parentJoin = Builders.Join(
+      left = Builders.Source.events(
+        query = Builders.Query(),
+        table = "test.events",
+        topic = "kafka://test-topic"
+      ),
+      joinParts = Seq(),
+      metaData = Builders.MetaData(name = "test.parent_join_with_shadowed_field")
+    )
+    val joinSource = Builders.Source.joinSource(
+      join = parentJoin,
+      query = Builders.Query(selects = Map("transition_from" -> "transition_from"))
+    ).getJoinSource
+
+    val mockApi = mock[Api]
+    val mockFetcher = mock[Fetcher]
+    val mockMetadataStore = mock[MetadataStore]
+    val mockJoinCodec = mock[JoinCodec]
+    when(mockApi.buildFetcher(debug = false)).thenReturn(mockFetcher)
+    when(mockFetcher.metadataStore).thenReturn(mockMetadataStore)
+    when(mockMetadataStore.buildJoinCodec(parentJoin, refreshOnFail = false)).thenReturn(mockJoinCodec)
+
+    // Use different types to make it explicit that the join response field is authoritative.
+    when(mockJoinCodec.valueSchema).thenReturn(
+      StructType("join_enriched", Array(StructField("transition_from", IntType))))
+
+    val schema = JoinSourceQueryFunction.buildJoinSchema(
+      inputSchema :+ ("transition_from" -> StringType),
+      joinSource,
+      mockApi,
+      enableDebug = false
+    )
+
+    schema.fields.count(_.name == "transition_from") shouldBe 1
+    schema.fields.find(_.name == "transition_from").get.fieldType shouldBe IntType
+  }
+
   it should "build a chained join codec from an already projected nested left key" in {
     val productGroupBy = Builders.GroupBy(
       metaData = Builders.MetaData(name = "unit_test.product_hydrate.latest_value", online = true, version = 4),

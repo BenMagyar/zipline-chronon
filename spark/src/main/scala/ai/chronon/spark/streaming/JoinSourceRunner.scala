@@ -61,6 +61,15 @@ object LocalIOCache {
   }
 }
 
+object JoinSourceRunner {
+  private[streaming] def mergeJoinSchemas(leftSourceSchema: StructType, joinValueSchema: StructType): StructType = {
+    // Join response fields are authoritative on collision, matching the right-biased runtime
+    // merge of response.request.keys ++ responseMap in JoinSourceRunner.
+    val joinValueFieldNames = joinValueSchema.fieldNames.toSet
+    StructType(leftSourceSchema.filterNot(field => joinValueFieldNames.contains(field.name)) ++ joinValueSchema)
+  }
+}
+
 class JoinSourceRunner(groupByConf: api.GroupBy, conf: Map[String, String] = Map.empty, debug: Boolean, lagMillis: Int)(
     implicit
     session: SparkSession,
@@ -200,7 +209,7 @@ class JoinSourceRunner(groupByConf: api.GroupBy, conf: Map[String, String] = Map
         // immediately fails if the codec has partial error to avoid using stale codec
         .buildJoinCodec(joinSource.getJoin, refreshOnFail = false)
     val joinValueSchema: StructType = SparkConversions.fromChrononSchema(joinCodec.valueSchema)
-    val joinSchema: StructType = StructType(leftSourceSchema ++ joinValueSchema)
+    val joinSchema: StructType = JoinSourceRunner.mergeJoinSchemas(leftSourceSchema, joinValueSchema)
     val joinSourceSchema: StructType = outputSchema(joinSchema, enrichQuery(joinSource.query))
 
     // GroupBy -> JoinSource (Join + outer_query)
