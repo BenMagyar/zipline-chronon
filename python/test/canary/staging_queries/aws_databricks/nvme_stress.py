@@ -37,6 +37,7 @@ scaled_dim_listings = StagingQuery(
         common={
             "spark.executor.cores": "4",
             "spark.executor.memory": "2g",
+            "spark.executor.memoryOverhead": "4g",
             "spark.executor.instances": "1",
             "spark.dynamicAllocation.enabled": "false",
             "spark.dynamicAllocation.minExecutors": "1",

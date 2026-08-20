@@ -23,6 +23,7 @@ EXPECTED_SPARK_CONF = {
     "spark.driver.memory": "1g",
     "spark.executor.cores": "4",
     "spark.executor.memory": "2g",
+    "spark.executor.memoryOverhead": "4g",
     "spark.executor.instances": "1",
     "spark.dynamicAllocation.enabled": "false",
     "spark.default.parallelism": "1024",

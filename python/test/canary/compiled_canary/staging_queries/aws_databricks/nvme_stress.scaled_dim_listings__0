@@ -29,6 +29,7 @@
           "spark.executor.cores": "4",
           "spark.executor.instances": "1",
           "spark.executor.memory": "2g",
+          "spark.executor.memoryOverhead": "4g",
           "spark.sql.adaptive.enabled": "false",
           "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
           "spark.sql.catalog.workspace": "io.unitycatalog.spark.UCSingleCatalog",
