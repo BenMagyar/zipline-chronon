@@ -37,6 +37,7 @@ import ai.chronon.online.fetcher.FeaturesResponseType.ResponseType
 import ai.chronon.online.metrics.{Metrics, TTLCache}
 import ai.chronon.online.serde._
 import com.google.gson.Gson
+import com.linkedin.avro.fastserde.FastSerdeCache
 import org.apache.avro.generic.GenericRecord
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -840,6 +841,73 @@ class Fetcher(val kvStore: KVStore,
       }
 
     joinSchemaResponse
+  }
+
+  /** Best-effort triggers FastSerde class generation (see AvroCodec.warmUp / FastSerdeCache) for every schema
+    * a join actually uses on the request-serving path, ahead of live traffic, without needing a real request
+    * payload.
+    *
+    * Only the codec direction that's actually exercised is touched, since compiling the unused direction is
+    * wasted work that only makes the (optional) wait slower:
+    *   - GroupBy keyCodec: encode only - Api.createKeyBytes encodes it to build the KV store lookup key on
+    *     every fetch; it's never decoded.
+    *   - GroupBy valueAvroCodec/selectedCodec/irCodec/outputCodec: decode only - GroupByResponseHandler only
+    *     ever decodes stored bytes back; none of these are encoded on the serving path.
+    *   - Join keyCodec: encode only - used by encodeAndPublishLog for the sampled feature-logging key hash.
+    *   - Join valueCodec (the derived-value schema): encode only - used by encodeJoinResponses (the
+    *     fetchJoinV2 avro-string/avro-bytes response path) and by encodeAndPublishLog's logged value payload.
+    *   - Join baseValueCodec is intentionally not touched at all - it's constructed but never encoded or
+    *     decoded anywhere on the serving path (valueCodec, the schema after derivations, is what's actually
+    *     used); compiling it would be pure waste.
+    *
+    * waitForCompileMillis / cache are forwarded to AvroCodec.warmUp - see there for what they control.
+    *
+    * Returns Try[Future[Unit]]: the outer Try reflects whether resolving the join/GroupBys and firing the
+    * (synchronous, cheap) FastSerde triggers succeeded; the inner Future reflects the (optionally
+    * asynchronous, non-blocking) wait for those triggered compiles to settle. Awaiting the inner Future never
+    * blocks a thread - see AvroCodec.warmUp.
+    *
+    * joinCodecCache(joinName) can itself throw synchronously (rather than returning a Failure) for a
+    * persistently-unresolvable join - MetadataStore's retry-on-failure path calls getJoinConf.refresh(), which
+    * re-throws uncaught if the join still doesn't resolve. warmUpJoinCodec is documented as never throwing, so
+    * that call is wrapped rather than relied upon to return a Try.
+    */
+  def warmUpJoinCodec(joinName: String,
+                      waitForCompileMillis: Long = 0L,
+                      cache: FastSerdeCache = FastSerdeCache.getDefaultInstance()): Try[Future[Unit]] = {
+    Try(joinCodecCache(joinName)).flatMap(identity).map { joinCodec =>
+      val writerCodecs = mutable.ArrayBuffer(joinCodec.keyCodec, joinCodec.valueCodec)
+      val readerCodecs = new mutable.ArrayBuffer[AvroCodec]
+
+      joinCodec.conf.joinPartOps
+        .map(_.groupBy.metaData.getName)
+        .distinct
+        .foreach { groupByName =>
+          // The whole per-groupBy body is wrapped so a codec that throws while resolving (e.g. a schema
+          // derivation bug) only costs this one groupBy's touches - not the join-level codecs already
+          // collected above, nor any other groupBy still left to process in this loop.
+          Try {
+            metadataStore.getGroupByServingInfo(groupByName) match {
+              case Success(servingInfo) =>
+                writerCodecs += servingInfo.keyCodec
+                readerCodecs ++= Seq(servingInfo.valueAvroCodec,
+                                     servingInfo.selectedCodec,
+                                     servingInfo.irCodec,
+                                     servingInfo.outputCodec)
+              case Failure(exception) =>
+                log(DEBUG,
+                    s"Warmup: couldn't resolve servingInfo for groupBy $groupByName while warming join $joinName",
+                    exception)
+            }
+          }.recover { case exception =>
+            log(DEBUG,
+                s"Warmup: couldn't resolve codecs for groupBy $groupByName while warming join $joinName",
+                exception)
+          }
+        }
+
+      AvroCodec.warmUp(writerCodecs.toSeq, readerCodecs.toSeq, waitForCompileMillis, cache)
+    }
   }
 
   def fetchGroupBySchema(groupByName: String): Try[GroupBySchemaResponse] = {

@@ -25,9 +25,13 @@ import org.apache.avro.generic.{GenericData, GenericRecord}
 import org.apache.avro.io._
 import com.linkedin.avro.fastserde.FastGenericDatumReader
 import com.linkedin.avro.fastserde.FastGenericDatumWriter
+import com.linkedin.avro.fastserde.FastSerdeCache
 import java.util.concurrent.ConcurrentHashMap
 
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.{CompletableFuture, TimeUnit}
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 class AvroCodec(val schemaStr: String, val writerSchemaStr: Option[String] = None) extends Serializable {
   @transient private lazy val parser = new Schema.Parser()
@@ -154,4 +158,66 @@ object AvroCodec {
   }
 
   def of(schemaStr: String): AvroCodec = ofThreaded(schemaStr).get()
+
+  private val PollIntervalMillis = 50L
+
+  /** Best-effort triggers FastSerde class generation (see FastSerdeCache) for writerCodecs' schemas
+    * (serializer direction) and readerCodecs' schemas (deserializer direction), without needing any real
+    * data - operates on each codec's Schema directly rather than calling its encode/decode, so there's
+    * nothing to construct or fail on non-nullable fields, and no risk of touching a live, shared codec's
+    * mutable encode/decode buffers.
+    *
+    * The triggers above fire synchronously (cheap - just a cache registration each), but waitForCompileMillis,
+    * if positive, needs the returned Future to settle before every touched schema's build attempt has
+    * finished - hasDynamicClassGenerationDone flips true once FastSerdeCache's background build finishes,
+    * whether it lands on a real generated class or falls back to the vanilla Avro path after a compile
+    * failure - or the deadline elapses, whichever comes first. This never blocks a calling thread while
+    * waiting: the poll between checks is scheduled via CompletableFuture.delayedExecutor (a shared, lightweight
+    * JDK timer), not Thread.sleep, so a caller can fire many of these concurrently without needing one thread
+    * per in-flight wait. waitForCompileMillis = 0 (default) returns an already-completed Future - nothing to
+    * wait for.
+    *
+    * cache defaults to the real, process-wide FastSerdeCache singleton; pass an isolated instance instead to
+    * avoid cross-test schema-fingerprint collisions or to inspect exactly what got touched.
+    */
+  def warmUp(writerCodecs: Seq[AvroCodec],
+             readerCodecs: Seq[AvroCodec],
+             waitForCompileMillis: Long = 0L,
+             cache: FastSerdeCache = FastSerdeCache.getDefaultInstance()): Future[Unit] = {
+    writerCodecs.foreach(codec => Try(cache.getFastGenericSerializer(codec.schema)))
+    readerCodecs.foreach(codec => Try(cache.getFastGenericDeserializer(codec.schema, codec.schema)))
+
+    if (waitForCompileMillis <= 0) {
+      Future.successful(())
+    } else {
+      waitUntilCompiled(writerCodecs, readerCodecs, cache, System.currentTimeMillis() + waitForCompileMillis)
+    }
+  }
+
+  // Non-blocking: each "poll" is a callback scheduled after PollIntervalMillis on a shared JDK timer
+  // (CompletableFuture.delayedExecutor), not a sleeping thread - so waiting on N of these concurrently costs
+  // N lightweight scheduled callbacks, not N held threads.
+  private def waitUntilCompiled(writerCodecs: Seq[AvroCodec],
+                                readerCodecs: Seq[AvroCodec],
+                                cache: FastSerdeCache,
+                                deadlineMillis: Long): Future[Unit] = {
+    val ready = writerCodecs.forall(codec => isSerializerCompiled(cache, codec.schema)) &&
+      readerCodecs.forall(codec => isDeserializerCompiled(cache, codec.schema))
+
+    if (ready || System.currentTimeMillis() >= deadlineMillis) {
+      Future.successful(())
+    } else {
+      implicit val delayedEc: ExecutionContext =
+        ExecutionContext.fromExecutor(CompletableFuture.delayedExecutor(PollIntervalMillis, TimeUnit.MILLISECONDS))
+      Future(()).flatMap(_ => waitUntilCompiled(writerCodecs, readerCodecs, cache, deadlineMillis))
+    }
+  }
+
+  // Defaults to "ready" on any lookup failure so a transient error can't turn into an unbounded-feeling wait -
+  // the outer deadline in warmUp is still the only thing that can end the loop early either way.
+  private def isSerializerCompiled(cache: FastSerdeCache, schema: Schema): Boolean =
+    Try(cache.getFastGenericSerializer(schema).hasDynamicClassGenerationDone).getOrElse(true)
+
+  private def isDeserializerCompiled(cache: FastSerdeCache, schema: Schema): Boolean =
+    Try(cache.getFastGenericDeserializer(schema, schema).hasDynamicClassGenerationDone).getOrElse(true)
 }

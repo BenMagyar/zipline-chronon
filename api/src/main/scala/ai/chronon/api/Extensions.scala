@@ -675,14 +675,27 @@ object Extensions {
     // de-duplicate all columns necessary for aggregation in a deterministic order
     // so we use distinct instead of toSet here
     def aggregationInputs: Array[String] =
-      groupBy.aggregations
-        .iterator()
-        .toScala
-        .flatMap(agg =>
-          Option(agg.buckets)
-            .map(_.iterator().toScala.toSeq)
-            .getOrElse(Seq.empty) :+ agg.inputColumn)
-        .toArray
+      Option(groupBy.aggregations)
+        .map(
+          _.iterator().toScala
+            .flatMap(agg =>
+              Option(agg.buckets)
+                .map(_.iterator().toScala.toSeq)
+                .getOrElse(Seq.empty) :+ agg.inputColumn)
+            .toArray
+        )
+        .getOrElse(
+          // no-agg case - mirrors valueColumns below: every selected, non-key column passes through directly
+          groupBy.sources
+            .get(0)
+            .query
+            .selects
+            .keySet()
+            .iterator()
+            .toScala
+            .filterNot(groupBy.keyColumns.contains)
+            .toArray
+        )
         .distinct
 
     def valueColumns: Array[String] =

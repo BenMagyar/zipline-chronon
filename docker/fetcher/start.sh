@@ -108,6 +108,45 @@ if [ -n "$CHRONON_JOIN_CODEC_TTL_MILLIS" ]; then
   TTL_OPTS="$TTL_OPTS -Dai.chronon.join.codec.ttl.millis=$CHRONON_JOIN_CODEC_TTL_MILLIS"
 fi
 
+WARMUP_OPTS=()
+# Single-group convenience keys
+if [ -n "$WARMUP_JOIN_REGEX" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.join.regex=$WARMUP_JOIN_REGEX")
+fi
+if [ -n "$WARMUP_PAYLOAD" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.payload=$WARMUP_PAYLOAD")
+fi
+if [ -n "$WARMUP_TIMES_PER_JOIN" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.times.per.join=$WARMUP_TIMES_PER_JOIN")
+fi
+# Indexed multi-group keys: WARMUP_JOIN_N_REGEX / WARMUP_JOIN_N_PAYLOAD for N = 0, 1, 2, ...
+i=0
+while true; do
+  regex_var="WARMUP_JOIN_${i}_REGEX"
+  payload_var="WARMUP_JOIN_${i}_PAYLOAD"
+  if [ -z "${!regex_var}" ]; then
+    break
+  fi
+  WARMUP_OPTS+=("-Dai.chronon.warmup.join.${i}.regex=${!regex_var}")
+  if [ -n "${!payload_var}" ]; then
+    WARMUP_OPTS+=("-Dai.chronon.warmup.join.${i}.payload=${!payload_var}")
+  fi
+  i=$((i + 1))
+done
+# Compile-touch (FastSerde) for all online joins + periodic re-check for newly-online joins
+if [ -n "$WARMUP_COMPILE_ALL_ONLINE_JOINS" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.compile.all.online.joins=$WARMUP_COMPILE_ALL_ONLINE_JOINS")
+fi
+if [ -n "$WARMUP_PERIODIC_ENABLED" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.periodic.enabled=$WARMUP_PERIODIC_ENABLED")
+fi
+if [ -n "$WARMUP_PERIODIC_INTERVAL_SECONDS" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.periodic.interval.seconds=$WARMUP_PERIODIC_INTERVAL_SECONDS")
+fi
+if [ -n "$WARMUP_COMPILE_WAIT_TIMEOUT_SECONDS" ]; then
+  WARMUP_OPTS+=("-Dai.chronon.warmup.compile.wait.timeout.seconds=$WARMUP_COMPILE_WAIT_TIMEOUT_SECONDS")
+fi
+
 echo "Starting Fetcher service with online jar $ONLINE_JAR and online class $ONLINE_CLASS"
 if ! java $JVM_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.service.ChrononServiceLauncher \
   run ai.chronon.service.FetcherVerticle \
@@ -115,6 +154,7 @@ if ! java $JVM_OPTS $METRICS_OPTS -cp $FETCHER_JAR:$ONLINE_JAR ai.chronon.servic
   -Donline.jar=$ONLINE_JAR \
   -Donline.api.props='{"kv.tablePrefix":"'"$KV_TABLE_PREFIX"'"}' \
   $TTL_OPTS \
+  "${WARMUP_OPTS[@]}" \
   -Donline.class=$ONLINE_CLASS; then
   echo "Error: Fetcher service failed to start"
   exit 1

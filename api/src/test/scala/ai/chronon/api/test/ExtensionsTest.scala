@@ -82,6 +82,20 @@ class ExtensionsTest extends AnyFlatSpec {
     assertTrue(join.partSkewFilter(joinPart).isEmpty)
   }
 
+  // A GroupBy with no aggregations (aggregations left null - a supported "pass raw columns through" config,
+  // same as what valueColumns already handles a few lines below aggregationInputs in Extensions.scala) should
+  // not throw. Reproduces a NullPointerException seen in production warmup logs for exactly this shape of
+  // GroupBy: "Cannot invoke java.util.List.iterator() because this.groupBy.aggregations is null".
+  it should "compute aggregationInputs for a no-agg GroupBy instead of throwing on null aggregations" in {
+    val source = Builders.Source.events(
+      query = Builders.Query(selects = Map("user_id" -> "user_id", "amount" -> "amount", "currency" -> "currency")),
+      table = "db.table"
+    )
+    val groupBy = Builders.GroupBy(sources = Seq(source), keyColumns = Seq("user_id"), metaData = Builders.MetaData(name = "test"))
+
+    assertEquals(Set("amount", "currency"), groupBy.aggregationInputs.toSet)
+  }
+
   it should "group by keys should contain partition column" in {
     val groupBy = spy[GroupBy](new GroupBy())
     val baseKeys = List("a", "b")

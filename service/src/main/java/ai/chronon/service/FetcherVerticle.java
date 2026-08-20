@@ -20,6 +20,9 @@ import io.vertx.ext.web.Router;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * Entry point for the Chronon fetcher endpoints. We wire up our API routes and configure and launch our HTTP service here.
  * We choose to use just 1 verticle for now as it allows us to keep things simple and we don't need to scale /
@@ -29,6 +32,7 @@ public class FetcherVerticle extends AbstractVerticle {
     private static final Logger logger = LoggerFactory.getLogger(FetcherVerticle.class);
 
     private HttpServer server;
+    private long warmupPeriodicTimerId = FetcherWarmup.NO_TIMER;
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
@@ -40,15 +44,25 @@ public class FetcherVerticle extends AbstractVerticle {
         long joinCodecTtl = cfgStore.getJoinCodecTtlMillis();
         logger.info("Join conf TTL: {}ms, Join codec TTL: {}ms", joinConfTtl, joinCodecTtl);
 
+        // Joins seen by the startup warmup pass below, so the periodic re-check (started once the HTTP
+        // server is up) only acts on joins that come online afterward.
+        Set<String> touchedJoins = ConcurrentHashMap.newKeySet();
+
         // Execute the blocking Bigtable initialization in a separate worker thread
         vertx.executeBlocking(() -> api.buildJavaFetcher("feature-service", false, joinConfTtl, joinCodecTtl))
         .onSuccess(fetcher -> {
-            try {
-                // This code runs back on the event loop when the blocking operation completes
-                startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
-            } catch (Exception e) {
-                startPromise.fail(e);
-            }
+            // Run warmup before opening the HTTP server to traffic — always completes successfully
+            FetcherWarmup.run(vertx, fetcher, cfgStore, touchedJoins)
+                .onComplete(ar -> {
+                    try {
+                        startHttpServer(cfgStore.getServerPort(), cfgStore.encodeConfig(), api, fetcher, startPromise);
+                        if (cfgStore.isWarmupPeriodicEnabled()) {
+                            warmupPeriodicTimerId = FetcherWarmup.schedulePeriodic(vertx, fetcher, cfgStore, touchedJoins);
+                        }
+                    } catch (Exception e) {
+                        startPromise.fail(e);
+                    }
+                });
         })
         .onFailure(startPromise::fail);
     }
@@ -122,6 +136,9 @@ public class FetcherVerticle extends AbstractVerticle {
 
     @Override
     public void stop(Promise<Void> stopPromise) {
+        if (warmupPeriodicTimerId != FetcherWarmup.NO_TIMER) {
+            vertx.cancelTimer(warmupPeriodicTimerId);
+        }
         logger.info("Stopping HTTP server...");
         if (server != null) {
             server.close()

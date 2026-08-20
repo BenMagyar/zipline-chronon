@@ -19,6 +19,7 @@ package ai.chronon.online;
 import ai.chronon.api.ScalaJavaConversions;
 import ai.chronon.online.fetcher.Fetcher;
 import ai.chronon.online.fetcher.FeaturesResponseType;
+import com.linkedin.avro.fastserde.FastSerdeCache;
 import scala.compat.java8.FutureConverters;
 import scala.concurrent.ExecutionContext;
 import scala.util.Try;
@@ -215,6 +216,24 @@ public class JavaFetcher {
   public JTry<JavaGroupByStatusResponse> fetchGroupByStatus(String groupByName) {
     Try<Fetcher.GroupByStatusResponse> scalaResponse = this.fetcher.fetchGroupByStatus(groupByName);
     return JTry.fromScala(scalaResponse).map(JavaGroupByStatusResponse::new);
+  }
+
+  // Best-effort triggers FastSerde class generation for the join's and its GroupBys' schemas ahead of live
+  // traffic - see Fetcher.warmUpJoinCodec for the mechanism. No request payload needed.
+  public JTry<CompletableFuture<Void>> warmUpJoinCodec(String joinName) {
+    return warmUpJoinCodec(joinName, 0L);
+  }
+
+  // The returned JTry's success/failure reflects whether resolving the join/GroupBys and firing the
+  // (synchronous, cheap) FastSerde triggers succeeded. The wrapped CompletableFuture completes once the
+  // (optionally asynchronous, non-blocking) wait for those triggered compiles to settle finishes or times
+  // out at waitForCompileMillis - awaiting it does not block any thread. See Fetcher.warmUpJoinCodec /
+  // AvroCodec.warmUp for the mechanism.
+  public JTry<CompletableFuture<Void>> warmUpJoinCodec(String joinName, long waitForCompileMillis) {
+    Try<scala.concurrent.Future<scala.runtime.BoxedUnit>> scalaResponse =
+        this.fetcher.warmUpJoinCodec(joinName, waitForCompileMillis, FastSerdeCache.getDefaultInstance());
+    return JTry.fromScala(scalaResponse)
+        .map(future -> FutureConverters.toJava(future).toCompletableFuture().thenApply(ignored -> (Void) null));
   }
 
   @FunctionalInterface
