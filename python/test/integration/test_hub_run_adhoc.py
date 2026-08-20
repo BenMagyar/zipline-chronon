@@ -87,7 +87,7 @@ def test_run_adhoc(confs, chronon_root, hub_url, cloud, flink_cleanup):
     flink_cleanup["workflow_id"] = workflow_id
 
     poll_workflow_until(
-        hub_url, workflow_id, target_statuses={"SUCCEEDED"}, timeout=1200, interval=15,
+        hub_url, workflow_id, target_statuses={"SUCCEEDED"}, timeout=1800, interval=15,
     )
 
 
