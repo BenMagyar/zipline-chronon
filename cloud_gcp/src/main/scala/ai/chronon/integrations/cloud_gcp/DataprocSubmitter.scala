@@ -80,10 +80,17 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
 
     val manifestStr = new String(gcsClient.downloadObjectToMemory(manifestObjectPath))
     val manifestTuples = manifestStr.split(",")
-    val flinkJobTuple = manifestTuples.find(_.startsWith("flinkJobId"))
-    val flinkJobId = flinkJobTuple
-      .map(_.split("=")(1))
-      .getOrElse(throw new RuntimeException("Flink job id not found in manifest file."))
+    // Fail loud on an empty/malformed manifest rather than silently starting the job without state: a fresh
+    // start could reprocess or drop data and cause correctness issues, and that path change would be
+    // unexpected to the user. FlinkJob.runWriteInternalManifestJob re-emits the manifest on every restart to
+    // keep this file populated, so reaching here indicates a genuine problem worth surfacing. Require an
+    // exact flinkJobId key with a non-blank value.
+    val flinkJobId = manifestTuples
+      .find(_.split("=", 2)(0) == "flinkJobId")
+      .map(_.split("=", 2))
+      .collect { case Array(_, id) if id.nonEmpty => id }
+      .getOrElse(throw new RuntimeException(
+        s"Flink job id not found in manifest file at $manifestObjectPath (content: [$manifestStr])."))
 
     // flinkCheckpointUri is already the checkpoints base path (e.g. gs://bucket/flink-state/checkpoints).
     // List directly under it rather than going through StorageClient.resolveLatestCheckpointPath which

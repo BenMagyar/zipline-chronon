@@ -21,6 +21,7 @@ import org.apache.flink.streaming.api.CheckpointingMode
 import org.apache.flink.streaming.api.datastream.{DataStream, DataStreamSink}
 import org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
+import org.apache.flink.streaming.api.functions.source.{RichSourceFunction, SourceFunction}
 import org.rogach.scallop.{ScallopConf, ScallopOption, Serialization}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -63,9 +64,23 @@ object FlinkJob {
     }
 
     env
-      .fromElements(parentJobId)
+      // Deliberately a stateless source that re-emits on every (re)start rather than env.fromElements,
+      // whose FromElementsFunction checkpoints its emitted-count and emits nothing after a restore. Paired
+      // with the OVERWRITE sink below, a restore of the exhausted bounded source would truncate a
+      // previously-correct manifest to an empty file. Re-emitting guarantees the OVERWRITE rewrites correct
+      // content whenever the branch is re-executed; when the branch is fully finished it is skipped on
+      // restore and the existing (correct) file is left untouched. The Flink job id is unchanged across
+      // in-place restarts, so the re-emitted manifest is identical.
+      .addSource(new RichSourceFunction[String] {
+        @volatile private var isRunning = true
+        override def run(ctx: SourceFunction.SourceContext[String]): Unit = {
+          if (isRunning) ctx.collect(parentJobId)
+        }
+        override def cancel(): Unit = isRunning = false
+      })
       .uid(s"$groupByName-manifest-source-operator-$parentJobId")
       .name("Manifest source to map Flink job id to parent job id")
+      .setParallelism(1)
       .map(new RichMapFunction[String, String] {
         def map(parentJobId: String): String = {
           val flinkJobId = getRuntimeContext.getJobId

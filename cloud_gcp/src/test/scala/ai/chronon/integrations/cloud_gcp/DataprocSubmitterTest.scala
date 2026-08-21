@@ -993,7 +993,9 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     )
   }
 
-  it should "test getLatestFlinkCheckpoint should throw exception if flink job id not found in manifest" in {
+  // Fail loud on a malformed manifest rather than silently starting the job without state, which could
+  // reprocess/drop data. FlinkJob.runWriteInternalManifestJob keeps this file populated across restarts.
+  it should "test getLatestFlinkCheckpoint should throw if flink job id not found in manifest" in {
     val ziplineGcsClient = mock[GCSClient]
     val submitter = new DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
                                                             region = "test-region",
@@ -1005,6 +1007,49 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     val expectedParentJobId = "some-parent-job-id"
     when(ziplineGcsClient.downloadObjectToMemory("gs://test-bucket/flink-manifest/test-groupby-name/manifest.txt"))
       .thenReturn(s"parentJobId=$expectedParentJobId".getBytes)
+
+    assertThrows[RuntimeException] {
+      submitter
+        .getLatestFlinkCheckpoint(groupByName = "test-groupby-name",
+                                  manifestBucketPath = "gs://test-bucket/flink-manifest",
+                                  flinkCheckpointUri = "gs://test-bucket/flink-state")
+    }
+  }
+
+  // A restart could leave a 0-byte manifest (see FlinkJob.runWriteInternalManifestJob); fail loud instead
+  // of silently starting the job without state.
+  it should "test getLatestFlinkCheckpoint should throw if manifest is empty" in {
+    val ziplineGcsClient = mock[GCSClient]
+    val submitter = new DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
+                                          region = "test-region",
+                                          projectId = "test-project",
+                                          gcsClient = ziplineGcsClient)
+
+    when(ziplineGcsClient.fileExists("gs://test-bucket/flink-manifest/test-groupby-name/manifest.txt"))
+      .thenReturn(true)
+    when(ziplineGcsClient.downloadObjectToMemory("gs://test-bucket/flink-manifest/test-groupby-name/manifest.txt"))
+      .thenReturn("".getBytes)
+
+    assertThrows[RuntimeException] {
+      submitter
+        .getLatestFlinkCheckpoint(groupByName = "test-groupby-name",
+                                  manifestBucketPath = "gs://test-bucket/flink-manifest",
+                                  flinkCheckpointUri = "gs://test-bucket/flink-state")
+    }
+  }
+
+  // A blank flinkJobId value (e.g. "flinkJobId=") is malformed; exact-key matching must reject it and throw.
+  it should "test getLatestFlinkCheckpoint should throw if flinkJobId value is blank" in {
+    val ziplineGcsClient = mock[GCSClient]
+    val submitter = new DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
+                                          region = "test-region",
+                                          projectId = "test-project",
+                                          gcsClient = ziplineGcsClient)
+
+    when(ziplineGcsClient.fileExists("gs://test-bucket/flink-manifest/test-groupby-name/manifest.txt"))
+      .thenReturn(true)
+    when(ziplineGcsClient.downloadObjectToMemory("gs://test-bucket/flink-manifest/test-groupby-name/manifest.txt"))
+      .thenReturn("flinkJobId=,parentJobId=some-parent-job-id".getBytes)
 
     assertThrows[RuntimeException] {
       submitter

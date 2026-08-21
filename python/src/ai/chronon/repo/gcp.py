@@ -559,12 +559,30 @@ class GcpRunner(Runner):
                         )
                         manifest_tuples = manifest.split(",")
 
-                        flink_job_id = [
-                            f.split("=")[1] for f in manifest_tuples if f.startswith("flinkJobId")
-                        ][0]
-                        parent_job_id = [
-                            f.split("=")[1] for f in manifest_tuples if f.startswith("parentJobId")
-                        ][0]
+                        # A manifest can be present but empty/malformed (e.g. a 0-byte file left by a Flink
+                        # restart) or written by a not-yet-current job. Treat any of these as "not ready yet"
+                        # and keep polling instead of crashing on an empty list index.
+                        flink_job_ids = [
+                            f.split("=", 1)[1]
+                            for f in manifest_tuples
+                            if f.startswith("flinkJobId") and "=" in f and f.split("=", 1)[1]
+                        ]
+                        parent_job_ids = [
+                            f.split("=", 1)[1]
+                            for f in manifest_tuples
+                            if f.startswith("parentJobId") and "=" in f and f.split("=", 1)[1]
+                        ]
+
+                        if not flink_job_ids or not parent_job_ids:
+                            LOG.info(
+                                f"Manifest present but not in expected format yet: [{manifest}]. Retrying..."
+                            )
+                            LOG.info(f"Sleeping for {interval_seconds} seconds...")
+                            time.sleep(interval_seconds)
+                            continue
+
+                        flink_job_id = flink_job_ids[0]
+                        parent_job_id = parent_job_ids[0]
 
                         if parent_job_id == submitted_job_id:
                             LOG.info(
