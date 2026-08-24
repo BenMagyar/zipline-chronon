@@ -1,8 +1,10 @@
 package ai.chronon.integrations.aws
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
-import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus
+import software.amazon.awssdk.services.dynamodb.model.{BatchGetItemRequest, BatchGetItemResponse, ReplicaStatus}
 
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 
 /** Subclass of DynamoDBKVStoreImpl that records calls to addReplicaRegions instead of executing them.
@@ -58,4 +60,83 @@ class ReplicaFailingKVStore(client: DynamoDbAsyncClient, conf: Map[String, Strin
     extends DynamoDBKVStoreImpl(client, conf) {
   override protected def addReplicaRegions(tableName: String, waitForActive: Boolean): Unit =
     throw new RuntimeException(s"Simulated replica failure for '$tableName'")
+}
+
+/** Test helper that wraps PrefixedDynamoDbAsyncClient and counts BatchGetItem invocations,
+  * so tests can verify chunking behavior (e.g. N=100 → 1 call, N=101 → 2 calls).
+  */
+class CountingPrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, prefix: String)
+    extends PrefixedDynamoDbAsyncClient(delegate, prefix) {
+  val batchGetCallCount: AtomicInteger = new AtomicInteger(0)
+  val batchGetChunkSizes: mutable.ListBuffer[Int] = mutable.ListBuffer.empty
+
+  override def batchGetItem(request: BatchGetItemRequest): CompletableFuture[BatchGetItemResponse] = {
+    batchGetCallCount.incrementAndGet()
+    synchronized {
+      val totalKeys = request
+        .requestItems()
+        .values()
+        .stream()
+        .mapToInt(_.keys().size())
+        .sum()
+      batchGetChunkSizes += totalKeys
+    }
+    super.batchGetItem(request)
+  }
+}
+
+/** Subclass that installs a CountingPrefixedDynamoDbAsyncClient so tests can assert on chunking. */
+class CountingBatchDynamoDBKVStore(client: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
+    extends DynamoDBKVStoreImpl(client, conf) {
+  override protected def newPrefixedClient(delegate: DynamoDbAsyncClient,
+                                           prefix: String): PrefixedDynamoDbAsyncClient =
+    new CountingPrefixedDynamoDbAsyncClient(delegate, prefix)
+
+  def batchGetCallCount: Int =
+    prefixedDynamoDbClient.asInstanceOf[CountingPrefixedDynamoDbAsyncClient].batchGetCallCount.get()
+
+  def batchGetChunkSizes: Seq[Int] =
+    prefixedDynamoDbClient.asInstanceOf[CountingPrefixedDynamoDbAsyncClient].batchGetChunkSizes.toSeq
+}
+
+/** Wraps BatchGetItem so any request whose keys contain `poisonBytes` in the partition-key column
+  * fails with the provided throwable. Used to exercise per-chunk failure isolation.
+  */
+class PoisonedBatchDynamoDbAsyncClient(delegate: DynamoDbAsyncClient,
+                                       prefix: String,
+                                       partitionKeyColumn: String,
+                                       poisonBytes: Array[Byte],
+                                       error: Throwable)
+    extends PrefixedDynamoDbAsyncClient(delegate, prefix) {
+  override def batchGetItem(request: BatchGetItemRequest): CompletableFuture[BatchGetItemResponse] = {
+    val contains = request
+      .requestItems()
+      .values()
+      .stream()
+      .anyMatch { ka =>
+        ka.keys().stream().anyMatch { key =>
+          val av = key.get(partitionKeyColumn)
+          av != null && java.util.Arrays.equals(av.b().asByteArray(), poisonBytes)
+        }
+      }
+    if (contains) {
+      val f = new CompletableFuture[BatchGetItemResponse]()
+      f.completeExceptionally(error)
+      f
+    } else super.batchGetItem(request)
+  }
+}
+
+class PoisonedChunkBatchDynamoDBKVStore(client: DynamoDbAsyncClient,
+                                        conf: Map[String, String],
+                                        poisonBytes: Array[Byte],
+                                        error: Throwable)
+    extends DynamoDBKVStoreImpl(client, conf) {
+  override protected def newPrefixedClient(delegate: DynamoDbAsyncClient,
+                                           prefix: String): PrefixedDynamoDbAsyncClient =
+    new PoisonedBatchDynamoDbAsyncClient(delegate,
+                                         prefix,
+                                         DynamoDBKVStoreConstants.partitionKeyColumn,
+                                         poisonBytes,
+                                         error)
 }

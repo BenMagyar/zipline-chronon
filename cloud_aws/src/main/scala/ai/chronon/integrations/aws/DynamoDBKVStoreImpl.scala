@@ -49,11 +49,17 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toList)
       .getOrElse(List.empty)
 
+  protected val batchGetEnabled: Boolean =
+    getOptional(DynamoEnableBatchGetKey, conf).exists(_.toBoolean)
+
+  protected def newPrefixedClient(delegate: DynamoDbAsyncClient, prefix: String): PrefixedDynamoDbAsyncClient =
+    new PrefixedDynamoDbAsyncClient(delegate, prefix)
+
   // Wrap the client to automatically prefix all table names
-  private val prefixedDynamoDbClient: PrefixedDynamoDbAsyncClient = {
+  protected val prefixedDynamoDbClient: PrefixedDynamoDbAsyncClient = {
     logger.info(
-      s"Using: table prefix: '$tablePrefix' (prefix will be added to all table names used by this KVStore); enableTtl: $enableTtl")
-    new PrefixedDynamoDbAsyncClient(rawDynamoDbClient, tablePrefix)
+      s"Using: table prefix: '$tablePrefix' (prefix will be added to all table names used by this KVStore); enableTtl: $enableTtl; batchGetEnabled: $batchGetEnabled")
+    newPrefixedClient(rawDynamoDbClient, tablePrefix)
   }
 
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("dynamodb")
@@ -174,7 +180,11 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     Future.sequence(getItemResults ++ aggregatedQueryResults)
   }
 
-  protected def doGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
+  protected def doGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] =
+    if (batchGetEnabled) doBatchGetLookups(getLookups)
+    else doSingleGetLookups(getLookups)
+
+  protected def doSingleGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
     val getItemCompletables = getLookups.map { req =>
       val keyAttributeMap = primaryKeyMap(req.keyBytes)
       val tableName = resolveTableName(req.dataset)
@@ -197,6 +207,123 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         }
     }
     getItemResults
+  }
+
+  // UnprocessedKeys returned by DynamoDB (partial throttling, 16MB payload cap, >1MB per partition)
+  // become per-key Failure rather than triggering a retry — retry-with-backoff is deliberately
+  // deferred for simplicity at the moment.
+  protected def doBatchGetLookups(getLookups: Seq[KVStore.GetRequest]): Seq[Future[GetResponse]] = {
+    if (getLookups.isEmpty) return Seq.empty
+
+    val defaultTimestamp = Instant.now().toEpochMilli
+    val resolved = getLookups.map(ResolvedLookup(_, resolveTableName))
+
+    // One Future per chunk; each Future carries a Try so a failed chunk only fails the
+    // requests whose keys were in that chunk. At 6k keys / 100 per chunk this is O(60)
+    // callback allocations instead of O(6000) for a per-key future graph.
+    val chunks: Seq[Seq[(String, KeyWrapper)]] =
+      dedupedTableKeyPairs(resolved).grouped(BatchGetItemMaxKeys).toSeq
+    val chunkResults: Seq[Future[Try[Map[(String, KeyWrapper), ChunkKeyOutcome]]]] =
+      chunks.map { chunk =>
+        fetchChunk(chunk)
+          .map(Success(_): Try[Map[(String, KeyWrapper), ChunkKeyOutcome]])
+          .recover { case e => Failure(e) }
+      }
+
+    val keyToChunkResult: Map[(String, KeyWrapper), Future[Try[Map[(String, KeyWrapper), ChunkKeyOutcome]]]] =
+      chunks.iterator
+        .zip(chunkResults.iterator)
+        .flatMap { case (chunk, fut) =>
+          chunk.iterator.map(pair => pair -> fut)
+        }
+        .toMap
+
+    resolved.map(r => assembleResponse(r, keyToChunkResult((r.table, r.key)), defaultTimestamp))
+  }
+
+  // DynamoDB rejects duplicate keys within a single BatchGetItem with ValidationException, so
+  // per-table dedup is required.
+  private def dedupedTableKeyPairs(resolved: Seq[ResolvedLookup]): Seq[(String, KeyWrapper)] =
+    resolved.map(r => (r.table, r.key)).distinct
+
+  private def fetchChunk(chunk: Seq[(String, KeyWrapper)]): Future[Map[(String, KeyWrapper), ChunkKeyOutcome]] = {
+    val request = buildBatchGetRequest(chunk)
+    val startTs = System.currentTimeMillis()
+    // Distinct suffix so per-batch latency doesn't distort the existing per-key `multiget` histogram.
+    val tableSummary = chunk.map(_._1).distinct.mkString(",")
+    handleDynamoDbOperation(metricsContext.withSuffix("multiget_batch"), tableSummary, startTs)(
+      prefixedDynamoDbClient.batchGetItem(request)
+    ).map(response => chunkLookupFromResponse(chunk, response))
+  }
+
+  private def assembleResponse(resolved: ResolvedLookup,
+                               chunkResult: Future[Try[Map[(String, KeyWrapper), ChunkKeyOutcome]]],
+                               defaultTimestamp: Long): Future[GetResponse] =
+    chunkResult.map {
+      case Success(lookup) =>
+        lookup.get((resolved.table, resolved.key)) match {
+          case Some(ChunkKeyOutcome.Item(item)) =>
+            GetResponse(resolved.req, extractTimedValues(List(item).toJava, defaultTimestamp))
+          case Some(ChunkKeyOutcome.Unprocessed) =>
+            GetResponse(
+              resolved.req,
+              Failure(
+                new RuntimeException(s"BatchGetItem returned UnprocessedKey for dataset '${resolved.req.dataset}'")))
+          case None =>
+            // Shouldn't happen — chunkLookupFromResponse populates every requested pair.
+            GetResponse(
+              resolved.req,
+              Failure(new RuntimeException(s"BatchGetItem chunk missing entry for dataset '${resolved.req.dataset}'")))
+        }
+      case Failure(e) =>
+        GetResponse(resolved.req, Failure(e))
+    }
+
+  private def buildBatchGetRequest(chunk: Seq[(String, KeyWrapper)]): BatchGetItemRequest = {
+    val requestItems: util.Map[String, KeysAndAttributes] = chunk
+      .groupBy(_._1)
+      .map { case (table, pairs) =>
+        val keys = pairs.map(p => primaryKeyMap(p._2.bytes).toJava).toList.toJava
+        table -> KeysAndAttributes.builder.keys(keys).build
+      }
+      .toJava
+    BatchGetItemRequest.builder.requestItems(requestItems).build
+  }
+
+  // Turns a BatchGetItemResponse into a (table, key) -> ChunkKeyOutcome lookup for this chunk.
+  //   - Missing key (requested, no match) -> Item(empty map) so extractTimedValues yields Success(Seq.empty).
+  //     Reuses a shared Collections.emptyMap since extractTimedValues doesn't mutate.
+  //   - UnprocessedKey -> Unprocessed, so assembleResponse can surface a per-request Failure that
+  //     names the caller's logical dataset (not the resolved physical table).
+  private def chunkLookupFromResponse(chunk: Seq[(String, KeyWrapper)],
+                                      response: BatchGetItemResponse): Map[(String, KeyWrapper), ChunkKeyOutcome] = {
+    val items = mutable.Map.empty[(String, KeyWrapper), util.Map[String, AttributeValue]]
+    if (response.hasResponses) {
+      response.responses().forEach { (tableName, tableItems) =>
+        tableItems.forEach { item =>
+          Option(item.get(partitionKeyColumn))
+            .map(av => KeyWrapper(av.b().asByteArray()))
+            .foreach(k => items.update((tableName, k), item))
+        }
+      }
+    }
+    val unprocessed = mutable.Set.empty[(String, KeyWrapper)]
+    if (response.hasUnprocessedKeys) {
+      response.unprocessedKeys().forEach { (tableName, ka) =>
+        ka.keys().forEach { key =>
+          Option(key.get(partitionKeyColumn))
+            .map(av => KeyWrapper(av.b().asByteArray()))
+            .foreach(k => unprocessed.add((tableName, k)))
+        }
+      }
+    }
+    val emptyItem = java.util.Collections.emptyMap[String, AttributeValue]()
+    chunk.iterator.map { pair =>
+      val outcome: ChunkKeyOutcome =
+        if (unprocessed.contains(pair)) ChunkKeyOutcome.Unprocessed
+        else ChunkKeyOutcome.Item(items.getOrElse(pair, emptyItem))
+      pair -> outcome
+    }.toMap
   }
 
   protected def queryPartition(dataset: String,
@@ -820,6 +947,46 @@ object DynamoDBKVStoreConstants {
   val DynamoReplicaWaitDefaultTimeout: Duration = Duration.ofMinutes(60)
   val MinReplicaWaitTimeout: Duration = Duration.ofMinutes(1)
   val ReplicaWaitPollIntervalMs: Long = 15 * 1000L
+
+  // DynamoDB BatchGetItem hard limit: max 100 keys per request. Not exposed as a
+  // public constant by the AWS SDK v2, so we mirror it here.
+  val BatchGetItemMaxKeys: Int = 100
+
+  val DynamoEnableBatchGetKey: String = "DYNAMO_ENABLE_BATCH_GET"
+
+  def getOptional(key: String, conf: Map[String, String]): Option[String] =
+    sys.env.get(key).orElse(conf.get(key))
+
+  // Array[Byte] doesn't implement structural equality; wrap it so keys can dedupe in a Map/Set.
+  final class KeyWrapper(val bytes: Array[Byte]) {
+    private val hash: Int = util.Arrays.hashCode(bytes)
+    override def hashCode(): Int = hash
+    override def equals(other: Any): Boolean = other match {
+      case that: KeyWrapper => util.Arrays.equals(bytes, that.bytes)
+      case _                => false
+    }
+  }
+  object KeyWrapper {
+    def apply(bytes: Array[Byte]): KeyWrapper = new KeyWrapper(bytes)
+  }
+
+  // Per-request state carried through the batch pipeline: original request, resolved physical
+  // table, and the wrapped key used for map lookups. Kept in caller-request order so the final
+  // Seq[Future[GetResponse]] preserves that order.
+  final case class ResolvedLookup(req: KVStore.GetRequest, table: String, key: KeyWrapper)
+  object ResolvedLookup {
+    def apply(req: KVStore.GetRequest, resolveTable: String => String): ResolvedLookup =
+      ResolvedLookup(req, resolveTable(req.dataset), KeyWrapper(req.keyBytes))
+  }
+
+  // Per-key outcome within a successfully-completed batch chunk. Split out from Try so the
+  // UnprocessedKey Failure message can name the caller's logical dataset rather than the
+  // resolved physical table (only known at assembleResponse time).
+  sealed trait ChunkKeyOutcome
+  object ChunkKeyOutcome {
+    final case class Item(value: util.Map[String, AttributeValue]) extends ChunkKeyOutcome
+    case object Unprocessed extends ChunkKeyOutcome
+  }
 
   val BatchTableGCAgeDays = 30
   val BatchTableGCMaxDelete = 10

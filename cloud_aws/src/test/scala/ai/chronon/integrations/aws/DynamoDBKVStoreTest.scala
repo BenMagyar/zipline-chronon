@@ -844,6 +844,211 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     tables.contains(oldTableName) shouldBe true
   }
 
+  // ===== BatchGetItem path (DYNAMO_ENABLE_BATCH_GET=true) =====
+
+  private val batchGetConf = Map(DynamoDBKVStoreConstants.DynamoEnableBatchGetKey -> "true")
+
+  it should "batch multiGet parity with single-get for N=1, 5, 99" in {
+    val dataset = "BATCH_PARITY_DATASET"
+    val props = Map(isTimedSorted -> "false")
+    val singleStore = new DynamoDBKVStoreImpl(client)
+    val batchStore = new DynamoDBKVStoreImpl(client, batchGetConf)
+    singleStore.create(dataset, props)
+
+    val models = (0 until 99).map(i => Model(s"parity_model_$i", s"parity model $i", online = i % 2 == 0))
+    val putResults = Await.result(singleStore.multiPut(models.map(buildModelPutRequest(_, dataset))), 1.minute)
+    putResults.forall(identity) shouldBe true
+
+    Seq(1, 5, 99).foreach { n =>
+      val reqs = models.take(n).map(buildModelGetRequest(_, dataset))
+      val singleResp = Await.result(singleStore.multiGet(reqs), 1.minute)
+      val batchResp = Await.result(batchStore.multiGet(reqs), 1.minute)
+
+      batchResp.length shouldBe singleResp.length
+      batchResp.zip(singleResp).foreach { case (b, s) =>
+        b.request shouldBe s.request
+        (b.values, s.values) match {
+          case (Success(bv), Success(sv)) =>
+            bv.map(v => new String(v.bytes, StandardCharsets.UTF_8)) shouldBe
+              sv.map(v => new String(v.bytes, StandardCharsets.UTF_8))
+          case other => fail(s"Mismatched result kinds: $other")
+        }
+      }
+    }
+  }
+
+  it should "batch multiGet chunks at BatchGetItemMaxKeys boundary" in {
+    val dataset = "BATCH_CHUNKING_DATASET"
+    val props = Map(isTimedSorted -> "false")
+    val seedStore = new DynamoDBKVStoreImpl(client)
+    seedStore.create(dataset, props)
+
+    val models = (0 until 250).map(i => Model(s"chunk_model_$i", s"chunk $i", online = true))
+    Await.result(seedStore.multiPut(models.map(buildModelPutRequest(_, dataset))), 1.minute)
+
+    def expectCalls(n: Int, expected: Int, expectedSizes: Seq[Int]): Unit = {
+      val counting = new CountingBatchDynamoDBKVStore(client, batchGetConf)
+      val reqs = models.take(n).map(buildModelGetRequest(_, dataset))
+      val resp = Await.result(counting.multiGet(reqs), 1.minute)
+      resp.length shouldBe n
+      counting.batchGetCallCount shouldBe expected
+      counting.batchGetChunkSizes.sorted shouldBe expectedSizes.sorted
+    }
+
+    expectCalls(100, 1, Seq(100))
+    expectCalls(101, 2, Seq(100, 1))
+    expectCalls(250, 3, Seq(100, 100, 50))
+  }
+
+  it should "batch multiGet fans out duplicate keys to identical responses" in {
+    val dataset = "BATCH_DUP_DATASET"
+    val props = Map(isTimedSorted -> "false")
+    val seedStore = new DynamoDBKVStoreImpl(client)
+    seedStore.create(dataset, props)
+    val model = Model("dup_model", "dup", online = true)
+    Await.result(seedStore.multiPut(Seq(buildModelPutRequest(model, dataset))), 1.minute)
+
+    val counting = new CountingBatchDynamoDBKVStore(client, batchGetConf)
+    val req = buildModelGetRequest(model, dataset)
+    val resp = Await.result(counting.multiGet(Seq(req, req, req)), 1.minute)
+
+    resp.length shouldBe 3
+    counting.batchGetCallCount shouldBe 1
+    // Dedupe: only one physical key was sent in the batch even though 3 GetRequests reference it
+    counting.batchGetChunkSizes shouldBe Seq(1)
+    resp.foreach { r =>
+      r.values.isSuccess shouldBe true
+      r.values.get.length shouldBe 1
+      val decoded = objectMapper.readValue(new String(r.values.get.head.bytes, StandardCharsets.UTF_8), classOf[Model])
+      decoded shouldBe model
+    }
+  }
+
+  it should "batch multiGet returns empty Success for missing keys" in {
+    val dataset = "BATCH_MISSING_DATASET"
+    val props = Map(isTimedSorted -> "false")
+    val seedStore = new DynamoDBKVStoreImpl(client)
+    seedStore.create(dataset, props)
+    val present = Model("present_model", "present", online = true)
+    Await.result(seedStore.multiPut(Seq(buildModelPutRequest(present, dataset))), 1.minute)
+
+    val absent = Model("absent_model", "absent", online = true)
+    val batchStore = new DynamoDBKVStoreImpl(client, batchGetConf)
+    val resp = Await.result(
+      batchStore.multiGet(Seq(buildModelGetRequest(present, dataset), buildModelGetRequest(absent, dataset))),
+      1.minute
+    )
+
+    resp.length shouldBe 2
+    resp.head.values.isSuccess shouldBe true
+    resp.head.values.get.length shouldBe 1
+    resp(1).values.isSuccess shouldBe true
+    resp(1).values.get shouldBe empty
+  }
+
+  it should "batch multiGet packs cross-table keys into a single BatchGetItem call" in {
+    val datasetA = "BATCH_CROSS_A"
+    val datasetB = "BATCH_CROSS_B"
+    val props = Map(isTimedSorted -> "false")
+    val seedStore = new DynamoDBKVStoreImpl(client)
+    seedStore.create(datasetA, props)
+    seedStore.create(datasetB, props)
+
+    val a = Model("cross_a", "aa", online = true)
+    val b = Model("cross_b", "bb", online = false)
+    Await.result(seedStore.multiPut(Seq(buildModelPutRequest(a, datasetA), buildModelPutRequest(b, datasetB))), 1.minute)
+
+    val counting = new CountingBatchDynamoDBKVStore(client, batchGetConf)
+    val resp = Await.result(
+      counting.multiGet(Seq(buildModelGetRequest(a, datasetA), buildModelGetRequest(b, datasetB))),
+      1.minute
+    )
+
+    resp.length shouldBe 2
+    counting.batchGetCallCount shouldBe 1
+    counting.batchGetChunkSizes shouldBe Seq(2)
+    resp.foreach(_.values.isSuccess shouldBe true)
+  }
+
+  it should "batch multiGet interoperates with query lookups in the same multiGet" in {
+    val getDataset = "BATCH_MIX_GET"
+    val streamingDataset = "BATCH_MIX_V1_STREAMING"
+
+    val getStore = new DynamoDBKVStoreImpl(client)
+    getStore.create(getDataset, Map(isTimedSorted -> "false"))
+    val m = Model("mix_model", "mix", online = true)
+    Await.result(getStore.multiPut(Seq(buildModelPutRequest(m, getDataset))), 1.minute)
+
+    kvStoreImpl = new DynamoDBKVStoreImpl(client, batchGetConf)
+    kvStoreImpl.create(streamingDataset)
+    val entityKey = "batch_mix_entity".getBytes(StandardCharsets.UTF_8)
+    val tileSize = 1.hour.toMillis
+    val tileStart = 1728000000000L
+    val tileReq = createTilePutRequest(streamingDataset, entityKey, tileSize, tileStart, "mix_tile_value")
+    Await.result(kvStoreImpl.multiPut(Seq(tileReq)), 1.minute)
+
+    val queryTileKey = TilingUtils.buildTileKey(streamingDataset, entityKey, Some(tileSize), None)
+    val queryKeyBytes = TilingUtils.serializeTileKey(queryTileKey)
+    val queryReq = GetRequest(queryKeyBytes, streamingDataset, Some(tileStart), Some(tileStart + tileSize))
+    val getReq = buildModelGetRequest(m, getDataset)
+
+    val resp = Await.result(kvStoreImpl.multiGet(Seq(getReq, queryReq)), 1.minute)
+    resp.length shouldBe 2
+    val getResp = resp.find(_.request == getReq).get
+    val qResp = resp.find(_.request == queryReq).get
+    getResp.values.isSuccess shouldBe true
+    getResp.values.get.length shouldBe 1
+    qResp.values.isSuccess shouldBe true
+    qResp.values.get.length shouldBe 1
+  }
+
+  it should "batch multiGet isolates a failed chunk from successful chunks" in {
+    val dataset = "BATCH_CHUNK_ISOLATION"
+    val props = Map(isTimedSorted -> "false")
+    val seedStore = new DynamoDBKVStoreImpl(client)
+    seedStore.create(dataset, props)
+
+    // 150 keys -> two chunks (100 + 50). Poison one key in the second chunk;
+    // requests in the first chunk must still succeed.
+    val models = (0 until 150).map(i => Model(s"iso_model_$i", s"iso $i", online = true))
+    Await.result(seedStore.multiPut(models.map(buildModelPutRequest(_, dataset))), 1.minute)
+
+    val poisoned = models(120)
+    val poisonBytes = modelKeyEncoder(poisoned)
+    val failure = new RuntimeException("simulated chunk failure")
+    val store = new PoisonedChunkBatchDynamoDBKVStore(client, batchGetConf, poisonBytes, failure)
+
+    val reqs = models.map(buildModelGetRequest(_, dataset))
+    val resp = Await.result(store.multiGet(reqs), 1.minute)
+
+    resp.length shouldBe 150
+    // First-chunk requests unaffected by the poisoned second chunk
+    resp.take(100).foreach { r =>
+      r.values.isSuccess shouldBe true
+      r.values.get.length shouldBe 1
+    }
+    // Every request whose key landed in the failing chunk gets the underlying error, not a silent empty
+    resp.drop(100).foreach { r =>
+      r.values.isFailure shouldBe true
+      r.values.failed.get shouldBe failure
+    }
+  }
+
+  it should "single-get path remains the default when DYNAMO_ENABLE_BATCH_GET is unset" in {
+    val dataset = "BATCH_DEFAULT_OFF"
+    val props = Map(isTimedSorted -> "false")
+    val counting = new CountingBatchDynamoDBKVStore(client) // no conf → batchGetEnabled=false
+    counting.create(dataset, props)
+
+    val m = Model("default_off", "no batch", online = true)
+    Await.result(counting.multiPut(Seq(buildModelPutRequest(m, dataset))), 1.minute)
+    val resp = Await.result(counting.multiGet(Seq(buildModelGetRequest(m, dataset))), 1.minute)
+    resp.length shouldBe 1
+    resp.head.values.isSuccess shouldBe true
+    // No batchGetItem calls should have been made — routing chose single-get
+    counting.batchGetCallCount shouldBe 0
+  }
+
   private def buildModelPutRequest(model: Model, dataset: String): PutRequest = {
     val keyBytes = modelKeyEncoder(model)
     val valueBytes = modelValueEncoder(model)

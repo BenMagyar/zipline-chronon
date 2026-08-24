@@ -34,6 +34,35 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     delegate.getItem(prefixedRequest)
   }
 
+  def batchGetItem(request: BatchGetItemRequest): CompletableFuture[BatchGetItemResponse] = {
+    if (tablePrefix.isEmpty) {
+      delegate.batchGetItem(request)
+    } else {
+      val originalItems = request.requestItems()
+      val prefixedItems = new java.util.HashMap[String, KeysAndAttributes](originalItems.size())
+      originalItems.forEach((tableName, keysAndAttrs) => prefixedItems.put(prefixTableName(tableName), keysAndAttrs))
+      val prefixedRequest = request.toBuilder.requestItems(prefixedItems).build()
+      delegate.batchGetItem(prefixedRequest).thenApply { response =>
+        // Strip prefix from Responses and UnprocessedKeys so callers see logical table names
+        val stripped = response.toBuilder
+        if (response.hasResponses) {
+          val newResponses = new java.util.HashMap[String, java.util.List[java.util.Map[String, AttributeValue]]]()
+          response.responses().forEach((tableName, items) => newResponses.put(stripTableName(tableName), items))
+          stripped.responses(newResponses)
+        }
+        if (response.hasUnprocessedKeys) {
+          val newUnprocessed = new java.util.HashMap[String, KeysAndAttributes]()
+          response.unprocessedKeys().forEach((tableName, ka) => newUnprocessed.put(stripTableName(tableName), ka))
+          stripped.unprocessedKeys(newUnprocessed)
+        }
+        stripped.build()
+      }
+    }
+  }
+
+  private def stripTableName(name: String): String =
+    if (isTablePrefixed(name)) name.substring(tablePrefix.length) else name
+
   def query(request: QueryRequest): CompletableFuture[QueryResponse] = {
     val originalTableName = request.tableName()
     val prefixedTableName = prefixTableName(originalTableName)
