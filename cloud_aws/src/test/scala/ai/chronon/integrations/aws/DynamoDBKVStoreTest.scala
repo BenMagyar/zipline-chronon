@@ -2,6 +2,7 @@ package ai.chronon.integrations.aws
 
 import ai.chronon.api.Constants.{
   ContinuationKey,
+  DynamoDbReplicaWaitTimeoutMsKey,
   KvEnableTtlArg,
   KvReplicaRegionsArg,
   KvTablePrefixArg,
@@ -685,6 +686,22 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     genericConfiguredStore.configuredImportTimeout shouldBe Duration.ofHours(1)
   }
 
+  it should "configure replica wait timeout with default and custom values" in {
+    val defaultStore = new DynamoDBKVStoreImpl(client)
+    defaultStore.configuredReplicaWaitTimeout shouldBe Duration.ofMinutes(60)
+
+    val configuredStore = new DynamoDBKVStoreImpl(client, Map(DynamoDbReplicaWaitTimeoutMsKey -> "120000"))
+    configuredStore.configuredReplicaWaitTimeout shouldBe Duration.ofMinutes(2)
+  }
+
+  it should "reject replica wait timeout below the 1 minute minimum" in {
+    val tooSmallStore = new DynamoDBKVStoreImpl(client, Map(DynamoDbReplicaWaitTimeoutMsKey -> "30000"))
+    val ex = intercept[IllegalArgumentException] {
+      tooSmallStore.configuredReplicaWaitTimeout
+    }
+    ex.getMessage should include(DynamoDbReplicaWaitTimeoutMsKey)
+  }
+
   it should "gcOldBatchTables deletes tables older than the GC threshold" in {
     val logicalName = "GC_CLEANUP_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client)
@@ -923,6 +940,8 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     kvStore.replicaCalls.length shouldBe 1
     kvStore.replicaCalls.head._1 shouldBe dataset
     kvStore.replicaCalls.head._2 shouldBe List("us-west-2", "eu-west-1")
+    // create() must not block on ACTIVE (no atomic pointer swap to protect)
+    kvStore.replicaCalls.head._3 shouldBe false
   }
 
   it should "not call addReplicaRegions when no replica regions configured" in {
@@ -954,6 +973,126 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     kvStore.replicaCalls.length shouldBe 1
     kvStore.replicaCalls.head._1 shouldBe dataset
     kvStore.replicaCalls.head._2 shouldBe List("eu-west-1")
+    kvStore.replicaCalls.head._3 shouldBe false
+  }
+
+  it should "waitForReplicasActive returns once every expected replica reaches ACTIVE" in {
+    import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus
+    val sequence = Seq(
+      Map("us-east-1" -> ReplicaStatus.CREATING, "eu-west-1" -> ReplicaStatus.CREATING),
+      Map("us-east-1" -> ReplicaStatus.ACTIVE, "eu-west-1" -> ReplicaStatus.CREATING),
+      Map("us-east-1" -> ReplicaStatus.ACTIVE, "eu-west-1" -> ReplicaStatus.ACTIVE)
+    )
+    val kvStore = new ScriptedReplicaStatusKVStore(client, Map(KvEnableTtlArg -> "false"), sequence)
+    kvStore.waitForReplicasActive("SOME_TABLE", Set("us-east-1", "eu-west-1"), Duration.ofSeconds(30))
+    kvStore.pollCount shouldBe 3
+  }
+
+  it should "waitForReplicasActive throws if a replica enters CREATION_FAILED" in {
+    import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus
+    val sequence = Seq(
+      Map("us-east-1" -> ReplicaStatus.CREATING),
+      Map("us-east-1" -> ReplicaStatus.CREATION_FAILED)
+    )
+    val kvStore = new ScriptedReplicaStatusKVStore(client, Map(KvEnableTtlArg -> "false"), sequence)
+    val ex = intercept[RuntimeException] {
+      kvStore.waitForReplicasActive("FAILED_TABLE", Set("us-east-1"), Duration.ofSeconds(30))
+    }
+    ex.getMessage should include("Replica creation failed")
+    ex.getMessage should include("us-east-1")
+  }
+
+  it should "waitForReplicasActive throws on timeout when replicas never reach ACTIVE" in {
+    import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus
+    // Sticks on CREATING forever
+    val sequence = Seq(Map("us-east-1" -> ReplicaStatus.CREATING))
+    val kvStore = new ScriptedReplicaStatusKVStore(client, Map(KvEnableTtlArg -> "false"), sequence)
+    val ex = intercept[RuntimeException] {
+      kvStore.waitForReplicasActive("SLOW_TABLE", Set("us-east-1"), Duration.ofMillis(50))
+    }
+    ex.getMessage should include("Timed out")
+    ex.getMessage should include("us-east-1=CREATING")
+  }
+
+  it should "waitForReplicasActive treats a replica missing from DescribeTable as pending" in {
+    import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus
+    // First poll returns no replicas yet, second poll shows it active
+    val sequence = Seq(
+      Map.empty[String, ReplicaStatus],
+      Map("us-east-1" -> ReplicaStatus.ACTIVE)
+    )
+    val kvStore = new ScriptedReplicaStatusKVStore(client, Map(KvEnableTtlArg -> "false"), sequence)
+    kvStore.waitForReplicasActive("LATE_TABLE", Set("us-east-1"), Duration.ofSeconds(30))
+    kvStore.pollCount shouldBe 2
+  }
+
+  // Regression for the original bug: finalizeBulkPut is the post-import path in bulkPut that
+  // (1) waits for replicas ACTIVE and (2) flips the batch-table registry pointer. If replica setup
+  // throws, the registry pointer MUST NOT be flipped — otherwise readers in a replica region would
+  // route to a physical table that doesn't exist there yet.
+  it should "finalizeBulkPut does not update registry when addReplicaRegions fails" in {
+    val logicalTableName = "FINALIZE_FAILURE_GROUPBY"
+    val physicalTableName = "FINALIZE_FAILURE_GROUPBY_2026_08_24_1"
+
+    // Set up the physical table using a plain kvStore (no replica config → no replica step to fail).
+    new DynamoDBKVStoreImpl(client, Map(KvEnableTtlArg -> "false")).create(physicalTableName)
+
+    val conf = Map(KvReplicaRegionsArg -> "us-east-1", KvEnableTtlArg -> "false")
+    val kvStore = new ReplicaFailingKVStore(client, conf)
+    val ex = intercept[RuntimeException] {
+      kvStore.finalizeBulkPut(logicalTableName, physicalTableName)
+    }
+    ex.getMessage should include("Simulated replica failure")
+
+    // Registry either wasn't created or has no mapping for this logical key.
+    val registryKey = (logicalTableName + batchSuffix).getBytes(StandardCharsets.UTF_8)
+    val getResult = Await.result(kvStore.multiGet(Seq(GetRequest(registryKey, batchTableRegistry, None, None))), 1.minute)
+    getResult.length shouldBe 1
+    // Missing key surfaces as a Failure or as an empty value list; either way, no physical name was written.
+    getResult.head.values match {
+      case Success(values) => values shouldBe empty
+      case Failure(_)      => succeed
+    }
+  }
+
+  it should "finalizeBulkPut waits for replicas ACTIVE (waitForActive=true)" in {
+    val logicalTableName = "FINALIZE_WAIT_GROUPBY"
+    val physicalTableName = "FINALIZE_WAIT_GROUPBY_2026_08_24_1"
+
+    new DynamoDBKVStoreImpl(client, Map(KvEnableTtlArg -> "false")).create(physicalTableName)
+
+    val conf = Map(KvReplicaRegionsArg -> "us-east-1", KvEnableTtlArg -> "false")
+    val kvStore = new SpyingDynamoDBKVStore(client, conf)
+    kvStore.finalizeBulkPut(logicalTableName, physicalTableName)
+
+    // finalizeBulkPut also calls create(batchTableRegistry), which itself invokes addReplicaRegions;
+    // filter to the call for the physical table under test.
+    val physicalCall = kvStore.replicaCalls.find(_._1 == physicalTableName).getOrElse(fail("expected replica call for physical table"))
+    physicalCall._2 shouldBe List("us-east-1")
+    // Pointer flip follows — replica wait must be enforced for this call.
+    physicalCall._3 shouldBe true
+  }
+
+  // Regression for the retry-safety gap: if a prior create() succeeded in creating the table but
+  // failed before replicas reached ACTIVE, a retry hits the "table already exists" fast path.
+  // create() must still call addReplicaRegions so the replica reconciliation completes on retry.
+  it should "create still calls addReplicaRegions when table already exists (retry path)" in {
+    val conf = Map(KvReplicaRegionsArg -> "us-west-2", KvEnableTtlArg -> "false")
+    val dataset = "RETRY_REPLICA_RECONCILE_TABLE"
+
+    // First call: creates the table (real DynamoDB Local) + records the addReplicaRegions call
+    val firstStore = new SpyingDynamoDBKVStore(client, conf)
+    firstStore.create(dataset)
+    firstStore.replicaCalls.length shouldBe 1
+
+    // Simulate a retry: fresh spy, table already exists. Replica reconciliation must still fire.
+    val retryStore = new SpyingDynamoDBKVStore(client, conf)
+    retryStore.create(dataset)
+    retryStore.replicaCalls.length shouldBe 1
+    retryStore.replicaCalls.head._1 shouldBe dataset
+    retryStore.replicaCalls.head._2 shouldBe List("us-west-2")
+    // Retry path must also skip the wait to avoid multi-minute blocks on caller threads.
+    retryStore.replicaCalls.head._3 shouldBe false
   }
 
   private def validatePutResults(results: Seq[Boolean], expectedCount: Int): Unit = {

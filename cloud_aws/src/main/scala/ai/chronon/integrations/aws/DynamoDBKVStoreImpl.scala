@@ -4,6 +4,7 @@ import ai.chronon.api.Constants.{
   ContinuationKey,
   KvEnableTtlArg,
   KvReplicaRegionsArg,
+  DynamoDbReplicaWaitTimeoutMsKey,
   KvTablePrefixArg,
   KvUploadBatchTableGCAgeDaysKey,
   KvUploadTimeoutMsKey,
@@ -94,6 +95,10 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   override def create(dataset: String, props: Map[String, Any]): Unit = {
     if (tableExists(dataset)) {
       logger.info(s"DynamoDB table $dataset already exists, skipping creation")
+      // Retry safety: a prior create() may have created the table but failed before replicas
+      // were requested. Reconcile now — but don't block on ACTIVE; create() has no atomic pointer
+      // swap to protect, and blocking multi-minutes here can trip Vert.x worker-thread checkers.
+      addReplicaRegions(dataset, waitForActive = false)
       return
     }
 
@@ -143,7 +148,8 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         logger.info(s"TTL enabled on table: $dataset with attribute 'ttl'")
       }
 
-      addReplicaRegions(dataset)
+      // Non-atomic caller: fire-and-forget replica creation. See addReplicaRegions comment.
+      addReplicaRegions(dataset, waitForActive = false)
 
       metricsContext.increment("create.successes")
     } catch {
@@ -389,29 +395,7 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
       waitForImportCompletion(importArn, physicalTableName, configuredImportTimeout)
 
-      // ImportTable API does not support TTL configuration; must be applied after import completes
-      if (enableTtl) {
-        val ttlSpec = TimeToLiveSpecification.builder.enabled(true).attributeName("ttl").build
-        val ttlRequest = UpdateTimeToLiveRequest.builder
-          .tableName(physicalTableName)
-          .timeToLiveSpecification(ttlSpec)
-          .build
-        prefixedDynamoDbClient.updateTimeToLive(ttlRequest).join()
-        logger.info(s"TTL enabled on imported table: $physicalTableName")
-      }
-
-      addReplicaRegions(physicalTableName)
-
-      // Register the physical table name in the batch table registry
-      create(batchTableRegistry)
-      val registryKey = logicalTableName.sanitize.toUpperCase + batchSuffix
-      Await.result(
-        multiPut(Seq(KVStore.PutRequest(registryKey.getBytes, physicalTableName.getBytes, batchTableRegistry))),
-        30.seconds
-      )
-      logger.info(s"Registry updated: $registryKey -> $physicalTableName")
-
-      gcOldBatchTables(logicalTableName)
+      finalizeBulkPut(logicalTableName, physicalTableName)
 
       val duration = System.currentTimeMillis() - startTs
       logger.info(s"DynamoDB import completed for table: $physicalTableName in ${duration}ms")
@@ -423,6 +407,38 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
         metricsContext.increment("bulkPut.failures")
         throw e
     }
+  }
+
+  // Post-import steps for bulkPut. Extracted so tests can drive the replica → registry ordering
+  // without also needing to stub out ImportTable (which requires S3). The registry pointer flip
+  // MUST come after addReplicaRegions returns successfully — otherwise readers in replica regions
+  // can see the new physical table name before the replica exists.
+  private[aws] def finalizeBulkPut(logicalTableName: String, physicalTableName: String): Unit = {
+    // ImportTable API does not support TTL configuration; must be applied after import completes
+    if (enableTtl) {
+      val ttlSpec = TimeToLiveSpecification.builder.enabled(true).attributeName("ttl").build
+      val ttlRequest = UpdateTimeToLiveRequest.builder
+        .tableName(physicalTableName)
+        .timeToLiveSpecification(ttlSpec)
+        .build
+      prefixedDynamoDbClient.updateTimeToLive(ttlRequest).join()
+      logger.info(s"TTL enabled on imported table: $physicalTableName")
+    }
+
+    // Registry pointer flip follows — must block until replicas are ACTIVE, or readers routed to
+    // a replica region would hit ResourceNotFoundException on the freshly swapped physical table.
+    addReplicaRegions(physicalTableName, waitForActive = true)
+
+    // Register the physical table name in the batch table registry
+    create(batchTableRegistry)
+    val registryKey = logicalTableName.sanitize.toUpperCase + batchSuffix
+    Await.result(
+      multiPut(Seq(KVStore.PutRequest(registryKey.getBytes, physicalTableName.getBytes, batchTableRegistry))),
+      30.seconds
+    )
+    logger.info(s"Registry updated: $registryKey -> $physicalTableName")
+
+    gcOldBatchTables(logicalTableName)
   }
 
   /** Deletes batch tables for the given logical name that are older than the configured GC age, up to
@@ -643,36 +659,116 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   }
 
   // Global Tables v2: called after a table is active to add read replicas in additional regions.
-  // Failure is non-fatal — replicas are best-effort for read locality.
-  // Uses a per-request 30s timeout override because UpdateTable is a control-plane operation
-  // that is much slower than data-plane calls and would otherwise hit the shared 3s client timeout.
-  protected def addReplicaRegions(tableName: String): Unit = {
+  // When `waitForActive` is true, blocks until every configured replica reports ACTIVE — required
+  // for callers that immediately publish a pointer to the new physical table (e.g. bulkPut flipping
+  // the batch-table registry). Non-atomic callers (create()) pass false and rely on eventual
+  // consistency, avoiding multi-minute blocks on their thread.
+  // Idempotent: pre-checks existing replicas via DescribeTable and only issues CreateReplication
+  // for regions not already present (AWS rejects duplicate CreateReplicationGroupMemberAction with
+  // a ValidationException). This makes retries safe when a first attempt created the table but
+  // failed before replicas reached ACTIVE.
+  protected def addReplicaRegions(tableName: String, waitForActive: Boolean): Unit = {
     if (replicaRegions.isEmpty) return
-    try {
-      val replicaUpdates = replicaRegions.map { region =>
+
+    val existingReplicas = fetchReplicaStatuses(tableName).keySet
+    val regionsToCreate = replicaRegions.filterNot(existingReplicas.contains)
+
+    if (regionsToCreate.nonEmpty) {
+      val replicaUpdates = regionsToCreate.map { region =>
         ReplicationGroupUpdate
           .builder()
           .create(CreateReplicationGroupMemberAction.builder().regionName(region).build())
           .build()
       }
-      val requestOverride = AwsRequestOverrideConfiguration
-        .builder()
-        .apiCallTimeout(Duration.ofSeconds(10))
-        .apiCallAttemptTimeout(Duration.ofSeconds(10))
-        .build()
       val updateRequest = UpdateTableRequest
         .builder()
         .tableName(tableName)
         .replicaUpdates(replicaUpdates.toList.toJava)
-        .overrideConfiguration(requestOverride)
+        .overrideConfiguration(DynamoDBKVStoreConstants.ControlPlaneApiOverride)
         .build()
       prefixedDynamoDbClient.updateTable(updateRequest).join()
-      logger.info(s"Global Table replicas added for '$tableName' in regions: ${replicaRegions.mkString(", ")}")
-    } catch {
-      case e: Exception =>
-        logger.warn(s"Failed to add replica regions for table '$tableName' — replicas are best-effort", e)
+      logger.info(
+        s"Global Table replica creation initiated for '$tableName' in regions: ${regionsToCreate.mkString(", ")}")
+    } else {
+      logger.info(
+        s"All configured replicas already present for '$tableName' in regions: ${replicaRegions.mkString(", ")}")
+    }
+
+    if (waitForActive) {
+      waitForReplicasActive(tableName, replicaRegions.toSet, configuredReplicaWaitTimeout)
     }
   }
+
+  private[aws] def configuredReplicaWaitTimeout: Duration = {
+    val timeout = conf
+      .get(DynamoDbReplicaWaitTimeoutMsKey)
+      .map(timeoutMillis => Duration.ofMillis(timeoutMillis.toLong))
+      .getOrElse(DynamoReplicaWaitDefaultTimeout)
+    // A single DescribeTable can take up to 30s (control-plane apiCallTimeout) and we poll every 15s;
+    // require at least a minute so the caller's timeout budget can absorb one full poll cycle plus a
+    // slow response without immediately tripping.
+    require(
+      timeout.compareTo(MinReplicaWaitTimeout) >= 0,
+      s"$DynamoDbReplicaWaitTimeoutMsKey must be >= ${MinReplicaWaitTimeout.toMillis}ms; got ${timeout.toMillis}ms"
+    )
+    timeout
+  }
+
+  // Fetch current replica statuses from the source region's DescribeTable response.
+  // Extracted as a seam so tests can stub replica progression without a real Global Table.
+  private[aws] def fetchReplicaStatuses(tableName: String): Map[String, ReplicaStatus] = {
+    val describeRequest = DescribeTableRequest.builder
+      .tableName(tableName)
+      .overrideConfiguration(DynamoDBKVStoreConstants.ControlPlaneApiOverride)
+      .build
+    val table = prefixedDynamoDbClient.describeTable(describeRequest).join().table()
+    Option(table.replicas()).map(_.toScala).getOrElse(Seq.empty).map(r => r.regionName() -> r.replicaStatus()).toMap
+  }
+
+  // Poll DescribeTable in the source region until every expected replica is ACTIVE.
+  // Throws if any replica enters CREATION_FAILED or if the wait exceeds `timeout`.
+  private[aws] def waitForReplicasActive(tableName: String, expectedRegions: Set[String], timeout: Duration): Unit = {
+    val maxWaitTimeMs = timeout.toMillis
+    val startTime = System.currentTimeMillis()
+
+    while (true) {
+      val statusByRegion = fetchReplicaStatuses(tableName)
+
+      val failed = statusByRegion.collect {
+        case (region, ReplicaStatus.CREATION_FAILED) if expectedRegions.contains(region) => region
+      }
+      if (failed.nonEmpty) {
+        throw new RuntimeException(
+          s"Replica creation failed for table '$tableName' in regions: ${failed.mkString(", ")}")
+      }
+
+      val pending = expectedRegions.filterNot(r => statusByRegion.get(r).contains(ReplicaStatus.ACTIVE))
+      if (pending.isEmpty) {
+        logger.info(
+          s"Global Table replicas ACTIVE for '$tableName' in regions: ${expectedRegions.toSeq.sorted.mkString(", ")}")
+        return
+      }
+
+      val elapsedMs = System.currentTimeMillis() - startTime
+      if (elapsedMs >= maxWaitTimeMs) {
+        val statusStr = expectedRegions.toSeq.sorted
+          .map(r => s"$r=${statusByRegion.getOrElse(r, "NOT_PRESENT")}")
+          .mkString(", ")
+        throw new RuntimeException(
+          s"Timed out after ${timeout} waiting for replicas ACTIVE for table '$tableName'. Statuses: $statusStr")
+      }
+
+      logger.info(
+        s"Waiting for replicas ACTIVE for '$tableName' (${elapsedMs / 1000}s elapsed); pending: ${pending.toSeq.sorted
+            .mkString(", ")}")
+      // Cap the sleep at the remaining wait budget so we don't overshoot the configured timeout
+      // (e.g. avoid sleeping 15s when only 2s remain).
+      val remainingMs = math.max(0L, maxWaitTimeMs - elapsedMs)
+      Thread.sleep(math.min(replicaWaitPollIntervalMs, remainingMs))
+    }
+  }
+
+  protected def replicaWaitPollIntervalMs: Long = ReplicaWaitPollIntervalMs
 }
 
 object DynamoDBKVStoreConstants {
@@ -721,6 +817,9 @@ object DynamoDBKVStoreConstants {
   val DataTTLSeconds = 5.days.toSeconds.toInt
   val MillisPerDay = 1.day.toMillis
   val DynamoImportDefaultTimeout: Duration = Duration.ofMinutes(60)
+  val DynamoReplicaWaitDefaultTimeout: Duration = Duration.ofMinutes(60)
+  val MinReplicaWaitTimeout: Duration = Duration.ofMinutes(1)
+  val ReplicaWaitPollIntervalMs: Long = 15 * 1000L
 
   val BatchTableGCAgeDays = 30
   val BatchTableGCMaxDelete = 10

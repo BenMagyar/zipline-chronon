@@ -105,4 +105,5 @@ object Constants {
   val ChrononSparkConfPrefix = "spark.chronon."
   val KvUploadTimeoutMsKey = "spark.chronon.kv_upload.timeout_ms"
   val KvUploadBatchTableGCAgeDaysKey = "spark.chronon.kv_upload.batch_table_gc_age_days"
+  val DynamoDbReplicaWaitTimeoutMsKey = "spark.chronon.dynamo_upload.replica_wait_timeout_ms"
 }
