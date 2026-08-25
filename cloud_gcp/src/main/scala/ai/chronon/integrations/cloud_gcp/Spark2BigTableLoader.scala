@@ -11,6 +11,7 @@ import org.apache.spark.sql.functions
 import org.apache.spark.sql.functions.udf
 import org.rogach.scallop.ScallopConf
 import org.rogach.scallop.ScallopOption
+import org.slf4j.LoggerFactory
 
 /** This Spark app handles loading data via Spark's BigTable connector (https://github.com/GoogleCloudDataproc/spark-bigtable-connector) into BigTable.
   * At the moment this uses the DF support in the BT connector. A limitation with this connector is that it does not support
@@ -18,6 +19,8 @@ import org.rogach.scallop.ScallopOption
   * to that of the endDs + span. If we need to tweak this behavior, we'll need to reach for the RDD version of these connector classes (BigtableRDD.writeRDD).
   */
 object Spark2BigTableLoader {
+
+  private lazy val logger = LoggerFactory.getLogger(getClass)
 
   class Conf(args: Seq[String]) extends ScallopConf(args) {
 
@@ -79,6 +82,19 @@ object Spark2BigTableLoader {
     val spark = SparkSessionBuilder.build(s"Spark2BigTableLoader-${tableName}")
     val tableUtils: TableUtils = TableUtils(spark)
 
+    // The BT connector reads its config only from the DataFrame .option() map (BigtableSparkConf.fromMap),
+    // not from the ambient SparkConf. Forward any spark.bigtable.* set on the (shared) session - e.g. from the
+    // team's ConfigProperties in teams.py - so writes can be tuned (app profile, flow control, batch size)
+    // without a code change. Required options below are applied afterwards so they always take precedence.
+    val passthroughBtOptions: Map[String, String] =
+      spark.sparkContext.getConf.getAll.collect {
+        case (k, v) if k.startsWith("spark.bigtable.") => k -> v
+      }.toMap
+    // Log keys only: some spark.bigtable.* options (e.g. spark.bigtable.auth.credentials_provider.args.*)
+    // can carry secrets, which the connector itself masks in its own logging.
+    logger.info(
+      s"Forwarding BigTable connector options from Spark conf: ${passthroughBtOptions.keys.toSeq.sorted.mkString(", ")}")
+
     // filter to only include data for the specified end date
     val partitionFilter = s"WHERE ds = '$endDate'"
 
@@ -107,6 +123,7 @@ object Spark2BigTableLoader {
 
     finalDataDf.write
       .format("bigtable")
+      .options(passthroughBtOptions)
       .option("catalog", catalog)
       .option("spark.bigtable.project.id", projectId)
       .option("spark.bigtable.instance.id", instanceId)
