@@ -22,8 +22,6 @@ import scala.concurrent.ExecutionContext
 import scala.concurrent.ExecutionContextExecutor
 
 object FlexibleExecutionContext {
-  private val instanceId = java.util.UUID.randomUUID().toString.take(8)
-
   val ThreadPoolSizeProperty = "ai.chronon.threadpool.size"
   val QueueCapacityProperty = "ai.chronon.threadpool.queue.capacity"
   val KeepAliveSecondsProperty = "ai.chronon.threadpool.keepalive.seconds"
@@ -45,27 +43,33 @@ object FlexibleExecutionContext {
     if (v >= 0) v else default
   }
 
-  // Create a thread factory so that we can name the threads for easier debugging
-  val threadFactory: ThreadFactory = new ThreadFactory {
-    private val counter = new AtomicInteger(0)
-    override def newThread(r: Runnable): Thread = {
-      val t = new Thread(r)
-      t.setName(s"chronon-fetcher-$instanceId-${counter.incrementAndGet()}")
-      // Set the context class loader if missing for libs like Spark (used in catalyst util) that rely on it to find classes
-      if (t.getContextClassLoader == null) {
-        t.setContextClassLoader(getClass.getClassLoader)
+  private def buildThreadFactory(threadPrefix: String, daemonSetting: Option[Boolean]): ThreadFactory =
+    new ThreadFactory {
+      private val instanceId = java.util.UUID.randomUUID().toString.take(8)
+      private val counter = new AtomicInteger(0)
+
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r)
+        t.setName(s"$threadPrefix-$instanceId-${counter.incrementAndGet()}")
+        daemonSetting.foreach(t.setDaemon)
+        // Set the context class loader if missing for libs like Spark (used in catalyst util) that rely on it to find classes
+        if (t.getContextClassLoader == null) {
+          t.setContextClassLoader(getClass.getClassLoader)
+        }
+
+        t
       }
-
-      t
     }
-  }
 
-  def buildExecutor(metricsContext: Metrics.Context): ThreadPoolExecutor = {
-    val cores = Runtime.getRuntime.availableProcessors()
-    val defaultPoolSize = cores * 4
-    val poolSize = readPositiveInt(ThreadPoolSizeProperty, defaultPoolSize)
-    val queueCapacity = readPositiveInt(QueueCapacityProperty, DefaultQueueCapacity)
-    val keepAliveSeconds = readNonNegativeInt(KeepAliveSecondsProperty, DefaultKeepAliveSeconds)
+  // Create a thread factory so that we can name the threads for easier debugging
+  // None preserves the existing factory's inherited daemon status.
+  val threadFactory: ThreadFactory = buildThreadFactory("chronon-fetcher", daemonSetting = None)
+
+  private def newExecutor(poolSize: Int,
+                          queueCapacity: Int,
+                          keepAliveSeconds: Long,
+                          threadFactory: ThreadFactory,
+                          metricsContext: Metrics.Context): ThreadPoolExecutor =
     new InstrumentedThreadPoolExecutor(
       poolSize, // corePoolSize
       poolSize, // maxPoolSize
@@ -75,6 +79,30 @@ object FlexibleExecutionContext {
       threadFactory,
       metricsContext = metricsContext
     )
+
+  def buildExecutor(
+      poolSize: Int,
+      queueCapacity: Int,
+      threadPrefix: String,
+      metricsContext: Metrics.Context,
+      daemonThreads: Boolean
+  ): ThreadPoolExecutor = {
+    require(poolSize > 0, s"poolSize must be positive, got $poolSize")
+    require(queueCapacity > 0, s"queueCapacity must be positive, got $queueCapacity")
+    newExecutor(poolSize,
+                queueCapacity,
+                keepAliveSeconds = 0L,
+                buildThreadFactory(threadPrefix, daemonSetting = Some(daemonThreads)),
+                metricsContext)
+  }
+
+  def buildExecutor(metricsContext: Metrics.Context): ThreadPoolExecutor = {
+    val cores = Runtime.getRuntime.availableProcessors()
+    val defaultPoolSize = cores * 4
+    val poolSize = readPositiveInt(ThreadPoolSizeProperty, defaultPoolSize)
+    val queueCapacity = readPositiveInt(QueueCapacityProperty, DefaultQueueCapacity)
+    val keepAliveSeconds = readNonNegativeInt(KeepAliveSecondsProperty, DefaultKeepAliveSeconds)
+    newExecutor(poolSize, queueCapacity, keepAliveSeconds, threadFactory, metricsContext)
   }
 
   lazy val buildExecutor: ThreadPoolExecutor =

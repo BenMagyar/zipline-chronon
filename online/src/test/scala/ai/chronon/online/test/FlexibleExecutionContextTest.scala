@@ -1,9 +1,10 @@
 package ai.chronon.online.test
 
-import ai.chronon.online.metrics.FlexibleExecutionContext
+import ai.chronon.online.metrics.{FlexibleExecutionContext, Metrics}
 import org.scalatest.flatspec.AnyFlatSpec
 
-import java.util.concurrent.{ArrayBlockingQueue, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.{ArrayBlockingQueue, CountDownLatch, ThreadPoolExecutor, TimeUnit}
 
 class FlexibleExecutionContextTest extends AnyFlatSpec {
 
@@ -26,5 +27,35 @@ class FlexibleExecutionContextTest extends AnyFlatSpec {
     assert(FlexibleExecutionContext.ThreadPoolSizeProperty == "ai.chronon.threadpool.size")
     assert(FlexibleExecutionContext.QueueCapacityProperty == "ai.chronon.threadpool.queue.capacity")
     assert(FlexibleExecutionContext.KeepAliveSecondsProperty == "ai.chronon.threadpool.keepalive.seconds")
+  }
+
+  it should "build an explicitly sized executor with named daemon threads" in {
+    val executor = FlexibleExecutionContext.buildExecutor(
+      poolSize = 3,
+      queueCapacity = 7,
+      threadPrefix = "custom-pool",
+      metricsContext = Metrics.Context(environment = "test"),
+      daemonThreads = true
+    )
+    val worker = new AtomicReference[Thread]()
+    val taskFinished = new CountDownLatch(1)
+
+    try {
+      executor.execute(new Runnable {
+        override def run(): Unit = {
+          worker.set(Thread.currentThread())
+          taskFinished.countDown()
+        }
+      })
+
+      assert(taskFinished.await(10, TimeUnit.SECONDS))
+      assert(executor.getCorePoolSize == 3)
+      assert(executor.getMaximumPoolSize == 3)
+      assert(executor.getQueue.asInstanceOf[ArrayBlockingQueue[_]].remainingCapacity() == 7)
+      assert(worker.get().getName.startsWith("custom-pool-"))
+      assert(worker.get().isDaemon)
+    } finally {
+      executor.shutdownNow()
+    }
   }
 }
