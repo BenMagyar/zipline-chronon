@@ -125,4 +125,113 @@ class ExtensionsTest extends AnyFlatSpec {
     assertEquals(4, keys.size)
   }
 
+  it should "withoutExecutionInfo clears executionInfo on outer and each joinPart's groupBy" in {
+    val gb = Builders.GroupBy(
+      keyColumns = Seq("k"),
+      metaData = Builders.MetaData(name = "gb", executionInfo = new ExecutionInfo().setStepDays(3)))
+    val join = Builders.Join(
+      joinParts = Seq(Builders.JoinPart(groupBy = gb)),
+      metaData = Builders.MetaData(name = "j", executionInfo = new ExecutionInfo().setStepDays(7)))
+
+    // Sanity: Builders populates executionInfo at both levels.
+    assertTrue(join.metaData.isSetExecutionInfo)
+    assertTrue(join.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+
+    val stripped = join.withoutExecutionInfo
+
+    assertFalse(stripped.metaData.isSetExecutionInfo)
+    assertFalse(stripped.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+    // Other metaData fields survive.
+    assertEquals("j", stripped.metaData.getName)
+    assertEquals("gb", stripped.joinParts.get(0).groupBy.metaData.getName)
+    // Deep-copy semantics: caller's input is untouched.
+    assertTrue(join.metaData.isSetExecutionInfo)
+    assertTrue(join.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+  }
+
+  it should "withoutExecutionInfo is a safe no-op when executionInfo is absent" in {
+    val gb = Builders.GroupBy(keyColumns = Seq("k"), metaData = Builders.MetaData(name = "gb"))
+    val join = Builders.Join(
+      joinParts = Seq(Builders.JoinPart(groupBy = gb)),
+      metaData = Builders.MetaData(name = "j"))
+    join.metaData.unsetExecutionInfo()
+    join.joinParts.get(0).groupBy.metaData.unsetExecutionInfo()
+
+    val stripped = join.withoutExecutionInfo
+
+    assertFalse(stripped.metaData.isSetExecutionInfo)
+    assertFalse(stripped.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+    assertEquals("j", stripped.metaData.getName)
+  }
+
+  it should "withoutExecutionInfo recurses into joinSources under joinPart groupBy sources (chained join)" in {
+    // Parent join whose Join object gets embedded as a JoinSource under an outer chained groupBy.
+    val parentGb = Builders.GroupBy(
+      keyColumns = Seq("k"),
+      metaData = Builders.MetaData(name = "parent_gb", executionInfo = new ExecutionInfo().setStepDays(3)))
+    val parentJoin = Builders.Join(
+      joinParts = Seq(Builders.JoinPart(groupBy = parentGb)),
+      metaData = Builders.MetaData(name = "parent_j", executionInfo = new ExecutionInfo().setStepDays(4)))
+
+    val chainingGb = Builders.GroupBy(
+      sources = Seq(Builders.Source.joinSource(parentJoin, Builders.Query())),
+      keyColumns = Seq("k"),
+      metaData = Builders.MetaData(name = "chaining_gb", executionInfo = new ExecutionInfo().setStepDays(5)))
+    val chainingJoin = Builders.Join(
+      joinParts = Seq(Builders.JoinPart(groupBy = chainingGb)),
+      metaData = Builders.MetaData(name = "chaining_j", executionInfo = new ExecutionInfo().setStepDays(7)))
+
+    // Sanity: every level starts with executionInfo populated.
+    val nestedJoinBefore = chainingJoin.joinParts.get(0).groupBy.sources.get(0).getJoinSource.getJoin
+    assertTrue(chainingJoin.metaData.isSetExecutionInfo)
+    assertTrue(chainingJoin.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+    assertTrue(nestedJoinBefore.metaData.isSetExecutionInfo)
+    assertTrue(nestedJoinBefore.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+
+    val stripped = chainingJoin.withoutExecutionInfo
+    val nestedJoinAfter = stripped.joinParts.get(0).groupBy.sources.get(0).getJoinSource.getJoin
+
+    // All four levels are cleared.
+    assertFalse(stripped.metaData.isSetExecutionInfo)
+    assertFalse(stripped.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+    assertFalse(nestedJoinAfter.metaData.isSetExecutionInfo)
+    assertFalse(nestedJoinAfter.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+
+    // Deep-copy semantics: the input is untouched at every level.
+    assertTrue(chainingJoin.metaData.isSetExecutionInfo)
+    assertTrue(chainingJoin.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+    assertTrue(nestedJoinBefore.metaData.isSetExecutionInfo)
+    assertTrue(nestedJoinBefore.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+  }
+
+  it should "withoutExecutionInfo recurses into a joinSource under the outer left" in {
+    val parentGb = Builders.GroupBy(
+      keyColumns = Seq("k"),
+      metaData = Builders.MetaData(name = "left_parent_gb", executionInfo = new ExecutionInfo().setStepDays(2)))
+    val parentJoin = Builders.Join(
+      joinParts = Seq(Builders.JoinPart(groupBy = parentGb)),
+      metaData = Builders.MetaData(name = "left_parent_j", executionInfo = new ExecutionInfo().setStepDays(6)))
+
+    val outerJoin = Builders.Join(
+      left = Builders.Source.joinSource(parentJoin, Builders.Query()),
+      joinParts = Seq.empty,
+      metaData = Builders.MetaData(name = "outer_j", executionInfo = new ExecutionInfo().setStepDays(9)))
+
+    val leftJoinBefore = outerJoin.left.getJoinSource.getJoin
+    assertTrue(outerJoin.metaData.isSetExecutionInfo)
+    assertTrue(leftJoinBefore.metaData.isSetExecutionInfo)
+    assertTrue(leftJoinBefore.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+
+    val stripped = outerJoin.withoutExecutionInfo
+    val leftJoinAfter = stripped.left.getJoinSource.getJoin
+
+    assertFalse(stripped.metaData.isSetExecutionInfo)
+    assertFalse(leftJoinAfter.metaData.isSetExecutionInfo)
+    assertFalse(leftJoinAfter.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+
+    // Input untouched.
+    assertTrue(leftJoinBefore.metaData.isSetExecutionInfo)
+    assertTrue(leftJoinBefore.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
+  }
+
 }

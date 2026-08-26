@@ -203,10 +203,15 @@ class ChainingFetcherTest extends SparkTestBase {
     )
   }
 
-  def executeFetch(joinConf: api.Join, endDs: String, namespace: String): (DataFrame, Seq[Row]) = {
+  def executeFetch(joinConf: api.Join,
+                   endDs: String,
+                   namespace: String,
+                   preUploadTransform: api.Join => api.Join = identity): (DataFrame, Seq[Row]) = {
     implicit val executionContext: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
     implicit val tableUtils: TableUtils = TableUtils(spark)
-    val kvStoreFunc = () => OnlineUtils.buildInMemoryKVStore("ChainingFetcherTest")
+    // Scope the in-memory KV store by namespace so parallel stripped/non-stripped variants of
+    // the same joinConf don't pollute each other's KV state (see FetcherTestUtil for the same fix).
+    val kvStoreFunc = () => OnlineUtils.buildInMemoryKVStore(s"ChainingFetcherTest#$namespace")
     val inMemoryKvStore = kvStoreFunc()
     val mockApi = new MockApi(kvStoreFunc, namespace)
 
@@ -234,7 +239,7 @@ class ChainingFetcherTest extends SparkTestBase {
     val tsIndex = endDsQueries.schema.fieldIndex(Constants.TimeColumn)
     val metadataStore = new MetadataStore(FetchContext(inMemoryKvStore))
     inMemoryKvStore.create(MetadataDataset)
-    metadataStore.putJoinConf(joinConf)
+    metadataStore.putJoinConf(preUploadTransform(joinConf))
 
     def buildRequests(lagMs: Int = 0): Array[Request] =
       endDsQueries.collect()
@@ -313,6 +318,29 @@ class ChainingFetcherTest extends SparkTestBase {
     assertTrue(chainingJoinConf.joinParts.get(0).groupBy.sources.get(0).isSetJoinSource)
 
     val (expected, fetcherResponse) = executeFetch(chainingJoinConf, "2021-04-18", namespace)
+    compareTemporalFetch(chainingJoinConf, expected, fetcherResponse, "listing")
+  }
+
+  // Regression guards: KVUploadNodeRunner strips executionInfo before writing the Join to KV.
+  // These tests prove the fetch path works when executionInfo is absent on the served Join and
+  // its joinParts' groupBy metaData — both for the classic parent-join case and for the chained
+  // case (where the nested joinSource.join still carries executionInfo since the runner strip
+  // only clears outer + direct joinParts).
+  it should "fetch parent join with executionInfo stripped from KV metadata" in {
+    val namespace = "parent_join_fetch_stripped"
+    val joinConf = generateMutationData(namespace, Accuracy.TEMPORAL)
+    val (expected, fetcherResponse) =
+      executeFetch(joinConf, "2021-04-15", namespace, _.withoutExecutionInfo)
+    compareTemporalFetch(joinConf, expected, fetcherResponse, "user")
+  }
+
+  it should "fetch chaining deterministic with executionInfo stripped from KV metadata" in {
+    val namespace = "chaining_fetch_stripped"
+    val chainingJoinConf = generateChainingJoinData(namespace, Accuracy.TEMPORAL)
+    assertTrue(chainingJoinConf.joinParts.get(0).groupBy.sources.get(0).isSetJoinSource)
+
+    val (expected, fetcherResponse) =
+      executeFetch(chainingJoinConf, "2021-04-18", namespace, _.withoutExecutionInfo)
     compareTemporalFetch(chainingJoinConf, expected, fetcherResponse, "listing")
   }
 }

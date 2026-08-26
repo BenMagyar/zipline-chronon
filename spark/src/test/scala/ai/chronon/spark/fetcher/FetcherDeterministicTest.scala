@@ -42,6 +42,22 @@ class FetcherDeterministicTest extends SparkTestBase {
                                          dropDsOnWrite = true)(spark)
   }
 
+  // Regression guard: KVUploadNodeRunner strips executionInfo before writing the Join to KV.
+  // This test proves the fetch path (which reads the Join back out of KV) works when executionInfo
+  // is absent on the served Join and each of its joinParts' groupBy metaData.
+  it should "test temporal fetch join with executionInfo stripped from KV metadata" in {
+    import ai.chronon.api.Extensions.JoinOps
+    val namespace = "deterministic_fetch_stripped"
+    val joinConf = FetcherTestUtil.generateMutationData(namespace, tableUtils, spark)
+    FetcherTestUtil.compareTemporalFetch(
+      joinConf,
+      "2021-04-10",
+      namespace,
+      consistencyCheck = false,
+      dropDsOnWrite = true,
+      preUploadTransform = _.withoutExecutionInfo)(spark)
+  }
+
   it should "test fetchJoinV2 with different response types" in {
     implicit val executionContext: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
     val namespace = "fetch_join_v2_test"

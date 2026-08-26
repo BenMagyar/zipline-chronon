@@ -140,10 +140,14 @@ object FetcherTestUtil {
                            dropDsOnWrite: Boolean,
                            enableTiling: Boolean = false,
                            partitionSpec: PartitionSpec = PartitionSpec.daily,
-                           offlineAssertion: DataFrame => Unit = _ => ())(implicit spark: SparkSession): Unit = {
+                           offlineAssertion: DataFrame => Unit = _ => (),
+                           preUploadTransform: api.Join => api.Join = identity)(implicit spark: SparkSession): Unit = {
     implicit val executionContext: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
     implicit val tableUtils: TableUtils = TableUtils(spark, partitionSpec)
-    val kvStoreFunc = () => OnlineUtils.buildInMemoryKVStore("FetcherTest")
+    // Scope the in-memory KV store by namespace so tests that reuse the same joinConf name
+    // (e.g. multiple compareTemporalFetch calls with different namespaces) don't pollute each
+    // other's KV state via the singleton InMemoryKvStore map.
+    val kvStoreFunc = () => OnlineUtils.buildInMemoryKVStore(s"FetcherTest#$namespace")
     val inMemoryKvStore = kvStoreFunc()
 
     val tilingEnabledFlagStore = new FlagStore {
@@ -231,7 +235,7 @@ object FetcherTestUtil {
     val tsIndex = endDsQueries.schema.fieldIndex(Constants.TimeColumn)
     val metadataStore = new MetadataStore(FetchContext(inMemoryKvStore))
     inMemoryKvStore.create(MetadataDataset)
-    metadataStore.putJoinConf(joinConf)
+    metadataStore.putJoinConf(preUploadTransform(joinConf))
 
     def buildRequests(lagMs: Int = 0): Array[Request] =
       endDsQueries

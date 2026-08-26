@@ -1,7 +1,7 @@
 package ai.chronon.spark.kv_store
 
 import ai.chronon.api.Constants.MetadataDataset
-import ai.chronon.api.Extensions.{MetadataOps, TableInfoOps}
+import ai.chronon.api.Extensions.{JoinOps, MetadataOps, TableInfoOps}
 import ai.chronon.api._
 import ai.chronon.api.planner.NodeRunner
 import ai.chronon.api.secrets.SecretResolver
@@ -42,7 +42,9 @@ class KVUploadNodeRunner(api: Api) extends NodeRunner {
   }
 
   private def doUploadJoinMetadata(conf: NodeContent): Unit = {
-    val join = conf.getJoinMetadataUpload.join
+    // executionInfo carries per-mode env/conf blobs relevant only to compute/orchestration nodes;
+    // Fetcher never reads it off the KV-served Join, so strip it to shrink the payload.
+    val join = conf.getJoinMetadataUpload.join.withoutExecutionInfo
     val joinName = join.metaData.name
 
     val startTime = System.currentTimeMillis()

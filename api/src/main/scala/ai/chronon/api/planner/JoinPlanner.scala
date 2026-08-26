@@ -64,12 +64,7 @@ class JoinPlanner(join: Join)(implicit outputPartitionSpec: PartitionSpec)
   // will mutate the join in place - use on deepCopy-ied objects only
   private def joinWithoutKeyFilters(join: Join): Unit = join.unsetKeyFiltersRecursively()
 
-  private def joinWithoutExecutionInfo: Join = {
-    val copied = join.deepCopy()
-    copied.metaData.unsetExecutionInfo()
-    Option(copied.joinParts).foreach(_.iterator().toScala.foreach(_.groupBy.metaData.unsetExecutionInfo()))
-    copied
-  }
+  private def joinWithoutExecutionInfo: Join = join.withoutExecutionInfo
 
   val leftSourceNode: Node = {
 

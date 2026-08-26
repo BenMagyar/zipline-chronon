@@ -1057,6 +1057,37 @@ object Extensions {
         Option(joinPart.groupBy).foreach(_.unsetKeyFiltersRecursively())))
     }
 
+    // executionInfo carries per-mode env/conf blobs relevant only to compute/orchestration nodes;
+    // the Fetcher never reads it off the KV-served Join, so both JoinPlanner (before wrapping in
+    // JoinMetadataUpload) and KVUploadNodeRunner (before persisting) strip it to shrink the payload.
+    // Returns a deep copy with executionInfo cleared on the outer metaData, each direct joinPart's
+    // groupBy metaData, and every JoinSource-embedded join reached transitively (both under
+    // join.left and under any joinPart.groupBy.sources[*].joinSource) — chained joins can carry
+    // their own executionInfo blobs at every nesting level.
+    def withoutExecutionInfo: Join = {
+      val copied = join.deepCopy()
+      copied.unsetExecutionInfoRecursively()
+      copied
+    }
+
+    // Mutating counterpart to withoutExecutionInfo — use on deepCopy-ied objects only.
+    def unsetExecutionInfoRecursively(): Unit = {
+      Option(join.metaData).foreach(_.unsetExecutionInfo())
+      Option(join.left).foreach { left =>
+        if (left.isSetJoinSource && left.getJoinSource.isSetJoin)
+          left.getJoinSource.getJoin.unsetExecutionInfoRecursively()
+      }
+      Option(join.joinParts).foreach(_.iterator().toScala.foreach { jp =>
+        Option(jp.groupBy).foreach { gb =>
+          Option(gb.metaData).foreach(_.unsetExecutionInfo())
+          Option(gb.sources).foreach(_.iterator().toScala.foreach { source =>
+            if (source.isSetJoinSource && source.getJoinSource.isSetJoin)
+              source.getJoinSource.getJoin.unsetExecutionInfoRecursively()
+          })
+        }
+      })
+    }
+
     /*
      * semanticHash contains hashes of left side and each join part, and is used to detect join definition
      * changes and determine whether any intermediate/final tables of the join need to be recomputed.
