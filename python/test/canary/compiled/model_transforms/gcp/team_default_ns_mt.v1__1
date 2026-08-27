@@ -60,7 +60,8 @@
           "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.io.ResolvingFileIO",
           "spark.sql.catalog.spark_catalog.warehouse": "gs://zipline-warehouse-canary/data/tables/",
           "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
-          "spark.sql.shuffle.partitions": "10"
+          "spark.sql.shuffle.partitions": "10",
+          "taskmanager.memory.process.size": "4G"
         }
       },
       "env": {
@@ -171,7 +172,8 @@
               "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.io.ResolvingFileIO",
               "spark.sql.catalog.spark_catalog.warehouse": "gs://zipline-warehouse-canary/data/tables/",
               "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
-              "spark.sql.shuffle.partitions": "10"
+              "spark.sql.shuffle.partitions": "10",
+              "taskmanager.memory.process.size": "4G"
             }
           },
           "env": {
@@ -346,7 +348,8 @@
                         "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.io.ResolvingFileIO",
                         "spark.sql.catalog.spark_catalog.warehouse": "gs://zipline-warehouse-canary/data/tables/",
                         "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
-                        "spark.sql.shuffle.partitions": "10"
+                        "spark.sql.shuffle.partitions": "10",
+                        "taskmanager.memory.process.size": "4G"
                       }
                     },
                     "env": {
@@ -793,7 +796,8 @@
                         "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.io.ResolvingFileIO",
                         "spark.sql.catalog.spark_catalog.warehouse": "gs://zipline-warehouse-canary/data/tables/",
                         "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
-                        "spark.sql.shuffle.partitions": "10"
+                        "spark.sql.shuffle.partitions": "10",
+                        "taskmanager.memory.process.size": "4G"
                       }
                     },
                     "env": {
@@ -925,7 +929,8 @@
                   "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.io.ResolvingFileIO",
                   "spark.sql.catalog.spark_catalog.warehouse": "gs://zipline-warehouse-canary/data/tables/",
                   "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
-                  "spark.sql.shuffle.partitions": "10"
+                  "spark.sql.shuffle.partitions": "10",
+                  "taskmanager.memory.process.size": "4G"
                 }
               },
               "env": {

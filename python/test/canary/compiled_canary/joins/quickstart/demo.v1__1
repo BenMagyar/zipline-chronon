@@ -411,7 +411,8 @@
                 "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                 "spark.sql.defaultCatalog": "iceberg",
                 "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                "spark.sql.shuffle.partitions": "10"
+                "spark.sql.shuffle.partitions": "10",
+                "taskmanager.memory.process.size": "4G"
               },
               "modeConfigs": {
                 "backfill": {
@@ -436,7 +437,8 @@
                   "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                   "spark.sql.defaultCatalog": "iceberg",
                   "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                  "spark.sql.shuffle.partitions": "10"
+                  "spark.sql.shuffle.partitions": "10",
+                  "taskmanager.memory.process.size": "4G"
                 },
                 "upload": {
                   "spark.chronon.coalesce.factor": "10",
@@ -458,7 +460,8 @@
                   "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                   "spark.sql.defaultCatalog": "iceberg",
                   "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                  "spark.sql.shuffle.partitions": "10"
+                  "spark.sql.shuffle.partitions": "10",
+                  "taskmanager.memory.process.size": "4G"
                 }
               }
             },
@@ -619,7 +622,8 @@
                 "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                 "spark.sql.defaultCatalog": "iceberg",
                 "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                "spark.sql.shuffle.partitions": "10"
+                "spark.sql.shuffle.partitions": "10",
+                "taskmanager.memory.process.size": "4G"
               },
               "modeConfigs": {
                 "backfill": {
@@ -644,7 +648,8 @@
                   "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                   "spark.sql.defaultCatalog": "iceberg",
                   "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                  "spark.sql.shuffle.partitions": "10"
+                  "spark.sql.shuffle.partitions": "10",
+                  "taskmanager.memory.process.size": "4G"
                 },
                 "upload": {
                   "spark.chronon.coalesce.factor": "10",
@@ -666,7 +671,8 @@
                   "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
                   "spark.sql.defaultCatalog": "iceberg",
                   "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                  "spark.sql.shuffle.partitions": "10"
+                  "spark.sql.shuffle.partitions": "10",
+                  "taskmanager.memory.process.size": "4G"
                 }
               }
             },
@@ -897,7 +903,8 @@
           "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
           "spark.sql.defaultCatalog": "iceberg",
           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-          "spark.sql.shuffle.partitions": "10"
+          "spark.sql.shuffle.partitions": "10",
+          "taskmanager.memory.process.size": "4G"
         },
         "modeConfigs": {
           "backfill": {
@@ -922,7 +929,8 @@
             "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
             "spark.sql.defaultCatalog": "iceberg",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            "spark.sql.shuffle.partitions": "10"
+            "spark.sql.shuffle.partitions": "10",
+            "taskmanager.memory.process.size": "4G"
           },
           "upload": {
             "spark.chronon.coalesce.factor": "10",
@@ -944,7 +952,8 @@
             "spark.sql.catalog.iceberg.warehouse": "s3a://warehouse/",
             "spark.sql.defaultCatalog": "iceberg",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            "spark.sql.shuffle.partitions": "10"
+            "spark.sql.shuffle.partitions": "10",
+            "taskmanager.memory.process.size": "4G"
           }
         }
       },

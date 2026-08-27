@@ -12,6 +12,7 @@ default = Team(
     conf=ConfigProperties(
         common={
             "spark.chronon.partition.column": "ds",
+            "taskmanager.memory.process.size": "4G",
         }
     ),
     env=EnvironmentVariables(
@@ -163,7 +164,6 @@ aws = Team(
             "spark.driver.cores": "1",
             "spark.executor.memory": "1g",
             "spark.executor.cores": "1",
-            "taskmanager.memory.process.size": "4G",
         },
         modeConfigs={
             RunMode.BACKFILL: {
@@ -294,7 +294,6 @@ azure = Team(
             "spark.driver.cores": "1",
             "spark.executor.memory": "512m",
             "spark.executor.cores": "1",
-            "taskmanager.memory.process.size": "4G",
         },
     ),
 )

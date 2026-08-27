@@ -48,7 +48,8 @@
                 "spark.sql.catalog.workspace_iceberg.warehouse": "workspace",
                 "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
                 "spark.sql.shuffle.partitions": "10",
-                "spark.sql.warehouse.dir": "s3://zipline-warehouse-canary/data/uc-poc/warehouse/"
+                "spark.sql.warehouse.dir": "s3://zipline-warehouse-canary/data/uc-poc/warehouse/",
+                "taskmanager.memory.process.size": "4G"
               }
             },
             "env": {
@@ -154,7 +155,8 @@
           "spark.sql.catalog.workspace_iceberg.warehouse": "workspace",
           "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
           "spark.sql.shuffle.partitions": "10",
-          "spark.sql.warehouse.dir": "s3://zipline-warehouse-canary/data/uc-poc/warehouse/"
+          "spark.sql.warehouse.dir": "s3://zipline-warehouse-canary/data/uc-poc/warehouse/",
+          "taskmanager.memory.process.size": "4G"
         }
       },
       "env": {
