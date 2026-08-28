@@ -311,25 +311,65 @@ class PrefixedDynamoDbAsyncClientTest extends AnyFlatSpec with Matchers with Moc
     result.lastEvaluatedTableName() shouldBe "table_a"
   }
 
-  it should "not modify listTables response names that do not carry the prefix" in {
-    // Tables created outside the prefix namespace should pass through unchanged
+  it should "drop other-deployment names from listTables results when a prefix is set" in {
+    // Tables outside the prefix namespace belong to other deployments and must not surface.
     val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
     val request = ListTablesRequest.builder().build()
 
     when(mockDelegate.listTables(any[ListTablesRequest]())).thenReturn(
       CompletableFuture.completedFuture(
         ListTablesResponse.builder()
-          .tableNames("unrelated_table")
+          .tableNames(s"${testPrefix}mine_a", s"${testPrefix}mine_b", "unrelated_table")
           .build()
       )
     )
 
     val result = client.listTables(request).join()
-    result.tableNames().toArray shouldBe Array("unrelated_table")
+    // takeWhile stops at the first non-prefixed name; we assume ASCII order from DynamoDB.
+    result.tableNames().toArray shouldBe Array("mine_a", "mine_b")
   }
 
-  it should "handle listTables with no exclusiveStartTableName" in {
+  it should "suppress lastEvaluatedTableName when the page diverges past the prefix" in {
+    // If we passed an un-stripped cursor back to the caller they'd feed it in, we'd re-prefix
+    // it, and DynamoDB would land at a phantom key — silently skipping our tables. Truncating
+    // pagination here is what prevents that.
     val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
+    val request = ListTablesRequest.builder().build()
+
+    when(mockDelegate.listTables(any[ListTablesRequest]())).thenReturn(
+      CompletableFuture.completedFuture(
+        ListTablesResponse.builder()
+          .tableNames(s"${testPrefix}mine_a", "unrelated_table")
+          .lastEvaluatedTableName("unrelated_table")
+          .build()
+      )
+    )
+
+    val result = client.listTables(request).join()
+    result.tableNames().toArray shouldBe Array("mine_a")
+    result.lastEvaluatedTableName() shouldBe null
+  }
+
+  it should "inject tablePrefix as the physical start key when no cursor is provided" in {
+    // Bootstraps the scoped-pagination trick: DynamoDB starts iterating strictly after
+    // `tablePrefix`, which is the first key in our slice.
+    val client = new PrefixedDynamoDbAsyncClient(mockDelegate, testPrefix)
+    val request = ListTablesRequest.builder().limit(10).build()
+
+    when(mockDelegate.listTables(any[ListTablesRequest]())).thenReturn(
+      CompletableFuture.completedFuture(ListTablesResponse.builder().build())
+    )
+
+    client.listTables(request).join()
+
+    val captor = ArgumentCaptor.forClass(classOf[ListTablesRequest])
+    verify(mockDelegate).listTables(captor.capture())
+    captor.getValue.exclusiveStartTableName() shouldBe testPrefix
+    captor.getValue.limit() shouldBe 10
+  }
+
+  it should "not inject a start key when tablePrefix is empty" in {
+    val client = new PrefixedDynamoDbAsyncClient(mockDelegate, "")
     val request = ListTablesRequest.builder().limit(10).build()
 
     when(mockDelegate.listTables(any[ListTablesRequest]())).thenReturn(

@@ -602,7 +602,7 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result2.values.get.isEmpty shouldBe true
   }
 
-  // ===== gcOldBatchTables / enableTtl =====
+  // ===== cleanupTables / enableTtl =====
 
   it should "enable TTL on table when enableTtl=true (default)" in {
     val dataset = "TTL_ENABLED_TABLE"
@@ -702,146 +702,325 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     ex.getMessage should include(DynamoDbReplicaWaitTimeoutMsKey)
   }
 
-  it should "gcOldBatchTables deletes tables older than the GC threshold" in {
+  // ===== cleanupTables — scoped mode (datasetName = Some(...)) mirrors the old gcOldBatchTables =====
+
+  it should "cleanupTables scoped: deletes tables older than the GC threshold" in {
     val logicalName = "GC_CLEANUP_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client)
-
-    // threshold + 10 days old — should be deleted
-    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 10)
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
-    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000"
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 10)
+    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000000000"
     kvStore.create(oldTableName)
 
-    // threshold - 10 days old — should NOT be deleted
     val recentDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays - 10)
-    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000"
+    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000000000"
     kvStore.create(recentTableName)
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
     val tables = client.listTables().join().tableNames()
     tables.contains(oldTableName) shouldBe false
     tables.contains(recentTableName) shouldBe true
   }
 
-  it should "gcOldBatchTables uses configured GC threshold" in {
+  it should "cleanupTables scoped: uses configured GC threshold" in {
     val logicalName = "GC_CONFIGURED_THRESHOLD_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client, Map(KvUploadBatchTableGCAgeDaysKey -> "7"))
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
 
     val oldDate = LocalDate.now().minusDays(10)
-    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000"
+    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000000000"
     kvStore.create(oldTableName)
 
     val recentDate = LocalDate.now().minusDays(5)
-    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000"
+    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000000000"
     kvStore.create(recentTableName)
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
     val tables = client.listTables().join().tableNames()
     tables.contains(oldTableName) shouldBe false
     tables.contains(recentTableName) shouldBe true
   }
 
-  it should "gcOldBatchTables respects the BatchTableGCMaxDelete limit" in {
+  it should "cleanupTables scoped: respects the default BatchTableGCMaxDelete cap" in {
     val logicalName = "GC_LIMIT_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client)
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
 
-    // Create BatchTableGCMaxDelete + 5 tables all older than the GC threshold (threshold + 5 days)
     val total = DynamoDBKVStoreConstants.BatchTableGCMaxDelete + 5
     val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
     (1 to total).foreach { i =>
-      kvStore.create(s"${logicalName}_${oldDate.format(fmt)}_${i}000000")
+      kvStore.create(s"${logicalName}_${oldDate.format(fmt)}_${i}000000000000")
     }
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
     val remaining = client.listTables().join().tableNames().toScala.filter(_.startsWith(logicalName))
-    // At most BatchTableGCMaxDelete deleted, so at least 5 remain
     remaining.length should be >= (total - DynamoDBKVStoreConstants.BatchTableGCMaxDelete)
     remaining.length should be <= total
   }
 
-  it should "gcOldBatchTables does not delete tables with malformed date in name" in {
+  it should "cleanupTables: request-supplied maxDelete overrides the default cap" in {
+    val logicalName = "GC_MAX_OVERRIDE_TEST"
+    val kvStore = new DynamoDBKVStoreImpl(client)
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    val total = 4
+    (1 to total).foreach { i =>
+      kvStore.create(s"${logicalName}_${oldDate.format(fmt)}_${i}000000000000")
+    }
+
+    val deleted = kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName), maxDelete = Some(2)))
+    deleted shouldBe 2
+
+    val remaining = client.listTables().join().tableNames().toScala.filter(_.startsWith(logicalName))
+    remaining.length shouldBe (total - 2)
+  }
+
+  it should "cleanupTables scoped: does not delete tables with malformed date in name" in {
     val logicalName = "GC_MALFORMED_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client)
 
-    // Table with unparseable date segment — should be left alone
+    // Non-matching name — regex requires trailing `_YYYY_MM_DD_<10+digit epoch>`
     val malformedName = s"${logicalName}_NOTADATE_12345"
     kvStore.create(malformedName)
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
     val tables = client.listTables().join().tableNames()
     tables.contains(malformedName) shouldBe true
   }
 
-  it should "gcOldBatchTables does not delete tables belonging to a different logical dataset" in {
+  it should "cleanupTables scoped: does not delete tables belonging to a different logical dataset" in {
     val logicalName = "GC_ISOLATION_A"
     val otherLogicalName = "GC_ISOLATION_B"
     val kvStore = new DynamoDBKVStoreImpl(client)
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
 
     val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 10)
-    val tableA = s"${logicalName}_${oldDate.format(fmt)}_1000000"
-    val tableB = s"${otherLogicalName}_${oldDate.format(fmt)}_1000000"
+    val tableA = s"${logicalName}_${oldDate.format(fmt)}_1000000000000"
+    val tableB = s"${otherLogicalName}_${oldDate.format(fmt)}_1000000000000"
     kvStore.create(tableA)
     kvStore.create(tableB)
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
     val tables = client.listTables().join().tableNames()
-    tables.contains(tableA) shouldBe false  // GC'd
-    tables.contains(tableB) shouldBe true   // different dataset, untouched
+    tables.contains(tableA) shouldBe false
+    tables.contains(tableB) shouldBe true
   }
 
-  it should "gcOldBatchTables swallows errors and does not throw" in {
-    // Use a dataset name for which there are no matching tables — GC should complete silently
+  it should "cleanupTables scoped: swallows errors and does not throw" in {
     val kvStore = new DynamoDBKVStoreImpl(client)
-    kvStore.gcOldBatchTables("NONEXISTENT_DATASET_XYZ")
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some("NONEXISTENT_DATASET_XYZ")))
   }
 
-  it should "gcOldBatchTables works correctly when a table prefix is configured" in {
+  it should "cleanupTables scoped: works correctly when a table prefix is configured" in {
     val tablePrefix = "MY_PREFIX_"
     val logicalName = "GC_PREFIX_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> tablePrefix))
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
 
-    // threshold + 10 days old — should be deleted
     val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 10)
-    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000"
+    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000000000"
     kvStore.create(oldTableName)
 
-    // threshold - 10 days old — should NOT be deleted
     val recentDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays - 10)
-    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000"
+    val recentTableName = s"${logicalName}_${recentDate.format(fmt)}_2000000000000"
     kvStore.create(recentTableName)
 
-    kvStore.gcOldBatchTables(logicalName)
+    kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
 
-    // Verify via the raw client (which sees physical prefixed names)
     val physicalTables = client.listTables().join().tableNames()
     physicalTables.contains(tablePrefix + oldTableName) shouldBe false
     physicalTables.contains(tablePrefix + recentTableName) shouldBe true
   }
 
-  it should "gcOldBatchTables does not run when enableTtl=false" in {
+  it should "cleanupTables: is a no-op when enableTtl=false" in {
     val logicalName = "GC_DISABLED_TTL_TEST"
     val kvStore = new DynamoDBKVStoreImpl(client, Map(KvEnableTtlArg -> "false"))
     val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
 
-    // threshold + 10 days old — would be deleted if GC ran
     val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 10)
-    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000"
+    val oldTableName = s"${logicalName}_${oldDate.format(fmt)}_1000000000000"
     kvStore.create(oldTableName)
 
-    kvStore.gcOldBatchTables(logicalName)
+    val scopedDeleted = kvStore.cleanupTables(CleanupRequest(datasetName = Some(logicalName)))
+    val unscopedDeleted = kvStore.cleanupTables(CleanupRequest())
+    scopedDeleted shouldBe 0
+    unscopedDeleted shouldBe 0
 
-    // Table must still exist — GC is skipped when TTL is disabled
     val tables = client.listTables().join().tableNames()
     tables.contains(oldTableName) shouldBe true
+  }
+
+  // ===== cleanupTables — unscoped mode (datasetName = None): cross-GroupBy orphan sweep =====
+
+  it should "cleanupTables unscoped: deletes only tables older than the GC threshold across all logical names" in {
+    // Isolate this test's tables via a dedicated table-prefix so leaked tables from earlier tests
+    // (shared DynamoDB Local container has no per-test cleanup) don't interfere with assertions.
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> "SWEEPMIX_"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    val recentDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays - 5)
+
+    val oldA = s"GBA_BATCH_${oldDate.format(fmt)}_1000000000000"
+    val recentA = s"GBA_BATCH_${recentDate.format(fmt)}_2000000000000"
+    val oldB = s"GBB_BATCH_${oldDate.format(fmt)}_3000000000000"
+    val recentB = s"GBB_BATCH_${recentDate.format(fmt)}_4000000000000"
+    Seq(oldA, recentA, oldB, recentB).foreach(kvStore.create)
+
+    // Bump maxDelete: unscoped sweep walks the underlying account (ignoring KV prefixes), so
+    // batch tables leaked by earlier tests in this shared container can hit the default cap
+    // before we reach our targets. In production, all batch tables share one KV prefix per
+    // deployment and this isn't an issue.
+    kvStore.cleanupTables(CleanupRequest(maxDelete = Some(50)))
+
+    val physicalTables = client.listTables().join().tableNames()
+    physicalTables.contains("SWEEPMIX_" + oldA) shouldBe false
+    physicalTables.contains("SWEEPMIX_" + oldB) shouldBe false
+    physicalTables.contains("SWEEPMIX_" + recentA) shouldBe true
+    physicalTables.contains("SWEEPMIX_" + recentB) shouldBe true
+  }
+
+  it should "cleanupTables unscoped: ignores tables that don't match the batch-table name pattern" in {
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> "SWEEPPAT_"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    // Short epoch tail (< 10 digits) — regex won't match, protects non-Chronon tables
+    val shortEpochTable = s"RAW_STREAMING_${oldDate.format(fmt)}_1000"
+    // Missing trailing epoch entirely (older pre-timestamp Chronon table shape)
+    val dateOnlyTable = s"OLD_FORMAT_TABLE_${oldDate.format(fmt)}"
+    // Streaming table (no date/epoch tail)
+    val streamingTable = "SOME_GROUPBY_STREAMING"
+    kvStore.create(shortEpochTable)
+    kvStore.create(dateOnlyTable)
+    kvStore.create(streamingTable)
+
+    kvStore.cleanupTables(CleanupRequest())
+
+    val physicalTables = client.listTables().join().tableNames()
+    physicalTables.contains("SWEEPPAT_" + shortEpochTable) shouldBe true
+    physicalTables.contains("SWEEPPAT_" + dateOnlyTable) shouldBe true
+    physicalTables.contains("SWEEPPAT_" + streamingTable) shouldBe true
+  }
+
+  it should "cleanupTables unscoped: deletes hourly-partitioned batch tables (YYYY_MM_DD_HH_00_epoch)" in {
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> "SWEEPHR_"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    val recentDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays - 5)
+    val oldHourly = s"AWS_DAYOFFSET_GRIDDED_V8__8_${oldDate.format(fmt)}_22_00_1787611967817"
+    val recentHourly = s"AWS_DAYOFFSET_GRIDDED_V8__8_${recentDate.format(fmt)}_22_00_1787612207390"
+    kvStore.create(oldHourly)
+    kvStore.create(recentHourly)
+
+    kvStore.cleanupTables(CleanupRequest(maxDelete = Some(50)))
+
+    val physicalTables = client.listTables().join().tableNames()
+    physicalTables.contains("SWEEPHR_" + oldHourly) shouldBe false
+    physicalTables.contains("SWEEPHR_" + recentHourly) shouldBe true
+  }
+
+  it should "cleanupTables unscoped: respects the default BatchTableSweepMaxDelete cap" in {
+    // Prefix + a leading '0' logical namespace so these tables sort ahead of any leaked
+    // stale tables from earlier tests — makes the cap assertion deterministic in the
+    // shared DynamoDB Local container.
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> "0SWEEPCAP_"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    val total = DynamoDBKVStoreConstants.BatchTableSweepMaxDelete + 3
+    val names = (1 to total).map(i => s"GB${i}_BATCH_${oldDate.format(fmt)}_${i}000000000000")
+    names.foreach(kvStore.create)
+
+    val deleted = kvStore.cleanupTables(CleanupRequest())
+    deleted shouldBe DynamoDBKVStoreConstants.BatchTableSweepMaxDelete
+
+    val physicalTables = client.listTables().join().tableNames().toScala.toSet
+    val remainingMine = names.count(n => physicalTables.contains("0SWEEPCAP_" + n))
+    remainingMine shouldBe (total - DynamoDBKVStoreConstants.BatchTableSweepMaxDelete)
+  }
+
+  it should "cleanupTables unscoped: honors the configured GC age override" in {
+    val kvStore =
+      new DynamoDBKVStoreImpl(client, Map(KvUploadBatchTableGCAgeDaysKey -> "7", KvTablePrefixArg -> "SWEEPOVR_"))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldName = s"OVERRIDE_BATCH_${LocalDate.now().minusDays(10).format(fmt)}_1000000000000"
+    val recentName = s"OVERRIDE_BATCH_${LocalDate.now().minusDays(5).format(fmt)}_2000000000000"
+    kvStore.create(oldName)
+    kvStore.create(recentName)
+
+    // See sibling: bump maxDelete past leaked-batch-table cruft in the shared container.
+    kvStore.cleanupTables(CleanupRequest(maxDelete = Some(50)))
+
+    val physicalTables = client.listTables().join().tableNames()
+    physicalTables.contains("SWEEPOVR_" + oldName) shouldBe false
+    physicalTables.contains("SWEEPOVR_" + recentName) shouldBe true
+  }
+
+  it should "cleanupTables unscoped: applies the table prefix when deleting" in {
+    val tablePrefix = "SWEEP_PREFIX_"
+    val kvStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> tablePrefix))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+    val logical = s"PREFIXED_GB_BATCH_${oldDate.format(fmt)}_1000000000000"
+    kvStore.create(logical)
+
+    // See sibling: bump maxDelete past leaked-batch-table cruft in the shared container.
+    kvStore.cleanupTables(CleanupRequest(maxDelete = Some(50)))
+
+    val physicalTables = client.listTables().join().tableNames()
+    physicalTables.contains(tablePrefix + logical) shouldBe false
+  }
+
+  it should "cleanupTables unscoped: stays within deployment prefix across multiple pages when other deployments interleave" in {
+    // Regression coverage for the pagination bug: unscoped sweep used to walk the entire
+    // account, and the wrapper's re-prefixing of un-stripped continuation tokens could
+    // silently skip our own tables and/or fire delete attempts against other deployments'
+    // physical names. With wrapper-level scoping, the raw ListTables never surfaces
+    // other-deployment names to the sweep, so pagination stays inside our slice even when
+    // the account contains regex-matching stale tables under a sibling prefix.
+    val ourPrefix = "SWMPA_"
+    val otherPrefix = "SWMPB_" // sorts strictly after ourPrefix, so the wrapper's takeWhile bails on it
+    val ourStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> ourPrefix))
+    val otherStore = new DynamoDBKVStoreImpl(client, Map(KvTablePrefixArg -> otherPrefix))
+    val fmt = DynamoDBKVStoreConstants.BatchTableDateFormatter
+
+    val oldDate = LocalDate.now().minusDays(DynamoDBKVStoreConstants.BatchTableGCAgeDays + 5)
+
+    // maxDelete=25 → pageSize=25 (floor is 20; we want > pageSize in-prefix stale tables to
+    // force at least one continuation page inside our slice).
+    val maxDelete = 25
+    val ourStaleCount = 30
+    val ourStale = (1 to ourStaleCount).map(i => s"GB_${i}_BATCH_${oldDate.format(fmt)}_${1000000000000L + i}")
+    ourStale.foreach(ourStore.create)
+
+    // Other-deployment stale tables that would match the batch regex and be old enough to
+    // delete if the sweep ever considered them. If the wrapper regresses to letting these
+    // leak through, the sweep would still (via the wrapper on the delete path) try to
+    // delete them under our prefix — a phantom name — and never actually delete them, but
+    // it would also short-circuit progress inside our slice via re-prefixed cursors.
+    val otherStale = (1 to 5).map(i => s"OTHER_GB_${i}_BATCH_${oldDate.format(fmt)}_${2000000000000L + i}")
+    otherStale.foreach(otherStore.create)
+
+    val deleted = ourStore.cleanupTables(CleanupRequest(maxDelete = Some(maxDelete)))
+    deleted shouldBe maxDelete
+
+    val physicalTables = client.listTables().join().tableNames().toScala.toSet
+    // Every other-deployment table must survive — the sweep never should have seen them.
+    otherStale.foreach(name => physicalTables.contains(otherPrefix + name) shouldBe true)
+    // Exactly `maxDelete` of ours were removed; the rest still exist.
+    val remainingOurs = ourStale.count(name => physicalTables.contains(ourPrefix + name))
+    remainingOurs shouldBe (ourStaleCount - maxDelete)
   }
 
   // ===== BatchGetItem path (DYNAMO_ENABLE_BATCH_GET=true) =====

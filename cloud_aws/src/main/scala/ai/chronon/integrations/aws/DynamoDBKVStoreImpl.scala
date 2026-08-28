@@ -565,79 +565,180 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
     )
     logger.info(s"Registry updated: $registryKey -> $physicalTableName")
 
-    gcOldBatchTables(logicalTableName)
+    cleanupTables(KVStore.CleanupRequest(datasetName = Some(logicalTableName)))
   }
 
-  /** Deletes batch tables for the given logical name that are older than the configured GC age, up to
-    * BatchTableGCMaxDelete at a time. Failures are swallowed so GC never blocks bulkPut.
+  /** Scoped mode ([[KVStore.CleanupRequest.datasetName]] set): ASCII-ordered ListTables pagination
+    * starts at the prefix and bails as soon as names diverge. Within a scoped prefix the
+    * YYYY_MM_DD_epoch tail means names sort oldest-first — the earliest `maxDelete` matches ARE
+    * the oldest ones.
+    *
+    * Unscoped mode: pages the whole account, filtering by the [[BatchTableNameRegex]] and age
+    * predicate on the fly. Stops as soon as `maxDelete` deletion-eligible tables are collected.
+    * Deletes the first-alphabetical `maxDelete` stale tables per run
+    *
+    * Returns the number of tables actually deleted. Never throws — per-table and top-level errors
+    * are logged and swallowed so cleanup never blocks the caller.
     */
-  private[aws] def gcOldBatchTables(logicalTableName: String): Unit = {
-    if (!enableTtl) return
-    try {
-      val prefix = logicalTableName.sanitize.toUpperCase + "_"
+  override def cleanupTables(request: KVStore.CleanupRequest): Int = {
+    def gcCutoffDate: LocalDate = {
       val cleanupDays = conf.get(KvUploadBatchTableGCAgeDaysKey).map(_.toLong).getOrElse(BatchTableGCAgeDays.toLong)
-      val cutoff = LocalDate.now().minusDays(cleanupDays)
+      LocalDate.now().minusDays(cleanupDays)
+    }
 
-      // DynamoDB listTables returns names in ASCII order. By starting pagination at the prefix
-      // (exclusive), we land right at the first matching table and stop as soon as names diverge —
-      // avoiding a full scan of all tables.
-      val allMatchingTables = mutable.Set.empty[String]
-      // prefix always ends with "_" (e.g. "MY_GROUPBY_BATCH_"). Dropping it gives "MY_GROUPBY_BATCH",
-      // which sorts before all "MY_GROUPBY_BATCH_..." names, so DynamoDB starts returning
-      // matches from the first page.
-      var exclusiveStart: Option[String] = Some(prefix.dropRight(1))
-      var hasMore = true
-      while (hasMore) {
-        val reqBuilder = ListTablesRequest.builder.limit(100)
-        exclusiveStart.foreach(reqBuilder.exclusiveStartTableName)
-        val resp = prefixedDynamoDbClient.listTables(reqBuilder.build()).join()
-        val page = resp.tableNames().toScala
-        val matching = page.takeWhile(_.startsWith(prefix))
-        allMatchingTables ++= matching
-        // Stop if we've gone past the prefix range or there are no more pages
-        if (matching.size < page.size || resp.lastEvaluatedTableName() == null) {
-          hasMore = false
-        } else {
-          exclusiveStart = Some(resp.lastEvaluatedTableName())
-        }
-      }
-
-      // Parse dates from table names: {PREFIX}_{YYYY_MM_DD}_{timestamp}
-      val oldTables = allMatchingTables.flatMap { tableName =>
-        val suffix = tableName.stripPrefix(prefix) // e.g. "2026_02_17_1708192000000"
-        val parts = suffix.split("_")
-        // date is first 3 parts: YYYY, MM, DD
-        if (parts.length >= 4) {
-          val dateStr = s"${parts(0)}_${parts(1)}_${parts(2)}"
-          try {
-            val tableDate = LocalDate.parse(dateStr, BatchTableDateFormatter)
-            if (tableDate.isBefore(cutoff)) Some(tableName) else None
-          } catch {
-            case e: DateTimeParseException =>
-              logger.warn(s"Could not parse date from batch table name '$tableName': ${e.getMessage}")
-              None
-          }
-        } else None
-      }
-
-      val toDelete = oldTables.toSeq.sortBy(identity).take(BatchTableGCMaxDelete)
-      logger.info(
-        s"Batch table GC for $logicalTableName: found ${oldTables.size} tables older than $cleanupDays days, deleting ${toDelete.size}")
-
+    if (!enableTtl) return 0
+    val defaultMax = request.datasetName.fold(BatchTableSweepMaxDelete)(_ => BatchTableGCMaxDelete)
+    val maxDelete = request.maxDelete.getOrElse(defaultMax)
+    val prefix = request.datasetName.map(_.sanitize.toUpperCase + "_")
+    val mode = if (prefix.isDefined) "scoped" else "sweep"
+    val modeTag = Map("mode" -> mode)
+    val cleanupMetrics = metricsContext.withSuffix("cleanup")
+    val logContext = prefix.map(p => s"Batch table cleanup for prefix $p").getOrElse("Batch table sweep")
+    val cycleStartTs = System.currentTimeMillis()
+    cleanupMetrics.increment("cycles", modeTag)
+    try {
+      val cutoff = gcCutoffDate
+      val toDelete = collectDeletionCandidates(prefix, cutoff, maxDelete)
+      cleanupMetrics.distribution("candidates_found", toDelete.size.toLong, modeTag)
+      logger.info(s"$logContext: deleting ${toDelete.size} table(s) (cap=$maxDelete)")
+      var deleted = 0
       toDelete.foreach { tableName =>
+        val physicalName = prefixedDynamoDbClient.prefixTableName(tableName)
         try {
-          prefixedDynamoDbClient
-            .deleteTable(DeleteTableRequest.builder.tableName(tableName).build())
-            .join()
-          logger.info(s"Deleted old batch table: $tableName")
+          if (removeReplicasThenDelete(tableName, modeTag)) {
+            logger.info(s"Deleted old batch table: $physicalName")
+            cleanupMetrics.increment("deleted", modeTag)
+            deleted += 1
+          }
+          // False = replica removal was kicked off but the table itself isn't gone yet; a
+          // subsequent cleanup cycle picks it up once replicas are removed.
         } catch {
           case e: Exception =>
-            logger.warn(s"Failed to delete old batch table: $tableName", e)
+            logger.warn(s"Failed to delete old batch table: $physicalName", e)
+            cleanupMetrics.increment("delete_failures", modeTag)
         }
       }
+      deleted
     } catch {
       case e: Exception =>
-        logger.warn(s"Batch table GC failed for $logicalTableName, skipping", e)
+        logger.warn(s"$logContext failed, skipping", e)
+        cleanupMetrics.increment("cycle_failures", modeTag)
+        0
+    } finally {
+      cleanupMetrics.distribution("cycle_latency_ms", System.currentTimeMillis() - cycleStartTs, modeTag)
+    }
+  }
+
+  // DeleteTable on a global-table primary while replicas exist returns ResourceInUseException.
+  // Fire-and-forget: if replicas exist we issue one UpdateTable to remove them and return
+  // `false` — replica removal is asynchronous on the AWS side (can take minutes to tens of
+  // minutes) and we don't want to stall the callers. A subsequent cleanup cycle will observe
+  // the replicas are gone and issue DeleteTable. Returns true iff the primary was deleted this call.
+  private[aws] def removeReplicasThenDelete(tableName: String, modeTag: Map[String, String] = Map.empty): Boolean = {
+    val cleanupMetrics = metricsContext.withSuffix("cleanup")
+    val physicalName = prefixedDynamoDbClient.prefixTableName(tableName)
+    val replicaStatuses = fetchReplicaStatuses(tableName)
+    if (replicaStatuses.nonEmpty) {
+      // Only ACTIVE replicas can be removed via DeleteReplicationGroupMemberAction. Any other
+      // state (DELETING = removal already in flight; CREATING / UPDATING / CREATION_FAILED /
+      // REGION_DISABLED / INACCESSIBLE_ENCRYPTION_CREDENTIALS = transitional or terminal-bad)
+      // makes AWS reject the delete action. In practice these are rare 30 days after table
+      // creation, so we skip the whole table this cycle and surface a metric — a persistently
+      // stuck replica is an operational problem in its own right, not something cleanup can fix.
+      val active = replicaStatuses.collect { case (region, ReplicaStatus.ACTIVE) => region }.toSeq
+      val nonActive = replicaStatuses.filterNot { case (_, s) => s == ReplicaStatus.ACTIVE }
+      if (nonActive.nonEmpty) {
+        logger.info(s"Table '$physicalName' has non-ACTIVE replicas ${nonActive
+            .map { case (r, s) => s"$r=$s" }
+            .toSeq
+            .sorted
+            .mkString(", ")}; skipping this cycle")
+        cleanupMetrics.increment("skipped_non_active_replica", modeTag)
+        return false
+      }
+      logger.info(s"Table '$physicalName' has replicas in ${active.sorted
+          .mkString(", ")}; issuing async removal — DeleteTable deferred to a later cleanup cycle")
+      val replicaUpdates = active.map { region =>
+        ReplicationGroupUpdate
+          .builder()
+          .delete(DeleteReplicationGroupMemberAction.builder().regionName(region).build())
+          .build()
+      }
+      val updateRequest = UpdateTableRequest
+        .builder()
+        .tableName(tableName)
+        .replicaUpdates(replicaUpdates.toList.toJava)
+        .overrideConfiguration(DynamoDBKVStoreConstants.ControlPlaneApiOverride)
+        .build()
+      prefixedDynamoDbClient.updateTable(updateRequest).join()
+      cleanupMetrics.increment("replica_removal_issued", modeTag)
+      return false
+    }
+    val deleteRequest = DeleteTableRequest
+      .builder()
+      .tableName(tableName)
+      .overrideConfiguration(DynamoDBKVStoreConstants.ControlPlaneApiOverride)
+      .build()
+    prefixedDynamoDbClient.deleteTable(deleteRequest).join()
+    true
+  }
+
+  // Paginate ListTables, filter by prefix / regex + age on the fly, stop as soon as we have
+  // `maxDelete` deletion-eligible names.
+  //
+  // `prefixedDynamoDbClient.listTables` scopes results to this deployment's `tablePrefix`
+  // automatically — cross-deployment tables never surface here. That means:
+  //   - Scoped mode: page returns only in-deployment names; we further narrow to the logical
+  //     dataset prefix and stop the moment names diverge past it.
+  //   - Unscoped mode: page returns this deployment's tables in ASCII order; we filter each
+  //     page by [[BatchTableNameRegex]] to skip non-batch-shaped names (e.g. streaming tables
+  //     or non-Chronon tables that happen to share the deployment prefix).
+  private[aws] def collectDeletionCandidates(prefix: Option[String], cutoff: LocalDate, maxDelete: Int): Seq[String] = {
+    if (maxDelete <= 0) return Seq.empty
+    // Use a modest page size — no need for the full 100 when we only want a handful, but not so
+    // small that a prefix with mostly-recent tables burns roundtrips before finding old ones.
+    val pageSize = math.min(100, math.max(20, maxDelete))
+    val collected = mutable.ListBuffer.empty[String]
+    val seen = mutable.Set.empty[String]
+    var exclusiveStart: Option[String] = prefix.map(_.dropRight(1))
+    var hasMore = true
+    while (hasMore && collected.size < maxDelete) {
+      val reqBuilder = ListTablesRequest.builder.limit(pageSize)
+      exclusiveStart.foreach(reqBuilder.exclusiveStartTableName)
+      val resp = prefixedDynamoDbClient.listTables(reqBuilder.build()).join()
+      val page = resp.tableNames().toScala
+      val (inScope, divergedPastPrefix) = prefix match {
+        case Some(p) =>
+          val matching = page.takeWhile(_.startsWith(p))
+          (matching, matching.size < page.size)
+        case None =>
+          (page.filter(BatchTableNameRegex.pattern.matcher(_).matches()), false)
+      }
+      inScope.iterator
+        .filterNot(seen.contains)
+        .foreach { name =>
+          seen += name
+          parseBatchTableDate(name).foreach { date =>
+            if (date.isBefore(cutoff) && collected.size < maxDelete) collected += name
+          }
+        }
+      if (divergedPastPrefix || resp.lastEvaluatedTableName() == null) hasMore = false
+      else exclusiveStart = Some(resp.lastEvaluatedTableName())
+    }
+    collected.toSeq
+  }
+
+  // Parses the {YYYY_MM_DD} date from a Chronon batch physical table name. Anchors on the
+  // trailing {YYYY_MM_DD}_{epochMillis} tail (see [[BatchTableNameRegex]]) so scoped and
+  // unscoped callers share one path — no need to know the logical prefix ahead of time.
+  private def parseBatchTableDate(tableName: String): Option[LocalDate] = {
+    BatchTableNameRegex.findFirstMatchIn(tableName).flatMap { m =>
+      try Some(LocalDate.parse(m.group(1), BatchTableDateFormatter))
+      catch {
+        case e: DateTimeParseException =>
+          logger.warn(s"Could not parse date from batch table name '$tableName': ${e.getMessage}")
+          None
+      }
     }
   }
 
@@ -990,9 +1091,18 @@ object DynamoDBKVStoreConstants {
 
   val BatchTableGCAgeDays = 30
   val BatchTableGCMaxDelete = 10
+  // sweep delete counts are lower as we run them periodically
+  val BatchTableSweepMaxDelete = 5
   // Batch table names embed the date with '_' separators (e.g. 2026_04_16) since '-' is not valid in DynamoDB table names
   val BatchTableDateFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern(PartitionSpec.daily.format.replace("-", "_"))
+  // Chronon batch physical table name shapes (see bulkPut):
+  //   Daily:  {SANITIZED_LOGICAL}_YYYY_MM_DD_{epochMillis}
+  //   Hourly: {SANITIZED_LOGICAL}_YYYY_MM_DD_HH_00_{epochMillis} (hourly partition spec)
+  // We anchor on the trailing 10+ digit epoch to keep false-positive risk low against arbitrary
+  // non-Chronon tables in the same account.
+  val BatchTableNameRegex: scala.util.matching.Regex =
+    """.*_(\d{4}_\d{2}_\d{2})(?:_\d{2}_\d{2})?_\d{10,}$""".r
 
   def roundToDay(timestampMillis: Long): Long = {
     timestampMillis - (timestampMillis % MillisPerDay)

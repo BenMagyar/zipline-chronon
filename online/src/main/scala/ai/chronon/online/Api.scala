@@ -55,6 +55,10 @@ object KVStore {
   case class ListValue(keyBytes: Array[Byte], valueBytes: Array[Byte])
   case class ListRequest(dataset: String, props: Map[String, Any])
   case class ListResponse(request: ListRequest, values: Try[Seq[ListValue]], resultProps: Map[String, Any])
+
+  // datasetName - When present, scopes cleanup to tables associated with the given logical dataset (e.g. per-GroupBy cleanup),
+  // maxDelete - Cap on the number of tables deleted
+  case class CleanupRequest(datasetName: Option[String] = None, maxDelete: Option[Int] = None)
 }
 
 // the main system level api for key value storage
@@ -79,6 +83,8 @@ trait KVStore {
   def multiPut(keyValueDatasets: Seq[PutRequest]): Future[Seq[Boolean]]
 
   def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit
+
+  def cleanupTables(request: CleanupRequest): Int = 0
 
   def put(putRequest: PutRequest): Future[Boolean] = multiPut(Seq(putRequest)).map(_.head)
 

@@ -15,7 +15,7 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
 
   private val logger = LoggerFactory.getLogger(getClass)
 
-  private def prefixTableName(tableName: String): String = {
+  private[aws] def prefixTableName(tableName: String): String = {
     if (tableName == null || tableName.isEmpty) tableName
     else tablePrefix + tableName
   }
@@ -110,29 +110,45 @@ class PrefixedDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, tablePrefix: St
     delegate.createTable(prefixedRequest)
   }
 
-  /** Lists tables whose names start with the given prefix (after applying the client table prefix).
-    * The response table names have the client prefix stripped so callers see logical names.
+  /** Pagination:
+    *   - Callers pass a logical `exclusiveStartTableName` (or none for the first page). We
+    *     compose the physical start key here. On page 1 with no cursor, we inject
+    *     `tablePrefix` as the physical start so DynamoDB begins iterating at the prefix range
+    *     (rather than the top of the account).
+    *   - If a page's returned names diverge past `tablePrefix`, we truncate the response and
+    *     suppress `lastEvaluatedTableName` — from the caller's perspective there are no more
+    *     pages. This prevents an un-stripped other-deployment cursor from being fed back on
+    *     the next page and re-prefixed by us into a phantom key that silently skips our
+    *     tables (the old behavior).
     */
   def listTables(request: ListTablesRequest): CompletableFuture[ListTablesResponse] = {
-    // Prefix the exclusiveStartTableName if present
-    val prefixedRequest = if (request.exclusiveStartTableName() != null) {
-      request.toBuilder.exclusiveStartTableName(prefixTableName(request.exclusiveStartTableName())).build()
-    } else {
-      request
+    val hasPrefix = tablePrefix.nonEmpty
+    val prefixedRequest = (request.exclusiveStartTableName(), hasPrefix) match {
+      case (null, true)  => request.toBuilder.exclusiveStartTableName(tablePrefix).build()
+      case (null, false) => request
+      case (name, _)     => request.toBuilder.exclusiveStartTableName(prefixTableName(name)).build()
     }
     delegate.listTables(prefixedRequest).thenApply { response =>
-      // Strip the client prefix from returned table names so callers see logical names
-      val strippedNames = response.tableNames().toArray(new Array[String](0)).map { name =>
-        if (isTablePrefixed(name)) name.substring(tablePrefix.length)
-        else name
-      }
-      val builder = response.toBuilder.tableNames(strippedNames: _*)
-      // Strip prefix from lastEvaluatedTableName if present
-      val lastEval = response.lastEvaluatedTableName()
-      if (lastEval != null && tablePrefix.nonEmpty && lastEval.startsWith(tablePrefix)) {
-        builder.lastEvaluatedTableName(lastEval.substring(tablePrefix.length)).build()
+      if (!hasPrefix) {
+        response
       } else {
-        builder.build()
+        val rawNames = response.tableNames()
+        // takeWhile: results come back in ASCII order, so once a name diverges from the
+        // prefix we're past our slice — everything after is other deployments.
+        val inScopePhysical = rawNames.toArray(new Array[String](0)).takeWhile(_.startsWith(tablePrefix))
+        val divergedPastPrefix = inScopePhysical.length < rawNames.size()
+        val stripped = inScopePhysical.map(_.substring(tablePrefix.length))
+        val builder = response.toBuilder.tableNames(stripped: _*)
+        val lastEval = response.lastEvaluatedTableName()
+        if (divergedPastPrefix) {
+          // Explicitly clear — if we returned it, the caller would feed it back and we'd
+          // re-prefix into a nonsense key. From their view, pagination is done.
+          builder.lastEvaluatedTableName(null.asInstanceOf[String]).build()
+        } else if (lastEval != null && lastEval.startsWith(tablePrefix)) {
+          builder.lastEvaluatedTableName(lastEval.substring(tablePrefix.length)).build()
+        } else {
+          builder.build()
+        }
       }
     }
   }
