@@ -23,7 +23,7 @@
           "spark.sql.defaultCatalog": "iceberg",
           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
           "spark.sql.shuffle.partitions": "10",
-          "taskmanager.memory.process.size": "4G"
+          "taskmanager.memory.process.size": "16G"
         },
         "modeConfigs": {
           "backfill": {
@@ -49,7 +49,7 @@
             "spark.sql.defaultCatalog": "iceberg",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
             "spark.sql.shuffle.partitions": "10",
-            "taskmanager.memory.process.size": "4G"
+            "taskmanager.memory.process.size": "16G"
           },
           "upload": {
             "spark.chronon.coalesce.factor": "10",
@@ -72,7 +72,7 @@
             "spark.sql.defaultCatalog": "iceberg",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
             "spark.sql.shuffle.partitions": "10",
-            "taskmanager.memory.process.size": "4G"
+            "taskmanager.memory.process.size": "16G"
           }
         }
       },

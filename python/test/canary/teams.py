@@ -12,7 +12,7 @@ default = Team(
     conf=ConfigProperties(
         common={
             "spark.chronon.partition.column": "ds",
-            "taskmanager.memory.process.size": "4G",
+            "taskmanager.memory.process.size": "16G",
         }
     ),
     env=EnvironmentVariables(

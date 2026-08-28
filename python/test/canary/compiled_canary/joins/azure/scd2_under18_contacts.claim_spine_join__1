@@ -49,7 +49,7 @@
                 "spark.sql.catalog.spark_catalog.uri": "https://vejlulx-azure-oc.snowflakecomputing.com/polaris/api/catalog",
                 "spark.sql.catalog.spark_catalog.warehouse": "demo-v2",
                 "spark.sql.shuffle.partitions": "10",
-                "taskmanager.memory.process.size": "4G"
+                "taskmanager.memory.process.size": "16G"
               }
             },
             "env": {
@@ -158,7 +158,7 @@
                 "spark.sql.catalog.spark_catalog.uri": "https://vejlulx-azure-oc.snowflakecomputing.com/polaris/api/catalog",
                 "spark.sql.catalog.spark_catalog.warehouse": "demo-v2",
                 "spark.sql.shuffle.partitions": "10",
-                "taskmanager.memory.process.size": "4G"
+                "taskmanager.memory.process.size": "16G"
               }
             },
             "env": {
@@ -252,7 +252,7 @@
                               "spark.sql.catalog.spark_catalog.uri": "https://vejlulx-azure-oc.snowflakecomputing.com/polaris/api/catalog",
                               "spark.sql.catalog.spark_catalog.warehouse": "demo-v2",
                               "spark.sql.shuffle.partitions": "10",
-                              "taskmanager.memory.process.size": "4G"
+                              "taskmanager.memory.process.size": "16G"
                             }
                           },
                           "env": {
@@ -353,7 +353,7 @@
                         "spark.sql.catalog.spark_catalog.uri": "https://vejlulx-azure-oc.snowflakecomputing.com/polaris/api/catalog",
                         "spark.sql.catalog.spark_catalog.warehouse": "demo-v2",
                         "spark.sql.shuffle.partitions": "10",
-                        "taskmanager.memory.process.size": "4G"
+                        "taskmanager.memory.process.size": "16G"
                       }
                     },
                     "env": {
@@ -467,7 +467,7 @@
           "spark.sql.catalog.spark_catalog.uri": "https://vejlulx-azure-oc.snowflakecomputing.com/polaris/api/catalog",
           "spark.sql.catalog.spark_catalog.warehouse": "demo-v2",
           "spark.sql.shuffle.partitions": "10",
-          "taskmanager.memory.process.size": "4G"
+          "taskmanager.memory.process.size": "16G"
         }
       },
       "env": {

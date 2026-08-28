@@ -57,7 +57,7 @@
                 "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
                 "spark.sql.shuffle.partitions": "10",
                 "spark.sql.warehouse.dir": "s3://zipline-warehouse-crucible/data/uc-poc/warehouse/",
-                "taskmanager.memory.process.size": "4G"
+                "taskmanager.memory.process.size": "16G"
               }
             },
             "env": {
@@ -173,7 +173,7 @@
           "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
           "spark.sql.shuffle.partitions": "10",
           "spark.sql.warehouse.dir": "s3://zipline-warehouse-crucible/data/uc-poc/warehouse/",
-          "taskmanager.memory.process.size": "4G"
+          "taskmanager.memory.process.size": "16G"
         }
       },
       "env": {

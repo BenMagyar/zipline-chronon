@@ -46,7 +46,7 @@
                 "spark.sql.defaultCatalog": "spark_catalog",
                 "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
                 "spark.sql.shuffle.partitions": "10",
-                "taskmanager.memory.process.size": "4G"
+                "taskmanager.memory.process.size": "16G"
               }
             },
             "env": {
@@ -183,7 +183,7 @@
           "spark.sql.defaultCatalog": "spark_catalog",
           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
           "spark.sql.shuffle.partitions": "10",
-          "taskmanager.memory.process.size": "4G"
+          "taskmanager.memory.process.size": "16G"
         }
       },
       "env": {

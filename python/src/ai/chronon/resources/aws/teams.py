@@ -14,7 +14,7 @@ default = Team(
 
             "spark.chronon.table_write.upload.format": "ion",
             # Flink
-            "taskmanager.memory.process.size": "4G",
+            "taskmanager.memory.process.size": "16G",
 
             # TODO: Choose a data catalog configuration.
 
