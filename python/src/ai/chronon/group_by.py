@@ -202,8 +202,10 @@ class Operation:
 
         :param k: Number of unique top-ranked values to return.
 
-        Automatically deduplicates inputs. For structs, requires sort_key (String)
-        and unique_id (Long) fields.
+        Automatically deduplicates inputs. For structs, the row with the maximum
+        sort_key is retained for each unique_id, with equal sort_key values ordered
+        by unique_id ascending. Rows with the same unique_id and sort_key must have
+        identical payloads. Requires sort_key (String) and unique_id (Long) fields.
         """
         return collector(ttypes.Operation.UNIQUE_TOP_K, k)
 

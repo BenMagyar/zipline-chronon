@@ -40,7 +40,7 @@ of aggregations.
 
 `count`, `average`, `variance`, `min`, `max`, `top_k`, `bottom_k` are some self-describing and simple aggregations.
 
-`unique_top_k` returns the top k unique elements based on their values (not frequency). It automatically deduplicates inputs using unique identifiers and ranks them by their ordering values. For primitive types (int, long, string), the value itself is used for both ordering and uniqueness. For struct types, the struct must contain:
+`unique_top_k` returns the top k unique elements based on their values (not frequency). It automatically deduplicates inputs using unique identifiers and ranks them by their ordering values. For primitive types (int, long, string), the value itself is used for both ordering and uniqueness. For struct inputs, the row with the maximum `sort_key` is retained for each `unique_id`, then rows are ranked by `sort_key` descending and `unique_id` ascending. Rows with the same `unique_id` and `sort_key` must have identical payloads. Structs must contain:
 - `sort_key` field of type String - used for ordering/ranking
 - `unique_id` field of type Long - used for deduplication
 

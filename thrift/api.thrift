@@ -233,7 +233,7 @@ enum Operation {
 
     APPROX_FREQUENT_K = 18, // returns map(string -> int) of top k most frequent elems
     APPROX_HEAVY_HITTERS_K = 19,  // returns skewed elements of the column upto size k
-    UNIQUE_TOP_K = 20  // returns top k unique elements based on frequency
+    UNIQUE_TOP_K = 20  // returns top k elements, retaining the maximum-ranked row for each unique ID
 }
 
 

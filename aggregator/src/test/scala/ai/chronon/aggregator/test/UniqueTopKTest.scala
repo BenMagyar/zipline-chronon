@@ -9,6 +9,27 @@ import scala.util.Random
 
 class UniqueTopKAggregatorTest extends AnyFlatSpec {
 
+  private val uniqueTopKStructType = StructType("TestStruct",
+                                                Array(
+                                                  StructField("sort_key", StringType),
+                                                  StructField("unique_id", LongType),
+                                                  StructField("value", IntType)
+                                                ))
+
+  private def structResult(aggregator: UniqueTopKAggregator[Array[Any]], ir: Any): List[(String, Long, Int)] =
+    aggregator
+      .finalize(ir)
+      .asScala
+      .map(row => (row(0).asInstanceOf[String], row(1).asInstanceOf[Long], row(2).asInstanceOf[Int]))
+      .toList
+
+  private def aggregateStructs(inputs: Seq[Array[Any]], k: Int): List[(String, Long, Int)] = {
+    val aggregator = new UniqueTopKAggregator[Array[Any]](uniqueTopKStructType, k)
+    val ir = aggregator.prepare(inputs.head)
+    inputs.tail.foreach(input => aggregator.update(ir, input))
+    structResult(aggregator, ir)
+  }
+
   "UniqueTopKAggregator with IntType" should "return top k unique integers" in {
     val k = 3
     val aggregator = new UniqueTopKAggregator[Int](IntType, k)
@@ -70,21 +91,14 @@ class UniqueTopKAggregatorTest extends AnyFlatSpec {
   }
 
   "UniqueTopKAggregator with StructType" should "return top k unique structs" in {
-    val structType = StructType("TestStruct",
-                                Array(
-                                  StructField("sort_key", StringType),
-                                  StructField("unique_id", LongType),
-                                  StructField("value", IntType)
-                                ))
-
     val k = 2
-    val aggregator = new UniqueTopKAggregator[Array[Any]](structType, k)
+    val aggregator = new UniqueTopKAggregator[Array[Any]](uniqueTopKStructType, k)
 
     val inputs = List(
       Array("z", 1L, 10),
       Array("y", 2L, 20),
       Array("x", 3L, 30),
-      Array("z", 1L, 40), // Duplicate unique_id
+      Array("x", 1L, 40), // Lower-ranked duplicate unique_id
       Array("w", 4L, 50)
     )
 
@@ -97,6 +111,106 @@ class UniqueTopKAggregatorTest extends AnyFlatSpec {
     assertEquals(k, result.size())
     assertEquals("z", resultList(0)(0)) // Top by sort_key
     assertEquals("y", resultList(1)(0)) // Second by sort_key
+  }
+
+  it should "retain the maximum sort key for each unique id regardless of input order" in {
+    val lowerRankedDuplicate = Array[Any]("a", 1L, 10)
+    val higherRankedDuplicate = Array[Any]("c", 1L, 30)
+    val other = Array[Any]("b", 2L, 20)
+
+    val lowerFirst = aggregateStructs(Seq(lowerRankedDuplicate, other, higherRankedDuplicate), k = 2)
+    val higherFirst = aggregateStructs(Seq(higherRankedDuplicate, other, lowerRankedDuplicate), k = 2)
+
+    val expected = List(("c", 1L, 30), ("b", 2L, 20))
+    assertEquals(expected, lowerFirst)
+    assertEquals(expected, higherFirst)
+  }
+
+  it should "retain the maximum sort key for each unique id regardless of merge order" in {
+    def states() = {
+      val aggregator = new UniqueTopKAggregator[Array[Any]](uniqueTopKStructType, k = 3)
+
+      val left = aggregator.prepare(Array[Any]("a", 1L, 10))
+      aggregator.update(left, Array[Any]("b", 2L, 20))
+
+      val right = aggregator.prepare(Array[Any]("d", 1L, 40))
+      aggregator.update(right, Array[Any]("c", 3L, 30))
+
+      (aggregator, left, right)
+    }
+
+    def merge(leftFirst: Boolean): List[(String, Long, Int)] = {
+      val (aggregator, left, right) = states()
+      val merged = if (leftFirst) aggregator.merge(left, right) else aggregator.merge(right, left)
+      structResult(aggregator, merged)
+    }
+
+    val expected = List(("d", 1L, 40), ("c", 3L, 30), ("b", 2L, 20))
+    assertEquals(expected, merge(leftFirst = true))
+    assertEquals(expected, merge(leftFirst = false))
+  }
+
+  it should "use unique id to deterministically break equal sort key ties" in {
+    val inputs = Seq(
+      Array[Any]("a", 3L, 30),
+      Array[Any]("a", 2L, 20),
+      Array[Any]("a", 1L, 10)
+    )
+
+    val expected = List(("a", 1L, 10), ("a", 2L, 20))
+    assertEquals(expected, aggregateStructs(inputs, k = 2))
+    assertEquals(expected, aggregateStructs(inputs.reverse, k = 2))
+  }
+
+  it should "reject conflicting payloads for the same unique id and sort key" in {
+    val aggregator = new UniqueTopKAggregator[Array[Any]](uniqueTopKStructType, k = 2)
+    val ir = aggregator.prepare(Array[Any]("a", 1L, 10))
+
+    val exception = intercept[IllegalArgumentException] {
+      aggregator.update(ir, Array[Any]("a", 1L, 20))
+    }
+
+    assertTrue(exception.getMessage.contains("unique_id=1"))
+    assertTrue(exception.getMessage.contains("sort_key=a"))
+  }
+
+  it should "match an exact top k oracle across pruning and merge orders" in {
+    val k = 5
+    val inputs = (0 until 120).map { index =>
+      val uniqueId = (index % 17).toLong
+      val score = (index * 37) % 20
+      Array[Any](f"$score%02d", uniqueId, index)
+    }
+    val expected = inputs
+      .groupBy(row => row(1).asInstanceOf[Long])
+      .values
+      .map(_.maxBy(row => row(0).asInstanceOf[String]))
+      .toSeq
+      .sortWith { (left, right) =>
+        val leftSortKey = left(0).asInstanceOf[String]
+        val rightSortKey = right(0).asInstanceOf[String]
+        leftSortKey > rightSortKey ||
+        (leftSortKey == rightSortKey && left(1).asInstanceOf[Long] < right(1).asInstanceOf[Long])
+      }
+      .take(k)
+      .map(row => (row(0).asInstanceOf[String], row(1).asInstanceOf[Long], row(2).asInstanceOf[Int]))
+      .toList
+
+    (0 until 5).foreach { seed =>
+      val aggregator = new UniqueTopKAggregator[Array[Any]](uniqueTopKStructType, k)
+      val partialStates = new Random(seed)
+        .shuffle(inputs)
+        .grouped(7)
+        .map { group =>
+          val state = aggregator.prepare(group.head)
+          group.tail.foreach(row => aggregator.update(state, row))
+          state
+        }
+        .toSeq
+      val merged = new Random(seed + 100).shuffle(partialStates).reduce(aggregator.merge)
+
+      assertEquals(s"seed=$seed", expected, structResult(aggregator, merged))
+    }
   }
 
   "UniqueTopKAggregator with StructType" should "validate struct field requirements" in {

@@ -489,11 +489,11 @@ object FetcherTestUtil {
     val mutationData = Seq(
       Row(1L,
           toTs("2021-04-08 00:30:00"),
-          Row("z", 1L, 400),
+          Row("zz", 1L, 400),
           "2021-04-09",
           toTs("2021-04-08 00:30:00"),
           false
-      ), // duplicate unique_id
+      ), // higher-ranked duplicate unique_id
       Row(1L, toTs("2021-04-09 00:30:00"), Row("v", 7L, 600), "2021-04-09", toTs("2021-04-09 00:30:00"), false)
     )
 

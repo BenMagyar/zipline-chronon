@@ -52,8 +52,31 @@ object UniqueOrderByLimit {
 
     def insert(elem: T, state: State[T, OrderType]): Unit = {
 
-      // dedup first
-      if (state.ids.contains(getId(elem))) return
+      val id = getId(elem)
+
+      if (state.ids.contains(id)) {
+        var index = 0
+        while (index < state.elems.size() && getId(state.elems.get(index)) != id) {
+          index += 1
+        }
+
+        if (index == state.elems.size()) {
+          throw new IllegalStateException(s"UniqueTopK state contains id $id without its corresponding element")
+        }
+
+        val existing = state.elems.get(index)
+        val comparison = ordering.compare(getOrderKey(elem), getOrderKey(existing))
+        if ((topK && comparison > 0) || (!topK && comparison < 0)) {
+          state.elems.set(index, elem)
+        } else if (
+          comparison == 0 &&
+          !util.Objects.deepEquals(existing.asInstanceOf[AnyRef], elem.asInstanceOf[AnyRef])
+        ) {
+          throw new IllegalArgumentException(
+            s"Conflicting UNIQUE_TOP_K rows for unique_id=$id, sort_key=${getOrderKey(existing)}")
+        }
+        return
+      }
 
       val orderKey = getOrderKey(elem)
 
@@ -67,12 +90,12 @@ object UniqueOrderByLimit {
           }
 
           state.elems.add(elem)
-          state.ids.add(getId(elem))
+          state.ids.add(id)
 
-        } else if (ordering.gt(orderKey, state.orderWaterMark)) {
+        } else if (ordering.gteq(orderKey, state.orderWaterMark)) {
 
           state.elems.add(elem)
-          state.ids.add(getId(elem))
+          state.ids.add(id)
 
         }
       } else {
@@ -85,12 +108,12 @@ object UniqueOrderByLimit {
           }
 
           state.elems.add(elem)
-          state.ids.add(getId(elem))
+          state.ids.add(id)
 
-        } else if (ordering.lt(orderKey, state.orderWaterMark)) {
+        } else if (ordering.lteq(orderKey, state.orderWaterMark)) {
 
           state.elems.add(elem)
-          state.ids.add(getId(elem))
+          state.ids.add(id)
 
         }
       }
@@ -107,14 +130,11 @@ object UniqueOrderByLimit {
           val o1Key = getOrderKey(o1)
           val o2Key = getOrderKey(o2)
 
-          // sort desc when topK or sort asc when bottomK
-          if (topK) {
-            // descending
-            ordering.compare(o2Key, o1Key)
-          } else {
-            // ascending
-            ordering.compare(o1Key, o2Key)
-          }
+          val orderComparison =
+            if (topK) ordering.compare(o2Key, o1Key)
+            else ordering.compare(o1Key, o2Key)
+
+          if (orderComparison != 0) orderComparison else java.lang.Long.compare(getId(o1), getId(o2))
         }
       })
     }
