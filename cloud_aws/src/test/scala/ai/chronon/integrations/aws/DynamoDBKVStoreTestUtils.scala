@@ -1,7 +1,13 @@
 package ai.chronon.integrations.aws
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
-import software.amazon.awssdk.services.dynamodb.model.{BatchGetItemRequest, BatchGetItemResponse, ReplicaStatus}
+import software.amazon.awssdk.services.dynamodb.model.{
+  BatchGetItemRequest,
+  BatchGetItemResponse,
+  GetItemRequest,
+  GetItemResponse,
+  ReplicaStatus
+}
 
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicInteger
@@ -139,4 +145,27 @@ class PoisonedChunkBatchDynamoDBKVStore(client: DynamoDbAsyncClient,
                                          DynamoDBKVStoreConstants.partitionKeyColumn,
                                          poisonBytes,
                                          error)
+}
+
+/** Wraps getItem to count calls whose table name matches the given target. Used to prove that a
+  * request landing between scheduler ticks does NOT trigger an extra loader call.
+  */
+class CountingGetItemDynamoDbAsyncClient(delegate: DynamoDbAsyncClient, prefix: String, targetTable: String)
+    extends PrefixedDynamoDbAsyncClient(delegate, prefix) {
+  val targetGetItemCallCount: AtomicInteger = new AtomicInteger(0)
+
+  override def getItem(request: GetItemRequest): CompletableFuture[GetItemResponse] = {
+    if (request.tableName() == targetTable) targetGetItemCallCount.incrementAndGet()
+    super.getItem(request)
+  }
+}
+
+class CountingRegistryGetItemKVStore(client: DynamoDbAsyncClient, conf: Map[String, String] = Map.empty)
+    extends DynamoDBKVStoreImpl(client, conf) {
+  override protected def newPrefixedClient(delegate: DynamoDbAsyncClient,
+                                           prefix: String): PrefixedDynamoDbAsyncClient =
+    new CountingGetItemDynamoDbAsyncClient(delegate, prefix, DynamoDBKVStoreConstants.batchTableRegistry)
+
+  def registryGetItemCount: Int =
+    prefixedDynamoDbClient.asInstanceOf[CountingGetItemDynamoDbAsyncClient].targetGetItemCallCount.get()
 }

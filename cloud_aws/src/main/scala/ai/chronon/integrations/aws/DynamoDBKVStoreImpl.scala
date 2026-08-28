@@ -2,14 +2,15 @@ package ai.chronon.integrations.aws
 
 import ai.chronon.api.Constants.{
   ContinuationKey,
+  DynamoDbReplicaWaitTimeoutMsKey,
   KvEnableTtlArg,
   KvReplicaRegionsArg,
-  DynamoDbReplicaWaitTimeoutMsKey,
   KvTablePrefixArg,
   KvUploadBatchTableGCAgeDaysKey,
   KvUploadTimeoutMsKey,
   ListLimit
 }
+import ai.chronon.integrations.aws.AwsApiImpl.DynamoBatchRegistryRefreshIntervalMs
 import ai.chronon.api.Extensions.StringOps
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api.{Constants, PartitionSpec, TilingUtils}
@@ -27,7 +28,14 @@ import java.nio.charset.Charset
 import java.time.{Duration, Instant, LocalDate}
 import java.time.format.{DateTimeFormatter, DateTimeParseException}
 import java.util
-import java.util.concurrent.{CompletableFuture, CompletionException}
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{
+  CompletableFuture,
+  CompletionException,
+  ScheduledFuture,
+  ScheduledThreadPoolExecutor,
+  TimeUnit
+}
 import scala.collection.mutable
 import scala.compat.java8.FutureConverters
 import scala.concurrent.duration._
@@ -64,8 +72,22 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
 
   protected val metricsContext: Metrics.Context = Metrics.Context(Metrics.Environment.KVStore).withSuffix("dynamodb")
 
+  // Scheduled refresher drives cache freshness; request-path refresh() is a fallback for scheduler
+  // gaps and cold-start reads. Cache's refresh interval is tuned to 2x scheduler interval so a request
+  // landing between ticks doesn't enqueue a redundant refresh in the steady state. When the scheduler
+  // is disabled, fall back to the pre-scheduler 8s cadence so request-driven refreshes remain the sole
+  // freshness source.
+  protected def batchRegistryRefreshIntervalMs: Long =
+    getOptional(DynamoBatchRegistryRefreshIntervalMs, conf)
+      .map(_.toLong)
+      .getOrElse(DefaultBatchRegistryRefreshIntervalMs)
+
+  private val batchTableCacheRefreshMs: Long =
+    if (batchRegistryRefreshIntervalMs > 0) batchRegistryRefreshIntervalMs * 2
+    else BatchTableCacheRefreshIntervalWhenSchedulerDisabledMs
+
   // TTLCache: resolves logical batch dataset names to physical date-suffixed table names
-  private val batchTableCache: TTLCache[String, String] = new TTLCache[String, String](
+  private[aws] val batchTableCache: TTLCache[String, String] = new TTLCache[String, String](
     f = { dataset =>
       val keyMap = Map(partitionKeyColumn -> AttributeValue.builder.b(SdkBytes.fromByteArray(dataset.getBytes)).build)
       val request = GetItemRequest.builder
@@ -76,14 +98,50 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
       val item = prefixedDynamoDbClient.getItem(request).join().item().toScala
       item.get("valueBytes").map(v => new String(v.b().asByteArray())).getOrElse(dataset)
     },
-    contextBuilder = { _ => metricsContext.withSuffix("batch_table_cache") }
+    contextBuilder = { _ => metricsContext.withSuffix("batch_table_cache") },
+    refreshIntervalMillis = batchTableCacheRefreshMs
   )
 
   private[aws] def resolveTableName(dataset: String): String = {
-    // Use refresh() instead of apply() so the cache re-checks DynamoDB every ~8s rather than every 2hrs
+    // refresh() is fallback: steady-state refresh is driven by the scheduled refresher below, but this
+    // self-heals if the scheduler misses a tick (GC pause, one bad key stalling the runnable, etc.).
     if (dataset.endsWith(batchSuffix)) batchTableCache.refresh(dataset)
     else dataset
   }
+
+  // Iterates every batch dataset the cache has seen and forces a refresh. Runs on the isolated TTLCache
+  // refresh pool via force() → asyncUpdateOnExpiry(_, 0). Per-key try/catch so one bad key can't kill
+  // the schedule (loader exceptions are also swallowed inside TTLCache's runnable).
+  private[aws] def refreshBatchRegistryOnce(): Unit = {
+    val it = batchTableCache.cMap.keySet().iterator()
+    while (it.hasNext) {
+      val key = it.next()
+      try {
+        batchTableCache.force(key)
+      } catch {
+        case e: Exception =>
+          logger.warn(s"Scheduled batch registry refresh failed for key '$key'", e)
+      }
+    }
+  }
+
+  private val batchRegistryHandle: Option[BatchRegistryScheduler.Handle] = {
+    val intervalMs = batchRegistryRefreshIntervalMs
+    if (intervalMs <= 0) {
+      logger.info(s"Scheduled batch registry refresh disabled ($DynamoBatchRegistryRefreshIntervalMs=$intervalMs)")
+      None
+    } else {
+      val handle = BatchRegistryScheduler.register(
+        intervalMs,
+        () => refreshBatchRegistryOnce(),
+        onError = e => logger.warn("Scheduled batch registry refresh tick failed", e)
+      )
+      logger.info(s"Scheduled batch registry refresh every ${intervalMs}ms")
+      Some(handle)
+    }
+  }
+
+  def close(): Unit = batchRegistryHandle.foreach(BatchRegistryScheduler.unregister)
 
   override def create(dataset: String): Unit = create(dataset, Map.empty)
 
@@ -999,6 +1057,54 @@ class DynamoDBKVStoreImpl(rawDynamoDbClient: DynamoDbAsyncClient, conf: Map[Stri
   protected def replicaWaitPollIntervalMs: Long = ReplicaWaitPollIntervalMs
 }
 
+// One shared executor keeps discarded-but-not-closed instances (e.g. from genMetricsKvStore /
+// genEnhancedStatsKvStore, which build a fresh KVStore per call) from each leaking their own
+// scheduler thread.
+private[aws] object BatchRegistryScheduler {
+  type Handle = ScheduledFuture[_]
+
+  // Lazy so callers that never enable scheduled refresh (interval <= 0) don't spin up a thread.
+  // setRemoveOnCancelPolicy(true) so unregister() promptly frees the queue slot instead of waiting
+  // for the next scheduled fire — matters when tests churn through many short-lived registrations.
+  private lazy val executor: ScheduledThreadPoolExecutor = {
+    val counter = new AtomicInteger(0)
+    val exec = new ScheduledThreadPoolExecutor(
+      1,
+      (r: Runnable) => {
+        val t = new Thread(r)
+        t.setDaemon(true)
+        t.setName(s"chronon-dynamo-batch-registry-refresh-${counter.incrementAndGet()}")
+        t
+      }
+    )
+    exec.setRemoveOnCancelPolicy(true)
+    exec
+  }
+
+  def register(intervalMs: Long, callback: () => Unit, onError: Throwable => Unit): Handle = {
+    require(intervalMs > 0, s"intervalMs must be > 0; got $intervalMs")
+    executor.scheduleWithFixedDelay(
+      () =>
+        try callback()
+        catch {
+          case e: Exception =>
+            try onError(e)
+            catch { case _: Throwable => () }
+        },
+      intervalMs,
+      intervalMs,
+      TimeUnit.MILLISECONDS
+    )
+  }
+
+  def unregister(handle: Handle): Unit = {
+    handle.cancel(false)
+    ()
+  }
+
+  private[aws] def activeRegistrations: Int = executor.getQueue.size()
+}
+
 object DynamoDBKVStoreConstants {
   val batchTableRegistry: String = "CHRONON_BATCH_TABLE_REGISTRY"
   val batchSuffix = "_BATCH"
@@ -1048,6 +1154,12 @@ object DynamoDBKVStoreConstants {
   val DynamoReplicaWaitDefaultTimeout: Duration = Duration.ofMinutes(60)
   val MinReplicaWaitTimeout: Duration = Duration.ofMinutes(1)
   val ReplicaWaitPollIntervalMs: Long = 15 * 1000L
+  // Off by default; opt-in via DYNAMO_BATCH_REGISTRY_REFRESH_INTERVAL_MS. When off, cache freshness
+  // is driven by the request-path refresh() fallback at BatchTableCacheRefreshIntervalWhenSchedulerDisabledMs.
+  val DefaultBatchRegistryRefreshIntervalMs: Long = 0L
+  // Matches TTLCache's pre-scheduler default refresh cadence. Used when the scheduled refresher is
+  // disabled so request-driven refresh() still catches registry swaps at ~8s granularity.
+  val BatchTableCacheRefreshIntervalWhenSchedulerDisabledMs: Long = 8 * 1000L
 
   // DynamoDB BatchGetItem hard limit: max 100 keys per request. Not exposed as a
   // public constant by the AWS SDK v2, so we mirror it here.

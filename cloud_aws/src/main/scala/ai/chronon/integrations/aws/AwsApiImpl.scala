@@ -177,6 +177,7 @@ object AwsApiImpl {
   private[aws] val DynamoApiCallTimeout = "DYNAMO_API_CALL_TIMEOUT"
   private[aws] val DynamoApiCallAttemptTimeout = "DYNAMO_API_CALL_ATTEMPT_TIMEOUT"
   private[aws] val DynamoSdkMetricsEnabled = "DYNAMO_SDK_METRICS_ENABLED"
+  private[aws] val DynamoBatchRegistryRefreshIntervalMs = "DYNAMO_BATCH_REGISTRY_REFRESH_INTERVAL_MS"
 
   private[aws] def getOptional(key: String, conf: Map[String, String]): Option[String] =
     sys.env

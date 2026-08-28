@@ -13,6 +13,7 @@ import ai.chronon.api.Constants.{
 import ai.chronon.api.ScalaJavaConversions._
 import java.time.LocalDate
 import ai.chronon.api.TilingUtils
+import ai.chronon.integrations.aws.AwsApiImpl.DynamoBatchRegistryRefreshIntervalMs
 import ai.chronon.integrations.aws.DynamoDBKVStoreConstants.isTimedSorted
 import ai.chronon.online.KVStore._
 import ai.chronon.spark.IonPathConfig
@@ -1477,6 +1478,160 @@ class DynamoDBKVStoreTest extends AnyFlatSpec with Matchers with BeforeAndAfterA
     retryStore.replicaCalls.head._2 shouldBe List("us-west-2")
     // Retry path must also skip the wait to avoid multi-minute blocks on caller threads.
     retryStore.replicaCalls.head._3 shouldBe false
+  }
+
+  // ===== Scheduled batch-registry refresher =====
+
+  // Refreshes run on TTLCache's isolated executor, so assertions on their effect must poll.
+  private def awaitCond(timeoutMillis: Long = 3000L)(cond: => Boolean): Boolean = {
+    val deadline = System.currentTimeMillis() + timeoutMillis
+    while (System.currentTimeMillis() < deadline && !cond) Thread.sleep(10)
+    cond
+  }
+
+  private def putRegistryPointer(kvStore: DynamoDBKVStoreImpl, logicalKey: String, physicalTable: String): Unit = {
+    val results = Await.result(
+      kvStore.multiPut(Seq(PutRequest(logicalKey.getBytes(StandardCharsets.UTF_8),
+                                      physicalTable.getBytes(StandardCharsets.UTF_8),
+                                      batchTableRegistry))),
+      30.seconds
+    )
+    results.foreach(_ shouldBe true)
+  }
+
+  it should "refreshBatchRegistryOnce updates cached pointer after registry swap" in {
+    val logicalKey = "SCHED_REFRESH_LOGICAL" + batchSuffix
+    val initialPhysical = "SCHED_REFRESH_PHYSICAL_V1"
+    val nextPhysical = "SCHED_REFRESH_PHYSICAL_V2"
+
+    // Scheduler disabled so the test drives refreshBatchRegistryOnce() deterministically.
+    val kvStore = new DynamoDBKVStoreImpl(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "0"))
+    try {
+      kvStore.create(batchTableRegistry)
+
+      putRegistryPointer(kvStore, logicalKey, initialPhysical)
+      kvStore.resolveTableName(logicalKey) shouldBe initialPhysical
+
+      putRegistryPointer(kvStore, logicalKey, nextPhysical)
+      // Without a refresh the cache still holds the old pointer (well within TTL).
+      kvStore.resolveTableName(logicalKey) shouldBe initialPhysical
+
+      kvStore.refreshBatchRegistryOnce()
+      awaitCond()(kvStore.resolveTableName(logicalKey) == nextPhysical) shouldBe true
+    } finally kvStore.close()
+  }
+
+  it should "request landing between scheduler ticks does not trigger extra loader call" in {
+    val logicalKey = "SCHED_DEDUP_LOGICAL" + batchSuffix
+    val physical = "SCHED_DEDUP_PHYSICAL"
+    // Long-enough scheduler interval that the shared scheduler's tick doesn't fire this
+    // registration during the test window; we drive ticks manually via refreshBatchRegistryOnce().
+    // This gives us the production wiring (cache refreshIntervalMillis = 2 * scheduler interval)
+    // without racing the real timer.
+    val kvStore = new CountingRegistryGetItemKVStore(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "60000"))
+    try {
+      kvStore.create(batchTableRegistry)
+      putRegistryPointer(kvStore, logicalKey, physical)
+
+      // Prime the cache (cold insert issues one getItem for the registry key).
+      kvStore.resolveTableName(logicalKey) shouldBe physical
+      val postPrime = kvStore.registryGetItemCount
+
+      // Simulate a scheduler tick.
+      kvStore.refreshBatchRegistryOnce()
+      awaitCond()(kvStore.registryGetItemCount > postPrime) shouldBe true
+      val postTick = kvStore.registryGetItemCount
+
+      // A request landing right after must NOT enqueue another refresh. Poll briefly to give the
+      // async pool a chance to (incorrectly) fire — we want to prove the count stays flat.
+      (1 to 5).foreach(_ => kvStore.resolveTableName(logicalKey) shouldBe physical)
+      Thread.sleep(200)
+      kvStore.registryGetItemCount shouldBe postTick
+    } finally kvStore.close()
+  }
+
+  it should "scheduled refresh is disabled when interval <= 0" in {
+    val before = BatchRegistryScheduler.activeRegistrations
+    val kvStore = new DynamoDBKVStoreImpl(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "0"))
+    try {
+      BatchRegistryScheduler.activeRegistrations shouldBe before
+      noException should be thrownBy kvStore.refreshBatchRegistryOnce()
+    } finally kvStore.close()
+  }
+
+  it should "refreshBatchRegistryOnce refreshes every cached key on a single tick" in {
+    val keyA = "SCHED_MULTI_A" + batchSuffix
+    val keyB = "SCHED_MULTI_B" + batchSuffix
+    val physicalA1 = "SCHED_MULTI_A_V1"
+    val physicalB1 = "SCHED_MULTI_B_V1"
+    val physicalA2 = "SCHED_MULTI_A_V2"
+    val physicalB2 = "SCHED_MULTI_B_V2"
+
+    val kvStore = new DynamoDBKVStoreImpl(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "0"))
+    try {
+      kvStore.create(batchTableRegistry)
+      putRegistryPointer(kvStore, keyA, physicalA1)
+      putRegistryPointer(kvStore, keyB, physicalB1)
+      kvStore.resolveTableName(keyA) shouldBe physicalA1
+      kvStore.resolveTableName(keyB) shouldBe physicalB1
+
+      putRegistryPointer(kvStore, keyA, physicalA2)
+      putRegistryPointer(kvStore, keyB, physicalB2)
+      kvStore.refreshBatchRegistryOnce()
+      awaitCond() {
+        kvStore.resolveTableName(keyA) == physicalA2 && kvStore.resolveTableName(keyB) == physicalB2
+      } shouldBe true
+    } finally kvStore.close()
+  }
+
+  it should "scheduled refresher fires periodically when interval > 0" in {
+    val logicalKey = "SCHED_TIMER_LOGICAL" + batchSuffix
+    val initialPhysical = "SCHED_TIMER_PHYSICAL_V1"
+    val nextPhysical = "SCHED_TIMER_PHYSICAL_V2"
+
+    // Observing scheduler-driven refresh requires NOT calling resolveTableName during the wait —
+    // it would fire the request-path refresh() fallback (cache refreshIntervalMillis = 2 * 100 =
+    // 200ms) and pass this test even if the scheduler never ran. We watch the loader-call counter
+    // and the raw cache entry instead, and only touch resolveTableName after both have advanced.
+    val kvStore = new CountingRegistryGetItemKVStore(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "100"))
+    try {
+      kvStore.create(batchTableRegistry)
+      putRegistryPointer(kvStore, logicalKey, initialPhysical)
+      kvStore.resolveTableName(logicalKey) shouldBe initialPhysical
+      val postPrime = kvStore.registryGetItemCount
+
+      putRegistryPointer(kvStore, logicalKey, nextPhysical)
+
+      awaitCond(timeoutMillis = 5000L)(kvStore.registryGetItemCount > postPrime) shouldBe true
+      awaitCond(timeoutMillis = 2000L) {
+        val entry = kvStore.batchTableCache.cMap.get(logicalKey)
+        entry != null && entry.value == nextPhysical
+      } shouldBe true
+
+      kvStore.resolveTableName(logicalKey) shouldBe nextPhysical
+    } finally kvStore.close()
+  }
+
+  it should "close() unregisters instance from the shared scheduler" in {
+    val before = BatchRegistryScheduler.activeRegistrations
+    val kvStore = new DynamoDBKVStoreImpl(
+      client,
+      Map(KvEnableTtlArg -> "false", DynamoBatchRegistryRefreshIntervalMs -> "60000"))
+    BatchRegistryScheduler.activeRegistrations shouldBe (before + 1)
+    kvStore.close()
+    BatchRegistryScheduler.activeRegistrations shouldBe before
+    noException should be thrownBy kvStore.close()
+    BatchRegistryScheduler.activeRegistrations shouldBe before
   }
 
   private def validatePutResults(results: Seq[Boolean], expectedCount: Int): Unit = {
