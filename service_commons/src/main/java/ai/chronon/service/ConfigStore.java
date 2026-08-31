@@ -2,6 +2,7 @@ package ai.chronon.service;
 
 import io.vertx.config.ConfigRetriever;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
 import ai.chronon.online.metrics.TTLCache;
@@ -12,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -299,15 +301,72 @@ public class ConfigStore {
         return jsonConfig.getLong(JOIN_CODEC_TTL_MILLIS, TTLCache.DefaultTtlMillis());
     }
 
+    // Six literal '*' followed by up to MASK_TAIL_CHARS trailing chars of the original value; the
+    // tail lets operators correlate the masked value against the credential they intended to set
+    // without leaking enough of the secret to be useful to an attacker.
+    private static final int MASK_TAIL_CHARS = 4;
+    private static final String MASK_PREFIX = "******";
+
+    // Any config key whose name ends (case-insensitive) in one of these is treated as a secret and
+    // its value masked before exposure via /config. endsWith intentionally catches both bare forms
+    // (password) and namespaced forms (db.password, auth_secret, gcp.credential).
+    private static boolean isSecretKey(String key) {
+        if (key == null) return false;
+        // Locale.ROOT so a Turkish default locale doesn't map 'I' → 'ı' and break the suffix match.
+        String lower = key.toLowerCase(Locale.ROOT);
+        return lower.endsWith("password") || lower.endsWith("secret") || lower.endsWith("credential");
+    }
+
+    private static String maskScalar(Object value) {
+        String s = value.toString();
+        if (s.length() > MASK_TAIL_CHARS) {
+            return MASK_PREFIX + s.substring(s.length() - MASK_TAIL_CHARS);
+        }
+        return MASK_PREFIX;
+    }
+
+    // Walks the object graph and masks any value under a secret-named key. A secret-named parent
+    // whose value is a nested object or array has its whole subtree collapsed to MASK_PREFIX
+    // (no tail, no recursion) — we can't derive a meaningful correlation tail from a composite,
+    // and recursing risks leaking subfields that only appear innocuous.
+    private static void redactSecrets(JsonObject obj) {
+        for (String key : new ArrayList<>(obj.fieldNames())) {
+            Object value = obj.getValue(key);
+            if (value == null) continue;
+            if (isSecretKey(key)) {
+                if (value instanceof JsonObject || value instanceof JsonArray) {
+                    obj.put(key, MASK_PREFIX);
+                } else {
+                    obj.put(key, maskScalar(value));
+                }
+            } else if (value instanceof JsonObject) {
+                redactSecrets((JsonObject) value);
+            } else if (value instanceof JsonArray) {
+                redactArray((JsonArray) value);
+            }
+        }
+    }
+
+    private static void redactArray(JsonArray arr) {
+        for (int i = 0; i < arr.size(); i++) {
+            Object v = arr.getValue(i);
+            if (v instanceof JsonObject) redactSecrets((JsonObject) v);
+            else if (v instanceof JsonArray) redactArray((JsonArray) v);
+        }
+    }
+
     public String encodeConfig() {
-        // Redact payload keys — they may contain entity keys that should not be exposed via /config.
-        // JsonObject(Map) does not copy the backing map, so copy it ourselves before mutating - otherwise
-        // remove() below would delete the key from the live jsonConfig, not a redacted copy of it.
-        JsonObject redacted = new JsonObject(new HashMap<>(jsonConfig.getMap()));
+        // Deep copy so we can freely mutate nested objects — a shallow HashMap copy of the top-level
+        // map would still share nested JsonObject references with the live config.
+        JsonObject redacted = jsonConfig.copy();
+
+        // Warmup payloads may contain entity keys — separate concern from credential redaction.
         redacted.remove(WARMUP_PAYLOAD);
         for (int i = 0; jsonConfig.getString(String.format(WARMUP_JOIN_INDEXED_REGEX_FMT, i)) != null; i++) {
             redacted.remove(String.format(WARMUP_JOIN_INDEXED_PAYLOAD_FMT, i));
         }
+
+        redactSecrets(redacted);
         return redacted.encodePrettily();
     }
 }
