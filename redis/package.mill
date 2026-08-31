@@ -11,10 +11,7 @@ object `package` extends Cross[RedisModule](build.Constants.scalaVersions) with 
 trait RedisModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.api(crossValue), build.online(crossValue), build.spark(crossValue))
 
-  def compileMvnDeps = build.Constants.sparkDeps ++ Seq(
-    mvn"org.rogach::scallop:5.1.0"
-  )
-
+  def compileMvnDeps = build.Constants.sparkDeps
 
   def mvnDeps = build.Constants.commonDeps ++
     build.Constants.loggingApiDeps ++
@@ -41,4 +38,3 @@ trait RedisModule extends Cross.Module[String] with build.BaseModule {
     def forkArgs = build.Constants.commonTestForkArgs
   }
 }
-

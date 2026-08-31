@@ -1,7 +1,8 @@
 package ai.chronon.integrations.redis
 
 import ai.chronon.online.KVStore.GetRequest
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, argThat}
+import org.mockito.ArgumentMatcher
 import org.mockito.Mockito.{mock, times, verify, when}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -27,7 +28,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     when(firstPipeline.get(any(classOf[Array[Byte]]))).thenReturn(firstResponse)
     when(firstResponse.get())
       .thenThrow(new IllegalStateException("Please close pipeline or multi block before calling this method."))
-    when(cluster.get(any(classOf[Array[Byte]]))).thenReturn(storedValue)
+    stubDataReads(cluster, storedValue)
     when(retryPipeline.get(any(classOf[Array[Byte]]))).thenReturn(retryResponse)
     when(retryResponse.get()).thenReturn(storedValue)
 
@@ -37,7 +38,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     responses.map(response => new String(response.values.get.head.bytes, StandardCharsets.UTF_8)) shouldBe
       Seq("value", "value")
     verify(cluster, times(2)).pipelined()
-    verify(cluster, times(1)).get(any(classOf[Array[Byte]]))
+    verify(cluster, times(1)).get(dataKey)
   }
 
   it should "retry the whole pipeline once after a queue-time connection failure" in {
@@ -49,7 +50,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
 
     when(cluster.pipelined()).thenReturn(firstPipeline, retryPipeline)
     when(firstPipeline.get(any(classOf[Array[Byte]]))).thenThrow(new JedisConnectionException("disconnected"))
-    when(cluster.get(any(classOf[Array[Byte]]))).thenReturn(storedValue)
+    stubDataReads(cluster, storedValue)
     when(retryPipeline.get(any(classOf[Array[Byte]]))).thenReturn(retryResponse)
     when(retryResponse.get()).thenReturn(storedValue)
 
@@ -57,7 +58,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
 
     responses.map(_.values.get.head.millis) shouldBe Seq(456L, 456L)
     verify(cluster, times(2)).pipelined()
-    verify(cluster, times(1)).get(any(classOf[Array[Byte]]))
+    verify(cluster, times(1)).get(dataKey)
   }
 
   it should "preserve first-attempt successes when another command fails during retry" in {
@@ -76,7 +77,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     when(firstSuccess.get()).thenReturn(firstValue)
     when(firstFailure.get())
       .thenThrow(new IllegalStateException("Please close pipeline or multi block before calling this method."))
-    when(cluster.get(any(classOf[Array[Byte]]))).thenReturn(retryValue)
+    stubDataReads(cluster, retryValue)
     when(retryPipeline.get(any(classOf[Array[Byte]]))).thenReturn(retryFailure, retrySuccess)
     when(retryFailure.get()).thenThrow(new JedisConnectionException("different node failed"))
     when(retrySuccess.get()).thenReturn(retryValue)
@@ -103,7 +104,7 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     when(pipeline.get(any(classOf[Array[Byte]]))).thenReturn(askResponse, successfulResponse)
     when(askResponse.get()).thenThrow(ask)
     when(successfulResponse.get()).thenReturn(pipelineValue)
-    when(cluster.get(any(classOf[Array[Byte]]))).thenReturn(directValue)
+    stubDataReads(cluster, directValue)
 
     val responses = readTwoBatchKeys(cluster)
 
@@ -111,15 +112,46 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     responses.map(response => new String(response.values.get.head.bytes, StandardCharsets.UTF_8)) shouldBe
       Seq("direct", "pipeline")
     verify(cluster, times(1)).pipelined()
-    verify(cluster, times(1)).get(any(classOf[Array[Byte]]))
+    verify(cluster, times(1)).get(dataKey)
+    verify(pipeline, times(1)).close()
+  }
+
+  it should "isolate managed publication failures after one unified pipeline" in {
+    val pipeline = mock(classOf[ClusterPipeline])
+    val managedResponse = mock(classOf[Response[Array[Byte]]])
+    val publicationModeResponse = mock(classOf[Response[Array[Byte]]])
+    val statusResponse = mock(classOf[Response[Array[Byte]]])
+    val ordinaryResponse = mock(classOf[Response[Array[Byte]]])
+    val cluster = mock(classOf[JedisCluster])
+    val managedValue = encodeStoredValue("managed", 555L)
+    val ordinaryValue = encodeStoredValue("ordinary", 666L)
+
+    when(cluster.pipelined()).thenReturn(pipeline)
+    when(pipeline.get(any(classOf[Array[Byte]])))
+      .thenReturn(managedResponse, publicationModeResponse, statusResponse, ordinaryResponse)
+    when(managedResponse.get()).thenReturn(managedValue)
+    when(publicationModeResponse.get()).thenReturn("incremental".getBytes(StandardCharsets.UTF_8))
+    when(statusResponse.get()).thenReturn(null)
+    when(ordinaryResponse.get()).thenReturn(ordinaryValue)
+
+    val managed = GetRequest("managed-key".getBytes(StandardCharsets.UTF_8), "MANAGED_NO_STATUS_BATCH")
+    val ordinary = GetRequest("ordinary-key".getBytes(StandardCharsets.UTF_8), "ORDINARY_BATCH_VALUE")
+    val responses = Await.result(new RedisKVStoreImpl(cluster).multiGet(Seq(managed, ordinary)), 10.seconds)
+
+    responses.map(_.request) shouldBe Seq(managed, ordinary)
+    responses.head.values.isFailure shouldBe true
+    responses.head.values.failed.get.getMessage should include("no applied-status marker")
+    new String(responses(1).values.get.head.bytes, StandardCharsets.UTF_8) shouldBe "ordinary"
+    verify(cluster, times(1)).pipelined()
+    verify(pipeline, times(4)).get(any(classOf[Array[Byte]]))
     verify(pipeline, times(1)).close()
   }
 
   private def readTwoBatchKeys(cluster: JedisCluster) = {
     val kvStore = new RedisKVStoreImpl(cluster)
     val requests = Seq(
-      GetRequest("key-a".getBytes(StandardCharsets.UTF_8), "RETRY_A_BATCH"),
-      GetRequest("key-b".getBytes(StandardCharsets.UTF_8), "RETRY_B_BATCH")
+      GetRequest("key-a".getBytes(StandardCharsets.UTF_8), "RETRY_A"),
+      GetRequest("key-b".getBytes(StandardCharsets.UTF_8), "RETRY_B")
     )
     Await.result(kvStore.multiGet(requests), 10.seconds)
   }
@@ -128,4 +160,18 @@ class RedisPipelineRetryTest extends AnyFlatSpec with Matchers {
     val valueBytes = value.getBytes(StandardCharsets.UTF_8)
     ByteBuffer.allocate(java.lang.Long.BYTES + valueBytes.length).putLong(timestamp).put(valueBytes).array()
   }
+
+  private def stubDataReads(cluster: JedisCluster, storedValue: Array[Byte]): Unit =
+    when(cluster.get(any(classOf[Array[Byte]]))).thenAnswer { invocation =>
+      val key = invocation.getArgument[Array[Byte]](0)
+      if (isInternalKey(key)) null else storedValue
+    }
+
+  private def dataKey: Array[Byte] =
+    argThat(new ArgumentMatcher[Array[Byte]] {
+      override def matches(key: Array[Byte]): Boolean = key != null && !isInternalKey(key)
+    })
+
+  private def isInternalKey(key: Array[Byte]): Boolean =
+    new String(key, StandardCharsets.UTF_8).contains(":__chronon_")
 }

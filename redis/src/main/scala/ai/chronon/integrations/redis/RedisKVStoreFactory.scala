@@ -58,13 +58,29 @@ object RedisKVStoreFactory {
     * @return Initialized RedisKVStoreImpl ready for use
     * @throws IllegalArgumentException if REDIS_CLUSTER_NODES is not set
     */
-  def create(conf: Map[String, String]): RedisKVStoreImpl = {
-    val storeSettings = settingsForStore(conf)
-    val jedisCluster = createClient(storeSettings.client)
-    val kvStore = new RedisKVStoreImpl(jedisCluster, conf)
-    kvStore.init()
-    kvStore
-  }
+  def create(conf: Map[String, String]): RedisKVStoreImpl =
+    createFullSnapshot(conf)
+
+  /** Creates a store whose batch uploads use all-row SETEX writes. */
+  def createFullSnapshot(conf: Map[String, String]): RedisKVStoreImpl =
+    createStore(conf, _ => RedisBatchMode.FullSnapshot)
+
+  /** Creates a store whose batch uploads use durable incremental publication. */
+  def createIncremental(conf: Map[String, String], conditionalObjectWriter: ConditionalObjectWriter): RedisKVStoreImpl =
+    createStore(conf, _ => RedisBatchMode.Incremental(conditionalObjectWriter))
+
+  /** Creates a store that resolves its upload mode only when a batch write is invoked. */
+  def createWithUploadMode(conf: Map[String, String],
+                           defaultMode: RedisBatchModeSelection,
+                           conditionalObjectWriter: ConditionalObjectWriter): RedisKVStoreImpl =
+    createStore(
+      conf,
+      uploadConf =>
+        configuredBatchUploadMode(uploadConf, defaultMode) match {
+          case RedisBatchModeSelection.FullSnapshot => RedisBatchMode.FullSnapshot
+          case RedisBatchModeSelection.Incremental  => RedisBatchMode.Incremental(conditionalObjectWriter)
+        }
+    )
 
   /** Resolves the batch-upload mode from the properties submitted to the upload job. */
   def configuredBatchUploadMode(conf: Map[String, String],
@@ -75,6 +91,15 @@ object RedisKVStoreFactory {
       .filter(_.nonEmpty)
       .map(RedisBatchModeSelection.parse)
       .getOrElse(defaultMode)
+
+  private def createStore(conf: Map[String, String],
+                          batchMode: Map[String, String] => RedisBatchMode): RedisKVStoreImpl = {
+    val storeSettings = settingsForStore(conf)
+    val jedisCluster = createClient(storeSettings.client)
+    val kvStore = new RedisKVStoreImpl(jedisCluster, conf, batchMode, storeSettings)
+    kvStore.init()
+    kvStore
+  }
 
   private[redis] def buildConnectionPoolConfig(
       maxConnections: Int,
@@ -146,12 +171,14 @@ object RedisKVStoreFactory {
   def settings(conf: Map[String, String], env: Map[String, String] = sys.env): ClientSettings = {
     val maxConnections =
       intSetting(EnvRedisMaxConnections, PropRedisMaxConnections, DefaultMaxConnections, conf, env)
-    val maxIdleConnections = getOptional(EnvRedisMaxIdleConnections, PropRedisMaxIdleConnections, conf, env)
-      .map(_.toInt)
-      .getOrElse(math.min(DefaultMaxIdleConnections, maxConnections))
-    val minIdleConnections = getOptional(EnvRedisMinIdleConnections, PropRedisMinIdleConnections, conf, env)
-      .map(_.toInt)
-      .getOrElse(math.min(DefaultMinIdleConnections, maxIdleConnections))
+    val configuredMinIdleConnections =
+      getOptional(EnvRedisMinIdleConnections, PropRedisMinIdleConnections, conf, env).map(_.toInt)
+    val configuredMaxIdleConnections =
+      getOptional(EnvRedisMaxIdleConnections, PropRedisMaxIdleConnections, conf, env).map(_.toInt)
+    val maxIdleConnections =
+      configuredMaxIdleConnections.getOrElse(math.min(DefaultMaxIdleConnections, maxConnections))
+    val minIdleConnections =
+      configuredMinIdleConnections.getOrElse(math.min(DefaultMinIdleConnections, maxIdleConnections))
 
     ClientSettings(
       nodes = getOrElseThrow(EnvRedisClusterNodes, PropRedisClusterNodes, conf, env),

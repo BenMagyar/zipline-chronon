@@ -37,6 +37,28 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
     settings.maxRedirections shouldBe 9
   }
 
+  it should "bound default idle connections by a smaller configured pool" in {
+    val settings = RedisKVStoreFactory.settings(
+      Map(
+        "redis.cluster.nodes" -> "localhost:6379",
+        "redis.max.connections" -> "4"
+      ),
+      env = Map.empty
+    )
+
+    settings.maxConnections shouldBe 4
+    settings.minIdleConnections shouldBe 4
+    settings.maxIdleConnections shouldBe 4
+    val poolConfig = RedisKVStoreFactory.buildConnectionPoolConfig(
+      settings.maxConnections,
+      settings.minIdleConnections,
+      settings.maxIdleConnections
+    )
+    poolConfig.getMaxTotal shouldBe 4
+    poolConfig.getMinIdle shouldBe 4
+    poolConfig.getMaxIdle shouldBe 4
+  }
+
   it should "give process environment values precedence over submitted properties" in {
     val settings = RedisKVStoreFactory.settings(
       Map(
@@ -65,28 +87,6 @@ class RedisKVStoreFactoryTest extends AnyFlatSpec with Matchers {
         env = Map.empty
       )
     }
-  }
-
-  it should "clamp default idle connections to a smaller configured pool" in {
-    val settings = RedisKVStoreFactory.settings(
-      Map(
-        "redis.cluster.nodes" -> "localhost:6379",
-        "redis.max.connections" -> "2"
-      ),
-      env = Map.empty
-    )
-
-    settings.maxConnections shouldBe 2
-    settings.maxIdleConnections shouldBe 2
-    settings.minIdleConnections shouldBe 2
-    val pool = RedisKVStoreFactory.buildConnectionPoolConfig(
-      settings.maxConnections,
-      settings.minIdleConnections,
-      settings.maxIdleConnections
-    )
-    pool.getMaxTotal shouldBe 2
-    pool.getMaxIdle shouldBe 2
-    pool.getMinIdle shouldBe 2
   }
 
   it should "reject ambiguous Redis cluster node endpoints" in {

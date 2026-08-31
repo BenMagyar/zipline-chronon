@@ -123,4 +123,31 @@ class RedisBatchUploadTest extends AnyFlatSpec with Matchers {
     incremental.deleteOlderVersions shouldBe false
   }
 
+  "Redis older-version retirement" should "migrate legacy retired tombstones to physical deletion exactly once" in {
+    val status = RedisBatchUpload.BatchStatus("retired-generation", "2024-07-27", 1000L, 2L, retired = true)
+    val retiredManifest = IncrementalRedisBatchModel.ReadyManifest(
+      status = status,
+      parentGeneration = Some("active-generation"),
+      stateGeneration = status.generation,
+      sourceTable = "source",
+      batchDataset = "DATASET__1_BATCH",
+      keyPrefix = "chronon",
+      stateBuckets = 4,
+      sourceRows = 0L,
+      dataRows = 0L,
+      changedKeys = 0L,
+      deletedKeys = 2L,
+      deltaRows = 3L,
+      tombstoneRows = 2L,
+      liveTTLSeconds = 3600,
+      deleteFenceTTLSeconds = 3600,
+      fullRebuild = false,
+      retired = true
+    )
+
+    IncrementalRedisBatchLoader.requiresRetiredPhysicalDeleteMigration(retiredManifest) shouldBe true
+    IncrementalRedisBatchLoader.requiresRetiredPhysicalDeleteMigration(retiredManifest.copy(tombstoneRows = 0L)) shouldBe false
+    IncrementalRedisBatchLoader.requiresRetiredPhysicalDeleteMigration(
+      retiredManifest.copy(status = status.copy(retired = false), retired = false)) shouldBe false
+  }
 }

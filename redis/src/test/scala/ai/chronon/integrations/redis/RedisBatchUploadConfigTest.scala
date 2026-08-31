@@ -58,4 +58,16 @@ class RedisBatchUploadConfigTest extends AnyFlatSpec with Matchers {
     IncrementalTuning().requireNoEviction shouldBe true
   }
 
+  "Effective Redis upload configuration" should "include Spark settings while keeping API properties authoritative" in {
+    val mode = RedisKVStoreConstants.PropRedisBatchMode
+    val sparkOnly = RedisKVStore.uploadConfig(Map.empty, Map(mode -> "full_snapshot"))
+    RedisKVStoreFactory.configuredBatchUploadMode(
+      sparkOnly,
+      RedisBatchModeSelection.Incremental) shouldBe RedisBatchModeSelection.FullSnapshot
+
+    val apiOverride = RedisKVStore.uploadConfig(Map(mode -> "incremental"), Map(mode -> "full_snapshot"))
+    RedisKVStoreFactory.configuredBatchUploadMode(
+      apiOverride,
+      RedisBatchModeSelection.FullSnapshot) shouldBe RedisBatchModeSelection.Incremental
+  }
 }
