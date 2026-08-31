@@ -1,288 +1,186 @@
 package ai.chronon.integrations.redis
 
-import ai.chronon.api.Extensions.{GroupByOps, WindowOps, WindowUtils}
-import ai.chronon.api.{GroupBy, MetaData, PartitionSpec}
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.submission.SparkSessionBuilder
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions.{col, lit, udf}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.rogach.scallop.{ScallopConf, ScallopOption}
 import org.slf4j.LoggerFactory
+import redis.clients.jedis.JedisCluster
 
-/** This Spark app handles loading Batch IR data into Redis Cluster.
-  * Similar to Spark2BigTableLoader, this uses DataFrame transformations to prepare data,
-  * but writes directly using Jedis API via foreachPartition.
-  *
-  * Why not use a Spark-Redis connector?
-  * - RedisLabs' spark-redis (org.apache.spark.sql.redis) only supports Jedis 3.x (unmaintained since 2021)
-  * - No actively maintained connector exists for Jedis 5.x + Spark 3.5.x
-  * - Manual foreachPartition approach gives us full control and works with modern Jedis
-  */
+import java.nio.charset.StandardCharsets
+import scala.util.Try
+
+/** Writes every row from one source snapshot without incremental status, tombstones, or deletion of omitted keys. */
 object Spark2RedisLoader {
   private val logger = LoggerFactory.getLogger(getClass)
+  private val KeyColumn = "key_bytes"
+  private val ValueColumn = "value_bytes"
+  private val BulkConnectionTimeoutMs = 10000
+  private val BulkSocketTimeoutMs = 30000
 
   class Conf(args: Seq[String]) extends ScallopConf(args) {
-    val tableName: ScallopOption[String] = opt[String](
-      name = "table-name",
-      descr = "Name of the Hive/Iceberg table containing the data to upload",
-      required = true
-    )
-
-    val dataset: ScallopOption[String] = opt[String](
-      name = "dataset",
-      descr = "Name of the GroupBy dataset (e.g., my_groupby_v1)",
-      required = true
-    )
-
-    val endDs: ScallopOption[String] = opt[String](
-      name = "end-ds",
-      descr = "Partition date to upload (e.g., 2024-01-15)",
-      required = true
-    )
-
-    val redisClusterNodes: ScallopOption[String] = opt[String](
-      name = "redis-cluster-nodes",
-      descr = "Comma-separated list of Redis cluster nodes (e.g., host1:7000,host2:7001)",
-      required = true
-    )
-
-    val keyPrefix: ScallopOption[String] = opt[String](
-      name = "key-prefix",
-      descr = "Optional key prefix (default: chronon)",
-      default = Some("chronon")
-    )
-
-    val ttl: ScallopOption[Int] = opt[Int](
-      name = "ttl",
-      descr = "TTL in seconds for Redis keys (default: 432000 = 5 days)",
-      default = Some(432000)
-    )
-
-    val batchSize: ScallopOption[Int] = opt[Int](
-      name = "batch-size",
-      descr = "Number of records to batch before syncing pipeline (default: 1000)",
-      default = Some(1000)
-    )
-
-    val useSsl: ScallopOption[Boolean] = opt[Boolean](
-      name = "use-ssl",
-      descr = "Enable TLS/SSL for Redis connections (required for ElastiCache in-transit encryption)",
-      default = Some(false)
-    )
-
+    val tableName: ScallopOption[String] =
+      opt[String](name = "table-name", descr = "Catalog table containing key_bytes and value_bytes", required = true)
+    val dataset: ScallopOption[String] =
+      opt[String](name = "dataset", descr = "Chronon GroupBy dataset", required = true)
+    val endDs: ScallopOption[String] =
+      opt[String](name = "end-ds", descr = "Source partition to upload", required = true)
+    val redisClusterNodes: ScallopOption[String] =
+      opt[String](name = "redis-cluster-nodes", descr = "Comma-separated Redis cluster nodes", required = true)
+    val keyPrefix: ScallopOption[String] =
+      opt[String](name = "key-prefix", descr = "Redis key prefix", default = Some("chronon"))
+    val ttl: ScallopOption[Int] =
+      opt[Int](name = "ttl", descr = "TTL in seconds", default = Some(RedisKVStoreConstants.DataTTLSeconds))
+    val batchSize: ScallopOption[Int] =
+      opt[Int](name = "batch-size", descr = "Commands per pipeline", default = Some(RedisBatchUploadDefaults.BatchSize))
+    val useSsl: ScallopOption[Boolean] =
+      opt[Boolean](name = "use-ssl", descr = "Enable TLS", default = Some(false))
     verify()
   }
 
+  private[redis] final case class Settings(job: BatchUploadJob,
+                                           target: RedisKVStoreFactory.StoreSettings,
+                                           options: FullSnapshotOptions = FullSnapshotOptions()) {
+    def sourceTable: String = job.sourceTable
+    def sourcePartition: String = job.sourcePartition
+    def partitionSpec = job.partitionSpec
+    def batchDataset: String = job.batchDataset
+    def batchTimestamp: Long = job.batchTimestamp
+    def keyPrefix: String = target.keyPrefix
+    def clientSettings: RedisKVStoreFactory.ClientSettings = target.client
+    def batchSize: Int = options.batchSize
+    def ttlSeconds: Int = options.ttlSeconds
+  }
+
+  /** Standalone compatibility entry point for explicitly requested full-snapshot uploads. */
   def main(args: Array[String]): Unit = {
     val config = new Conf(args)
+    val redisConf = Map(
+      RedisKVStoreConstants.PropRedisClusterNodes -> config.redisClusterNodes(),
+      RedisKVStoreConstants.PropRedisSSL -> config.useSsl().toString
+    )
+    val target = RedisKVStoreFactory.StoreSettings(
+      RedisKVStoreFactory.settings(redisConf, env = Map.empty),
+      config.keyPrefix()
+    )
+    val settings = Settings(
+      BatchUploadJob.from(config.tableName(), config.dataset(), config.endDs(), Map.empty),
+      target,
+      FullSnapshotOptions(config.batchSize(), config.ttl())
+    )
+    val spark = SparkSessionBuilder.build(s"Spark2RedisLoader-${settings.sourceTable}")
+    val controlClient = RedisKVStoreFactory.createClient(target.client)
+    try run(settings, spark, controlClient)
+    finally {
+      Try(controlClient.close())
+      spark.stop()
+    }
+  }
 
-    val tableName = config.tableName()
-    val dataset = config.dataset()
-    val endDate = config.endDs()
-    val clusterNodes = config.redisClusterNodes()
-    val keyPrefix = config.keyPrefix()
-    val ttl = config.ttl()
-    val batchSize = config.batchSize()
-    val useSsl = config.useSsl()
+  def run(settings: Settings, spark: SparkSession, controlClient: JedisCluster): Long = {
+    requireNoIncrementalStatus(settings, controlClient)
+    val tableUtils = TableUtils(spark, settings.partitionSpec)
+    require(
+      tableUtils.tableReachable(settings.sourceTable),
+      s"Redis full-snapshot upload requires a catalog-backed upload table. ${settings.sourceTable} is not reachable"
+    )
 
+    val source = tableUtils
+      .loadTable(settings.sourceTable)
+      .where(col(settings.partitionSpec.column) === lit(settings.sourcePartition))
+    val missing = Seq(KeyColumn, ValueColumn).filterNot(source.columns.contains)
+    require(missing.isEmpty,
+            s"Redis upload source ${settings.sourceTable} is missing required columns: ${missing.mkString(", ")}")
+
+    val uploadRows = source
+      .select(col(KeyColumn), col(ValueColumn))
+      .withColumn("dataset", lit(settings.batchDataset))
+    val recordCount = uploadRows.count()
+    requireNoIncrementalStatus(settings, controlClient)
+    RedisBatchUpload.claimPublicationMode(
+      controlClient,
+      settings.batchDataset,
+      settings.keyPrefix,
+      RedisBatchModeSelection.FullSnapshot
+    )
+    if (recordCount == 0L) {
+      logger.warn(
+        s"No records found in ${settings.sourceTable} for ${settings.partitionSpec.column}=${settings.sourcePartition}")
+      return 0L
+    }
+
+    val transformed = buildTransformedDataFrame(uploadRows, settings.keyPrefix, settings.batchTimestamp)
+    writeToRedis(transformed, settings)
     logger.info(
-      s"Starting Redis bulk load: table=$tableName, dataset=$dataset, partition=$endDate, batchSize=$batchSize")
-
-    val spark = SparkSessionBuilder.build(s"Spark2RedisLoader-$tableName")
-    val tableUtils = TableUtils(spark)
-
-    // Get the batch dataset name (with _batch suffix)
-    val groupBy = new GroupBy().setMetaData(new MetaData().setName(dataset))
-    val batchDataset = groupBy.batchDataset
-    // Or validate endDate format before use:
-    require(endDate.matches("""\d{4}-\d{2}-\d{2}"""), s"Invalid date format: $endDate")
-
-    val dataDf = tableUtils.sql(s"""
-       |SELECT key_bytes, value_bytes, '$batchDataset' as dataset
-       |FROM $tableName
-       |WHERE ds = '$endDate'
-       |""".stripMargin)
-
-    val recordCount = dataDf.count()
-    logger.info(s"Loaded $recordCount records from $tableName for partition $endDate")
-
-    if (recordCount == 0) {
-      logger.warn(s"No records found in $tableName for partition $endDate")
-      return
-    }
-
-    // Calculate timestamp for this batch (endDs + 1 Day)
-    // This ensures deterministic timestamps: same partition = same timestamp
-    val partitionSpec = PartitionSpec("ds", "yyyy-MM-dd", WindowUtils.Day.millis)
-    val endDsPlusOne = partitionSpec.epochMillis(endDate) + partitionSpec.spanMillis
-
-    // Transform DataFrame: Build Redis keys and prepend timestamp to values
-    val transformedDf = buildTransformedDataFrame(dataDf, keyPrefix, endDsPlusOne, spark)
-
-    // Write to Redis using foreachPartition with direct Jedis API
-    writeToRedis(transformedDf, clusterNodes, ttl, batchSize, useSsl)
-
-    logger.info(s"Successfully bulk loaded $recordCount records to Redis dataset $batchDataset")
+      s"Full-snapshot Redis bulk load wrote $recordCount records to ${settings.batchDataset} from ${settings.sourceTable}")
+    recordCount
   }
 
-  /** Test-friendly method that accepts an existing JedisCluster connection.
-    * This avoids executor connection issues in Testcontainers scenarios.
-    *
-    * Why is this needed for tests?
-    * - Testcontainers uses Docker port mapping (internal 7000 -> external 32xxx)
-    * - Even with cluster-announce-ip/port reconfiguration, Spark executors in local mode
-    *   sometimes have timing/networking issues connecting to the mapped ports
-    * - This method runs everything from the driver using the test's pre-configured JedisCluster
-    *   which has proper HostAndPortMapper to handle the port mapping
-    * - In production, foreachPartition works perfectly (no Docker, real routable IPs)
-    */
-  def writeWithExistingConnection(df: DataFrame,
-                                  jedisCluster: redis.clients.jedis.JedisCluster,
-                                  ttl: Int,
-                                  batchSize: Int = 1000): Unit = {
-    import java.nio.charset.StandardCharsets
+  def buildTransformedDataFrame(df: DataFrame, keyPrefix: String, batchTimestamp: Long): DataFrame = {
+    val buildRedisKeyUDF = udf((keyBytes: Array[Byte], dataset: String) =>
+      RedisKVStore.buildRedisKey(keyBytes.toSeq, dataset, keyPrefix = keyPrefix))
+    val prependTimestampUDF = udf((valueBytes: Array[Byte], timestamp: Long) =>
+      java.nio.ByteBuffer.allocate(8 + valueBytes.length).putLong(timestamp).put(valueBytes).array())
 
-    logger.info(s"Writing ${df.count()} records to Redis using provided JedisCluster connection (batchSize=$batchSize)")
-
-    // Collect to driver and write directly (avoids executor connection issues in tests)
-    val rows = df.collect()
-
-    val pipeline = jedisCluster.pipelined()
-    var batchCount = 0
-
-    rows.foreach { row =>
-      val key = row.getAs[String]("redis_key")
-      val value = row.getAs[Array[Byte]]("redis_value")
-
-      pipeline.setex(key.getBytes(StandardCharsets.UTF_8), ttl.toLong, value)
-      batchCount += 1
-
-      if (batchCount >= batchSize) {
-        pipeline.sync()
-        batchCount = 0
-      }
-    }
-
-    if (batchCount > 0) {
-      pipeline.sync()
-    }
-
-    logger.info("Successfully wrote data to Redis using provided connection")
-  }
-
-  /** Build Redis key with hash tags and prepend timestamp to value.
-    * This matches the format used by multiPut/multiGet.
-    */
-  def buildTransformedDataFrame(df: DataFrame,
-                                keyPrefix: String,
-                                batchTimestamp: Long,
-                                spark: SparkSession): DataFrame = {
-    import spark.implicits._
-
-    // UDF to build Redis key with hash tags for cluster co-location
-    val buildRedisKeyUDF = udf((keyBytes: Array[Byte], dataset: String) => {
-      val base64Key = java.util.Base64.getEncoder.encodeToString(keyBytes)
-      val prefix = if (keyPrefix.isEmpty) "" else s"$keyPrefix${RedisKVStoreConstants.KeySeparator}"
-      s"$prefix{$dataset${RedisKVStoreConstants.KeySeparator}$base64Key}"
-    })
-
-    // UDF to prepend 8-byte timestamp to value bytes
-    // This matches the format expected by multiGet
-    val prependTimestampUDF = udf((valueBytes: Array[Byte], ts: Long) => {
-      val timestampBytes = java.nio.ByteBuffer.allocate(8).putLong(ts).array()
-      timestampBytes ++ valueBytes
-    })
-
-    df.withColumn("redis_key", buildRedisKeyUDF(col("key_bytes"), col("dataset")))
-      .withColumn("redis_value", prependTimestampUDF(col("value_bytes"), lit(batchTimestamp)))
+    df.withColumn("redis_key", buildRedisKeyUDF(col(KeyColumn), col("dataset")))
+      .withColumn("redis_value", prependTimestampUDF(col(ValueColumn), lit(batchTimestamp)))
       .select("redis_key", "redis_value")
   }
 
-  /** Write DataFrame to Redis using foreachPartition with direct Jedis API.
-    * Each partition creates its own JedisCluster connection for efficient batch writes.
-    *
-    * Note: Redis cluster topology must be properly configured to announce
-    * externally accessible IPs/ports for Spark executors to connect.
-    */
-  private def writeToRedis(df: DataFrame,
-                           clusterNodes: String,
-                           ttl: Int,
-                           batchSize: Int,
-                           useSsl: Boolean = false): Unit = {
-    import redis.clients.jedis.{DefaultJedisClientConfig, HostAndPort, JedisCluster}
-    import scala.jdk.CollectionConverters._
-    import java.nio.charset.StandardCharsets
+  /** Source-compatible overload retained for callers compiled against the original standalone loader. */
+  def buildTransformedDataFrame(df: DataFrame,
+                                keyPrefix: String,
+                                batchTimestamp: Long,
+                                spark: SparkSession): DataFrame =
+    buildTransformedDataFrame(df, keyPrefix, batchTimestamp)
 
-    val clusterNodesBroadcast = df.sparkSession.sparkContext.broadcast(clusterNodes)
-    val ttlBroadcast = df.sparkSession.sparkContext.broadcast(ttl)
-    val useSslBroadcast = df.sparkSession.sparkContext.broadcast(useSsl)
+  private def writeToRedis(df: DataFrame, settings: Settings): Unit = {
+    val clientSettings = settings.clientSettings
+      .copy(
+        connectionTimeoutMs = math.max(settings.clientSettings.connectionTimeoutMs, BulkConnectionTimeoutMs),
+        soTimeoutMs = math.max(settings.clientSettings.soTimeoutMs, BulkSocketTimeoutMs)
+      )
+      .bulkWriter
+    val batchSize = settings.batchSize
+    val ttlSeconds = settings.ttlSeconds
 
-    logger.info(s"Writing to Redis using foreachPartition: nodes=${clusterNodes}, ssl=$useSsl, batchSize=$batchSize")
-
-    df.foreachPartition { rows: Iterator[org.apache.spark.sql.Row] =>
+    df.foreachPartition { rows: Iterator[Row] =>
       if (rows.hasNext) {
-        val nodes = clusterNodesBroadcast.value
-          .split(",")
-          .map { nodeStr =>
-            val parts = nodeStr.trim.split(":")
-            if (parts.length >= 2) { new HostAndPort(parts(0), parts(1).toInt) }
-            else { new HostAndPort(parts(0), RedisKVStoreConstants.DefaultPort) }
-          }
-          .toSet
-          .asJava
-
-        val poolConfig = new org.apache.commons.pool2.impl.GenericObjectPoolConfig[redis.clients.jedis.Connection]()
-        poolConfig.setMaxTotal(10)
-        poolConfig.setMaxIdle(5)
-        poolConfig.setMinIdle(1)
-
-        val clientConfigBuilder = DefaultJedisClientConfig
-          .builder()
-          .connectionTimeoutMillis(10000)
-          .socketTimeoutMillis(30000)
-          .ssl(useSslBroadcast.value)
-        if (useSslBroadcast.value) {
-          // ElastiCache cluster mode returns node IPs in the slot map; disable endpoint
-          // identification so Jedis can connect to those IPs without hostname mismatch.
-          // Certificate chain validation still uses the JVM default trust store.
-          clientConfigBuilder
-            .hostnameVerifier((_, _) => true)
-            .sslParameters(RedisKVStoreConstants.elastiCacheSslParams())
-        }
-        val clientConfig = clientConfigBuilder.build()
-
-        val jedisCluster = new JedisCluster(nodes, clientConfig, 5, poolConfig)
-
-        try {
-          // Use pipeline for batching within each partition
-          val pipeline = jedisCluster.pipelined()
-          var batchCount = 0
-
-          rows.foreach { row =>
-            val key = row.getAs[String]("redis_key")
-            val value = row.getAs[Array[Byte]]("redis_value")
-
-            // Use SETEX for batch IR data (simple key-value with TTL)
-            pipeline.setex(key.getBytes(StandardCharsets.UTF_8), ttlBroadcast.value.toLong, value)
-            batchCount += 1
-
-            // Flush pipeline every batchSize operations
-            if (batchCount >= batchSize) {
-              pipeline.sync()
-              batchCount = 0
-            }
-          }
-
-          // Flush remaining operations
-          if (batchCount > 0) {
-            pipeline.sync()
-          }
-        } finally {
-          jedisCluster.close()
-        }
+        val client = RedisKVStoreFactory.createClient(clientSettings)
+        try writeRows(rows, client, ttlSeconds, batchSize)
+        finally Try(client.close())
       }
     }
+  }
 
-    logger.info("Successfully wrote data to Redis using foreachPartition")
+  private def writeRows(rows: Iterator[Row], client: JedisCluster, ttlSeconds: Int, batchSize: Int): Unit =
+    rows.grouped(batchSize).foreach { batch =>
+      val pipeline = client.pipelined()
+      val responses =
+        try {
+          batch.map { row =>
+            pipeline.setex(
+              row.getAs[String]("redis_key").getBytes(StandardCharsets.UTF_8),
+              ttlSeconds.toLong,
+              row.getAs[Array[Byte]]("redis_value")
+            )
+          }
+        } finally pipeline.close()
+      responses.foreach(_.get())
+    }
+
+  def writeWithExistingConnection(df: DataFrame,
+                                  client: JedisCluster,
+                                  ttlSeconds: Int,
+                                  batchSize: Int = RedisBatchUploadDefaults.BatchSize): Unit =
+    writeRows(df.collect().iterator, client, ttlSeconds, batchSize)
+
+  private def requireNoIncrementalStatus(settings: Settings, controlClient: JedisCluster): Unit = {
+    val statusKey = RedisBatchUpload.buildStatusKey(settings.batchDataset, settings.keyPrefix)
+    require(
+      RedisBatchUpload.readStatus(controlClient, statusKey).isEmpty,
+      s"Redis full-snapshot upload cannot write incremental dataset ${settings.batchDataset}; use a new key prefix"
+    )
   }
 }
