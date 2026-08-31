@@ -146,6 +146,52 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "use the catalog upload path when catalog is configured" in {
+    val namespace = testNamespace("catalog_upload")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "catalog_upload_events"
+    val eventSchema = List(
+      Column("user", StringType, 10),
+      Column("views", IntType, 10)
+    )
+    DataFrameGen.events(spark, eventSchema, count = 1000, partitions = 18).save(s"$namespace.$eventsTable")
+
+    val groupByConf =
+      Builders.GroupBy(
+        sources = Seq(Builders.Source.events(Builders.Query(), table = eventsTable)),
+        keyColumns = Seq("user"),
+        aggregations = Seq(Builders.Aggregation(Operation.SUM, "views", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = namespace, name = "catalog_upload"),
+        accuracy = Accuracy.SNAPSHOT
+      )
+
+    val endDs = tableUtils.partitionSpec.at(System.currentTimeMillis())
+    val previousFormat = spark.conf.getOption(IonPathConfig.UploadFormatKey)
+    spark.conf.set(IonPathConfig.UploadFormatKey, "catalog")
+    try {
+      GroupByUpload.run(groupByConf, endDs)
+    } finally {
+      previousFormat.fold(spark.conf.unset(IonPathConfig.UploadFormatKey))(
+        spark.conf.set(IonPathConfig.UploadFormatKey, _))
+    }
+
+    val rows = tableUtils
+      .loadTable(groupByConf.metaData.uploadTable)
+      .where(s"ds = '$endDs'")
+      .collect()
+    rows.length should be > 1
+    rows.map(_.getAs[String]("key_json")) should contain(Constants.GroupByServingInfoKey)
+  }
+
+  it should "fall back to parquet for unset or unsupported upload formats" in {
+    GroupByUpload.uploadFormat(Map.empty) shouldBe "parquet"
+    GroupByUpload.uploadFormat(Map(IonPathConfig.UploadFormatKey -> "unknown")) shouldBe "parquet"
+    GroupByUpload.uploadFormat(Map(IonPathConfig.UploadFormatKey -> " ION ")) shouldBe "ion"
+    GroupByUpload.uploadFormat(Map(IonPathConfig.UploadFormatKey -> "Catalog")) shouldBe "catalog"
+  }
+
   // The ion upload stamps ts from partitionSpec.epochMillis(endDs) (the engine's partition start),
   // not a to_date/to_timestamp round-trip of the ds string.
   it should "stamp ion ts with the partition-start millis" in {
@@ -1324,4 +1370,3 @@ object GroupByUploadTest {
     tailHops.get(2).size() shouldBe 0
   }
 }
-

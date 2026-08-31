@@ -2,6 +2,8 @@ package ai.chronon.integrations.aws
 
 import ai.chronon.api.JobStatusType
 import ai.chronon.integrations.aws.EmrSubmitter.{
+  DatabricksOAuthTokenBareBracedVar,
+  DatabricksOAuthTokenBracedVar,
   DatabricksOAuthTokenVar,
   DefaultClusterIdleTimeout,
   DefaultClusterInstanceCount,
@@ -28,6 +30,7 @@ import software.amazon.awssdk.services.s3.S3Client
 
 import java.time.Instant
 import java.util.concurrent.Executors
+import java.util.regex.Matcher
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
@@ -48,6 +51,13 @@ class EmrSubmitter(customerId: String,
                    flinkHealthCheckFn: Option[String] => Boolean = _ => true,
                    flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None)
     extends JobSubmitter {
+
+  private val EnvVarPattern = """\$?\{([A-Z_][A-Z0-9_]*)\}""".r
+
+  private def resolveEnvVars(properties: Map[String, String], env: Map[String, String]): Map[String, String] =
+    properties.map { case (key, value) =>
+      key -> EnvVarPattern.replaceAllIn(value, m => Matcher.quoteReplacement(env.getOrElse(m.group(1), m.matched)))
+    }
 
   private val ClusterApplications = List(
     "Flink",
@@ -222,9 +232,12 @@ class EmrSubmitter(customerId: String,
     // Values referencing the Databricks OAuth token use double quotes to allow shell variable expansion
     val confArgs = jobProperties
       .map { case (k, v) =>
-        if (v.contains(DatabricksOAuthTokenVar)) {
+        val shellValue = v
+          .replace(DatabricksOAuthTokenBracedVar, DatabricksOAuthTokenVar)
+          .replace(DatabricksOAuthTokenBareBracedVar, DatabricksOAuthTokenVar)
+        if (shellValue.contains(DatabricksOAuthTokenVar)) {
           val escapedKey = k.replace("\"", "\\\"")
-          val escapedValue = v.replace("\"", "\\\"")
+          val escapedValue = shellValue.replace("\"", "\\\"")
           s"""--conf "$escapedKey=$escapedValue""""
         } else {
           val escapedKey = k.replace("'", "'\\''")
@@ -555,7 +568,19 @@ class EmrSubmitter(customerId: String,
 
       case TypeSparkJob =>
         val existingJobId = submissionProperties.getOrElse(ClusterId, throw new RuntimeException("JobFlowId not found"))
-        val sparkJobProperties = jobProperties ++ envVarsToSparkProperties(envVars)
+        val fetchesDatabricksTokenOnCluster =
+          submissionProperties.contains("DATABRICKS_HOST") && submissionProperties.contains("DATABRICKS_SECRET_NAME")
+        // When configured, classic EMR replaces any submitted token with a fresh on-cluster token. Direct-token
+        // submissions still resolve and forward their supplied value normally.
+        val placeholderEnv =
+          if (fetchesDatabricksTokenOnCluster) (sys.env.toMap ++ envVars) - "DATABRICKS_OAUTH_TOKEN"
+          else sys.env.toMap ++ envVars
+        val submittedEnv =
+          if (fetchesDatabricksTokenOnCluster && envVars.contains("DATABRICKS_OAUTH_TOKEN"))
+            envVars.updated("DATABRICKS_OAUTH_TOKEN", DatabricksOAuthTokenVar)
+          else envVars
+        val sparkJobProperties =
+          resolveEnvVars(jobProperties, placeholderEnv) ++ envVarsToSparkProperties(submittedEnv)
         val stepConfig = createStepConfig(files, submissionProperties, sparkJobProperties, userArgs: _*)
 
         val request = AddJobFlowStepsRequest
@@ -783,6 +808,8 @@ class EmrSubmitter(customerId: String,
 
 object EmrSubmitter {
   private val DatabricksOAuthTokenVar = "$DATABRICKS_OAUTH_TOKEN"
+  private val DatabricksOAuthTokenBracedVar = "${DATABRICKS_OAUTH_TOKEN}"
+  private val DatabricksOAuthTokenBareBracedVar = "{DATABRICKS_OAUTH_TOKEN}"
 
   def apply(k8sConfig: Option[Config] = None,
             flinkHealthCheckFn: Option[String] => Boolean = _ => true,

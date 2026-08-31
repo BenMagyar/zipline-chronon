@@ -266,12 +266,12 @@ class KVUploadNodeRunnerTest
   it should "read Chronon SparkConf API props" in {
     val sparkConf = new SparkConf(false)
       .set(KvUploadTimeoutMsKey, "3600000")
-      .set("spark.chronon.some.other.config", "enabled")
+      .set("spark.chronon.kv_upload.redis.mode", "full_snapshot")
       .set("spark.sql.shuffle.partitions", "1")
 
     KVUploadNodeRunner.sparkConfApiProps(sparkConf) shouldEqual Map(
       KvUploadTimeoutMsKey -> "3600000",
-      "spark.chronon.some.other.config" -> "enabled"
+      "spark.chronon.kv_upload.redis.mode" -> "full_snapshot"
     )
   }
 
@@ -279,10 +279,12 @@ class KVUploadNodeRunnerTest
     val mergedProps = KVUploadNodeRunner.mergeApiProps(
       nodeCommonConf = Map(
         KvUploadTimeoutMsKey -> "1800000",
+        "spark.chronon.kv_upload.redis.mode" -> "incremental",
         "node-only" -> "node"
       ),
       sparkConfProps = Map(
         KvUploadTimeoutMsKey -> "3600000",
+        "spark.chronon.kv_upload.redis.mode" -> "full_snapshot",
         "spark-only" -> "spark"
       ),
       props = Map(
@@ -293,6 +295,7 @@ class KVUploadNodeRunnerTest
 
     mergedProps shouldEqual Map(
       KvUploadTimeoutMsKey -> "7200000",
+      "spark.chronon.kv_upload.redis.mode" -> "full_snapshot",
       "node-only" -> "node",
       "spark-only" -> "spark",
       "cli-only" -> "cli"

@@ -47,7 +47,7 @@ class AzureApiImpl(conf: Map[String, String]) extends Api(conf) {
                     store
                   case "redis" =>
                     logger.info("Initializing Redis KV store")
-                    RedisKVStoreFactory.create(conf)
+                    RedisKVStoreFactory.createFullSnapshot(conf)
                   case other =>
                     throw new IllegalArgumentException(
                       s"Unsupported KV store type: $other. Supported types: cosmos, redis")

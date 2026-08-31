@@ -528,7 +528,7 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
   }
 
 
-  it should "use single quotes for regular confs and double quotes for Databricks token confs" in {
+  it should "resolve submitted env placeholders and expand the Databricks OAuth token on-cluster" in {
     val stepId = "mock-step-id"
     val clusterId = "j-MOCKCLUSTERID123"
 
@@ -553,11 +553,19 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       ),
       jobProperties = Map(
         "spark.executor.memory" -> "4g",
-        "spark.sql.catalog.workspace.token" -> "$DATABRICKS_OAUTH_TOKEN"
+        "spark.sql.catalog.workspace.token" -> "${DATABRICKS_OAUTH_TOKEN}",
+        "spark.sql.catalog.workspace.bareToken" -> "{DATABRICKS_OAUTH_TOKEN}",
+        "spark.sql.catalog.workspace.credential" -> "{DATABRICKS_CREDENTIAL}",
+        "spark.sql.catalog.workspace.clientId" -> "${DATABRICKS_CLIENT_ID}"
       ),
       files = List.empty,
       labels = Map.empty,
-      envVars = Map.empty,
+      envVars = Map(
+        "DATABRICKS_CREDENTIAL" -> "client:secret",
+        "DATABRICKS_CLIENT_ID" -> "client-id",
+        // Classic EMR must still use the fresh token fetched by its on-cluster script.
+        "DATABRICKS_OAUTH_TOKEN" -> "stale-submit-host-token"
+      ),
       args = "arg1"
     )
 
@@ -566,9 +574,44 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     assert(actualArgs.contains("--conf 'spark.executor.memory=4g'"))
     // Token confs use double quotes (shell expansion for $DATABRICKS_OAUTH_TOKEN)
     assert(actualArgs.contains("""--conf "spark.sql.catalog.workspace.token=$DATABRICKS_OAUTH_TOKEN""""))
+    assert(actualArgs.contains("""--conf "spark.sql.catalog.workspace.bareToken=$DATABRICKS_OAUTH_TOKEN""""))
+    assert(actualArgs.contains("--conf 'spark.sql.catalog.workspace.credential=client:secret'"))
+    assert(actualArgs.contains("--conf 'spark.sql.catalog.workspace.clientId=client-id'"))
+    assert(actualArgs.contains("""--conf "spark.executorEnv.DATABRICKS_OAUTH_TOKEN=$DATABRICKS_OAUTH_TOKEN""""))
+    assert(actualArgs.contains("""--conf "spark.yarn.appMasterEnv.DATABRICKS_OAUTH_TOKEN=$DATABRICKS_OAUTH_TOKEN""""))
+    actualArgs should not include "stale-submit-host-token"
     // Token fetch script is present
     assert(actualArgs.contains("aws secretsmanager get-secret-value"))
     assert(actualArgs.contains("DATABRICKS_OAUTH_TOKEN="))
+  }
+
+  it should "forward a directly submitted Databricks OAuth token when on-cluster refresh is not configured" in {
+    val mockEmrClient = mock[EmrClient]
+    val requestCaptor = org.mockito.ArgumentCaptor.forClass(classOf[AddJobFlowStepsRequest])
+    when(mockEmrClient.addJobFlowSteps(requestCaptor.capture()))
+      .thenReturn(AddJobFlowStepsResponse.builder().stepIds("mock-step-id").build())
+
+    val submitter =
+      new EmrSubmitter("canary", mockEmrClient, mock[Ec2Client], Some(mock[K8sFlinkSubmitter]), awsRegion = "us-west-2")
+    submitter.submit(
+      jobType = SparkJob,
+      submissionProperties = Map(
+        MainClass -> "some-main-class",
+        JarURI -> "s3://jar-uri",
+        ClusterId -> "j-MOCKCLUSTERID123"
+      ),
+      jobProperties = Map("spark.sql.catalog.workspace.token" -> "${DATABRICKS_OAUTH_TOKEN}"),
+      files = List.empty,
+      labels = Map.empty,
+      envVars = Map("DATABRICKS_OAUTH_TOKEN" -> "direct-token"),
+      args = "arg1"
+    )
+
+    val actualArgs = requestCaptor.getValue.steps().get(0).hadoopJarStep().args().toScala.mkString(" ")
+    actualArgs should include("--conf 'spark.sql.catalog.workspace.token=direct-token'")
+    actualArgs should include("--conf 'spark.executorEnv.DATABRICKS_OAUTH_TOKEN=direct-token'")
+    actualArgs should not include "$DATABRICKS_OAUTH_TOKEN"
+    actualArgs should not include "aws secretsmanager get-secret-value"
   }
 
   it should "throw exception when only DATABRICKS_HOST is set without DATABRICKS_SECRET_NAME" in {

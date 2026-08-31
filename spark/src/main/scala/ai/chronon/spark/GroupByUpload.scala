@@ -35,6 +35,7 @@ import org.apache.spark.sql.types.{BinaryType, StringType, StructField, StructTy
 import org.apache.spark.sql.{DataFrame, Encoder, Encoders, Row, SparkSession}
 import org.slf4j.{Logger, LoggerFactory}
 
+import java.util.Locale
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 import scala.util.Try
@@ -361,6 +362,13 @@ class GroupByUpload(endPartition: String,
 }
 
 object GroupByUpload {
+  private[spark] def uploadFormat(runtimeProperties: Map[String, String]): String =
+    runtimeProperties.get(IonPathConfig.UploadFormatKey).map(_.trim.toLowerCase(Locale.ROOT)) match {
+      case Some("ion")     => "ion"
+      case Some("catalog") => "catalog"
+      case _               => "parquet"
+    }
+
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
   case class UploadResult(kvDf: DataFrame, nullCounts: Map[String, Long])
@@ -593,7 +601,7 @@ object GroupByUpload {
     )
 
     val sparkConf = tableUtils.sparkSession.conf
-    val uploadFormat = sparkConf.getOption(IonPathConfig.UploadFormatKey).getOrElse("parquet")
+    val uploadFormat = GroupByUpload.uploadFormat(sparkConf.getAll)
     val partitionCol =
       sparkConf.getOption(IonPathConfig.PartitionColumnKey).getOrElse(IonPathConfig.DefaultPartitionColumn)
     val uploadDf = kvDf.union(metaDf).withColumn(partitionCol, lit(endDs))
