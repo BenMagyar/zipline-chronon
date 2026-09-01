@@ -20,21 +20,16 @@ import ai.chronon.aggregator.test.Column
 import ai.chronon.api
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.catalog.TableUtils
-import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.{DataFrameGen, SparkTestBase}
-import org.apache.spark.sql.SparkSession
-import org.scalatest.flatspec.AnyFlatSpec
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 import java.io.File
 import scala.io.Source
 
-class MetadataExporterTest extends AnyFlatSpec {
+class MetadataExporterTest extends SparkTestBase {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
-  val sessionName = "MetadataExporter"
-  val spark: SparkSession = SparkSessionBuilder.build(sessionName, local = true)
   val tableUtils: TableUtils = TableUtils(spark)
 
   def printFilesInDirectory(directoryPath: String): Unit = {

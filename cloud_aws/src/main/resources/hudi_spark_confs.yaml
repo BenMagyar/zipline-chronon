@@ -1,3 +1,2 @@
 spark.sql.catalog.spark_catalog: "org.apache.spark.sql.hudi.catalog.HoodieCatalog"
 spark.sql.extensions: "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
-spark.chronon.table_write.format: "hudi"

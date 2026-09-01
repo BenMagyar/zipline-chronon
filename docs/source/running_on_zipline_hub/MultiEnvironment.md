@@ -79,7 +79,6 @@ gcp = Team(
             }),
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
-            "spark.chronon.table_write.format": "iceberg",
         },
     ),
 )

@@ -23,17 +23,13 @@ import ai.chronon.online.serde.SparkConversions.toChrononSchema
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.stats.{EnhancedStatsCompute, StatsCompute}
-import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.{DataFrameGen, SparkTestBase}
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.lit
-import org.scalatest.flatspec.AnyFlatSpec
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
-class StatsComputeTest extends AnyFlatSpec {
+class StatsComputeTest extends SparkTestBase {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
-  lazy val spark: SparkSession = SparkSessionBuilder.build("StatsComputeTest", local = true)
   implicit val tableUtils: TableUtils = TableUtils(spark)
   val namespace: String = "stats_compute_test"
 

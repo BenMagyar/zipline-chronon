@@ -27,14 +27,12 @@ import ai.chronon.online.fetcher.{FetchContext, Fetcher}
 import ai.chronon.online.serde._
 import ai.chronon.spark.Extensions.DataframeOps
 import ai.chronon.spark.catalog.TableUtils
-import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.SparkTestBase
 import ai.chronon.spark.utils._
 import ai.chronon.spark.{LogFlattenerJob, LoggingSchema}
 import org.apache.spark.sql.functions.{col, lit}
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.junit.Assert.{assertEquals, assertFalse, assertNotEquals, assertTrue}
-import org.scalatest.flatspec.AnyFlatSpec
 
 import java.nio.charset.StandardCharsets
 import java.util.{Base64, TimeZone}
@@ -43,9 +41,8 @@ import scala.concurrent.Await
 import scala.concurrent.duration.{Duration, SECONDS}
 
 
-class SchemaEvolutionTest extends AnyFlatSpec {
+class SchemaEvolutionTest extends SparkTestBase {
 
-  val spark: SparkSession = SparkSessionBuilder.build("SchemaEvolutionTest", local = true)
   TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
   private val fetchingDs = "2022-10-03"
 

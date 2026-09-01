@@ -13,7 +13,6 @@ spark-submit \
       --conf spark.chronon.coalesce.factor=10 \
       --conf spark.chronon.partition.column=ds \
       --conf spark.chronon.partition.format=yyyy-MM-dd \
-      --conf spark.chronon.table_write.format=iceberg \
       --conf spark.default.parallelism=10 \
       --conf spark.executor.cores=1 \
       --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \

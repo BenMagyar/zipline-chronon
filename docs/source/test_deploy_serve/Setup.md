@@ -77,7 +77,6 @@ aws_team = Team(
             }),
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
-            "spark.chronon.table_write.format": "iceberg",
         },
     ),
 )
@@ -106,7 +105,6 @@ gcp_team = Team(
             }),
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
-            "spark.chronon.table_write.format": "iceberg",
         },
     ),
 )
@@ -134,7 +132,6 @@ azure_team = Team(
                 "spark.sql.catalog.spark_catalog.warehouse": "your-warehouse",
                 "spark.sql.catalog.spark_catalog.scope": "PRINCIPAL_ROLE:engine",
             }),
-            "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
         },
@@ -183,7 +180,6 @@ databricks_team = Team(
             "spark.sql.catalog.workspace_iceberg.scope": "all-apis",
             "spark.sql.catalog.workspace_iceberg.warehouse": "workspace",
 
-            "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.partition.column": "ds",
             "spark.chronon.partition.format": "yyyy-MM-dd",
         },
@@ -257,11 +253,12 @@ my_team = Team(
 
 These Spark properties control Chronon-specific behavior and should be set in `conf.common`:
 
+`spark.chronon.table_write.format` is deprecated and ignored. Chronon writes all output tables as Iceberg.
+
 | Property | Description | Example |
 |---|---|---|
 | `spark.chronon.partition.column` | Partition column name | `"ds"` |
 | `spark.chronon.partition.format` | Partition date format | `"yyyy-MM-dd"` |
-| `spark.chronon.table_write.format` | Output table format | `"iceberg"` |
 | `spark.chronon.coalesce.factor` | Output coalesce factor | `"10"` |
 | `spark.chronon.table.format_provider.class` | Cloud-specific format provider | `"ai.chronon.integrations.cloud_gcp.GcpFormatProvider"` |
 
@@ -335,7 +332,6 @@ recommendations = Team(
             }),
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
-            "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.coalesce.factor": "10",
             "spark.default.parallelism": "10",
             "spark.sql.shuffle.partitions": "10",

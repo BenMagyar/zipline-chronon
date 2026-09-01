@@ -33,7 +33,6 @@
           "spark.chronon.table.gcs.connector_output_project": "customer-zipline-dev",
           "spark.chronon.table.format_provider.class": "ai.chronon.integrations.cloud_gcp.GcpFormatProvider",
           "spark.chronon.table.gcs.temporary_gcs_bucket": "zipline-warehouse-customer",
-          "spark.chronon.table_write.format": "iceberg",
           "spark.default.parallelism": "11000",
           "spark.sql.shuffle.partitions": "30000",
           "spark.chronon.write.repartition": "false",

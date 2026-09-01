@@ -2,18 +2,23 @@ package ai.chronon.spark.utils
 
 import ai.chronon.api.{Constants, LongType, StringType, StructField, StructType}
 import ai.chronon.spark.catalog.{CreationUtils, TableUtils}
-import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.TestUtils.makeDf
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.Row
 import org.junit.Assert.{assertEquals, assertFalse, assertTrue}
 import org.scalatest.BeforeAndAfterEach
-import org.scalatest.flatspec.AnyFlatSpec
 import org.slf4j.{Logger, LoggerFactory}
 
-class SemanticUtilsTest extends AnyFlatSpec with BeforeAndAfterEach {
+class SemanticUtilsTest extends SparkTestBase with BeforeAndAfterEach {
+
+  override protected def sparkConfs: Map[String, String] = Map(
+    "spark.sql.catalog.spark_catalog.type" -> "hive",
+    "spark.hadoop.iceberg.engine.hive.lock-enabled" -> "false"
+  )
+
+  // The full suite can reuse a SparkContext, in which case Spark does not reapply spark.hadoop.* builder configs.
+  spark.sparkContext.hadoopConfiguration.set("iceberg.engine.hive.lock-enabled", "false")
 
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
-  lazy val spark: SparkSession = SparkSessionBuilder.build("semantic_utils_test", local = true)
   implicit val tableUtils: TableUtils = TableUtils(spark)
   private val semanticUtils = new SemanticUtils(tableUtils)
   private val namespace = "semantic_utils_test"
@@ -164,7 +169,7 @@ class SemanticUtilsTest extends AnyFlatSpec with BeforeAndAfterEach {
 
     // Old reuse table should have been moved to shelf with timestamp suffix
     // Find the shelf table (should match pattern: tableName_archive_YYYYMMDDHHMMSS)
-    val allTables = spark.catalog.listTables(testDb).collect().map(_.name)
+    val allTables = spark.sql(s"SHOW TABLES IN $testDb").collect().map(_.getAs[String]("tableName"))
     val shelfTables = allTables.filter(t =>
       t.startsWith(s"test_shelf_behavior_archive_") &&
       t != "test_shelf_behavior_archive_reuse" &&

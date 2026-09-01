@@ -31,7 +31,6 @@ class BigQueryCatalogTest extends AnyFlatSpec with MockitoSugar {
       Map(
         "spark.chronon.table.format_provider.class" -> classOf[GcpFormatProvider].getName,
         "spark.chronon.partition.column" -> "ds",
-        "spark.chronon.table_write.format" -> "iceberg",
 //        "spark.hadoop.fs.gs.impl" -> "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem",
 //        "spark.hadoop.fs.AbstractFileSystem.gs.impl" -> "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS",
         "spark.sql.catalogImplementation" -> "in-memory",

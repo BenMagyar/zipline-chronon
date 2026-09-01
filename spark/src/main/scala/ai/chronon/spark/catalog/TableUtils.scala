@@ -310,11 +310,8 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
 
     if (!tableReachable(tableName, ignoreFailure = true)) {
       try {
-        tableFormatProvider.writeFormat.createTable(tableName,
-                                                    dfRearranged.schema,
-                                                    partitionColumns,
-                                                    tableProperties,
-                                                    semanticHash)(sparkSession)
+        Iceberg.createTable(tableName, dfRearranged.schema, partitionColumns, tableProperties, semanticHash)(
+          sparkSession)
       } catch {
         case _: TableAlreadyExistsException =>
           logger.info(s"Table $tableName already exists, skipping creation")
@@ -328,7 +325,7 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
       expandTable(tableName, dfRearranged.schema)
     }
 
-    val defaultTableProperties = tableFormatProvider.writeFormat.tableProperties
+    val defaultTableProperties = Iceberg.tableProperties
     val userTableProperties = Option(tableProperties).getOrElse(Map.empty)
     val desiredTableProperties = defaultTableProperties ++ userTableProperties
     val existingTableProperties = getTableProperties(tableName).getOrElse(Map.empty)

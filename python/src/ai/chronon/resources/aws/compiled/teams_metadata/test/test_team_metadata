@@ -5,7 +5,6 @@
         "spark.chronon.coalesce.factor": "10",
         "spark.chronon.partition.column": "<partition-column-name>",
         "spark.chronon.partition.format": "<date-format>",
-        "spark.chronon.table_write.format": "iceberg",
         "spark.chronon.table_write.upload.format": "ion",
         "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-<customer_id>/data/ion_uploads/",
         "spark.default.parallelism": "10",

@@ -32,7 +32,6 @@ spark-shell \
   --conf "spark.sql.catalog.spark_catalog.scope=PRINCIPAL_ROLE:engine" \
   --conf "spark.sql.catalog.spark_catalog.header.X-Iceberg-Access-Delegation=vended-credentials" \
   --conf "spark.sql.defaultCatalog=spark_catalog" \
-  --conf "spark.chronon.table_write.format=iceberg" \
   --conf "spark.chronon.table.format_provider.class=ai.chronon.integrations.cloud_azure.AzureFormatProvider" \
   --conf "spark.chronon.partition.format=yyyy-MM-dd" \
   --conf "spark.chronon.partition.column=ds" \

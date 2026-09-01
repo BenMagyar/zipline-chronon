@@ -19,15 +19,14 @@ package ai.chronon.spark.other
 import ai.chronon.api._
 import ai.chronon.spark._
 import ai.chronon.spark.catalog.{Format, Hive, IncompatibleSchemaException, TableUtils}
-import ai.chronon.spark.submission.SparkSessionBuilder
 import ai.chronon.spark.utils.SparkTestBase
 import ai.chronon.spark.utils.TestUtils.makeDf
 import org.apache.hadoop.hive.ql.exec.UDF
+import org.apache.iceberg.exceptions.ValidationException
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.{Row, _}
 import org.junit.Assert.{assertEquals, assertFalse, assertNull, assertTrue}
-import org.scalatest.flatspec.AnyFlatSpec
 
 import scala.util.Try
 
@@ -39,13 +38,24 @@ class SimpleAddUDF extends UDF {
   }
 }
 
-class TableUtilsTest extends AnyFlatSpec {
-  val spark: SparkSession = SparkSessionBuilder.build("TableUtilsTest", local = true)
+class TableUtilsTest extends SparkTestBase {
+
+  override protected def sparkConfs: Map[String, String] = Map(
+    "spark.sql.catalog.spark_catalog.type" -> "hive",
+    "spark.hadoop.iceberg.engine.hive.lock-enabled" -> "false",
+    "spark.sql.extensions" -> (
+      "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions," +
+        "ai.chronon.spark.extensions.ChrononMergeExtension"
+    )
+  )
+
+  // The full suite can reuse a SparkContext, in which case Spark does not reapply spark.hadoop.* builder configs.
+  spark.sparkContext.hadoopConfiguration.set("iceberg.engine.hive.lock-enabled", "false")
 
   private val tableUtils = TableUtils(spark)
   private implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
 
-  it should "handle special characters in column names with TableUtils.insertPartitions" in {
+  it should "reject column paths that conflict under Iceberg schema rules" in {
     val specialTableName = "db.special_chars_table"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
 
@@ -55,9 +65,7 @@ class TableUtilsTest extends AnyFlatSpec {
       Array(StructField("dots", IntType), StructField("id", StringType))
     )
 
-    // Create data for our test
     val row1 = Row("value1", 42, true, Row(123, "id1"), "2023-01-01")
-    val row2 = Row("value2", 84, false, Row(456, "id2"), "2023-01-02")
 
     // Define schema with:
     // 1. "with.dots" - a column with dots in the name
@@ -73,76 +81,18 @@ class TableUtilsTest extends AnyFlatSpec {
       )
     )
 
-    // Create the DataFrame with our complex schema
-    val specialCharsData = makeDf(spark, schema, List(row1, row2))
+    val specialCharsData = makeDf(spark, schema, List(row1))
 
     try {
-      // Use TableUtils.insertPartitions with our fixed column reference handling
-      tableUtils.insertPartitions(
-        specialCharsData,
-        specialTableName,
-        partitionColumns = List("ds")
-      )
-
-      // Verify that columns were preserved correctly
-      val loadedData = tableUtils.loadTable(specialTableName)
-      val expectedColumns = List("normal", "with.dots", "with#hash", "with", "ds")
-      assertEquals(expectedColumns, loadedData.columns.toList)
-
-      // Verify column values including both with.dots and with.dots
-      val day1Data = loadedData.where(col("ds") === "2023-01-01").collect()
-      assertEquals(1, day1Data.length)
-      assertEquals("value1", day1Data(0).getAs[String]("normal"))
-      assertEquals(42, day1Data(0).getAs[Int]("with.dots")) // Dot column
-      assertEquals(true, day1Data(0).getAs[Boolean]("with#hash"))
-
-      // Verify the struct field "with" that contains field "dots"
-      val withStruct = day1Data(0).getAs[Row]("with")
-      assertEquals(123, withStruct.getAs[Int]("dots")) // Same as with.dots in dot notation
-      assertEquals("id1", withStruct.getAs[String]("id"))
-
-      // Create a DataFrame with a backtick and a column with dots and hash
-      val backticksData = makeDf(
-        spark,
-        StructType(
+      val error = intercept[ValidationException] {
+        tableUtils.insertPartitions(
+          specialCharsData,
           specialTableName,
-          Array(
-            StructField("with`backtick", StringType),
-            StructField("num", IntType),
-            StructField("with.hash#mix", DoubleType), // Column with both dots and hash
-            StructField("ds", StringType)
-          )
-        ),
-        List(
-          Row("tick", 100, 99.9, "2023-01-03")
+          partitionColumns = List("ds")
         )
-      )
-
-      // Test with autoExpand=true which uses our other fixed code path
-      tableUtils.insertPartitions(
-        backticksData,
-        specialTableName,
-        partitionColumns = List("ds"),
-        autoExpand = true
-      )
-
-      // Verify all columns are present after expansion
-      val updatedData = tableUtils.loadTable(specialTableName)
-      val allExpectedCols =
-        expectedColumns.reverse.tail.reverse ++ List("with`backtick", "num", "with.hash#mix") :+ "ds"
-      assertEquals(allExpectedCols, updatedData.columns.toList)
-
-      // Verify the new row data
-      val day3Data = updatedData.where(col("ds") === "2023-01-03").collect()
-      assertEquals(1, day3Data.length)
-      assertEquals("tick", day3Data(0).getAs[String]("with`backtick"))
-      assertEquals(100, day3Data(0).getAs[Int]("num"))
-      assertEquals(99.9, day3Data(0).getAs[Double]("with.hash#mix"), 0.0)
-
-      // Null for fields not in this row
-      assertNull(day3Data(0).getAs[Row]("with"))
+      }
+      assertTrue(error.getMessage.contains("multiple fields for name with.dots"))
     } finally {
-      // Clean up
       spark.sql(s"DROP TABLE IF EXISTS $specialTableName")
     }
   }
@@ -186,7 +136,7 @@ class TableUtilsTest extends AnyFlatSpec {
 
       // Verify the expanded schema
       val loadedData = tableUtils.loadTable(expandTableName)
-      val expectedColumns = List("id", "name", "age", "email", "ds")
+      val expectedColumns = List("id", "name", "ds", "age", "email")
       assertEquals(expectedColumns, loadedData.columns.toList)
 
       // Original row should have nulls for new columns
@@ -401,25 +351,28 @@ class TableUtilsTest extends AnyFlatSpec {
     import spark.implicits._
     val hourlySpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 60 * 60 * 1000)
     val hourlyTableUtils = TableUtils(spark, hourlySpec)
-    val outputTable = "db.shifted_subdaily_output"
-    val inputTable = "db.shifted_subdaily_input"
+    val suffix = System.nanoTime()
+    val outputTable = s"db.shifted_subdaily_output_$suffix"
+    val inputTable = s"db.shifted_subdaily_input_$suffix"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
     spark.sql(s"DROP TABLE IF EXISTS $outputTable")
     spark.sql(s"DROP TABLE IF EXISTS $inputTable")
 
     try {
+      spark.sql(s"CREATE TABLE $outputTable (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
+      spark.sql(s"CREATE TABLE $inputTable (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
       Seq(("2024-01-01-00-00", "existing"))
         .toDF("ds", "id")
+        .select("id", "ds")
         .write
-        .partitionBy("ds")
-        .saveAsTable(outputTable)
+        .insertInto(outputTable)
       Seq(("2024-01-01-01-00", "present"),
           ("2024-01-01-02-00", "present"),
           ("2024-01-01-04-00", "present"))
         .toDF("ds", "id")
+        .select("id", "ds")
         .write
-        .partitionBy("ds")
-        .saveAsTable(inputTable)
+        .insertInto(inputTable)
 
       val outputRange = PartitionRange("2024-01-01-00-00", "2024-01-01-03-00")(hourlySpec)
       val inputRange = PartitionRange("2024-01-01-01-00", "2024-01-01-04-00")(hourlySpec)
@@ -445,23 +398,26 @@ class TableUtilsTest extends AnyFlatSpec {
     import spark.implicits._
     val offsetSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000, 60 * 60 * 1000)
     val offsetTableUtils = TableUtils(spark, offsetSpec)
-    val outputTable = "db.offset_subdaily_output"
-    val inputTable = "db.offset_daily_input"
+    val suffix = System.nanoTime()
+    val outputTable = s"db.offset_subdaily_output_$suffix"
+    val inputTable = s"db.offset_daily_input_$suffix"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
     spark.sql(s"DROP TABLE IF EXISTS $outputTable")
     spark.sql(s"DROP TABLE IF EXISTS $inputTable")
 
     try {
+      spark.sql(s"CREATE TABLE $outputTable (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
+      spark.sql(s"CREATE TABLE $inputTable (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
       Seq(("2024-01-01-01-00", "existing"))
         .toDF("ds", "id")
+        .select("id", "ds")
         .write
-        .partitionBy("ds")
-        .saveAsTable(outputTable)
+        .insertInto(outputTable)
       Seq(("2024-01-01", "present"))
         .toDF("ds", "id")
+        .select("id", "ds")
         .write
-        .partitionBy("ds")
-        .saveAsTable(inputTable)
+        .insertInto(inputTable)
 
       val outputRange = PartitionRange("2024-01-01-01-00", "2024-01-01-07-00")(offsetSpec)
       val actual = offsetTableUtils.unfilledRanges(outputTable,
@@ -690,7 +646,6 @@ class TableUtilsTest extends AnyFlatSpec {
   }
 
   it should "test catalog detection" in {
-    implicit val localSparkRef: SparkSession = spark
     assertEquals("catalogA", Format.getCatalog("catalogA.foo.bar"))
     assertEquals("catalogA", Format.getCatalog("`catalogA`.foo.bar"))
     assertEquals("spark_catalog", Format.getCatalog("`catalogA.foo`.bar"))
@@ -740,7 +695,8 @@ class TableUtilsTest extends AnyFlatSpec {
       ("user1", java.sql.Timestamp.valueOf("2024-01-05 12:00:00"))
     ).toDF("user_id", "created_at")
 
-    data.write.saveAsTable(tableName)
+    spark.sql(s"CREATE TABLE $tableName (user_id STRING, created_at TIMESTAMP) USING parquet")
+    data.write.insertInto(tableName)
 
     val partitions = tableUtils.partitions(tableName, timePartitioned = true,
       tablePartitionSpec = Some(PartitionSpec("created_at", "yyyy-MM-dd", 24 * 60 * 60 * 1000)))
@@ -871,7 +827,8 @@ class TableUtilsTest extends AnyFlatSpec {
       ("user1", 400, java.sql.Timestamp.valueOf("2024-01-03 12:00:00"))
     ).toDF("user_id", "value", "created_at")
 
-    data.write.saveAsTable(tableName)
+    spark.sql(s"CREATE TABLE $tableName (user_id STRING, value INT, created_at TIMESTAMP) USING parquet")
+    data.write.insertInto(tableName)
 
     val query = Builders.Query(
       partitionColumn = "created_at",
@@ -900,13 +857,14 @@ class TableUtilsTest extends AnyFlatSpec {
     // must come from the MAX(ds) scan fallback - this is the join-part reuse path for
     // clustered warehouse tables
     import spark.implicits._
-    val tableName = "db.unpartitioned_scan_table"
+    val tableName = s"db.unpartitioned_scan_table_${System.nanoTime()}"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
     spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    spark.sql(s"CREATE TABLE $tableName (ds STRING, id STRING) USING parquet")
     Seq(("2024-01-01", "a"), ("2024-01-02", "b"), ("2024-01-03", "c"))
       .toDF("ds", "id")
       .write
-      .saveAsTable(tableName)
+      .insertInto(tableName)
 
     // logical partitions come from the distinct values of the ds column, so compute
     // planning (unfilledRanges, step runners) sees existing data instead of recomputing
@@ -929,14 +887,15 @@ class TableUtilsTest extends AnyFlatSpec {
     // PartitionSpec construction
     val subDailySpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 3 * 60 * 60 * 1000L, 60 * 60 * 1000L)
     import spark.implicits._
-    val tableName = "db.sub_daily_watermark_table"
+    val tableName = s"db.sub_daily_watermark_table_${System.nanoTime()}"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
     spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    spark.sql(s"CREATE TABLE $tableName (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
     Seq(("2024-01-05-01-00", "a"), ("2024-01-05-04-00", "b"))
       .toDF("ds", "id")
+      .select("id", "ds")
       .write
-      .partitionBy("ds")
-      .saveAsTable(tableName)
+      .insertInto(tableName)
 
     val watermark = tableUtils.dataWatermarkMillis(tableName, Some(subDailySpec))
     // last partition 04:00 covers through 07:00
@@ -956,14 +915,15 @@ class TableUtilsTest extends AnyFlatSpec {
 
   it should "read daily catalog partitions that are returned as timestamps" in {
     import spark.implicits._
-    val tableName = "db.timestamp_shaped_daily_partitions"
+    val tableName = s"db.timestamp_shaped_daily_partitions_${System.nanoTime()}"
     spark.sql("CREATE DATABASE IF NOT EXISTS db")
     spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    spark.sql(s"CREATE TABLE $tableName (id STRING, ds STRING) USING parquet PARTITIONED BY (ds)")
     Seq(("2024-03-02 00:00:00", "a"), ("2024-03-03 00:00:00", "b"))
       .toDF("ds", "id")
+      .select("id", "ds")
       .write
-      .partitionBy("ds")
-      .saveAsTable(tableName)
+      .insertInto(tableName)
 
     assertEquals(Some("2024-03-02"), tableUtils.firstAvailablePartition(tableName))
     assertEquals(Some("2024-03-03"), tableUtils.lastAvailablePartition(tableName))

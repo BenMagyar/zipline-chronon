@@ -4,8 +4,8 @@ import org.apache.spark.sql.SparkSession
 
 import scala.reflect.runtime.universe.runtimeMirror
 
-/** Dynamically provide the read / write table format depending on table name.
-  * This supports reading/writing tables with heterogeneous formats.
+/** Dynamically provide the read table format depending on table name.
+  * This supports reading tables with heterogeneous formats.
   * This approach enables users to override and specify a custom format provider if needed. This is useful in
   * cases such as leveraging different library versions from what we support in the Chronon project (e.g. newer delta lake)
   * as well as working with custom internal company logic / checks.
@@ -15,24 +15,9 @@ trait FormatProvider extends Serializable {
   def sparkSession: SparkSession
 
   def readFormat(tableName: String): Option[Format]
-
-  def writeFormat: Format = {
-    val typeString = sparkSession.conf.get("spark.chronon.table_write.format", "").toLowerCase
-    FormatProvider.formatFromTypeString(typeString)
-  }
-
 }
 
 object FormatProvider {
-
-  def formatFromTypeString(typeString: String): Format = typeString match {
-    case "iceberg"               => Iceberg
-    case "delta"                 => DeltaLake
-    case "hive" | "parquet" | "" => Hive
-    case other =>
-      throw new IllegalArgumentException(
-        s"Unsupported table write format: '$other'. Must be one of: iceberg, delta, hive, parquet, or empty.")
-  }
 
   def from(session: SparkSession): FormatProvider =
     try {

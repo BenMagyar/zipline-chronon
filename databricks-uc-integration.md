@@ -210,7 +210,6 @@ my_team = Team(
             "spark.sql.catalog.write_catalog.warehouse": "<YOUR_UC_CATALOG_NAME>",
 
             # --- Chronon Write Config ---
-            "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.partition.column": "ds",
             "spark.chronon.partition.format": "yyyy-MM-dd",
 

@@ -6,7 +6,10 @@ import ai.chronon.planner.Node
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.other.MockKVStore
 import ai.chronon.spark.utils.{MockApi, SparkTestBase}
+import org.apache.spark.sql.SaveMode
 import org.scalatest.matchers.should.Matchers
+
+import java.sql.Timestamp
 
 class BatchNodeRunnerStatsCompatibilityTest extends SparkTestBase with Matchers {
 
@@ -34,11 +37,11 @@ class BatchNodeRunnerStatsCompatibilityTest extends SparkTestBase with Matchers 
             id INT
           ) USING delta
         """)
-        spark.sql(s"""
-          INSERT INTO $table VALUES
-            (TIMESTAMP '2024-01-01 00:00:00', 1),
-            (TIMESTAMP '2024-01-01 06:00:00', 2)
-        """)
+        import spark.implicits._
+        Seq(
+          (Timestamp.valueOf("2024-01-01 00:00:00"), 1),
+          (Timestamp.valueOf("2024-01-01 06:00:00"), 2)
+        ).toDF("created_at", "id").write.mode(SaveMode.Append).format("delta").saveAsTable(table)
 
         val dependency = TableDependencies.fromTable(
           table,

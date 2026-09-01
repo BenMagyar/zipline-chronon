@@ -9,48 +9,32 @@ import ai.chronon.api.StructType
 import ai.chronon.spark.catalog.IncompatibleSchemaException
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.catalog.{DefaultFormatProvider, FormatProvider}
-import ai.chronon.spark.submission.SparkSessionBuilder
-import ai.chronon.spark.utils.{DataFrameGen, TestUtils}
+import ai.chronon.spark.utils.SparkTestBase
 import ai.chronon.spark.utils.TestUtils.makeDf
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.col
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.scalatest.flatspec.AnyFlatSpec
 
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 
-class TableUtilsFormatTest extends AnyFlatSpec {
+class TableUtilsFormatTest extends SparkTestBase {
 
   import TableUtilsFormatTest._
 
-  private val FormatTestEnvVar = "format_test"
-  val format: String = sys.env.getOrElse(FormatTestEnvVar, "hive")
-  private val formatConfigs = format match {
-    case "deltalake" =>
-      Map(
-        "spark.sql.extensions" -> "io.delta.sql.DeltaSparkSessionExtension",
-        "spark.sql.catalog.spark_catalog" -> "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        "spark.chronon.table_write.format" -> "delta"
-      )
-    case _ => Map.empty[String, String]
-  }
-  val spark: SparkSession =
-    SparkSessionBuilder.build("TableUtilsFormatTest", local = true, additionalConfig = Some(formatConfigs))
   val tableUtils: TableUtils = TableUtils(spark)
 
   it should "testing dynamic classloading" in {
     assertTrue(FormatProvider.from(spark).isInstanceOf[DefaultFormatProvider])
   }
 
-  it should "test insertion of partitioned data and adding of columns" in {
+  it should "ignore the deprecated write format config when inserting partitioned data" in {
     val dbName = s"db_${System.currentTimeMillis()}"
-    val tableName = s"$dbName.test_table_1_$format"
+    val tableName = s"$dbName.test_table_1_iceberg"
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
     val columns1 = Array(
       StructField("long_field", LongType),
@@ -80,12 +64,17 @@ class TableUtilsFormatTest extends AnyFlatSpec {
         Row(4L, 5, "6", 7.0, "2022-10-02")
       )
     )
-    testInsertPartitions(spark, tableUtils, tableName, format, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
+    spark.conf.set("spark.chronon.table_write.format", "delta")
+    try {
+      testInsertPartitions(spark, tableUtils, tableName, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
+    } finally {
+      spark.conf.unset("spark.chronon.table_write.format")
+    }
   }
 
   it should "test insertion of partitioned data and removal of columns" in {
     val dbName = s"db_${System.currentTimeMillis()}"
-    val tableName = s"$dbName.test_table_2_$format"
+    val tableName = s"$dbName.test_table_2_iceberg"
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
     val columns1 = Array(
       StructField("long_field", LongType),
@@ -115,12 +104,12 @@ class TableUtilsFormatTest extends AnyFlatSpec {
         Row(5L, 6, "7", "2022-10-02")
       )
     )
-    testInsertPartitions(spark, tableUtils, tableName, format, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
+    testInsertPartitions(spark, tableUtils, tableName, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
   }
 
   it should "test insertion of partitioned data and modification of columns" in {
     val dbName = s"db_${System.currentTimeMillis()}"
-    val tableName = s"$dbName.test_table_3_$format"
+    val tableName = s"$dbName.test_table_3_iceberg"
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
     val columns1 = Array(
       StructField("long_field", LongType),
@@ -152,12 +141,12 @@ class TableUtilsFormatTest extends AnyFlatSpec {
       )
     )
 
-    testInsertPartitions(spark, tableUtils, tableName, format, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
+    testInsertPartitions(spark, tableUtils, tableName, df1, df2, ds1 = "2022-10-01", ds2 = "2022-10-02")
   }
 
   it should "return empty read format if table doesn't exist" in {
     val dbName = s"db_${System.currentTimeMillis()}"
-    val tableName = s"$dbName.test_table_nonexistent_$format"
+    val tableName = s"$dbName.test_table_nonexistent_iceberg"
     assertTrue(FormatProvider.from(spark).readFormat(tableName).isEmpty)
     assertFalse(tableUtils.tableReachable(tableName))
   }
@@ -188,7 +177,6 @@ object TableUtilsFormatTest {
   private def testInsertPartitions(spark: SparkSession,
                                    tableUtils: TableUtils,
                                    tableName: String,
-                                   format: String,
                                    df1: DataFrame,
                                    df2: DataFrame,
                                    ds1: String,
@@ -219,9 +207,9 @@ object TableUtilsFormatTest {
 
     tableUtils.insertPartitions(df2, tableName, autoExpand = true)
 
-    // check that we wrote out a table in the right format
+    // Chronon writes are always Iceberg, regardless of source table formats.
     val readTableFormat = FormatProvider.from(spark).readFormat(tableName).get.toString
-    assertTrue(s"Mismatch in table format: $readTableFormat; expected: $format", readTableFormat.toLowerCase == format)
+    assertEquals("iceberg", readTableFormat.toLowerCase)
 
     // check we have all the partitions written
     val returnedPartitions = tableUtils.partitions(tableName)

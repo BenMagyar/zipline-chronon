@@ -7,7 +7,6 @@ default = Team(
     outputNamespace="default",
     conf=ConfigProperties(
         common={
-            "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.coalesce.factor": "10",
             "spark.default.parallelism": "10",
             "spark.sql.shuffle.partitions": "10",
