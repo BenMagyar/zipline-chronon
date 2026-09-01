@@ -862,7 +862,7 @@ object GroupBy {
         Some(Constants.TimeColumn -> source.query.timeColumn)
       } else {
         val dsBasedTimestamp = // 1 millisecond before ds + 1
-          s"(((UNIX_TIMESTAMP(${sourcePartitionSpec.column}, '${sourcePartitionSpec.format}') * 1000) + ${sourcePartitionSpec.spanMillis}) - 1)"
+          s"(((unix_seconds(try_to_timestamp(${sourcePartitionSpec.column}, '${sourcePartitionSpec.format}')) * 1000) + ${sourcePartitionSpec.spanMillis}) - 1)"
 
         Some(Constants.TimeColumn -> Option(source.query.timeColumn).getOrElse(dsBasedTimestamp))
       }

@@ -42,6 +42,9 @@ object CatalystUtil {
       .config("spark.cleaner.referenceTracking", "false")
       .config("spark.sql.session.timeZone", "UTC")
       .config("spark.sql.adaptive.enabled", "false")
+      // Spark 4 enables ANSI mode by default; Chronon's existing semantics assume it off
+      // (NULL on arithmetic overflow / divide-by-zero / invalid casts).
+      .config("spark.sql.ansi.enabled", "false")
       .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
       .config("spark.ui.enabled", "false")
       // the default column reader batch size is 4096 - spark reads that many rows into memory buffer at once.

@@ -141,7 +141,8 @@ class Summarizer(api: Api,
     if (timeCol != null) {
       addTileCol(timeCol)
     } else if (derivedCols.contains(tu.partitionColumn)) {
-      val conversionEx = s"unix_timestamp(to_timestamp(${tu.partitionColumn}, '${tu.partitionSpec.format}')) * 1000"
+      val conversionEx =
+        s"unix_seconds(try_to_timestamp(${tu.partitionColumn}, '${tu.partitionSpec.format}')) * 1000"
       // no rounding if no millisTime - just tile by partition column
       logger.info("Ignoring tileSize since no time column specified, tiling by the partition instead".blue)
       derivedDf.withColumn(Constants.TileColumn, expr(conversionEx)).drop(tu.partitionColumn)

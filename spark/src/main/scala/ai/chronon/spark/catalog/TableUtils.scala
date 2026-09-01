@@ -22,6 +22,7 @@ import ai.chronon.api.Extensions._
 import ai.chronon.api.ScalaJavaConversions._
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame, SaveMode, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
+import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, Project}
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.functions._
@@ -307,10 +308,11 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
     val colOrder = df.columns.diff(partitionColumns) ++ partitionColumns
 
     val dfRearranged = df.select(colOrder.map(colName => df.col(QuotingUtils.quoteIdentifier(colName))): _*)
+    val userTableProperties = CreationUtils.withoutTableTypeProperty(tableProperties)
 
     if (!tableReachable(tableName, ignoreFailure = true)) {
       try {
-        Iceberg.createTable(tableName, dfRearranged.schema, partitionColumns, tableProperties, semanticHash)(
+        Iceberg.createTable(tableName, dfRearranged.schema, partitionColumns, userTableProperties, semanticHash)(
           sparkSession)
       } catch {
         case _: TableAlreadyExistsException =>
@@ -326,7 +328,6 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
     }
 
     val defaultTableProperties = Iceberg.tableProperties
-    val userTableProperties = Option(tableProperties).getOrElse(Map.empty)
     val desiredTableProperties = defaultTableProperties ++ userTableProperties
     val existingTableProperties = getTableProperties(tableName).getOrElse(Map.empty)
     val propertyDiff = desiredTableProperties.filter { case (key, value) =>
@@ -374,16 +375,22 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
       finalizedDf.createOrReplaceTempView(tempView)
       val deleteCondition = partitionColumns
         .map { pc =>
-          val values = finalizedDf.select(col(pc)).distinct().collect().map(row => lit(row.get(0)).expr.sql)
+          val values = finalizedDf
+            .select(col(pc))
+            .distinct()
+            .collect()
+            .map(row => Literal.create(row.get(0), finalizedDf.schema(pc).dataType).sql)
           s"target.`$pc` IN (${values.mkString(", ")})"
         }
         .mkString(" AND ")
+      // Spark 4's MERGE grammar requires the NOT MATCHED [BY TARGET] clauses to
+      // precede NOT MATCHED BY SOURCE clauses.
       val mergeSQL =
         s"""MERGE INTO $tableName AS target
            |USING $tempView AS source
            |ON FALSE
-           |WHEN NOT MATCHED BY SOURCE AND $deleteCondition THEN DELETE
-           |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+           |WHEN NOT MATCHED THEN INSERT *
+           |WHEN NOT MATCHED BY SOURCE AND $deleteCondition THEN DELETE""".stripMargin
       sparkSession.sql(mergeSQL)
       sparkSession.catalog.dropTempView(tempView)
     } else {

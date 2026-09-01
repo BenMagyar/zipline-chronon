@@ -22,7 +22,7 @@ import ai.chronon.spark.JoinUtils
 import ai.chronon.spark.catalog.TableUtils
 import com.google.gson.Gson
 import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions.{col, date_format, from_unixtime, left, log, unix_timestamp}
+import org.apache.spark.sql.functions.{col, date_format, from_unixtime, left, lit, log, try_to_timestamp, unix_seconds}
 import org.apache.spark.sql.types.LongType
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -230,7 +230,7 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
           Constants.TimePartitionColumn,
           date_format(
             from_unixtime(
-              unix_timestamp(col(tableUtils.partitionColumn), partSpec.format) +
+              unix_seconds(try_to_timestamp(col(tableUtils.partitionColumn), lit(partSpec.format))) +
                 partSpec.spanMillis / 1000),
             partSpec.format
           )

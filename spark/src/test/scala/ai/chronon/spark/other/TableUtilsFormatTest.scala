@@ -72,6 +72,29 @@ class TableUtilsFormatTest extends SparkTestBase {
     }
   }
 
+  it should "ignore caller-supplied table_type properties" in {
+    import spark.implicits._
+
+    val dbName = s"db_${System.currentTimeMillis()}"
+    val tableName = s"$dbName.test_reserved_table_property"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $dbName")
+
+    val input = Seq((1L, "2022-10-01")).toDF("id", "ds")
+    tableUtils.insertPartitions(
+      input,
+      tableName,
+      tableProperties = Map(
+        "custom_property" -> "custom_value",
+        "table_type" -> "iceberg",
+        "TABLE_TYPE" -> "iceberg"
+      )
+    )
+
+    val properties = tableUtils.getTableProperties(tableName).get
+    assertEquals("custom_value", properties("custom_property"))
+    assertFalse(properties.keys.exists(_.equalsIgnoreCase("table_type")))
+  }
+
   it should "test insertion of partitioned data and removal of columns" in {
     val dbName = s"db_${System.currentTimeMillis()}"
     val tableName = s"$dbName.test_table_2_iceberg"

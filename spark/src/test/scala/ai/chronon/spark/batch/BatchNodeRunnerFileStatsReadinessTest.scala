@@ -44,7 +44,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
           ) USING delta
         """)
         spark.sql(s"""
-          INSERT INTO $deltaTable VALUES
+          INSERT INTO $deltaTable (created_at, id) VALUES
             (TIMESTAMP '2024-01-01 12:00:00', 1),
             (TIMESTAMP '2024-01-03 12:00:00', 2)
         """)
@@ -58,7 +58,7 @@ class BatchNodeRunnerFileStatsReadinessTest extends SparkTestBase with Matchers 
           PARTITIONED BY (ds)
         """)
         spark.sql(s"""
-          INSERT INTO $partitionedDeltaTable VALUES
+          INSERT INTO $partitionedDeltaTable (id, ds) VALUES
             (1, '2024-01-01'),
             (2, '2024-01-03')
         """)

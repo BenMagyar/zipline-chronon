@@ -7,6 +7,22 @@ import org.scalatest.matchers.should.Matchers
 
 class ExtensionsTest extends SparkTestBase with Matchers {
 
+  "withPartitionBasedTimestamp" should "only accept values matching the partition format" in {
+    import spark.implicits._
+
+    val compactDailySpec = PartitionSpec("ds", "yyyyMMdd", PartitionSpec.daily.spanMillis)
+    val result = Seq("20240101", "2024-01-01")
+      .toDF("ds")
+      .withPartitionBasedTimestamp("ts", spec = compactDailySpec)
+      .orderBy("ds")
+      .collect()
+
+    result(0).getAs[String]("ds") shouldBe "2024-01-01"
+    result(0).isNullAt(result(0).fieldIndex("ts")) shouldBe true
+    result(1).getAs[String]("ds") shouldBe "20240101"
+    result(1).getAs[Long]("ts") shouldBe compactDailySpec.epochMillis("20240101")
+  }
+
   "translatePartitionSpec" should "floor same-format partition values to the target grid" in {
     import spark.implicits._
 

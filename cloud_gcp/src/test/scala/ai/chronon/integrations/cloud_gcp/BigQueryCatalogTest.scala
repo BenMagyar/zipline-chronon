@@ -123,7 +123,7 @@ class BigQueryCatalogTest extends AnyFlatSpec with MockitoSugar {
     // Write the empty dataframe to create a table
     tableUtils.insertPartitions(emptyDf,
       originalTableName,
-      Map("file_format" -> "PARQUET", "table_type" -> "iceberg"),
+      Map("file_format" -> "PARQUET"),
       List.empty)
 
     // Verify the original table exists
@@ -298,7 +298,7 @@ class BigQueryCatalogTest extends AnyFlatSpec with MockitoSugar {
 
     tableUtils.insertPartitions(df,
                                 "data.tchow_test_iceberg",
-                                Map("file_format" -> "PARQUET", "table_type" -> "iceberg"),
+                                Map("file_format" -> "PARQUET"),
                                 List("ds"))
 
     val icebergCols = spark.catalog.listColumns("data.tchow_test_iceberg")

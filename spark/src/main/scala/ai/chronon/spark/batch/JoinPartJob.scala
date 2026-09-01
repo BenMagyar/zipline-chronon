@@ -11,7 +11,7 @@ import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.join.UnionJoin
 import ai.chronon.spark.{GroupBy, JoinUtils}
 import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions.{col, date_format, explode, lit, udf, unix_timestamp}
+import org.apache.spark.sql.functions.{col, date_format, explode, lit, try_to_timestamp, udf, unix_seconds}
 import org.apache.spark.sql.types.{LongType, StringType}
 import org.apache.spark.util.sketch.BloomFilter
 import org.slf4j.{Logger, LoggerFactory}
@@ -335,7 +335,8 @@ class JoinPartJob(node: JoinPartNode,
         !partSnapshotSpec.hasSameGrid(tableUtils.partitionSpec)
       ) {
         val snapshotStartMillis =
-          (unix_timestamp(col(tableUtils.partitionColumn), partSnapshotSpec.format) * lit(1000L)).cast(LongType)
+          (unix_seconds(try_to_timestamp(col(tableUtils.partitionColumn), lit(partSnapshotSpec.format))) * lit(1000L))
+            .cast(LongType)
         val physicalSpec = tableUtils.partitionSpec
         val physicalColumn = tableUtils.partitionColumn
         val snapshotSpanMillis = partSnapshotSpec.spanMillis

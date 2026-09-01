@@ -6,6 +6,12 @@ object CreationUtils {
 
   private val ALLOWED_TABLE_TYPES = List("iceberg", "delta", "hive", "parquet", "hudi")
 
+  // Spark 4 reserves table_type. Iceberg catalogs populate the equivalent metastore marker themselves.
+  private[catalog] def withoutTableTypeProperty(tableProperties: Map[String, String]): Map[String, String] =
+    Option(tableProperties)
+      .getOrElse(Map.empty)
+      .filterNot { case (key, _) => key.equalsIgnoreCase("table_type") }
+
   /** Escapes a string value for use in SQL by doubling single quotes.
     * This follows the SQL standard for escaping string literals.
     *
@@ -52,9 +58,10 @@ object CreationUtils {
       ""
     }
 
-    val propertiesFragment = if (tableProperties != null && tableProperties.nonEmpty) {
+    val settableTableProperties = withoutTableTypeProperty(tableProperties)
+    val propertiesFragment = if (settableTableProperties.nonEmpty) {
       s"""TBLPROPERTIES (
-         |    ${(tableProperties + ("file_format" -> "PARQUET") + ("table_type" -> tableTypeString))
+         |    ${(settableTableProperties + ("file_format" -> "PARQUET"))
           .transform((k, v) => s"'${escapeSqlStringValue(k)}'='${escapeSqlStringValue(v)}'")
           .values
           .mkString(",\n   ")}

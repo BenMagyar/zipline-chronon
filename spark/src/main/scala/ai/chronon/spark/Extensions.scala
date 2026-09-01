@@ -132,7 +132,7 @@ object Extensions {
       df.createOrReplaceTempView(viewName)
       assert(df.schema.names.contains(columnName),
              s"$columnName is not a column of the dataframe. Pick one of [${df.schema.names.mkString(", ")}]")
-      val minMaxRows = df.sqlContext
+      val minMaxRows = df.sparkSession
         .sql(s"select min($columnName), max($columnName) from $viewName")
         .collect()
       assert(minMaxRows.length == 1, "Logic error! There needs to be exactly one row")
@@ -273,7 +273,7 @@ object Extensions {
     def withPartitionBasedTimestamp(colName: String,
                                     inputColumn: String = tableUtils.partitionColumn,
                                     spec: PartitionSpec = tableUtils.partitionSpec): DataFrame =
-      df.withColumn(colName, unix_timestamp(df.col(inputColumn), spec.format) * 1000)
+      df.withColumn(colName, unix_seconds(try_to_timestamp(df.col(inputColumn), lit(spec.format))) * 1000)
 
     def withShiftedPartition(colName: String,
                              days: Int = 1,
@@ -282,7 +282,7 @@ object Extensions {
         colName,
         date_format(
           from_unixtime(
-            unix_timestamp(df.col(tableUtils.partitionColumn), spec.format) +
+            unix_seconds(try_to_timestamp(df.col(tableUtils.partitionColumn), lit(spec.format))) +
               (days.toLong * spec.spanMillis / 1000)),
           spec.format
         )
@@ -313,7 +313,7 @@ object Extensions {
       // translate partition values through the target spec; format equality is not enough
       // because mixed grids can share a ds format but require target-grid flooring.
       if (existingSpec.format != newSpec.format || !existingSpec.hasSameGrid(newSpec)) {
-        val seconds = unix_timestamp(col(newSpec.column), existingSpec.format)
+        val seconds = unix_seconds(try_to_timestamp(col(newSpec.column), lit(existingSpec.format)))
         val spanSeconds = newSpec.spanMillis / 1000
         val offsetSeconds = Math.floorMod(newSpec.offsetMillis, newSpec.spanMillis) / 1000
         val floored = seconds - pmod(seconds - lit(offsetSeconds), lit(spanSeconds))

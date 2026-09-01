@@ -25,12 +25,13 @@ class IcebergMergeSyntaxTest extends SparkTestBase with Matchers {
 
       spark.sql("CREATE OR REPLACE TEMP VIEW merge_source AS SELECT 10 as id, 'new' as value, '2024-01-01' as ds")
 
+      // Spark 4 grammar requires NOT MATCHED [BY TARGET] clauses before NOT MATCHED BY SOURCE.
       spark.sql(s"""
         MERGE INTO $tableName AS target
         USING merge_source AS source
         ON FALSE
-        WHEN NOT MATCHED BY SOURCE AND target.ds = '2024-01-01' THEN DELETE
         WHEN NOT MATCHED THEN INSERT *
+        WHEN NOT MATCHED BY SOURCE AND target.ds = '2024-01-01' THEN DELETE
       """)
 
       val result = spark.table(tableName).orderBy("ds", "id").collect()
@@ -66,8 +67,8 @@ class IcebergMergeSyntaxTest extends SparkTestBase with Matchers {
         MERGE INTO $tableName AS target
         USING merge_source_nocond AS source
         ON FALSE
-        WHEN NOT MATCHED BY SOURCE THEN DELETE
         WHEN NOT MATCHED THEN INSERT *
+        WHEN NOT MATCHED BY SOURCE THEN DELETE
       """)
 
       val result = spark.table(tableName).orderBy("ds").collect()

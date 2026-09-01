@@ -99,6 +99,8 @@ object SparkSessionBuilder {
 
     val baseConfigs = Map(
       "spark.sql.session.timeZone" -> existingConf.get("spark.sql.session.timeZone", "UTC"),
+      // Spark 4 enables ANSI mode by default; preserve Chronon's existing null-on-error semantics.
+      "spark.sql.ansi.enabled" -> existingConf.get("spark.sql.ansi.enabled", "false"),
       // needs to be uppercase until https://github.com/GoogleCloudDataproc/spark-bigquery-connector/pull/1313 is available
       "spark.sql.sources.partitionOverwriteMode" -> "DYNAMIC",
       "hive.exec.dynamic.partition" -> "true",
@@ -168,6 +170,7 @@ object SparkSessionBuilder {
       .config("spark.kryo.registrator", "ai.chronon.spark.submission.ChrononKryoRegistrator")
       .config("spark.kryoserializer.buffer.max", "2000m")
       .config("spark.kryo.referenceTracking", "false")
+      .config("spark.sql.ansi.enabled", "false")
       .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
     val builder = if (local) {

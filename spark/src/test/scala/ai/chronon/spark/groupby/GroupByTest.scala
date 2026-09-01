@@ -55,7 +55,7 @@ class GroupByTest extends SparkTestBase {
 
     val groupBy = new GroupBy(aggregations, Seq("user"), df)
     val actualDf = groupBy.snapshotEntities
-    val expectedDf = df.sqlContext.sql(s"""
+    val expectedDf = df.sparkSession.sql(s"""
                                           |SELECT user,
                                           |       ds,
                                           |       AVG(IF(ts  >= (unix_timestamp(ds, 'yyyy-MM-dd') - (86400*(10 - 1))) * 1000, session_length, null)) AS session_length_average_10d,
@@ -102,7 +102,7 @@ class GroupByTest extends SparkTestBase {
     val outputDatesDf = spark.createDataFrame(outputDatesList, StructType(Seq(StructField("ds", SparkStringType))))
     val datesViewName = "test_group_by_snapshot_events_output_range"
     outputDatesDf.createOrReplaceTempView(datesViewName)
-    val expectedDf = df.sqlContext.sql(s"""
+    val expectedDf = df.sparkSession.sql(s"""
                                           |select user,
                                           |       $datesViewName.ds,
                                           |       COUNT(DISTINCT session_length) as session_length_approx_unique_count,
@@ -149,7 +149,7 @@ class GroupByTest extends SparkTestBase {
     val computed = resultDf.select("user", "ts", "listing_view_last30", "listing_view_count")
     computed.show()
 
-    val expected = eventDf.sqlContext.sql("""
+    val expected = eventDf.sparkSession.sql("""
          |SELECT
          |      events_last_k.user as user,
          |      queries_last_k.ts as ts,

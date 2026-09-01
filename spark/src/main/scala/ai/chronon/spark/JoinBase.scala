@@ -128,7 +128,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
           Constants.TimePartitionColumn,
           date_format(
             from_unixtime(
-              unix_timestamp(col(tableUtils.partitionColumn), partSpec.format) +
+              unix_seconds(try_to_timestamp(col(tableUtils.partitionColumn), lit(partSpec.format))) +
                 partSpec.spanMillis / 1000),
             partSpec.format
           )

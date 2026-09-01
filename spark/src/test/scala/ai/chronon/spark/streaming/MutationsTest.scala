@@ -256,8 +256,8 @@ class MutationsTest extends SparkTestBase {
          |   event,
          |   ts,
          |   ds,
-         |   (rating_std + rating_add_sum - rating_sub_sum)
-         |   / (rating_ctd + rating_add_cnt - rating_sub_cnt) AS ${groupByName.replaceAll("\\.", "_")}_rating_average
+         |   try_divide(rating_std + rating_add_sum - rating_sub_sum,
+         |              rating_ctd + rating_add_cnt - rating_sub_cnt) AS ${groupByName.replaceAll("\\.", "_")}_rating_average
          | FROM (
          |   SELECT
          |     queries.listing_id,
