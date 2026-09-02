@@ -109,6 +109,32 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     assert(flinkJob.getSavepointUri.isEmpty)
   }
 
+  it should "test buildFlinkJob honors small taskmanager memory override without 64G tuning" in {
+    val submitter = new DataprocSubmitter(jobControllerClient = null,
+                                          gcsClient = null,
+                                          region = "test-region",
+                                          projectId = "test-project")
+    val job = submitter.buildFlinkJob(
+      mainClass = "ai.chronon.flink.FlinkJob",
+      jarUris = Array("gs://zipline-jars/cloud-gcp.jar"),
+      mainJarUri = "gs://zipline-jars/flink-assembly-0.1.0-SNAPSHOT.jar",
+      flinkCheckpointUri = "gs://zl-warehouse/flink-state",
+      maybeSavePointUri = None,
+      maybeFlinkJarsBasePath = None,
+      jobProperties = Map("taskmanager.memory.process.size" -> "4G"),
+      args = List("args1", "args2"): _*
+    )
+
+    val props = job.getFlinkJob.getPropertiesMap.asScala
+    assertEquals("4G", props("taskmanager.memory.process.size"))
+    assertEquals("1", props("taskmanager.numberOfTaskSlots"))
+    assert(!props.contains("taskmanager.memory.network.min"))
+    assert(!props.contains("taskmanager.memory.network.max"))
+    assert(!props.contains("taskmanager.memory.managed.fraction"))
+    assert(!props.contains("taskmanager.memory.jvm-metaspace.size"))
+    assert(!props.contains("taskmanager.memory.task.off-heap.size"))
+  }
+
   it should "test buildFlinkJob with pubsub connector uri" in {
     val submitter = DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
                                       storageClient = mock[Storage],
@@ -1816,6 +1842,34 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
     assert(propertyArgs.exists(_.startsWith("taskmanager.memory.process.size=")))
     assert(propertyArgs.exists(_.startsWith("state.backend.type=")))
     assert(propertyArgs.exists(_ == "custom.key=custom.value"))
+  }
+
+  it should "test buildFlinkApplicationJob honors small taskmanager memory override without 64G tuning" in {
+    val submitter = new DataprocSubmitter(jobControllerClient = null,
+                                          gcsClient = null,
+                                          region = "test-region",
+                                          projectId = "test-project")
+    val job = submitter.buildFlinkApplicationJob(
+      mainClass = "ai.chronon.flink.FlinkJob",
+      mainJarUri = "gs://zipline-jars/flink-assembly.jar",
+      launcherJarUri = "gs://zipline-jars/cloud-gcp.jar",
+      jarUris = Array("gs://zipline-jars/cloud-gcp.jar"),
+      flinkCheckpointUri = "gs://zl-warehouse/flink-state",
+      maybeSavePointUri = None,
+      maybeFlinkJarsBasePath = None,
+      jobProperties = Map("taskmanager.memory.process.size" -> "4G"),
+      args = List("--groupby-name", "test-gb"): _*
+    )
+
+    val launcherArgs = job.getHadoopJob.getArgsList.asScala
+    val propertyArgs = launcherArgs.zipWithIndex.filter(_._1 == "--flink-property").map(p => launcherArgs(p._2 + 1))
+    assert(propertyArgs.contains("taskmanager.memory.process.size=4G"))
+    assert(propertyArgs.contains("taskmanager.numberOfTaskSlots=1"))
+    assert(!propertyArgs.exists(_.startsWith("taskmanager.memory.network.min=")))
+    assert(!propertyArgs.exists(_.startsWith("taskmanager.memory.network.max=")))
+    assert(!propertyArgs.exists(_.startsWith("taskmanager.memory.managed.fraction=")))
+    assert(!propertyArgs.exists(_.startsWith("taskmanager.memory.jvm-metaspace.size=")))
+    assert(!propertyArgs.exists(_.startsWith("taskmanager.memory.task.off-heap.size=")))
   }
 
   it should "test buildFlinkApplicationJob without savepoint omits savepoint args" in {

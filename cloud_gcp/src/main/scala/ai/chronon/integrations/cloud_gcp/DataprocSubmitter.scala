@@ -1,6 +1,7 @@
 package ai.chronon.integrations.cloud_gcp
 import ai.chronon.api.Builders.MetaData
 import ai.chronon.api.JobStatusType
+import ai.chronon.spark.submission.FlinkMemoryConfig
 import ai.chronon.spark.submission.JobSubmitterConstants._
 import ai.chronon.spark.submission.{
   JobSubmitter,
@@ -336,8 +337,9 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
   }
 
   // JobManager is primarily responsible for coordinating the job (task slots, checkpoint triggering) and not much else
-  // so 4G should suffice.
-  // We go with 64G TM containers (4 task slots per container)
+  // so 4G should suffice. By default, Dataproc uses 64G TM containers (4 task slots per container).
+  // Explicit TM memory overrides select the matching shared Flink memory tier; sub-16G values use
+  // Flink defaults for network/managed/off-heap memory so small containers remain internally consistent.
   // Broadly Flink splits TM memory into:
   // 1) Metaspace, framework offheap etc
   // 2) Network buffers
@@ -346,20 +348,9 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
   // We tune down the network buffers to 1G-2G (default would be ~6.3G) and use some of the extra memory for
   // managed mem + jvm heap
   // Good doc - https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/memory/mem_setup_tm
-  private[cloud_gcp] def flinkEnvProps(flinkCheckpointUri: String): Map[String, String] =
+  private[cloud_gcp] def flinkEnvProps(flinkCheckpointUri: String,
+                                       jobProperties: Map[String, String] = Map.empty): Map[String, String] =
     Map(
-      "jobmanager.memory.process.size" -> "4G",
-      "taskmanager.memory.process.size" -> "64G",
-      "taskmanager.memory.network.min" -> "1G",
-      "taskmanager.memory.network.max" -> "2G",
-      // explicitly set the number of task slots as otherwise it defaults to the number of cores
-      // we go with multiple slots per TM as it allows us to squeeze more parallelism out of our resources
-      "taskmanager.numberOfTaskSlots" -> "4",
-      "taskmanager.memory.managed.fraction" -> "0.5f",
-      // default is 256m, we seem to be close to the limit so we give ourselves some headroom
-      "taskmanager.memory.jvm-metaspace.size" -> "512m",
-      // bump this a bit as Kafka and KV stores often need direct buffers
-      "taskmanager.memory.task.off-heap.size" -> "1G",
       "yarn.classpath.include-user-jar" -> "FIRST",
       "state.savepoints.dir" -> flinkCheckpointUri,
       "state.checkpoints.dir" -> flinkCheckpointUri,
@@ -377,7 +368,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
       "state.backend.type" -> "rocksdb",
       "state.backend.incremental" -> "true",
       "state.checkpoints.num-retained" -> MaxRetainedCheckpoints
-    )
+    ) ++ FlinkMemoryConfig.flinkMemoryConfig(jobProperties, FlinkMemoryConfig.TaskManager64G)
 
   private[cloud_gcp] def buildFlinkJob(mainClass: String,
                                        mainJarUri: String,
@@ -388,7 +379,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                                        jobProperties: Map[String, String],
                                        args: String*): Job.Builder = {
 
-    val envProps = flinkEnvProps(flinkCheckpointUri)
+    val envProps = flinkEnvProps(flinkCheckpointUri, jobProperties)
 
     val updatedJarUris = jarUris ++ DataprocAdditionalJars.additionalFlinkJobJars(maybeFlinkJarsBasePath)
 
@@ -421,7 +412,7 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                                                   jobProperties: Map[String, String],
                                                   args: String*): Job.Builder = {
 
-    val allProperties = flinkEnvProps(flinkCheckpointUri) ++ jobProperties
+    val allProperties = flinkEnvProps(flinkCheckpointUri, jobProperties) ++ jobProperties
 
     // Serialize Flink properties as launcher arguments
     val launcherArgs = new scala.collection.mutable.ArrayBuffer[String]()
