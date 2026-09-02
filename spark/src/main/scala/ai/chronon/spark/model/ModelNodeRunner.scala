@@ -49,10 +49,7 @@ class ModelNodeRunner(api: Api) extends NodeRunner {
       }
       val modelBackend = validateModelBackend(model)
       val modelPlatform = modelPlatformProvider.getPlatform(modelBackend, Map.empty)
-      val submitTrainingRequest = TrainingRequest(trainingSource = model.trainingConf.trainingDataSource,
-                                                  model = model,
-                                                  date = date,
-                                                  window = model.getTrainingConf.trainingDataWindow)
+      val submitTrainingRequest = TrainingRequest.fromModel(model, date)
       val trainingJobName = Await.result(modelPlatform.submitTrainingJob(submitTrainingRequest), 10.minutes)
 
       // TODO: should hook this up with the orchestration's step checking instead of polling here

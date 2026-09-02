@@ -328,6 +328,31 @@ case class PredictResponse(predictRequest: PredictRequest, outputs: Try[Seq[Map[
 case class TrainingRequest(trainingSource: Source, model: Model, date: String, window: Window)
 case class DeployModelRequest(model: Model, version: String, date: String)
 
+object TrainingRequest {
+
+  /** Builds the request for training a model over its configured training source and window,
+    * ending at the given partition date. Shared by the Spark ModelNodeRunner and by orchestration
+    * paths that submit training directly, so both produce an identical request.
+    */
+  def fromModel(model: Model, date: String): TrainingRequest = {
+    require(model != null, "A model is required to build a TrainingRequest")
+    require(model.getTrainingConf != null,
+            s"Model ${modelName(model)} has no trainingConf to build a TrainingRequest from")
+    require(Option(date).exists(_.nonEmpty), s"A training date is required for model ${modelName(model)}")
+
+    val trainingConf = model.getTrainingConf
+    TrainingRequest(
+      trainingSource = trainingConf.getTrainingDataSource,
+      model = model,
+      date = date,
+      window = trainingConf.getTrainingDataWindow
+    )
+  }
+
+  private def modelName(model: Model): String =
+    Option(model.getMetaData).flatMap(metaData => Option(metaData.getName)).getOrElse("<unnamed>")
+}
+
 // Trait used to distinguish between long-running Model Platform operations
 sealed trait ModelOperation
 case object DeployModel extends ModelOperation
