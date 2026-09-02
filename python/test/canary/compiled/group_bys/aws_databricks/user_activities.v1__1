@@ -421,7 +421,7 @@
           "spark.sql.catalog.workspace_iceberg.type": "rest",
           "spark.sql.catalog.workspace_iceberg.uri": "https://dbc-050d6f00-dcb3.cloud.databricks.com/api/2.1/unity-catalog/iceberg-rest",
           "spark.sql.catalog.workspace_iceberg.warehouse": "workspace",
-          "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+          "spark.sql.extensions": "ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtension,io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
           "spark.sql.shuffle.partitions": "10",
           "spark.sql.warehouse.dir": "s3://zipline-warehouse-canary/data/uc-poc/warehouse/",
           "taskmanager.memory.process.size": "16G"

@@ -182,9 +182,11 @@ my_team = Team(
     conf=ConfigProperties(
         common={
             # --- Spark Extensions ---
-            # Both Delta and Iceberg extensions are needed in the same session
+            # Order is required: Chronon data skipping, Delta, Chronon write fix, Iceberg
             "spark.sql.extensions": (
+                "ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtension,"
                 "io.delta.sql.DeltaSparkSessionExtension,"
+                "ai.chronon.spark.extensions.ChrononDeltaFixExtension,"
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
             ),
             "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",

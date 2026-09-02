@@ -154,8 +154,9 @@ databricks_team = Team(
     outputNamespace="data",
     conf=ConfigProperties(
         common={
-            # Delta + Iceberg extensions in same session
+            # Order is required: Chronon data skipping, Delta, Chronon write fix, Iceberg
             "spark.sql.extensions": (
+                "ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtension,"
                 "io.delta.sql.DeltaSparkSessionExtension,"
                 "ai.chronon.spark.extensions.ChrononDeltaFixExtension,"
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"

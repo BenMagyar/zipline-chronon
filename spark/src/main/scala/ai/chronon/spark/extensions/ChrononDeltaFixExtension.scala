@@ -4,7 +4,6 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, MergeIntoTable, V2WriteCommand}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.delta.stats.PrepareDeltaScan
 import org.apache.spark.sql.execution.command.DataWritingCommand
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 
@@ -14,7 +13,7 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
   * Registered AFTER DeltaSparkSessionExtension in spark.sql.extensions so this rule runs
   * after Delta's PrepareDeltaScan. For V2 writes without V1 fallback, V1 data-writing commands,
   * and MERGE source plans, we apply PrepareDeltaScan to the source table scans that Delta's
-  * rule skipped.
+  * rule skipped. The delegate also applies the delta-io/delta#6756 partial-stats workaround.
   */
 class ChrononDeltaFixExtension extends (SparkSessionExtensions => Unit) {
   override def apply(extensions: SparkSessionExtensions): Unit = {
@@ -24,7 +23,7 @@ class ChrononDeltaFixExtension extends (SparkSessionExtensions => Unit) {
 }
 
 private[extensions] class DeltaScanFixRule(session: SparkSession) extends Rule[LogicalPlan] {
-  private lazy val delegate = new PrepareDeltaScan(session)
+  private lazy val delegate = new PartialStatsPrepareDeltaScan(session)
 
   private def hasV1Fallback(table: Any): Boolean =
     table.getClass.getInterfaces.exists(_.getSimpleName == "V2TableWithV1Fallback")

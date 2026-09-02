@@ -12,6 +12,7 @@ class IcebergDeltaMergeSourceTest extends SparkTestBase with Matchers {
   override def sparkConfs: Map[String, String] = Map(
     "spark.serializer" -> "org.apache.spark.serializer.JavaSerializer",
     "spark.sql.extensions" -> (
+      "ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtension," +
       "io.delta.sql.DeltaSparkSessionExtension," +
       "ai.chronon.spark.extensions.ChrononDeltaFixExtension," +
       "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions," +

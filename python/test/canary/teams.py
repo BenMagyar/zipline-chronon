@@ -316,8 +316,8 @@ aws_databricks = Team(
     ),
     conf=ConfigProperties(
         common={
-            # Delta + Iceberg extensions in same session
-            "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+            # Order is required: Chronon data skipping, Delta, Chronon write fix, Iceberg
+            "spark.sql.extensions": "ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtension,io.delta.sql.DeltaSparkSessionExtension,ai.chronon.spark.extensions.ChrononDeltaFixExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
             # DeltaCatalog required by UCSingleCatalog for Delta reads
             "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
             # UC read catalog (Delta via UCSingleCatalog with OAuth auto-refresh)

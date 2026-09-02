@@ -157,6 +157,7 @@ jobs:
             'ai.chronon.spark.ExtensionsTest' \
             'ai.chronon.spark.catalog.DeltaLakeTest' \
             'ai.chronon.spark.catalog.IcebergMergeSyntaxTest' \
+            'ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtensionTest' \
             'ai.chronon.spark.submission.SparkSessionBuilderTest'
 
   non-spark:
