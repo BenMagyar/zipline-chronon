@@ -11,15 +11,21 @@ object `package` extends Cross[SparkModule](build.Constants.scalaVersions) with 
 trait SparkModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.aggregator(crossValue), build.api(crossValue), build.online(crossValue))
 
+  override def sources = Task.Sources(
+    moduleDir / "src" / "main" / "scala",
+    moduleDir / "src" / "main" / "java",
+    moduleDir / "src" / "main" / s"scala-${build.Constants.sparkProfileName}"
+  )
+
   def compileMvnDeps = build.Constants.sparkDeps ++ Seq(
-    mvn"io.delta::delta-spark:3.3.2",
+    mvn"io.delta::delta-spark:${build.Constants.deltaVersion}",
   )
 
   def mvnDeps = build.Constants.commonDeps ++
     build.Constants.loggingDeps ++
     build.Constants.utilityDeps ++
     Seq(
-      mvn"io.delta:delta-kernel-defaults:3.3.2"
+      mvn"io.delta:delta-kernel-defaults:${build.Constants.deltaVersion}"
         .exclude("org.apache.hadoop" -> "hadoop-client-runtime"),
       mvn"io.netty:netty-all:4.1.129.Final",
       mvn"org.rogach::scallop:5.1.0",
@@ -41,7 +47,7 @@ trait SparkModule extends Cross.Module[String] with build.BaseModule {
     override def testFramework = "org.scalatest.tools.Framework"
 
     def mvnDeps = super.mvnDeps() ++ build.Constants.sparkDeps ++ build.Constants.testDeps ++ Seq(
-      mvn"io.delta::delta-spark:3.3.2",
+      mvn"io.delta::delta-spark:${build.Constants.deltaVersion}",
       // Fix parquet version conflict - need 1.11.0+ for BROTLI field
 //      mvn"org.apache.parquet:parquet-common:1.15.2",
 //      mvn"org.apache.parquet:parquet-column:1.11.0",

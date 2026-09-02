@@ -140,9 +140,14 @@ class ChrononKryoRegistrator extends KryoRegistrator {
       "org.apache.iceberg.encryption.PlaintextEncryptionManager",
       "org.apache.iceberg.gcp.GCPProperties",
       "org.apache.iceberg.hadoop.HadoopFileIO",
+      "org.apache.iceberg.hadoop.SerializableConfiguration",
+      "org.apache.iceberg.Try",
+      "org.apache.iceberg.LocationProviders$DefaultLocationProvider",
+      "org.apache.iceberg.hadoop.HadoopCatalog",
       "org.apache.iceberg.hadoop.HadoopMetricsContext",
       "org.apache.iceberg.MetadataTableType",
       "org.apache.iceberg.io.ResolvingFileIO",
+      "org.apache.iceberg.spark.source.SerializableFileIOWithSize",
       // SerializableTableWithSize payloads are registered with JavaSerializer further below:
       // they are the Iceberg table broadcast payloads and must survive cyclic object graphs
       "org.apache.iceberg.spark.source.SparkWrite$TaskCommit",

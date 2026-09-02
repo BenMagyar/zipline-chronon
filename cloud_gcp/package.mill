@@ -14,6 +14,16 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.spark(crossValue), build.aggregator(crossValue), build.api(crossValue), build.online(crossValue))
   def bigqueryJarFile = Task.Source(moduleDir / "iceberg-bigquery-1.11.0-SNAPSHOT.jar")
 
+  private def bigQueryConnectorDep =
+    if (build.Constants.sparkProfileName == "spark4") {
+      mvn"com.google.cloud.spark:spark-4.1-bigquery:0.44.2-preview"
+    } else {
+      mvn"com.google.cloud.spark:spark-3.5-bigquery:0.42.0"
+    }
+
+  private def icebergSparkRuntimeDep =
+    mvn"org.apache.iceberg::${build.Constants.sparkProfile.icebergRuntimeArtifact}:${build.Constants.icebergVersion}"
+
   // Versions force-overridden to fix CVEs from uber-jar transitive deps.
   // Also used by patchAssemblyMetadata to write correct pom.properties.
   private val avroVersion = build.Constants.avroVersion
@@ -77,7 +87,7 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
   }
 
   def compileMvnDeps = build.Constants.sparkDeps ++ Seq(
-    mvn"com.google.cloud.spark:spark-3.5-bigquery:0.42.0",
+    bigQueryConnectorDep,
   )
 
 //  val googleBigdataVersion = "2.2.26"
@@ -95,7 +105,7 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
       mvn"com.google.cloud:google-cloud-dataproc:4.52.0",
       mvn"com.google.cloud:google-cloud-pubsub:1.134.2",
       mvn"com.google.cloud.hosted.kafka:managed-kafka-auth-login-handler:1.0.6",
-      mvn"org.apache.iceberg::iceberg-spark-runtime-3.5:1.10.0",
+      icebergSparkRuntimeDep,
       mvn"com.google.cloud:google-cloud-bigquery:2.54.1",
       mvn"com.google.cloud:google-cloud-bigtable:2.57.1",
       mvn"com.google.cloud:google-cloud-aiplatform:3.79.0",
@@ -105,7 +115,7 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
   ).map(excludeJackson) ++ Seq(
     mvn"com.fasterxml.jackson.core:jackson-core:${build.Constants.jacksonVersion}",
     mvn"com.fasterxml.jackson.core:jackson-databind:${build.Constants.jacksonVersion}",
-    mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonVersion}",
+    mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonAnnotationsVersion}",
     mvn"com.fasterxml.jackson.module::jackson-module-scala:${build.Constants.jacksonVersion}",
     mvn"com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${build.Constants.jacksonVersion}",
     mvn"org.apache.avro:avro:$avroVersion"
@@ -128,11 +138,11 @@ trait CloudGcpModule extends Cross.Module[String] with build.BaseModule {
     )
 
     def compileMvnDeps = build.Constants.sparkDeps ++ Seq(
-      mvn"org.apache.iceberg:iceberg-bigquery:1.10.0",
+      mvn"org.apache.iceberg:iceberg-bigquery:${build.Constants.icebergVersion}",
     )
 
     override def mvnDeps = super.mvnDeps() ++ build.Constants.sparkDeps ++ build.Constants.testDeps ++ Seq(
-      excludeJackson(mvn"com.google.cloud.spark:spark-3.5-bigquery:0.42.0"),
+      excludeJackson(bigQueryConnectorDep),
       // Use exact versions from Bazel configuration
       excludeJackson(mvn"com.google.cloud:google-cloud-bigtable-emulator:0.178.0")
         .exclude("io.grpc" -> "grpc-core")

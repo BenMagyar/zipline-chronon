@@ -63,8 +63,8 @@ case object DeltaLake extends Format {
   private def activePartitions(deltaTable: TableMetadata)(implicit
       sparkSession: SparkSession): List[Map[String, String]] =
     withScanFiles(deltaTable, includeStats = false) { (engine, snapshot, batches) =>
-      val partitionColumns = snapshot.getPartitionColumnNames(engine).asScala.map { logicalName =>
-        logicalName -> ColumnMapping.getPhysicalName(snapshot.getSchema(engine).get(logicalName))
+      val partitionColumns = DeltaKernelCompat.partitionColumnNames(snapshot, engine).asScala.map { logicalName =>
+        logicalName -> ColumnMapping.getPhysicalName(DeltaKernelCompat.schema(snapshot, engine).get(logicalName))
       }
 
       val distinctPartitions = mutable.LinkedHashSet.empty[Map[String, String]]
@@ -155,7 +155,7 @@ case object DeltaLake extends Format {
       val deltaTable = tableMetadataOrThrow(tableName)
       val field = deltaTable.schema(columnName)
       withScanFiles(deltaTable, includeStats = true) { (engine, snapshot, batches) =>
-        val kernelField = snapshot.getSchema(engine).get(columnName)
+        val kernelField = DeltaKernelCompat.schema(snapshot, engine).get(columnName)
         val physicalColumnName = ColumnMapping.getPhysicalName(kernelField)
         lazy val parsedCheckpointStats =
           checkpointParsedStats(snapshot.asInstanceOf[SnapshotImpl],
@@ -269,7 +269,7 @@ case object DeltaLake extends Format {
                                     kernelColumnType: io.delta.kernel.types.DataType,
                                     columnType: DataType,
                                     partitionSpec: PartitionSpec): scala.collection.Map[String, (Long, Long)] = {
-    val checkpointFiles = snapshot.getLogSegment.checkpoints
+    val checkpointFiles = DeltaKernelCompat.checkpoints(snapshot)
     if (checkpointFiles.isEmpty) {
       Map.empty
     } else {
@@ -394,7 +394,7 @@ case object DeltaLake extends Format {
     val snapshot = KernelTable.forPath(engine, deltaTable.path).getLatestSnapshot(engine)
     // Delta Kernel 3.3's public scan can omit stats. Its includeStats path is the
     // protocol-aware driver reader for both checkpoint and JSON-log file actions.
-    val scan = snapshot.getScanBuilder(engine).build().asInstanceOf[ScanImpl]
+    val scan = DeltaKernelCompat.scanBuilder(snapshot, engine).build().asInstanceOf[ScanImpl]
     val batches = scan.getScanFiles(engine, includeStats)
     try consume(engine, snapshot, batches)
     finally batches.close()

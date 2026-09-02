@@ -6,6 +6,59 @@ import coursier.maven.MavenRepository
 
 // Shared constants and dependencies
 object Constants {
+  final case class SparkBuildProfile(
+      sparkVersion: String,
+      deltaVersion: String,
+      icebergVersion: String,
+      icebergRuntimeArtifact: String,
+      hadoopVersion: String,
+      jacksonVersion: String,
+      jacksonAnnotationsVersion: String,
+      protobufVersion: String,
+      jettyVersion: String,
+      nettyVersion: String,
+      javaRelease: String
+  )
+
+  // Regular builds stay on Spark 3. The compatibility job selects Spark 4 in a clean,
+  // no-daemon Mill invocation so dependency outputs cannot be reused across profiles.
+  val sparkProfileName = sys.props.getOrElse("chronon.spark.profile", "spark3")
+
+  val sparkProfile = sparkProfileName match {
+    case "spark3" =>
+      SparkBuildProfile(
+        sparkVersion = "3.5.3",
+        deltaVersion = "3.3.2",
+        icebergVersion = "1.10.0",
+        icebergRuntimeArtifact = "iceberg-spark-runtime-3.5",
+        hadoopVersion = "3.3.6",
+        jacksonVersion = "2.18.9",
+        jacksonAnnotationsVersion = "2.18.9",
+        protobufVersion = "3.25.5",
+        jettyVersion = "12.0.36",
+        nettyVersion = "4.1.137.Final",
+        javaRelease = "11"
+      )
+    case "spark4" =>
+      SparkBuildProfile(
+        sparkVersion = "4.1.3",
+        deltaVersion = "4.3.1",
+        icebergVersion = "1.11.0",
+        icebergRuntimeArtifact = "iceberg-spark-runtime-4.1",
+        hadoopVersion = "3.4.2",
+        jacksonVersion = "2.21.5",
+        jacksonAnnotationsVersion = "2.21",
+        protobufVersion = "4.33.5",
+        jettyVersion = "12.1.10",
+        nettyVersion = "4.2.17.Final",
+        javaRelease = "17"
+      )
+    case unknown =>
+      throw new IllegalArgumentException(
+        s"Unknown chronon.spark.profile '$unknown'; expected spark3 or spark4"
+      )
+  }
+
   // Common repositories
   def repositories = Seq(
     MavenRepository("https://repo1.maven.org/maven2/"),
@@ -15,8 +68,10 @@ object Constants {
     MavenRepository("https://conjars.org/repo/")
   )
 
-  val defaultScalaVersion = "2.12.18"
-  val scalaVersions = Seq(defaultScalaVersion, "2.13.17")
+  val defaultScalaVersion =
+    if (sparkProfileName == "spark4") "2.13.17" else "2.12.18"
+  val scalaVersions =
+    if (sparkProfileName == "spark4") Seq(defaultScalaVersion) else Seq(defaultScalaVersion, "2.13.17")
 
   val jvmId = ""
 
@@ -56,16 +111,10 @@ object Constants {
     mvn"net.logstash.logback:logstash-logback-encoder:8.1"
   )
 
-  // Jackson: Spark 3.5.3 bundles 2.15.2 at runtime via its classloader,
-  // so the assembly version only matters for non-Spark processes (service, fetcher).
-  // GHSA-72hv-8253-57qq (async parser DoS) is fixed in jackson-core 2.21.1+,
-  // but jackson-annotations / jackson-databind aren't published at 2.21.x on
-  // Maven Central yet (only 2.19.0 / 2.18.4). A unified jacksonVersion bump
-  // is blocked until the full 2.21.x train ships; see .grype.yaml ignore.
-  // 2.18.9 patches CVE-2026-545{12,13,14,15} (GHSA-5jmj-h7xm-6q6v and siblings).
-  // Staying on the 2.18.x line: the 2.19.x line is unpatched for these until
-  // 2.21.4/2.21.5, which aren't on Maven Central either.
-  val jacksonVersion = "2.18.9"
+  // Keep the Spark 3 defaults unchanged. The Spark 4 compatibility build selects
+  // the Jackson train that Spark 4.1 carries at runtime.
+  val jacksonVersion = sparkProfile.jacksonVersion
+  val jacksonAnnotationsVersion = sparkProfile.jacksonAnnotationsVersion
 
   // log4j-1.2-api is the Log4j 1.x bridge bundled with Spark; pin to fix GHSA-h383-gmxw-35v2.
   val log4jVersion = "2.25.5"
@@ -125,7 +174,7 @@ object Constants {
   def utilityDeps = Seq(
     mvn"com.fasterxml.jackson.core:jackson-core:$jacksonVersion".forceVersion(),
     mvn"com.fasterxml.jackson.core:jackson-databind:$jacksonVersion".forceVersion(),
-    mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonVersion".forceVersion(),
+    mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonAnnotationsVersion".forceVersion(),
     mvn"com.fasterxml.jackson.module::jackson-module-scala:$jacksonVersion".forceVersion(),
     mvn"com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:$jacksonVersion".forceVersion(),
     mvn"org.apache.logging.log4j:log4j-1.2-api:$log4jVersion".forceVersion(),
@@ -152,18 +201,33 @@ object Constants {
   )
 
   // Version definitions
-  val sparkVersion = "3.5.3"
-  def sparkDeps = Seq(
+  val sparkVersion = sparkProfile.sparkVersion
+  val deltaVersion = sparkProfile.deltaVersion
+  val icebergVersion = sparkProfile.icebergVersion
+  val hadoopVersion = sparkProfile.hadoopVersion
+
+  def sparkDeps = {
+    val hadoopRuntime = mvn"org.apache.hadoop:hadoop-client-runtime:$hadoopVersion"
+    val compatibleHadoopRuntime = if (sparkProfileName == "spark4") {
+      hadoopRuntime
+        .exclude("org.apache.zookeeper" -> "zookeeper")
+        .exclude("org.apache.zookeeper" -> "zookeeper-jute")
+    } else {
+      hadoopRuntime
+    }
+
+    Seq(
     mvn"org.apache.spark::spark-core:$sparkVersion",
     mvn"org.apache.spark::spark-sql:$sparkVersion",
     mvn"org.apache.spark::spark-catalyst:$sparkVersion",
     mvn"org.apache.spark::spark-hive:$sparkVersion"
       .exclude("org.apache.zookeeper" -> "zookeeper")
       .exclude("org.apache.zookeeper" -> "zookeeper-jute"),
-    mvn"org.apache.hadoop:hadoop-client-api:3.3.6",
-    mvn"org.apache.hadoop:hadoop-client-runtime:3.3.6",
-    mvn"org.apache.iceberg::iceberg-spark-runtime-3.5:1.10.0",
-  )
+    mvn"org.apache.hadoop:hadoop-client-api:$hadoopVersion",
+    compatibleHadoopRuntime,
+    mvn"org.apache.iceberg::${sparkProfile.icebergRuntimeArtifact}:$icebergVersion",
+    )
+  }
 
   val flinkVersion = "1.17.0"
   def providedFlinkDeps = Seq(
@@ -172,12 +236,9 @@ object Constants {
   )
 
   val avroVersion = "1.12.1"
-  val protobufVersion = "3.25.5"
-  // 12.0.36 fixes GHSA-f4v5-65jj-pcr2 and GHSA-7p3p-8qv8-m2vh.
-  val jettyVersion = "12.0.36"
-  // GHSA-2qj4-mmr9-4v2f (High) / GHSA-8c42-7qj2-3j46 (Medium): netty-transport-sctp and
-  // netty-codec-http vulnerabilities, fixed in 4.1.137.Final
-  val nettyVersion = "4.1.137.Final"
+  val protobufVersion = sparkProfile.protobufVersion
+  val jettyVersion = sparkProfile.jettyVersion
+  val nettyVersion = sparkProfile.nettyVersion
   
   // Common JVM arguments for all test modules
   def commonTestForkArgs = Seq(
@@ -384,10 +445,10 @@ trait BaseModule extends CrossScalaModule with ScalafmtModule with GcsPublishMod
     "-language:implicitConversions",
     "-language:postfixOps",
     "-language:reflectiveCalls",
-    "-release:11"
+    s"-release:${Constants.sparkProfile.javaRelease}"
   )
 
-  def javacOptions = Seq("--release", "11")
+  def javacOptions = Seq("--release", Constants.sparkProfile.javaRelease)
 
   // Merge strategy for assembly
   override def assemblyRules = Assembly.defaultRules ++ Seq(

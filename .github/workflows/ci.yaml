@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       scala: ${{ steps.filter.outputs.scala }}
+      spark4: ${{ steps.filter.outputs.spark4 }}
       python: ${{ steps.filter.outputs.python }}
       smoke: ${{ steps.filter.outputs.smoke }}
       azure: ${{ steps.filter.outputs.azure }}
@@ -32,6 +33,20 @@ jobs:
               - '**/*.scala'
               - '*.mill'
               - '**/*.mill'
+            spark4:
+              - 'build.mill'
+              - 'mill'
+              - '.mill-version'
+              - 'api/**'
+              - 'aggregator/**'
+              - 'online/**'
+              - 'spark/**'
+              - 'cloud_k8s/**'
+              - 'cloud_gcp/**'
+              - 'cloud_azure/**'
+              - '.github/actions/setup-mill-cache/**'
+              - '.github/image/Dockerfile'
+              - '.github/workflows/ci.yaml'
             python:
               - 'python/**'
               - 'thrift/**'
@@ -103,6 +118,46 @@ jobs:
     uses: ./.github/workflows/reusable_spark_tests.yaml
     with:
       scala-version: ${{ matrix.scala-version }}
+
+  spark4-source-compat:
+    needs: changes
+    if: needs.changes.outputs.spark4 == 'true'
+    runs-on: ubuntu_32_core_128gb
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository }}-ci@sha256:e05025b580b6994eed02aa066ee182c46cde2a3843a10982221ac2c452e6b4b4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-mill-cache
+        with:
+          scala-version: 2.13.17
+          coursier-repositories: ${{ vars.COURSIER_REPOSITORIES }}
+      - name: "[Spark 4] Compile the Crucible and Eval dependency graphs"
+        run: |
+          ./mill --no-daemon clean
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            'cloud_k8s[2.13.17].compile' \
+            'cloud_gcp[2.13.17].compile' \
+            'cloud_azure[2.13.17].compile' \
+            'spark[2.13.17].test.compile'
+      - name: "[Spark 4] Run cross-version behavior tests"
+        run: |
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            'spark[2.13.17].test.testOnly' \
+            'ai.chronon.spark.ExtensionsTest' \
+            'ai.chronon.spark.catalog.DeltaLakeTest' \
+            'ai.chronon.spark.catalog.IcebergMergeSyntaxTest' \
+            'ai.chronon.spark.submission.SparkSessionBuilderTest'
 
   non-spark:
     needs: changes
@@ -386,7 +441,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [spark, non-spark, python-lint, python-tests, python-scaffold-smoke, cosmos, redis, format, grype, ci-infra]
+    needs: [spark, spark4-source-compat, non-spark, python-lint, python-tests, python-scaffold-smoke, cosmos, redis, format, grype, ci-infra]
     runs-on: ubuntu-latest
     steps:
       - name: Check CI results

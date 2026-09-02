@@ -3,7 +3,6 @@ package ai.chronon.integrations.cloud_gcp
 import ai.chronon.api.PartitionSpec
 import ai.chronon.spark.catalog.{Format, TableUtils}
 import com.google.cloud.bigquery._
-import com.google.cloud.spark.bigquery.v2.Spark35BigQueryTableProvider
 import org.apache.spark.sql.functions.{col, date_format, to_date}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -15,7 +14,7 @@ case class PartitionColumnNotFoundException(message: String) extends Unsupported
 
 case object BigQueryNative extends Format {
 
-  private val bqFormat = classOf[Spark35BigQueryTableProvider].getName
+  private val bqFormat = "bigquery"
   private lazy val bqOptions = BigQueryOptions.getDefaultInstance
   private lazy val bigQueryClient: BigQuery = bqOptions.getService
 

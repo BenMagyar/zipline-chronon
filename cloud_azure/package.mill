@@ -20,6 +20,14 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
   // Track the repo-wide Jackson version (see build.mill) so this can't drift.
   // Azure Cosmos SDK requires Jackson >= 2.17.2, which build.Constants satisfies.
   private val jacksonVersion = build.Constants.jacksonVersion
+  private val jacksonAnnotationsVersion = build.Constants.jacksonAnnotationsVersion
+
+  private def snowflakeConnectorDep =
+    if (build.Constants.sparkProfileName == "spark4") {
+      mvn"net.snowflake::spark-snowflake:3.2.1-spark_4.0"
+    } else {
+      mvn"net.snowflake:spark-snowflake_2.12:3.1.6"
+    }
 
   def excludeJackson(dep: mill.scalalib.Dep): mill.scalalib.Dep = {
     dep
@@ -49,7 +57,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
     mvn"com.azure:azure-security-keyvault-secrets:4.10.5"
       .exclude("com.azure" -> "azure-core-http-netty"),
     mvn"net.snowflake:snowflake-jdbc:3.16.0",
-    mvn"net.snowflake:spark-snowflake_2.12:3.1.6",
+    snowflakeConnectorDep,
     // BouncyCastle for parsing PEM private keys (required by Snowflake JDBC for key pair auth)
     mvn"org.bouncycastle:bcprov-jdk18on:1.80",
     mvn"org.bouncycastle:bcpkix-jdk18on:1.80",
@@ -57,7 +65,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
     // Use iceberg-azure (non-bundle) to avoid the bundle's partially-shaded reactor.netty
     // which conflicts with Cosmos's reactor-netty. Add azure-storage-file-datalake explicitly
     // since iceberg-azure marks it as provided/optional.
-    mvn"org.apache.iceberg:iceberg-azure:1.10.0"
+    mvn"org.apache.iceberg:iceberg-azure:${build.Constants.icebergVersion}"
       .exclude("com.azure" -> "azure-core-http-netty"),
     mvn"com.azure:azure-storage-file-datalake:12.22.0"
       .exclude("com.azure" -> "azure-core-http-netty"),
@@ -75,7 +83,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
   ).map(excludeJackson) ++ Seq(
     mvn"com.fasterxml.jackson.core:jackson-core:$jacksonVersion",
     mvn"com.fasterxml.jackson.core:jackson-databind:$jacksonVersion",
-    mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonVersion",
+    mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonAnnotationsVersion",
     mvn"com.fasterxml.jackson.module::jackson-module-scala:$jacksonVersion",
     mvn"com.fasterxml.jackson.datatype:jackson-datatype-jsr310:$jacksonVersion",
     // Reactor and Netty dependencies required by Cosmos SDK's internal ReactorNettyClient
@@ -208,7 +216,7 @@ trait CloudAzureModule extends Cross.Module[String] with build.BaseModule {
       // Force Jackson version to match azure-cosmos SDK requirements
       mvn"com.fasterxml.jackson.core:jackson-core:$jacksonVersion",
       mvn"com.fasterxml.jackson.core:jackson-databind:$jacksonVersion",
-      mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonVersion",
+      mvn"com.fasterxml.jackson.core:jackson-annotations:$jacksonAnnotationsVersion",
       mvn"com.fasterxml.jackson.module::jackson-module-scala:$jacksonVersion",
     ).map(_.forceVersion())
     override def testFramework = "org.scalatest.tools.Framework"

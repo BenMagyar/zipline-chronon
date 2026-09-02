@@ -6,13 +6,13 @@ import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.parser.ParserInterface
-import org.apache.spark.sql.catalyst.plans.logical.{DeleteAction, InsertAction, LogicalPlan, MergeIntoTable}
+import org.apache.spark.sql.catalyst.plans.logical.{DeleteAction, LogicalPlan, MergeIntoTable}
 import org.apache.spark.sql.types.{DataType, StructType}
 
 /** Spark session extension that adds support for WHEN NOT MATCHED BY SOURCE in MERGE INTO
-  * on Spark 3.5 (natively supported in Spark 4.0+).
+  * on Spark 3.5.
   *
-  * The execution engine in Spark 3.5 already handles notMatchedBySourceActions on MergeIntoTable —
+  * The execution engine in Spark 3.5 already handles notMatchedBySourceActions on MergeIntoTable;
   * only the parser lacks support for the syntax. This extension wraps the parser, intercepts
   * MERGE statements containing "NOT MATCHED BY SOURCE", strips that clause, parses the rest
   * with the delegate parser, then programmatically adds the notMatchedBySourceActions to the plan.
@@ -34,22 +34,17 @@ private[extensions] class MergeBySourceParser(session: SparkSession, delegate: P
       return delegate.parsePlan(sqlText)
     }
 
-    // Extract the WHEN NOT MATCHED BY SOURCE clause and parse the rest normally
     val (strippedSql, deleteCondition) = extractNotMatchedBySource(sqlText)
     val basePlan = delegate.parsePlan(strippedSql)
 
     basePlan match {
       case merge: MergeIntoTable =>
-        val conditionExpr = deleteCondition.map { cond =>
-          delegate.parseExpression(cond)
-        }
-        val deleteAction = DeleteAction(conditionExpr)
-        merge.copy(notMatchedBySourceActions = Seq(deleteAction))
+        val conditionExpr = deleteCondition.map(delegate.parseExpression)
+        merge.copy(notMatchedBySourceActions = Seq(DeleteAction(conditionExpr)))
       case other => other
     }
   }
 
-  // Delegate all other parser methods
   override def parseExpression(sqlText: String): Expression = delegate.parseExpression(sqlText)
   override def parseTableIdentifier(sqlText: String): TableIdentifier = delegate.parseTableIdentifier(sqlText)
   override def parseFunctionIdentifier(sqlText: String): FunctionIdentifier =
@@ -61,12 +56,7 @@ private[extensions] class MergeBySourceParser(session: SparkSession, delegate: P
 }
 
 private[extensions] object MergeBySourceParser {
-
-  /** Extracts the WHEN NOT MATCHED BY SOURCE ... THEN DELETE clause from a MERGE statement.
-    * Returns (sql without that clause, optional delete condition).
-    */
   def extractNotMatchedBySource(sql: String): (String, Option[String]) = {
-    // Match: WHEN NOT MATCHED BY SOURCE [AND <condition>] THEN DELETE
     val pattern =
       """(?is)\s*WHEN\s+NOT\s+MATCHED\s+BY\s+SOURCE\s+(?:AND\s+(.+?)\s+)?THEN\s+DELETE""".r
 

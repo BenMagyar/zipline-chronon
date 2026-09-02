@@ -35,7 +35,6 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
@@ -73,14 +72,14 @@ class InMemoryStream {
     val schema: StructType = StructType.from("input", SparkConversions.toChrononSchema(inputDf.schema))
     logger.info(s"Creating in-memory stream with schema: ${SparkConversions.fromChrononSchema(schema).catalogString}")
     val avroSchema = AvroConversions.fromChrononSchema(schema)
-    import spark.implicits._
-    val input: MemoryStream[Array[Byte]] =
-      new MemoryStream[Array[Byte]](inputDf.schema.catalogString.hashCode % 1000, spark.sqlContext)
-    input.addData(inputDf.collect.map { row: Row =>
-      val bytes = encode(avroSchema)(row)
-      bytes
-    })
-    input.toDF
+    MemoryStreamCompat.toDataFrame(
+      spark,
+      inputDf.schema.catalogString.hashCode % 1000,
+      inputDf.collect.map { row: Row =>
+        val bytes = encode(avroSchema)(row)
+        bytes
+      }
+    )
   }
 
   def getContinuousStreamDF(spark: SparkSession, baseInput: Dataset[Row]): DataFrame = {
@@ -98,18 +97,18 @@ class InMemoryStream {
     val schema: StructType = StructType.from("input", SparkConversions.toChrononSchema(inputDf.schema))
     val avroSchema = AvroConversions.fromChrononSchema(schema)
 
-    import spark.implicits._
-    val input: MemoryStream[Array[Byte]] =
-      new MemoryStream[Array[Byte]](inputDf.schema.catalogString.hashCode % 1000, spark.sqlContext)
-    input.addData(inputDf.collect.map { row: Row =>
-      val bytes =
-        encodeRecord(avroSchema)(
-          AvroConversions
-            .fromChrononRow(row, schema, avroSchema, GenericRowHandler.func)
-            .asInstanceOf[GenericData.Record])
-      bytes
-    })
-    input.toDF
+    MemoryStreamCompat.toDataFrame(
+      spark,
+      inputDf.schema.catalogString.hashCode % 1000,
+      inputDf.collect.map { row: Row =>
+        val bytes =
+          encodeRecord(avroSchema)(
+            AvroConversions
+              .fromChrononRow(row, schema, avroSchema, GenericRowHandler.func)
+              .asInstanceOf[GenericData.Record])
+        bytes
+      }
+    )
   }
 
   /** @param spark SparkSession

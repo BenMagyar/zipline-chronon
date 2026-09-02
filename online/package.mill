@@ -20,7 +20,7 @@ trait OnlineModule extends Cross.Module[String] with build.BaseModule {
 
   def compileMvnDeps = Seq(
     mvn"org.apache.spark::spark-hive:${build.Constants.sparkVersion}",
-    mvn"org.apache.hadoop:hadoop-client-api:3.3.6",
+    mvn"org.apache.hadoop:hadoop-client-api:${build.Constants.hadoopVersion}",
   )
 
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps ++ Seq(
