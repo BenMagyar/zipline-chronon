@@ -152,13 +152,21 @@ jobs:
             'cloud_gcp[2.13.17].compile' \
             'cloud_azure[2.13.17].compile' \
             'spark[2.13.17].test.compile'
-      - name: "[Spark 4] Verify the Crucible AWS Delta runtime"
+      - name: "[Spark 4] Verify the Crucible AWS table-format runtimes"
         run: |
           ./mill --no-daemon --define chronon.spark.profile=spark4 \
             show 'cloud_aws[2.13.17].compileClasspath' > /tmp/cloud-aws-spark4-classpath.json
           grep -F '/io/delta/delta-spark_4.1_2.13/' /tmp/cloud-aws-spark4-classpath.json
+          grep -F '/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/1.11.0/' /tmp/cloud-aws-spark4-classpath.json
+          grep -F '/io/unitycatalog/unitycatalog-spark_4.1_2.13/0.5.1/' /tmp/cloud-aws-spark4-classpath.json
+          grep -F '/io/unitycatalog/unitycatalog-client/0.5.1/' /tmp/cloud-aws-spark4-classpath.json
+          grep -F '/io/unitycatalog/unitycatalog-hadoop/0.5.1/' /tmp/cloud-aws-spark4-classpath.json
           if grep -F 'delta-spark_2.12-3.3.2.jar' /tmp/cloud-aws-spark4-classpath.json; then
             echo 'Spark 4 cloud_aws classpath contains the vendored Spark 3 Delta runtime' >&2
+            exit 1
+          fi
+          if grep -E 'iceberg-spark-runtime-3\.5_|cloud_aws/unitycatalog-' /tmp/cloud-aws-spark4-classpath.json; then
+            echo 'Spark 4 cloud_aws classpath contains a Spark 3 table-format runtime' >&2
             exit 1
           fi
       - name: "[Spark 4] Run cross-version behavior tests"
@@ -170,6 +178,9 @@ jobs:
             'ai.chronon.spark.catalog.IcebergMergeSyntaxTest' \
             'ai.chronon.spark.extensions.ChrononDeltaDataSkippingExtensionTest' \
             'ai.chronon.spark.submission.SparkSessionBuilderTest'
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            'cloud_aws[2.13.17].test.testOnly' \
+            'ai.chronon.integrations.aws.CatalogRuntimeCompatibilityTest'
 
   non-spark:
     needs: changes

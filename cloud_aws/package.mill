@@ -18,12 +18,8 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
 
   def moduleDeps = Seq(build.spark(crossValue), build.aggregator(crossValue), build.api(crossValue), build.online(crossValue), build.redis(crossValue), build.cloud_k8s(crossValue))
 
-  // Built from zipline-ai/unitycatalog@spark-3.5-scala-2.12 (Zipline rebuild
-  // commit on top of upstream UC HEAD). Spark connector now depends on the
-  // sibling client + hadoop modules (upstream split out credential providers
-  // into a separate hadoop subproject), so all three jars ship together.
-  // Local filenames keep the 0.4.0 suffix to match existing Chronon naming;
-  // the actual upstream version they were built against is 0.5.0-SNAPSHOT.
+  // Spark 3 retains the Zipline UC rebuild. Spark 4 uses the official connector
+  // artifact, which pulls in its matching client and Hadoop modules transitively.
   def ucSparkJarFile = Task.Source(moduleDir / "unitycatalog-spark_2.12-0.4.0.jar")
   def ucClientJarFile = Task.Source(moduleDir / "unitycatalog-client-0.4.0.jar")
   def ucHadoopJarFile = Task.Source(moduleDir / "unitycatalog-hadoop-0.4.0.jar")
@@ -39,14 +35,27 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
       Seq(mvn"io.delta:delta-storage:3.3.2")
     }
 
+  private def unityCatalogRuntimeDeps =
+    if (build.Constants.sparkProfileName == "spark4") {
+      Seq(mvn"io.unitycatalog:unitycatalog-spark_4.1_2.13:0.5.1")
+    } else {
+      Seq.empty
+    }
+
+  private def icebergSparkRuntimeDep =
+    mvn"org.apache.iceberg::${build.Constants.sparkProfile.icebergRuntimeArtifact}:${build.Constants.icebergVersion}"
+
   override def unmanagedClasspath = Task {
+    val unityCatalogRuntimeClasspath =
+      if (build.Constants.sparkProfileName == "spark4") {
+        Seq.empty
+      } else {
+        Seq(ucSparkJarFile(), ucClientJarFile(), ucHadoopJarFile())
+      }
     val deltaRuntimeClasspath =
       if (build.Constants.sparkProfileName == "spark4") Seq.empty else Seq(deltaSparkJarFile())
 
-    super.unmanagedClasspath() ++ Seq(
-      ucSparkJarFile(),
-      ucClientJarFile(),
-      ucHadoopJarFile(),
+    super.unmanagedClasspath() ++ unityCatalogRuntimeClasspath ++ Seq(
       build.icebergHttpPatch.assembly(),
     ) ++ deltaRuntimeClasspath
   }
@@ -75,15 +84,15 @@ trait CloudAwsModule extends Cross.Module[String] with build.BaseModule {
     mvn"org.apache.hadoop:hadoop-aws:3.4.1"
       .exclude("software.amazon.awssdk" -> "bundle"),
     mvn"software.amazon.awssdk:s3-transfer-manager:2.30.13",
-    mvn"org.apache.iceberg::iceberg-spark-runtime-3.5:1.10.0",
-    // Transitive deps that the old `io.unitycatalog:unitycatalog-client:0.4.0`
-    // Maven artifact provided. We now bundle the client jar locally (see
-    // ucClientJarFile above), so these have to be declared explicitly.
+    icebergSparkRuntimeDep,
+    // Support libraries required by Spark 3's vendored UC client. Spark 4's
+    // official connector also provides them transitively; keep the direct
+    // declarations so version selection remains consistent across profiles.
     mvn"com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${build.Constants.jacksonVersion}".forceVersion(),
     mvn"org.openapitools:jackson-databind-nullable:0.2.6",
     mvn"com.google.code.findbugs:jsr305:3.0.2",
     mvn"jakarta.annotation:jakarta.annotation-api:3.0.0",
-  ) ++ deltaRuntimeDeps ++ Seq(
+  ) ++ deltaRuntimeDeps ++ unityCatalogRuntimeDeps ++ Seq(
     // Force-override vulnerable transitive deps from unitycatalog-spark / uber-jars
     mvn"org.eclipse.jetty:jetty-server:$jettyVersion",
     mvn"org.eclipse.jetty:jetty-http:$jettyVersion",
