@@ -35,7 +35,7 @@ jobs:
         with:
           scala-version: ${{ env.SCALA_VERSION }}
           cache-output: "true"
-          output-cache-scope: scala-assemblies
+          output-cache-scope: spark3-spark4-assemblies
           coursier-repositories: ${{ vars.COURSIER_REPOSITORIES }}
 
       - name: Get the latest release tag
@@ -82,10 +82,13 @@ jobs:
           path: ${{ steps.build-wheel.outputs.wheel_file }}
 
 
-      - name: Build Mill Project
+      - name: Build Spark 3 and Spark 4 Mill artifacts
         id: mill-build
         run: |
           ./mill artifacts\[${{ env.SCALA_VERSION }}\].all
+          ./mill --no-daemon \
+            --define chronon.spark.profile=spark4 \
+            'artifacts[2.13.17].all'
 
       - name: Upload Flink Assembly Jar
         uses: actions/upload-artifact@v4
@@ -135,58 +138,6 @@ jobs:
           name: kinesis-jar
           path: out/flink_connectors/kinesis/${{ env.SCALA_VERSION }}/assembly.dest/out.jar
 
-    outputs:
-      wheel_file: ${{ steps.build-wheel.outputs.wheel_file }}
-      wheel_name: ${{ steps.build-wheel.outputs.wheel_name }}
-      version: ${{ steps.build-wheel.outputs.version }}
-
-  build_spark4_crucible_artifacts:
-    runs-on: ubuntu_32_core_128gb
-    container:
-      image: ghcr.io/${{ github.repository }}-ci@sha256:e05025b580b6994eed02aa066ee182c46cde2a3843a10982221ac2c452e6b4b4
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/setup-mill-cache
-        with:
-          scala-version: "2.13.17"
-          cache-output: "true"
-          output-cache-scope: spark4-crucible-assemblies
-          coursier-repositories: ${{ vars.COURSIER_REPOSITORIES }}
-
-      - name: Compute Spark 4 version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch --tags
-          TAG=$(git tag --sort=-creatordate | head -n 1)
-          TAG="${TAG#v}"
-          if [ -z "$TAG" ]; then
-            TAG="0.0.0"
-          fi
-          VERSION="${TAG}+${GITHUB_SHA}"
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "CHRONON_VERSION=$VERSION" >> "$GITHUB_ENV"
-
-      - name: Build Spark 4 Crucible JARs
-        run: |
-          ./mill --no-daemon \
-            --define chronon.spark.profile=spark4 \
-            'cloud_aws[2.13.17].assembly' \
-            'flink[2.13.17].assembly' \
-            'flink_connectors.kinesis[2.13.17].assembly'
-
       - name: Upload Spark 4 AWS engine artifact
         uses: actions/upload-artifact@v4
         with:
@@ -206,10 +157,12 @@ jobs:
           path: out/flink_connectors/kinesis/2.13.17/assembly.dest/out.jar
 
     outputs:
-      version: ${{ steps.version.outputs.value }}
+      wheel_file: ${{ steps.build-wheel.outputs.wheel_file }}
+      wheel_name: ${{ steps.build-wheel.outputs.wheel_name }}
+      version: ${{ steps.build-wheel.outputs.version }}
 
   push_spark4_crucible_artifacts:
-    needs: build_spark4_crucible_artifacts
+    needs: build_artifacts
     runs-on: ubuntu-latest
 
     permissions:
@@ -243,7 +196,7 @@ jobs:
 
       - name: Publish versioned Spark 4 Crucible JARs
         env:
-          VERSION: ${{ needs.build_spark4_crucible_artifacts.outputs.version }}
+          VERSION: ${{ needs.build_artifacts.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail

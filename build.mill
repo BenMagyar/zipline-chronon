@@ -574,20 +574,32 @@ object icebergHttpPatch extends JavaModule {
   )
 }
 
-// Aggregate target: builds all deploy assemblies in parallel via Mill's task graph.
-// Usage: ./mill artifacts[2.12.18]
+// Aggregate target: builds the supported deploy assemblies in parallel via Mill's task graph.
+// Usage: ./mill artifacts[2.12.18].all
 object artifacts extends Cross[ArtifactsModule](Constants.scalaVersions)
 trait ArtifactsModule extends Cross.Module[String] {
   def scalaVersion = crossValue
-  def all = Task {
-    Seq(
-      build.flink(scalaVersion).assembly(),
-      build.cloud_gcp(scalaVersion).assembly(),
-      build.cloud_aws(scalaVersion).assembly(),
-      build.cloud_azure(scalaVersion).assembly(),
-      build.service(scalaVersion).assembly(),
-      build.flink_connectors.pubsub(scalaVersion).assembly(),
-      build.flink_connectors.kinesis(scalaVersion).assembly()
-    )
-  }
+  def all =
+    if (Constants.sparkProfileName == "spark4") {
+      // Spark 4 is supported only on Crucible, which uses these three assemblies.
+      Task {
+        Seq(
+          build.flink(scalaVersion).assembly(),
+          build.cloud_aws(scalaVersion).assembly(),
+          build.flink_connectors.kinesis(scalaVersion).assembly()
+        )
+      }
+    } else {
+      Task {
+        Seq(
+          build.flink(scalaVersion).assembly(),
+          build.cloud_gcp(scalaVersion).assembly(),
+          build.cloud_aws(scalaVersion).assembly(),
+          build.cloud_azure(scalaVersion).assembly(),
+          build.service(scalaVersion).assembly(),
+          build.flink_connectors.pubsub(scalaVersion).assembly(),
+          build.flink_connectors.kinesis(scalaVersion).assembly()
+        )
+      }
+    }
 }
