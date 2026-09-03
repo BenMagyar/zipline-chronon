@@ -41,6 +41,28 @@ class KafkaFlinkSourceSpec extends AnyFlatSpec {
     kafkaSrc.bootstrap shouldBe "my-host:9092"
   }
 
+  it should "override partition-based parallelism from topic info" in {
+    val topicInfo = TopicInfo(
+      "test-topic",
+      "kafka",
+      Map(KafkaFlinkSource.KafkaBootstrap -> "my-kafka-server", KafkaFlinkSource.TaskParallelism -> "5")
+    )
+    val flinkSrc = FlinkSourceProvider.build(Map.empty, null, topicInfo)
+
+    flinkSrc.parallelism shouldBe 5
+  }
+
+  it should "prefer a parallelism override from properties over topic info" in {
+    val props = Map(
+      KafkaFlinkSource.KafkaBootstrap -> "my-kafka-server",
+      KafkaFlinkSource.TaskParallelism -> "7"
+    )
+    val topicInfo = TopicInfo("test-topic", "kafka", Map(KafkaFlinkSource.TaskParallelism -> "5"))
+    val flinkSrc = FlinkSourceProvider.build(props, null, topicInfo)
+
+    flinkSrc.parallelism shouldBe 7
+  }
+
   // --- resolveSaslJaasConfig ---
 
   "resolveSaslJaasConfig" should "inject sasl.jaas.config from env when security.protocol contains SASL and config is not set" in {

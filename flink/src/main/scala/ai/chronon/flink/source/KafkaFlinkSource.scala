@@ -35,7 +35,10 @@ class KafkaFlinkSource[T](props: Map[String, String],
   val scaleFactor = 0.25
 
   implicit lazy val parallelism: Int = {
-    math.ceil(TopicChecker.getPartitions(topicInfo.name, bootstrap, resolvedParams) * scaleFactor).toInt
+    FlinkUtils
+      .getProperty(TaskParallelism, props, topicInfo)
+      .map(_.toInt)
+      .getOrElse(math.ceil(TopicChecker.getPartitions(topicInfo.name, bootstrap, resolvedParams) * scaleFactor).toInt)
   }
 
   override def getDataStream(topic: String, groupByName: String)(env: StreamExecutionEnvironment,
@@ -76,6 +79,7 @@ class KafkaFlinkSource[T](props: Map[String, String],
 
 object KafkaFlinkSource {
   val KafkaBootstrap = "bootstrap"
+  val TaskParallelism = "tasks"
   val SecurityProtocol = "security.protocol"
   val SaslJaasConfig = "sasl.jaas.config"
   val SaslJaasConfigEnvVar = "SASL_JAAS_CONFIG"
