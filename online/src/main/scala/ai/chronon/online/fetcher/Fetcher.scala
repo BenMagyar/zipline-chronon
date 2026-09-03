@@ -951,19 +951,18 @@ class Fetcher(val kvStore: KVStore,
     val ctx =
       Metrics.Context(Metrics.Environment.MetaDataFetching, groupBy = groupByName).withSuffix("group_by_status")
 
-    val groupByConfTry = metadataStore.getConf[api.GroupBy](ConfPathOrName(confName = Some(groupByName)))
-
-    groupByConfTry
-      .flatMap { groupByConf =>
-        if (!groupByConf.metaData.online) {
-          Failure(
-            new IllegalArgumentException(
-              s"GroupBy $groupByName is not online. Fetcher status is only available for online GroupBys. " +
-                "Enable online=True and upload the GroupBy."))
-        } else {
-          metadataStore.getGroupByServingInfo(groupByName)
-        }
-      }
+    // GroupBy confs aren't uploaded to the metadata dataset (CHRONON_METADATA) - only the batch
+    // GroupByServingInfo is, under <NAME>_BATCH - and it embeds the full conf (GroupByUpload.setGroupBy).
+    // So read the serving info directly, mirroring how join/data fetching resolves each GroupBy's serving
+    // info instead of requiring a conf in CHRONON_METADATA.
+    //
+    // We deliberately do NOT gate on servingInfo.groupBy.metaData.online: a GroupBy that exists only as a
+    // join dependency is uploaded to <NAME>_BATCH (so the join can fetch it) yet commonly carries
+    // online=false in its own conf. Data/join fetching serve it regardless of that flag, so the status response must
+    // too. Presence of the serving info is the real signal; if it's absent, getGroupByServingInfo already surfaces a
+    // clear error.
+    metadataStore
+      .getGroupByServingInfo(groupByName)
       .map { servingInfo =>
         val response = GroupByStatusResponse(groupByName, servingInfo.batchEndDate)
         ctx.distribution(Metrics.Name.LatencyMillis, System.currentTimeMillis() - startTime)

@@ -85,20 +85,17 @@ public class GroupByStatusHandlerTest {
     }
 
     @Test
-    public void testOfflineGroupByRequest(TestContext context) {
+    public void testIllegalArgumentMapsTo400(TestContext context) {
         Async async = context.async();
 
-        String errorMessage = "GroupBy test_group_by is not online. Fetcher status is only available for online GroupBys. " +
-                "Enable online=True and upload the GroupBy.";
         when(mockFetcher.fetchGroupByStatus(anyString()))
-                .thenReturn(JTry.failure(new IllegalArgumentException(errorMessage)));
+                .thenReturn(JTry.failure(new IllegalArgumentException("bad request from fetcher")));
 
         verifyResponseOnEnd(context, async, 400, actualResponse -> {
             verify(mockFetcher).fetchGroupByStatus("test_group_by");
 
             String failureString = actualResponse.getJsonArray("errors").getString(0);
-            context.assertTrue(failureString.contains("online=True"));
-            context.assertTrue(failureString.contains("upload the GroupBy"));
+            context.assertTrue(failureString.contains("bad request from fetcher"));
         });
 
         handler.handle(routingContext);
