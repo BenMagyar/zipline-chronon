@@ -42,6 +42,7 @@ jobs:
               - 'online/**'
               - 'spark/**'
               - 'cloud_k8s/**'
+              - 'cloud_aws/**'
               - 'cloud_gcp/**'
               - 'cloud_azure/**'
               - '.github/actions/setup-mill-cache/**'
@@ -147,9 +148,19 @@ jobs:
           ./mill --no-daemon clean
           ./mill --no-daemon --define chronon.spark.profile=spark4 \
             'cloud_k8s[2.13.17].compile' \
+            'cloud_aws[2.13.17].assembly' \
             'cloud_gcp[2.13.17].compile' \
             'cloud_azure[2.13.17].compile' \
             'spark[2.13.17].test.compile'
+      - name: "[Spark 4] Verify the Crucible AWS Delta runtime"
+        run: |
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            show 'cloud_aws[2.13.17].compileClasspath' > /tmp/cloud-aws-spark4-classpath.json
+          grep -F '/io/delta/delta-spark_4.1_2.13/' /tmp/cloud-aws-spark4-classpath.json
+          if grep -F 'delta-spark_2.12-3.3.2.jar' /tmp/cloud-aws-spark4-classpath.json; then
+            echo 'Spark 4 cloud_aws classpath contains the vendored Spark 3 Delta runtime' >&2
+            exit 1
+          fi
       - name: "[Spark 4] Run cross-version behavior tests"
         run: |
           ./mill --no-daemon --define chronon.spark.profile=spark4 \

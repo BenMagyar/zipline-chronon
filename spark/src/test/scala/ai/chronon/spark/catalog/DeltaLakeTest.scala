@@ -65,8 +65,12 @@ class DeltaLakeTest extends AnyFlatSpec with BeforeAndAfterAll {
       .flatMap(source => Option(source.getLocation))
       .exists(_.toString.contains("cloud_aws/delta-spark_2.12-3.3.2.jar"))
 
-  // Do not register this case against upstream Delta, which does not include the checkpoint stats patch.
-  if (hasPatchedDeltaRuntime) {
+  private def supportsParsedCheckpointStats: Boolean =
+    Option(classOf[org.apache.spark.sql.delta.CheckpointProvider].getPackage.getImplementationVersion)
+      .exists(_.startsWith("4.")) || hasPatchedDeltaRuntime
+
+  // Delta 4 includes parsed checkpoint stats support. Delta 3 requires Zipline's patched runtime.
+  if (supportsParsedCheckpointStats) {
     it should "derive virtual partitions from parsed checkpoint stats when JSON stats are disabled" in {
       val dbName = s"delta_struct_stats_${System.nanoTime()}"
       val tableName = s"$dbName.time_with_struct_stats"

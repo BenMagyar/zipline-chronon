@@ -206,6 +206,15 @@ object Constants {
   val icebergVersion = sparkProfile.icebergVersion
   val hadoopVersion = sparkProfile.hadoopVersion
 
+  // Delta 4 publishes Spark-versioned artifacts. Select the Spark 4.1 build explicitly
+  // instead of relying on the unsuffixed compatibility artifact.
+  def deltaSparkDep =
+    if (sparkProfileName == "spark4") {
+      mvn"io.delta:delta-spark_4.1_2.13:$deltaVersion"
+    } else {
+      mvn"io.delta::delta-spark:$deltaVersion"
+    }
+
   def sparkDeps = {
     val hadoopRuntime = mvn"org.apache.hadoop:hadoop-client-runtime:$hadoopVersion"
     val compatibleHadoopRuntime = if (sparkProfileName == "spark4") {
