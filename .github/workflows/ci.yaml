@@ -45,6 +45,8 @@ jobs:
               - 'cloud_aws/**'
               - 'cloud_gcp/**'
               - 'cloud_azure/**'
+              - 'flink/**'
+              - 'flink_connectors/kinesis/**'
               - '.github/actions/setup-mill-cache/**'
               - '.github/image/Dockerfile'
               - '.github/workflows/ci.yaml'
@@ -151,6 +153,8 @@ jobs:
             'cloud_aws[2.13.17].assembly' \
             'cloud_gcp[2.13.17].compile' \
             'cloud_azure[2.13.17].compile' \
+            'flink[2.13.17].test.compile' \
+            'flink_connectors.kinesis[2.13.17].test.compile' \
             'spark[2.13.17].test.compile'
       - name: "[Spark 4] Verify the Crucible AWS table-format runtimes"
         run: |
@@ -181,6 +185,14 @@ jobs:
           ./mill --no-daemon --define chronon.spark.profile=spark4 \
             'cloud_aws[2.13.17].test.testOnly' \
             'ai.chronon.integrations.aws.CatalogRuntimeCompatibilityTest'
+      - name: "[Spark 4] Run Flink tests"
+        run: |
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            'flink[2.13.17].test'
+      - name: "[Spark 4] Run Kinesis connector tests"
+        run: |
+          ./mill --no-daemon --define chronon.spark.profile=spark4 \
+            'flink_connectors.kinesis[2.13.17].test'
 
   non-spark:
     needs: changes

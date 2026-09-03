@@ -32,8 +32,7 @@ class SparkExpressionEvalFn[T](encoder: Encoder[T],
   override def open(configuration: Configuration): Unit = {
     super.open(configuration)
 
-    val eventExprEncoder = encoder.asInstanceOf[ExpressionEncoder[T]]
-    rowSerializer = eventExprEncoder.createSerializer()
+    rowSerializer = SparkEncoderCompat.serializer(encoder)
 
     // Create evaluator with simplified constructor
     evaluator = new SparkExpressionEval[T](encoder, query, groupByName, dataModel)

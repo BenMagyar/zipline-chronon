@@ -49,11 +49,11 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
     mvn"org.apache.flink:flink-metrics-dropwizard:$flinkVersion",
     mvn"org.apache.flink:flink-metrics-prometheus:$flinkVersion",
     mvn"org.apache.flink:flink-avro:$flinkVersion",
-    mvn"io.confluent:kafka-schema-registry-client:7.8.0"
+    mvn"io.confluent:kafka-schema-registry-client:${build.Constants.confluentVersion}"
       .exclude("com.fasterxml.jackson.core" -> "jackson-core")
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
-    mvn"io.confluent:kafka-protobuf-provider:7.8.0"
+    mvn"io.confluent:kafka-protobuf-provider:${build.Constants.confluentVersion}"
       .exclude("com.fasterxml.jackson.core" -> "jackson-core")
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
@@ -133,7 +133,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
       // Force correct Jackson versions
       mvn"com.fasterxml.jackson.core:jackson-core:${build.Constants.jacksonVersion}",
       mvn"com.fasterxml.jackson.core:jackson-databind:${build.Constants.jacksonVersion}",
-      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonVersion}"
+      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonAnnotationsVersion}"
     )
   }
 }

@@ -3,11 +3,10 @@ package ai.chronon.flink.test
 import ai.chronon.api.Extensions.GroupByOps
 import ai.chronon.api.Constants
 import ai.chronon.api.ScalaJavaConversions.{IteratorOps, JListOps, JMapOps}
-import ai.chronon.flink.{SparkExpressionEval, SparkExpressionEvalFn}
+import ai.chronon.flink.{SparkEncoderCompat, SparkExpressionEval, SparkExpressionEvalFn}
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
-import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.{Encoder, Encoders, Row}
 import org.apache.spark.sql.types._
 import org.scalatest.flatspec.AnyFlatSpec
@@ -27,7 +26,7 @@ class SparkExpressionEvalFnTest extends AnyFlatSpec {
                           dataModel: ai.chronon.api.DataModel = ai.chronon.api.DataModel.EVENTS): Map[String, Any] = {
     val evaluator = new SparkExpressionEval(encoder, query, name, dataModel)
     evaluator.initialize(new UnregisteredMetricsGroup)
-    val serializer = encoder.asInstanceOf[ExpressionEncoder[T]].createSerializer()
+    val serializer = SparkEncoderCompat.serializer(encoder)
     evaluator.evaluateExpressions(event, serializer).head
   }
 

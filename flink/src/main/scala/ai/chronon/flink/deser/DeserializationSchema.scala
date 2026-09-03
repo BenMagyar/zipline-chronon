@@ -2,6 +2,7 @@ package ai.chronon.flink.deser
 
 import ai.chronon.api.{Constants, DataModel, DataType, Query}
 import ai.chronon.flink.SparkExpressionEval
+import ai.chronon.flink.SparkEncoderCompat
 import ai.chronon.online.serde.{Mutation, SerDe, SparkConversions}
 import ai.chronon.online.{ERROR, INFO, ThrottledLogging}
 import com.codahale.metrics.ExponentiallyDecayingReservoir
@@ -134,8 +135,7 @@ class SourceProjectionDeserializationSchema(deserSchemaProvider: SerDe,
     )
 
     // spark expr eval vars
-    val eventExprEncoder = sourceEventEncoder.asInstanceOf[ExpressionEncoder[Row]]
-    rowSerializer = eventExprEncoder.createSerializer()
+    rowSerializer = SparkEncoderCompat.serializer(sourceEventEncoder)
     evaluator = new SparkExpressionEval[Row](sourceEventEncoder, query, groupByName, dataModel)
     evaluator.initialize(metricsGroup)
   }

@@ -140,6 +140,122 @@ jobs:
       wheel_name: ${{ steps.build-wheel.outputs.wheel_name }}
       version: ${{ steps.build-wheel.outputs.version }}
 
+  build_spark4_crucible_artifacts:
+    runs-on: ubuntu_32_core_128gb
+    container:
+      image: ghcr.io/${{ github.repository }}-ci@sha256:e05025b580b6994eed02aa066ee182c46cde2a3843a10982221ac2c452e6b4b4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-mill-cache
+        with:
+          scala-version: "2.13.17"
+          cache-output: "true"
+          output-cache-scope: spark4-crucible-assemblies
+          coursier-repositories: ${{ vars.COURSIER_REPOSITORIES }}
+
+      - name: Compute Spark 4 version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --tags
+          TAG=$(git tag --sort=-creatordate | head -n 1)
+          TAG="${TAG#v}"
+          if [ -z "$TAG" ]; then
+            TAG="0.0.0"
+          fi
+          VERSION="${TAG}+${GITHUB_SHA}"
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "CHRONON_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build Spark 4 Crucible JARs
+        run: |
+          ./mill --no-daemon \
+            --define chronon.spark.profile=spark4 \
+            'cloud_aws[2.13.17].assembly' \
+            'flink[2.13.17].assembly' \
+            'flink_connectors.kinesis[2.13.17].assembly'
+
+      - name: Upload Spark 4 AWS engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-aws-spark4-jar
+          path: out/cloud_aws/2.13.17/assembly.dest/out.jar
+
+      - name: Upload Spark 4 Flink artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flink-spark4-assembly-jar
+          path: out/flink/2.13.17/assembly.dest/out.jar
+
+      - name: Upload Spark 4 Kinesis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinesis-spark4-jar
+          path: out/flink_connectors/kinesis/2.13.17/assembly.dest/out.jar
+
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+  push_spark4_crucible_artifacts:
+    needs: build_spark4_crucible_artifacts
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download Spark 4 AWS engine artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-aws-spark4-jar
+          path: cloud-aws-spark4-jar
+
+      - name: Download Spark 4 Flink artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flink-spark4-assembly-jar
+          path: flink-spark4-assembly-jar
+
+      - name: Download Spark 4 Kinesis artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kinesis-spark4-jar
+          path: kinesis-spark4-jar
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github_actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish versioned Spark 4 Crucible JARs
+        env:
+          VERSION: ${{ needs.build_spark4_crucible_artifacts.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          METADATA="updated_date=$(date -u +%Y-%m-%dT%H:%M:%SZ),commit=${GITHUB_SHA},branch=${GITHUB_REF_NAME},spark_profile=spark4,scala_version=2.13.17"
+          PREFIX="s3://zipline-artifacts-crucible/release/${VERSION}/jars"
+          aws s3 cp cloud-aws-spark4-jar/out.jar \
+            "$PREFIX/cloud_aws_lib_spark4_deploy.jar" --metadata="$METADATA"
+          aws s3 cp flink-spark4-assembly-jar/out.jar \
+            "$PREFIX/flink_assembly_spark4_deploy.jar" --metadata="$METADATA"
+          aws s3 cp kinesis-spark4-jar/out.jar \
+            "$PREFIX/connectors_kinesis_spark4_deploy.jar" --metadata="$METADATA"
+
   push_to_aws:
     needs: build_artifacts
     runs-on: ubuntu-latest
@@ -197,11 +313,15 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          aws s3 cp ${{ needs.build_artifacts.outputs.wheel_name }} s3://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/wheels/ --metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
-          aws s3 cp flink_assembly_deploy.jar s3://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/flink_assembly_deploy.jar --metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
-          aws s3 cp cloud_aws_lib_deploy.jar s3://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/cloud_aws_lib_deploy.jar --metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
-          aws s3 cp service_assembly_deploy.jar s3://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/service_assembly_deploy.jar --metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
-          aws s3 cp connectors_kinesis_deploy.jar s3://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/connectors_kinesis_deploy.jar --metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
+          VERSION="${{ needs.build_artifacts.outputs.version }}"
+          METADATA="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
+          for BUCKET in zipline-artifacts-canary zipline-artifacts-crucible; do
+            aws s3 cp ${{ needs.build_artifacts.outputs.wheel_name }} "s3://$BUCKET/release/$VERSION/wheels/" --metadata="$METADATA"
+            aws s3 cp flink_assembly_deploy.jar "s3://$BUCKET/release/$VERSION/jars/flink_assembly_deploy.jar" --metadata="$METADATA"
+            aws s3 cp cloud_aws_lib_deploy.jar "s3://$BUCKET/release/$VERSION/jars/cloud_aws_lib_deploy.jar" --metadata="$METADATA"
+            aws s3 cp service_assembly_deploy.jar "s3://$BUCKET/release/$VERSION/jars/service_assembly_deploy.jar" --metadata="$METADATA"
+            aws s3 cp connectors_kinesis_deploy.jar "s3://$BUCKET/release/$VERSION/jars/connectors_kinesis_deploy.jar" --metadata="$METADATA"
+          done
 
   push_to_gcp:
     needs: build_artifacts

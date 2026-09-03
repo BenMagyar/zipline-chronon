@@ -17,10 +17,10 @@ trait KinesisConnectorModule extends Cross.Module[String] with build.BaseModule 
 
   def mvnDeps = build.Constants.commonDeps ++ build.Constants.loggingApiDeps ++ build.Constants.utilityDeps ++ Seq(
     mvn"io.dropwizard.metrics:metrics-core:4.2.19",
-    mvn"com.google.protobuf:protobuf-java-util:3.25.1",
-    mvn"com.google.protobuf:protobuf-java:3.25.1",
+    mvn"com.google.protobuf:protobuf-java-util:${build.Constants.protobufVersion}",
+    mvn"com.google.protobuf:protobuf-java:${build.Constants.protobufVersion}",
     // Used for programmatic .proto string -> Descriptor conversion
-    mvn"io.confluent:kafka-protobuf-provider:7.8.0"
+    mvn"io.confluent:kafka-protobuf-provider:${build.Constants.confluentVersion}"
       .exclude("com.fasterxml.jackson.core" -> "jackson-core")
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
@@ -61,7 +61,7 @@ trait KinesisConnectorModule extends Cross.Module[String] with build.BaseModule 
       // Force correct Jackson versions
       mvn"com.fasterxml.jackson.core:jackson-core:${build.Constants.jacksonVersion}",
       mvn"com.fasterxml.jackson.core:jackson-databind:${build.Constants.jacksonVersion}",
-      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonVersion}"
+      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonAnnotationsVersion}"
     )
   }
 }

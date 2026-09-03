@@ -239,6 +239,7 @@ object Constants {
   }
 
   val flinkVersion = "1.17.0"
+  val confluentVersion = if (sparkProfileName == "spark4") "8.1.5" else "7.8.0"
   def providedFlinkDeps = Seq(
     mvn"org.apache.flink:flink-streaming-java:$flinkVersion",
     mvn"org.apache.flink:flink-clients:$flinkVersion",

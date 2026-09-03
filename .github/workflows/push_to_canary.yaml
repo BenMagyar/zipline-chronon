@@ -495,6 +495,24 @@ jobs:
           name: cloud-aws-jar
           path: cloud-aws-jar
 
+      - name: Download Spark 4 Cloud AWS Lib Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-aws-spark4-jar
+          path: cloud-aws-spark4-jar
+
+      - name: Download Spark 4 Flink Assembly Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: flink-spark4-assembly-jar
+          path: flink-spark4-assembly-jar
+
+      - name: Download Spark 4 Kinesis Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: kinesis-spark4-jar
+          path: kinesis-spark4-jar
+
       - name: Download Service Assembly Jar
         uses: actions/download-artifact@v4
         with:
@@ -511,6 +529,9 @@ jobs:
         run: |
           mv flink-assembly-jar/out.jar flink_assembly_deploy.jar
           mv cloud-aws-jar/out.jar cloud_aws_lib_deploy.jar
+          mv cloud-aws-spark4-jar/out.jar cloud_aws_lib_spark4_deploy.jar
+          mv flink-spark4-assembly-jar/out.jar flink_assembly_spark4_deploy.jar
+          mv kinesis-spark4-jar/out.jar connectors_kinesis_spark4_deploy.jar
           mv service-assembly-jar/out.jar service_assembly_deploy.jar
           mv kinesis-jar/out.jar connectors_kinesis_deploy.jar
 
@@ -525,9 +546,8 @@ jobs:
         run: |
           set -eo pipefail
           METADATA="updated_date=$(date),commit=${{ github.sha }},branch=${{ github.ref_name }}"
-          # zipline-artifacts-crucible is the crucible (in-cluster K8sSubmitter) deployment's
-          # artifact bucket; zipline-artifacts-canary serves the canary EMR Serverless
-          # deployment. Both consume the same chronon jars.
+          # Both buckets retain the Spark 3 filenames. Crucible also receives the Spark 4
+          # assemblies under distinct names after the existing integration tests.
           for BUCKET in zipline-artifacts-canary zipline-artifacts-crucible; do
             aws s3 cp ${{ needs.build_and_push.outputs.wheel_name }} s3://$BUCKET/release/passing-candidate/wheels/ --metadata="$METADATA"
             aws s3 cp flink_assembly_deploy.jar s3://$BUCKET/release/passing-candidate/jars/flink_assembly_deploy.jar --metadata="$METADATA"
@@ -535,6 +555,10 @@ jobs:
             aws s3 cp service_assembly_deploy.jar s3://$BUCKET/release/passing-candidate/jars/service_assembly_deploy.jar --metadata="$METADATA"
             aws s3 cp connectors_kinesis_deploy.jar s3://$BUCKET/release/passing-candidate/jars/connectors_kinesis_deploy.jar --metadata="$METADATA"
           done
+          SPARK4_METADATA="$METADATA,spark_profile=spark4,scala_version=2.13.17"
+          aws s3 cp cloud_aws_lib_spark4_deploy.jar s3://zipline-artifacts-crucible/release/passing-candidate/jars/cloud_aws_lib_spark4_deploy.jar --metadata="$SPARK4_METADATA"
+          aws s3 cp flink_assembly_spark4_deploy.jar s3://zipline-artifacts-crucible/release/passing-candidate/jars/flink_assembly_spark4_deploy.jar --metadata="$SPARK4_METADATA"
+          aws s3 cp connectors_kinesis_spark4_deploy.jar s3://zipline-artifacts-crucible/release/passing-candidate/jars/connectors_kinesis_spark4_deploy.jar --metadata="$SPARK4_METADATA"
 
       - name: Push Jars to s3 Bucket (latest)
         if: ${{ needs.run_aws_integration_tests.result == 'success' && needs.run_gcp_integration_tests.result == 'success' && needs.run_fetcher_integration_tests.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -542,9 +566,8 @@ jobs:
         run: |
           set -eo pipefail
           METADATA="updated_date=$(date),commit=${{ github.sha }},branch=${{ github.ref_name }}"
-          # zipline-artifacts-crucible is the crucible (in-cluster K8sSubmitter) deployment's
-          # artifact bucket; zipline-artifacts-canary serves the canary EMR Serverless
-          # deployment. Both consume the same chronon jars.
+          # Both buckets retain the Spark 3 filenames. Crucible also receives the Spark 4
+          # assemblies under distinct names after the existing integration tests.
           for BUCKET in zipline-artifacts-canary zipline-artifacts-crucible; do
             aws s3 cp ${{ needs.build_and_push.outputs.wheel_name }} s3://$BUCKET/release/latest/wheels/ --metadata="$METADATA"
             aws s3 cp flink_assembly_deploy.jar s3://$BUCKET/release/latest/jars/flink_assembly_deploy.jar --metadata="$METADATA"
@@ -552,6 +575,10 @@ jobs:
             aws s3 cp service_assembly_deploy.jar s3://$BUCKET/release/latest/jars/service_assembly_deploy.jar --metadata="$METADATA"
             aws s3 cp connectors_kinesis_deploy.jar s3://$BUCKET/release/latest/jars/connectors_kinesis_deploy.jar --metadata="$METADATA"
           done
+          SPARK4_METADATA="$METADATA,spark_profile=spark4,scala_version=2.13.17"
+          aws s3 cp cloud_aws_lib_spark4_deploy.jar s3://zipline-artifacts-crucible/release/latest/jars/cloud_aws_lib_spark4_deploy.jar --metadata="$SPARK4_METADATA"
+          aws s3 cp flink_assembly_spark4_deploy.jar s3://zipline-artifacts-crucible/release/latest/jars/flink_assembly_spark4_deploy.jar --metadata="$SPARK4_METADATA"
+          aws s3 cp connectors_kinesis_spark4_deploy.jar s3://zipline-artifacts-crucible/release/latest/jars/connectors_kinesis_spark4_deploy.jar --metadata="$SPARK4_METADATA"
 
 
   push_to_gcp_passing:
