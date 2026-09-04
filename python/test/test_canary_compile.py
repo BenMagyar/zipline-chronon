@@ -268,6 +268,8 @@ def test_aws_team_metadata_uses_rightsized_canary_emr(compiled_dir, canary):
     assert conf["spark.chronon.coalesce.factor"] == "4"
     assert conf["spark.default.parallelism"] == "4"
     assert conf["spark.sql.shuffle.partitions"] == "4"
+    assert conf["spark.executor.instances"] == "2"
+    assert conf["spark.dynamicAllocation.initialExecutors"] == "2"
     assert conf["spark.dynamicAllocation.maxExecutors"] == "2"
     assert emr["instanceType"] == "m5.large"
     assert emr["instanceCount"] == 3

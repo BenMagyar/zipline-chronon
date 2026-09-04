@@ -154,6 +154,9 @@ aws = Team(
             "spark.chronon.coalesce.factor": "4",
             "spark.default.parallelism": "4",
             "spark.sql.shuffle.partitions": "4",
+            # EMR Serverless defaults both starting executor counts to 3; keep them within the cap.
+            "spark.executor.instances": "2",
+            "spark.dynamicAllocation.initialExecutors": "2",
             "spark.dynamicAllocation.maxExecutors": "2",
             "spark.driver.memory": "1g",
             "spark.driver.cores": "1",
