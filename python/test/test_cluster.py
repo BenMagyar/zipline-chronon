@@ -1,11 +1,13 @@
 import json
 import os
+
 import pytest
+
 from ai.chronon.repo.cluster import (
+    GCP_DEFAULT_INIT_SCRIPTS,
+    fixed_gcp_cluster,
     generate_dataproc_cluster_config,
     generate_emr_cluster_config,
-    fixed_gcp_cluster,
-    GCP_DEFAULT_INIT_SCRIPTS,
 )
 
 
@@ -29,6 +31,28 @@ class TestDataprocClusterConfig:
         assert "initializationActions" in config
         assert config["workerConfig"]["numInstances"] == 10
         assert config["masterConfig"]["numInstances"] == 1
+
+    def test_custom_disk_config(self):
+        """Verify callers can right-size Dataproc boot and local disks."""
+        config_json = generate_dataproc_cluster_config(
+            num_workers=2,
+            project_id="test-project",
+            artifact_prefix="gs://test-bucket/artifacts",
+            master_boot_disk_size_gb=100,
+            worker_boot_disk_size_gb=64,
+            worker_local_ssds=0,
+        )
+        config = json.loads(config_json)
+
+        assert config["masterConfig"]["diskConfig"] == {
+            "bootDiskType": "pd-standard",
+            "bootDiskSizeGb": 100,
+        }
+        assert config["workerConfig"]["diskConfig"] == {
+            "bootDiskType": "pd-standard",
+            "bootDiskSizeGb": 64,
+            "numLocalSsds": 0,
+        }
 
     def test_initialization_scripts_are_included(self):
         """Verify default GCP initialization scripts are included in the config."""

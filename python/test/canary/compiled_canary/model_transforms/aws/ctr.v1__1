@@ -33,20 +33,21 @@
     "executionInfo": {
       "clusterConf": {
         "common": {
-          "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.xlarge\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 7200}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
+          "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.large\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 600}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
         }
       },
       "conf": {
         "common": {
-          "spark.chronon.coalesce.factor": "10",
+          "spark.chronon.coalesce.factor": "4",
           "spark.chronon.partition.column": "ds",
           "spark.chronon.partition.format": "yyyy-MM-dd",
           "spark.chronon.table_write.format": "iceberg",
           "spark.chronon.table_write.upload.format": "ion",
           "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-          "spark.default.parallelism": "10",
+          "spark.default.parallelism": "4",
           "spark.driver.cores": "1",
           "spark.driver.memory": "1g",
+          "spark.dynamicAllocation.maxExecutors": "2",
           "spark.executor.cores": "1",
           "spark.executor.memory": "1g",
           "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -55,20 +56,21 @@
           "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
           "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-          "spark.sql.shuffle.partitions": "10",
+          "spark.sql.shuffle.partitions": "4",
           "taskmanager.memory.process.size": "4G"
         },
         "modeConfigs": {
           "backfill": {
-            "spark.chronon.coalesce.factor": "10",
+            "spark.chronon.coalesce.factor": "4",
             "spark.chronon.partition.column": "ds",
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.table_write.format": "iceberg",
             "spark.chronon.table_write.upload.format": "ion",
             "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-            "spark.default.parallelism": "10",
+            "spark.default.parallelism": "4",
             "spark.driver.cores": "1",
             "spark.driver.memory": "1g",
+            "spark.dynamicAllocation.maxExecutors": "2",
             "spark.executor.cores": "1",
             "spark.executor.memory": "1g",
             "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -77,7 +79,7 @@
             "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
             "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            "spark.sql.shuffle.partitions": "10",
+            "spark.sql.shuffle.partitions": "4",
             "taskmanager.memory.process.size": "4G"
           }
         }
@@ -157,20 +159,21 @@
         "executionInfo": {
           "clusterConf": {
             "common": {
-              "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.xlarge\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 7200}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
+              "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.large\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 600}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
             }
           },
           "conf": {
             "common": {
-              "spark.chronon.coalesce.factor": "10",
+              "spark.chronon.coalesce.factor": "4",
               "spark.chronon.partition.column": "ds",
               "spark.chronon.partition.format": "yyyy-MM-dd",
               "spark.chronon.table_write.format": "iceberg",
               "spark.chronon.table_write.upload.format": "ion",
               "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-              "spark.default.parallelism": "10",
+              "spark.default.parallelism": "4",
               "spark.driver.cores": "1",
               "spark.driver.memory": "1g",
+              "spark.dynamicAllocation.maxExecutors": "2",
               "spark.executor.cores": "1",
               "spark.executor.memory": "1g",
               "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -179,20 +182,21 @@
               "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
               "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
               "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-              "spark.sql.shuffle.partitions": "10",
+              "spark.sql.shuffle.partitions": "4",
               "taskmanager.memory.process.size": "4G"
             },
             "modeConfigs": {
               "backfill": {
-                "spark.chronon.coalesce.factor": "10",
+                "spark.chronon.coalesce.factor": "4",
                 "spark.chronon.partition.column": "ds",
                 "spark.chronon.partition.format": "yyyy-MM-dd",
                 "spark.chronon.table_write.format": "iceberg",
                 "spark.chronon.table_write.upload.format": "ion",
                 "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                "spark.default.parallelism": "10",
+                "spark.default.parallelism": "4",
                 "spark.driver.cores": "1",
                 "spark.driver.memory": "1g",
+                "spark.dynamicAllocation.maxExecutors": "2",
                 "spark.executor.cores": "1",
                 "spark.executor.memory": "1g",
                 "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -201,7 +205,7 @@
                 "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                 "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                 "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                "spark.sql.shuffle.partitions": "10",
+                "spark.sql.shuffle.partitions": "4",
                 "taskmanager.memory.process.size": "4G"
               }
             }
@@ -346,20 +350,21 @@
                   "executionInfo": {
                     "clusterConf": {
                       "common": {
-                        "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.xlarge\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 7200}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
+                        "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.large\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 600}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
                       }
                     },
                     "conf": {
                       "common": {
-                        "spark.chronon.coalesce.factor": "10",
+                        "spark.chronon.coalesce.factor": "4",
                         "spark.chronon.partition.column": "ds",
                         "spark.chronon.partition.format": "yyyy-MM-dd",
                         "spark.chronon.table_write.format": "iceberg",
                         "spark.chronon.table_write.upload.format": "ion",
                         "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                        "spark.default.parallelism": "10",
+                        "spark.default.parallelism": "4",
                         "spark.driver.cores": "1",
                         "spark.driver.memory": "1g",
+                        "spark.dynamicAllocation.maxExecutors": "2",
                         "spark.executor.cores": "1",
                         "spark.executor.memory": "1g",
                         "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -368,20 +373,21 @@
                         "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                         "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                        "spark.sql.shuffle.partitions": "10",
+                        "spark.sql.shuffle.partitions": "4",
                         "taskmanager.memory.process.size": "4G"
                       },
                       "modeConfigs": {
                         "backfill": {
-                          "spark.chronon.coalesce.factor": "10",
+                          "spark.chronon.coalesce.factor": "4",
                           "spark.chronon.partition.column": "ds",
                           "spark.chronon.partition.format": "yyyy-MM-dd",
                           "spark.chronon.table_write.format": "iceberg",
                           "spark.chronon.table_write.upload.format": "ion",
                           "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                          "spark.default.parallelism": "10",
+                          "spark.default.parallelism": "4",
                           "spark.driver.cores": "1",
                           "spark.driver.memory": "1g",
+                          "spark.dynamicAllocation.maxExecutors": "2",
                           "spark.executor.cores": "1",
                           "spark.executor.memory": "1g",
                           "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -390,7 +396,7 @@
                           "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                           "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                          "spark.sql.shuffle.partitions": "10",
+                          "spark.sql.shuffle.partitions": "4",
                           "taskmanager.memory.process.size": "4G"
                         }
                       }
@@ -807,20 +813,21 @@
                   "executionInfo": {
                     "clusterConf": {
                       "common": {
-                        "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.xlarge\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 7200}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
+                        "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.large\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 600}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
                       }
                     },
                     "conf": {
                       "common": {
-                        "spark.chronon.coalesce.factor": "10",
+                        "spark.chronon.coalesce.factor": "4",
                         "spark.chronon.partition.column": "ds",
                         "spark.chronon.partition.format": "yyyy-MM-dd",
                         "spark.chronon.table_write.format": "iceberg",
                         "spark.chronon.table_write.upload.format": "ion",
                         "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                        "spark.default.parallelism": "10",
+                        "spark.default.parallelism": "4",
                         "spark.driver.cores": "1",
                         "spark.driver.memory": "1g",
+                        "spark.dynamicAllocation.maxExecutors": "2",
                         "spark.executor.cores": "1",
                         "spark.executor.memory": "1g",
                         "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -829,20 +836,21 @@
                         "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                         "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                        "spark.sql.shuffle.partitions": "10",
+                        "spark.sql.shuffle.partitions": "4",
                         "taskmanager.memory.process.size": "4G"
                       },
                       "modeConfigs": {
                         "backfill": {
-                          "spark.chronon.coalesce.factor": "10",
+                          "spark.chronon.coalesce.factor": "4",
                           "spark.chronon.partition.column": "ds",
                           "spark.chronon.partition.format": "yyyy-MM-dd",
                           "spark.chronon.table_write.format": "iceberg",
                           "spark.chronon.table_write.upload.format": "ion",
                           "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                          "spark.default.parallelism": "10",
+                          "spark.default.parallelism": "4",
                           "spark.driver.cores": "1",
                           "spark.driver.memory": "1g",
+                          "spark.dynamicAllocation.maxExecutors": "2",
                           "spark.executor.cores": "1",
                           "spark.executor.memory": "1g",
                           "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -851,7 +859,7 @@
                           "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                           "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                           "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                          "spark.sql.shuffle.partitions": "10",
+                          "spark.sql.shuffle.partitions": "4",
                           "taskmanager.memory.process.size": "4G"
                         }
                       }
@@ -948,20 +956,21 @@
             "executionInfo": {
               "clusterConf": {
                 "common": {
-                  "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.xlarge\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 7200}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
+                  "emr.config": "{\"releaseLabel\": \"emr-7.12.0\", \"instanceType\": \"m5.large\", \"instanceCount\": 3, \"autoTerminationPolicy\": {\"idleTimeout\": 600}, \"subnetName\": \"zipline-canary-subnet-main\", \"securityGroupName\": \"zipline-canary-sg\"}"
                 }
               },
               "conf": {
                 "common": {
-                  "spark.chronon.coalesce.factor": "10",
+                  "spark.chronon.coalesce.factor": "4",
                   "spark.chronon.partition.column": "ds",
                   "spark.chronon.partition.format": "yyyy-MM-dd",
                   "spark.chronon.table_write.format": "iceberg",
                   "spark.chronon.table_write.upload.format": "ion",
                   "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                  "spark.default.parallelism": "10",
+                  "spark.default.parallelism": "4",
                   "spark.driver.cores": "1",
                   "spark.driver.memory": "1g",
+                  "spark.dynamicAllocation.maxExecutors": "2",
                   "spark.executor.cores": "1",
                   "spark.executor.memory": "1g",
                   "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -970,20 +979,21 @@
                   "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                   "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                   "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                  "spark.sql.shuffle.partitions": "10",
+                  "spark.sql.shuffle.partitions": "4",
                   "taskmanager.memory.process.size": "4G"
                 },
                 "modeConfigs": {
                   "backfill": {
-                    "spark.chronon.coalesce.factor": "10",
+                    "spark.chronon.coalesce.factor": "4",
                     "spark.chronon.partition.column": "ds",
                     "spark.chronon.partition.format": "yyyy-MM-dd",
                     "spark.chronon.table_write.format": "iceberg",
                     "spark.chronon.table_write.upload.format": "ion",
                     "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
-                    "spark.default.parallelism": "10",
+                    "spark.default.parallelism": "4",
                     "spark.driver.cores": "1",
                     "spark.driver.memory": "1g",
+                    "spark.dynamicAllocation.maxExecutors": "2",
                     "spark.executor.cores": "1",
                     "spark.executor.memory": "1g",
                     "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
@@ -992,7 +1002,7 @@
                     "spark.sql.catalog.spark_catalog.warehouse": "s3://zipline-warehouse-canary/data/tables/",
                     "spark.sql.defaultUrlStreamHandlerFactory.enabled": "false",
                     "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                    "spark.sql.shuffle.partitions": "10",
+                    "spark.sql.shuffle.partitions": "4",
                     "taskmanager.memory.process.size": "4G"
                   }
                 }

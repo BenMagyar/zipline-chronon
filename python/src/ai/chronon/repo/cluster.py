@@ -48,6 +48,9 @@ def generate_dataproc_cluster_config(
     worker_host_type="n2-highmem-16",
     subnetwork="default",
     idle_timeout="7200s",
+    master_boot_disk_size_gb=1024,
+    worker_boot_disk_size_gb=64,
+    worker_local_ssds=2,
     initialization_actions=None,
     tags=None,
 ):
@@ -79,15 +82,18 @@ def generate_dataproc_cluster_config(
             "masterConfig": {
                 "numInstances": 1,
                 "machineTypeUri": master_host_type,
-                "diskConfig": {"bootDiskType": "pd-standard", "bootDiskSizeGb": 1024},
+                "diskConfig": {
+                    "bootDiskType": "pd-standard",
+                    "bootDiskSizeGb": master_boot_disk_size_gb,
+                },
             },
             "workerConfig": {
                 "numInstances": num_workers,
                 "machineTypeUri": worker_host_type,
                 "diskConfig": {
                     "bootDiskType": "pd-standard",
-                    "bootDiskSizeGb": 64,
-                    "numLocalSsds": 2,
+                    "bootDiskSizeGb": worker_boot_disk_size_gb,
+                    "numLocalSsds": worker_local_ssds,
                 },
             },
             "softwareConfig": {

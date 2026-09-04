@@ -231,6 +231,49 @@ def test_canary_team_metadata_uses_canary_fields(canary):
     assert "spark.chronon.test.prod_only_sentinel" not in conf_common
 
 
+@pytest.mark.parametrize("compiled_dir", ["compiled", "compiled_canary"])
+def test_gcp_team_metadata_uses_rightsized_canary_dataproc(compiled_dir, canary):
+    """Both GCP compile passes should carry the canary cost controls."""
+    _compile_canary(canary)
+
+    path = os.path.join(canary, compiled_dir, "teams_metadata/gcp/gcp_team_metadata")
+    payload = json.loads(open(path).read())
+    execution_info = payload["executionInfo"]
+    conf = execution_info["conf"]["common"]
+    upload_conf = execution_info["clusterConf"]["modeClusterConfigs"]["upload"]
+    dataproc = json.loads(upload_conf["dataproc.config"])
+
+    assert conf["spark.chronon.coalesce.factor"] == "4"
+    assert conf["spark.default.parallelism"] == "4"
+    assert conf["spark.sql.shuffle.partitions"] == "4"
+    assert conf["spark.dynamicAllocation.maxExecutors"] == "2"
+    assert dataproc["masterConfig"]["machineTypeUri"] == "n2-standard-4"
+    assert dataproc["masterConfig"]["diskConfig"]["bootDiskSizeGb"] == 100
+    assert dataproc["workerConfig"]["machineTypeUri"] == "n2-standard-2"
+    assert dataproc["workerConfig"]["diskConfig"]["numLocalSsds"] == 1
+    assert dataproc["lifecycleConfig"]["idleDeleteTtl"] == "600s"
+
+
+@pytest.mark.parametrize("compiled_dir", ["compiled", "compiled_canary"])
+def test_aws_team_metadata_uses_rightsized_canary_emr(compiled_dir, canary):
+    """Both AWS compile passes should carry the canary cost controls."""
+    _compile_canary(canary)
+
+    path = os.path.join(canary, compiled_dir, "teams_metadata/aws/aws_team_metadata")
+    payload = json.loads(open(path).read())
+    execution_info = payload["executionInfo"]
+    conf = execution_info["conf"]["common"]
+    emr = json.loads(execution_info["clusterConf"]["common"]["emr.config"])
+
+    assert conf["spark.chronon.coalesce.factor"] == "4"
+    assert conf["spark.default.parallelism"] == "4"
+    assert conf["spark.sql.shuffle.partitions"] == "4"
+    assert conf["spark.dynamicAllocation.maxExecutors"] == "2"
+    assert emr["instanceType"] == "m5.large"
+    assert emr["instanceCount"] == 3
+    assert emr["autoTerminationPolicy"]["idleTimeout"] == 600
+
+
 def test_canary_team_without_canary_fields_inherits_default(canary):
     """A team declared in `teams.canary.py` with no env/conf of its own still
     gets a team-metadata file in `compiled_canary/`. Its `executionInfo`

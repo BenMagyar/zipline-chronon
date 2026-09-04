@@ -87,9 +87,10 @@ gcp = Team(
             "spark.chronon.partition.format": "yyyy-MM-dd",
             "spark.chronon.partition.column": "ds",
 
-            "spark.chronon.coalesce.factor": "10",
-            "spark.default.parallelism": "10",
-            "spark.sql.shuffle.partitions": "10",
+            "spark.chronon.coalesce.factor": "4",
+            "spark.default.parallelism": "4",
+            "spark.sql.shuffle.partitions": "4",
+            "spark.dynamicAllocation.maxExecutors": "2",
             "spark.driver.memory": "512m",
             "spark.driver.cores": "1",
             "spark.executor.memory": "2g",
@@ -112,9 +113,12 @@ gcp = Team(
         modeClusterConfigs={
             RunMode.UPLOAD: {
                 "dataproc.config": generate_dataproc_cluster_config(2, "canary-443022", "gs://zipline-artifacts-canary",
-                                                                    idle_timeout="7200s",
-                                                                    worker_host_type="n2-highmem-4",
-                                                                    master_host_type="n2-highmem-8"),
+                                                                    idle_timeout="600s",
+                                                                    worker_host_type="n2-standard-2",
+                                                                    master_host_type="n2-standard-4",
+                                                                    master_boot_disk_size_gb=100,
+                                                                    worker_boot_disk_size_gb=64,
+                                                                    worker_local_ssds=1),
                 # Sentinel — prod-only cluster-conf marker for the test.
                 "prod_only_sentinel_cluster": "prod-only-cluster-sentinel-2e3f4a",
             }
@@ -157,9 +161,10 @@ aws = Team(
             "spark.chronon.table_write.upload.format": "ion",
             "spark.chronon.table_write.upload.location": "s3://zipline-warehouse-canary/data/ion_uploads/",
 
-            "spark.chronon.coalesce.factor": "10",
-            "spark.default.parallelism": "10",
-            "spark.sql.shuffle.partitions": "10",
+            "spark.chronon.coalesce.factor": "4",
+            "spark.default.parallelism": "4",
+            "spark.sql.shuffle.partitions": "4",
+            "spark.dynamicAllocation.maxExecutors": "2",
             "spark.driver.memory": "1g",
             "spark.driver.cores": "1",
             "spark.executor.memory": "1g",
@@ -176,8 +181,8 @@ aws = Team(
                 instance_count=3,
                 subnet_name="zipline-canary-subnet-main",
                 security_group_name="zipline-canary-sg",
-                instance_type="m5.xlarge",
-                idle_timeout=7200,
+                instance_type="m5.large",
+                idle_timeout=600,
                 release_label="emr-7.12.0"
             )
         }
