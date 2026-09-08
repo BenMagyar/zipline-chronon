@@ -94,37 +94,58 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
       val batchRequest = GetRequest(batchKeyBytes, groupByServingInfo.groupByOps.batchDataset)
 
-      val streamingRequestOpt = groupByServingInfo.groupByOps.inferredAccuracy match {
-        // fetch batch(ir) and streaming(input) and aggregate
-        case Accuracy.TEMPORAL =>
-          // Build a tile key for the streaming request
-          // When we build support for layering, we can expand this out into a utility that builds n tile keys for n layers
-          val keyBytes = if (fetchContext.isTilingEnabled) {
+      // Resolve query time once to avoid inconsistency across midnight boundaries
+      val resolvedQueryTs = request.atMillis.getOrElse(System.currentTimeMillis())
 
-            val tileKey = TilingUtils.buildTileKey(
-              groupByServingInfo.groupByOps.streamingDataset,
-              streamingKeyBytes,
-              Some(groupByServingInfo.smallestTailHopMillis),
-              None
-            )
+      val (streamingRequestOpt, megaTileHistoricalRequestsOpt) =
+        groupByServingInfo.groupByOps.inferredAccuracy match {
+          case Accuracy.TEMPORAL if groupByServingInfo.groupByOps.isMegaTilingEnabled =>
+            // Mega tiling: one daily point get per day from today back to batch day,
+            // plus one extra fallback day for no-batch windows.
+            val DayMillis = 24 * 3600 * 1000L
+            val dayStarts = groupByServingInfo.megaTileMerger
+              .streamingDayKeys(resolvedQueryTs, groupByServingInfo.batchEndTsMillis)
+            val dataset = groupByServingInfo.groupByOps.streamingDataset
 
-            TilingUtils.serializeTileKey(tileKey)
-          } else {
-            streamingKeyBytes
-          }
+            def megaTileRequest(dayStart: Long): GetRequest = {
+              val tileKey =
+                TilingUtils.buildTileKey(dataset, streamingKeyBytes, Some(DayMillis), Some(dayStart))
+              GetRequest(TilingUtils.serializeTileKey(tileKey), dataset)
+            }
 
-          Some(
-            GetRequest(keyBytes,
-                       groupByServingInfo.groupByOps.streamingDataset,
-                       Some(groupByServingInfo.batchEndTsMillis)))
+            (dayStarts.headOption.map(megaTileRequest),
+             Some(dayStarts.drop(1).map(dayStart => dayStart -> megaTileRequest(dayStart))))
 
-        // no further aggregation is required - the value in KvStore is good as is
-        case Accuracy.SNAPSHOT => None
+          case Accuracy.TEMPORAL =>
+            // Standard tiling or raw streaming
+            val keyBytes = if (fetchContext.isTilingEnabled) {
+              val tileKey = TilingUtils.buildTileKey(
+                groupByServingInfo.groupByOps.streamingDataset,
+                streamingKeyBytes,
+                Some(groupByServingInfo.smallestTailHopMillis),
+                None
+              )
+              TilingUtils.serializeTileKey(tileKey)
+            } else {
+              streamingKeyBytes
+            }
+            (Some(
+               GetRequest(keyBytes,
+                          groupByServingInfo.groupByOps.streamingDataset,
+                          Some(groupByServingInfo.batchEndTsMillis))),
+             None)
 
-      }
+          case Accuracy.SNAPSHOT => (None, None)
+        }
 
       val castedRequest = request.copy(keys = groupByServingInfo.keyChrononSchema.cast(request.keys))
-      LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, request.atMillis, context)
+      LambdaKvRequest(groupByServingInfo,
+                      castedRequest,
+                      batchRequest,
+                      streamingRequestOpt,
+                      megaTileHistoricalRequestsOpt,
+                      Some(resolvedQueryTs),
+                      context)
 
     }
 
@@ -176,9 +197,11 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
       LRUCache.collectCaffeineCacheMetrics(caffeineMetricsContext, cache.cache, cache.cacheName))
 
     val allRequestsToFetch: Seq[GetRequest] = groupByRequestToKvRequest.flatMap {
-      case (_, Success(LambdaKvRequest(_, _, batchRequest, streamingRequestOpt, _, _))) =>
+      case (_,
+            Success(LambdaKvRequest(_, _, batchRequest, streamingRequestOpt, megaTileHistoricalRequestsOpt, _, _))) =>
         // If a batch request is cached, don't include it in the list of requests to fetch because the batch IRs already cached
-        if (cachedRequests.contains(batchRequest)) streamingRequestOpt else Some(batchRequest) ++ streamingRequestOpt
+        val batchReqs = if (cachedRequests.contains(batchRequest)) Seq.empty else Seq(batchRequest)
+        batchReqs ++ streamingRequestOpt.toSeq ++ megaTileHistoricalRequestsOpt.getOrElse(Seq.empty).map(_._2)
 
       case _ => Seq.empty
     }
@@ -211,8 +234,13 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
         val responses: Seq[Response] = groupByRequestToKvRequest.iterator.map { case (request, requestMetaTry) =>
           val responseMapTry: Try[Map[String, AnyRef]] = requestMetaTry.map { requestMeta =>
-            val LambdaKvRequest(groupByServingInfo, castedRequest, batchRequest, streamingRequestOpt, _, context) =
-              requestMeta
+            val LambdaKvRequest(groupByServingInfo,
+                                castedRequest,
+                                batchRequest,
+                                streamingRequestOpt,
+                                megaTileHistoricalRequestsOpt,
+                                endTs,
+                                context) = requestMeta
 
             context.count("multi_get.batch.size", allRequestsToFetch.length)
             context.distribution("multi_get.bytes", totalResponseValueBytes)
@@ -237,8 +265,14 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
             val streamingResponsesOpt =
               streamingRequestOpt.map(responsesMap.getOrElse(_, Success(Seq.empty)).getOrElse(Seq.empty))
+            val megaTileHistoricalResponses =
+              megaTileHistoricalRequestsOpt
+                .getOrElse(Seq.empty)
+                .map { case (dayStart, historyRequest) =>
+                  dayStart -> responsesMap.getOrElse(historyRequest, Success(Seq.empty)).getOrElse(Seq.empty)
+                }
 
-            val queryTs = request.atMillis.getOrElse(System.currentTimeMillis())
+            val queryTs = endTs.getOrElse(request.atMillis.getOrElse(System.currentTimeMillis()))
             val requestContext = RequestContext(groupByServingInfo, queryTs, startTimeMs, context, request.keys)
 
             val groupByResponse: Map[String, AnyRef] =
@@ -248,7 +282,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
                     s"Constructing response for groupBy: ${groupByServingInfo.groupByOps.metaData.getName} " +
                       s"for keys: ${request.keys}")
 
-                decodeAndMerge(batchResponses, streamingResponsesOpt, requestContext)
+                decodeAndMerge(batchResponses, streamingResponsesOpt, megaTileHistoricalResponses, requestContext)
 
               } catch {
 
@@ -343,5 +377,6 @@ case class LambdaKvRequest(groupByServingInfoParsed: GroupByServingInfoParsed,
                            castedGroupByRequest: Fetcher.Request,
                            batchRequest: GetRequest,
                            streamingRequestOpt: Option[GetRequest],
+                           megaTileHistoricalRequestsOpt: Option[Seq[(Long, GetRequest)]] = None,
                            endTs: Option[Long],
                            context: metrics.Metrics.Context)

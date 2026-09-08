@@ -284,6 +284,11 @@ enum Accuracy {
     SNAPSHOT = 1
 }
 
+enum OnlineStrategy {
+    DEFAULT = 0,
+    STREAMING_MEGATILES = 1
+}
+
 enum EngineType {
     SPARK = 0,
     BIGQUERY = 1,
@@ -403,6 +408,10 @@ struct GroupBy {
     // NOTE: for TEMPORAL groupBys with a streaming topic, the streaming job still writes all keys,
     // so filtered-out keys may serve partial streaming-only aggregates instead of nulls.
     8: optional EntitySource keyFilter
+    // MERGE NOTE: onlineStrategy was field 8 on nikhil/megatile; main landed keyFilter at 8 first
+    // (#1991). Moved to 9 here. Field 6 is a retired id in this struct (was backfillStartDate),
+    // so it is not reused. onlineStrategy is streaming-only and excluded from semantic hashing.
+    9: optional OnlineStrategy onlineStrategy
 }
 
 struct JoinPart {

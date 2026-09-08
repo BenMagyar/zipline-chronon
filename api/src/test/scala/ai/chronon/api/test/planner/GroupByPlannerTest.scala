@@ -328,6 +328,34 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     firstSemanticHashes should equal(secondSemanticHashes)
   }
 
+  it should "GB planner batch nodes must keep the same semantic hash when only onlineStrategy flips" in {
+    // Batch outputs (backfill, upload, uploadToKV) are byte-identical regardless of online
+    // strategy — only the streaming side reads/writes them differently. Flipping onlineStrategy
+    // should NOT cause BatchNodeRunner to archive and re-run those batch jobs.
+    import ai.chronon.api.OnlineStrategy
+
+    val defaultGb = buildGroupBy(includeTopic = true)
+    val megatileGb = buildGroupBy(includeTopic = true)
+    megatileGb.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
+
+    val defaultPlan = new GroupByPlanner(defaultGb).buildPlan
+    val megatilePlan = new GroupByPlanner(megatileGb).buildPlan
+
+    def hashByContent(plan: ConfPlan, predicate: ai.chronon.planner.NodeContent => Boolean): String =
+      plan.nodes.asScala.find(n => predicate(n.content)).get.semanticHash
+
+    hashByContent(defaultPlan, _.isSetGroupByBackfill) should equal(
+      hashByContent(megatilePlan, _.isSetGroupByBackfill))
+    hashByContent(defaultPlan, _.isSetGroupByUpload) should equal(
+      hashByContent(megatilePlan, _.isSetGroupByUpload))
+    hashByContent(defaultPlan, _.isSetGroupByUploadToKV) should equal(
+      hashByContent(megatilePlan, _.isSetGroupByUploadToKV))
+
+    // Streaming node SHOULD differ — the streaming pipeline shape changes with online strategy.
+    hashByContent(defaultPlan, _.isSetGroupByStreaming) should not equal
+      hashByContent(megatilePlan, _.isSetGroupByStreaming)
+  }
+
   it should "GB planner uploadToKV node should have correct table dependencies" in {
     val gb = buildGroupBy()
     val planner = new GroupByPlanner(gb)

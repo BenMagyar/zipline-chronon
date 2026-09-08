@@ -118,6 +118,45 @@ class AllowedLatenessConfigTest extends AnyFlatSpec with Matchers {
     exception.getMessage should include("exceeds maximum")
   }
 
+  "buffering output millis config" should "be parsed from props before topicInfo params" in {
+    val props = Map("buffering_output_time_millis" -> "1000")
+    val topicInfo = TopicInfo("test-topic", "kafka", Map("buffering_output_time_millis" -> "2000"))
+
+    FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo) shouldBe 1000L
+  }
+
+  it should "be parsed from topicInfo params when props are absent" in {
+    val topicInfo = TopicInfo("test-topic", "kafka", Map("buffering_output_jitter_millis" -> "250"))
+
+    FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", Map.empty, topicInfo) shouldBe 250L
+  }
+
+  it should "default missing empty whitespace and negative values to 0" in {
+    val emptyTopicInfo = TopicInfo("test-topic", "kafka", Map("buffering_output_time_millis" -> ""))
+    val whitespaceTopicInfo = TopicInfo("test-topic", "kafka", Map.empty)
+    val negativeTopicInfo = TopicInfo("test-topic", "kafka", Map.empty)
+
+    FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", Map.empty, emptyTopicInfo) shouldBe 0L
+    FlinkUtils.getNonNegativeLongProperty(
+      "buffering_output_time_millis",
+      Map("buffering_output_time_millis" -> "   "),
+      whitespaceTopicInfo) shouldBe 0L
+    FlinkUtils.getNonNegativeLongProperty(
+      "buffering_output_time_millis",
+      Map("buffering_output_time_millis" -> "-1"),
+      negativeTopicInfo) shouldBe 0L
+  }
+
+  it should "throw IllegalArgumentException for non-numeric values" in {
+    val props = Map("buffering_output_jitter_millis" -> "nope")
+    val topicInfo = TopicInfo("test-topic", "kafka", Map.empty)
+
+    val exception = the[IllegalArgumentException] thrownBy {
+      FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+    }
+    exception.getMessage should include("invalid buffering_output_jitter_millis value")
+  }
+
   // defaultSeconds parameter tests
 
   it should "use defaultSeconds when property is absent" in {

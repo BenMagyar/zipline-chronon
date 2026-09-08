@@ -107,6 +107,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
       mvn"org.apache.flink:flink-test-utils:$flinkVersion"
         .exclude("org.apache.logging.log4j" -> "log4j-slf4j-impl")
         .exclude("log4j" -> "log4j"),
+      mvn"org.apache.flink:flink-streaming-java:$flinkVersion;classifier=tests",
       mvn"org.apache.spark::spark-hive:${build.Constants.sparkVersion}",
       mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}"
         .exclude("com.fasterxml.jackson.core" -> "jackson-core")

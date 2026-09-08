@@ -16,7 +16,7 @@
 
 package ai.chronon.online
 
-import ai.chronon.aggregator.windowing.{ResolutionUtils, SawtoothOnlineAggregator}
+import ai.chronon.aggregator.windowing.{MegaTileAggregator, MegaTileMerger, ResolutionUtils, SawtoothOnlineAggregator}
 import ai.chronon.api.Constants.{ReversalField, TimeField}
 import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, WindowOps, WindowUtils}
 import ai.chronon.api.ScalaJavaConversions.ListOps
@@ -117,6 +117,20 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
   lazy val tiledCodec: TileCodec = new TileCodec(groupBy, valueChrononSchema.fields.map(sf => (sf.name, sf.fieldType)))
 
   // End tiling specific variables
+
+  // Start mega tiling specific variables
+
+  private lazy val valueInputSchema: Seq[(String, DataType)] =
+    valueChrononSchema.fields.map(sf => (sf.name, sf.fieldType))
+
+  lazy val megaTileAggregator: MegaTileAggregator =
+    new MegaTileAggregator(groupByServingInfo.groupBy.aggregations.toScala, valueInputSchema)
+
+  lazy val megaTileMerger: MegaTileMerger = new MegaTileMerger(megaTileAggregator)
+
+  lazy val megaTileCodec: MegaTileCodec = new MegaTileCodec(groupBy, valueInputSchema)
+
+  // End mega tiling specific variables
 
   def outputChrononSchema: StructType =
     if (groupByServingInfo.groupBy.aggregations == null) {

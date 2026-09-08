@@ -57,7 +57,7 @@ trait OnlineModule extends Cross.Module[String] with build.BaseModule {
   object test extends build.BaseTestModule {
 
     def scalaVersion = crossValue
-    def moduleDeps = Seq(build.online(crossValue), build.api(crossValue).test)
+    def moduleDeps = Seq(build.online(crossValue), build.api(crossValue).test, build.aggregator(crossValue).test)
 
     // DataStreamBuilderTest builds its own SparkSession; every CatalystUtil-based
     // suite shares the process-wide CatalystUtil.session (a lazy val). getOrCreate

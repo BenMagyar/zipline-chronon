@@ -605,6 +605,9 @@ object Extensions {
       }
     }
 
+    def isMegaTilingEnabled: Boolean =
+      groupBy.onlineStrategy == OnlineStrategy.STREAMING_MEGATILES
+
     // keyFilter only shrinks batch uploads - it never changes what a groupBy computes, so it
     // must not participate in any semantic hash (offline join parts included). Recurses into
     // JoinSource-embedded joins. Mutates in place - use on deepCopy-ied objects only.
@@ -619,6 +622,7 @@ object Extensions {
     def semanticHash: String = {
       val newGroupBy = groupBy.deepCopy()
       newGroupBy.unsetKeyFiltersRecursively()
+      newGroupBy.unsetOnlineStrategy() // online-only, doesn't affect batch output
       val base = ThriftJsonCodec.semanticMd5Digest(newGroupBy)
       Option(groupBy.metaData).map(_.mixGridToken(base)).getOrElse(base)
     }

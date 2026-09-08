@@ -1,14 +1,18 @@
 package ai.chronon.flink.test
 
 import ai.chronon.api.Extensions.{GroupByOps, WindowOps, WindowUtils}
-import ai.chronon.api.{GroupBy, TilingUtils}
 import ai.chronon.api.ScalaJavaConversions._
-import ai.chronon.flink.{FlinkGroupByStreamingJob, SparkExpressionEval, SparkExpressionEvalFn}
+import ai.chronon.api.{Accuracy, Builders, Constants, GroupBy, OnlineStrategy, Operation, TilingUtils, TimeUnit, TsUtils, Window}
+import ai.chronon.flink.deser.ProjectedEvent
+import ai.chronon.flink.{FlinkGroupByStreamingJob, FlinkJob, SparkExpressionEval, SparkExpressionEvalFn}
 import ai.chronon.flink.types.TimestampedIR
 import ai.chronon.flink.types.TimestampedTile
 import ai.chronon.flink.types.WriteResponse
 import ai.chronon.online.{Api, GroupByServingInfoParsed, TopicInfo}
 import ai.chronon.online.serde.SparkConversions
+import org.apache.flink.api.common.eventtime.{TimestampAssignerSupplier, Watermark, WatermarkGeneratorSupplier, WatermarkOutput}
+import org.apache.flink.metrics.MetricGroup
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.flink.test.util.MiniClusterWithClientResource
@@ -19,6 +23,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers.convertToAnyShouldWrapper
 import org.scalatestplus.mockito.MockitoSugar.mock
 
+import java.time.Instant
 
 
 // Flink Job Integration Test for Event-based GroupBys
@@ -155,6 +160,166 @@ class FlinkJobEventIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     expectedFinalIRsPerKey shouldBe finalIRsPerKey
   }
 
+  it should "mega tiled flink job writes day-start keyed daily snapshots end to end" in {
+    implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(1)
+
+    val elements = Seq(
+      E2ETestEvent(id = "id1", int_val = 1, double_val = 1.5, created = 1712277000000L),
+      E2ETestEvent(id = "id1", int_val = 2, double_val = 2.0, created = 1712277900000L)
+    )
+
+    val groupBy = FlinkTestUtils.makeGroupBy(Seq("id"))
+    groupBy.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
+    val (job, groupByServingInfoParsed) = buildFlinkJob(groupBy, elements)
+    groupByServingInfoParsed.groupBy.isMegaTilingEnabled shouldBe true
+
+    job.runMegaTiledGroupByJob(env).addSink(new CollectSink)
+    env.execute("MegaTiledFlinkJobIntegrationTest")
+
+    val writeResponses = CollectSink.values.toScala
+    writeResponses.nonEmpty shouldBe true
+    writeResponses.forall(_.status) shouldBe true
+    writeResponses.map(_.dataset).distinct shouldBe Seq(groupByServingInfoParsed.groupBy.streamingDataset)
+
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val dayStart = TsUtils.round(elements.head.created, dayMillis)
+    val decodedTileKeys = writeResponses.map(response => TilingUtils.deserializeTileKey(response.keyBytes))
+    decodedTileKeys.map(_.tileSizeMillis).distinct shouldBe Seq(dayMillis)
+    decodedTileKeys.map(_.tileStartTimestampMillis).contains(dayStart) shouldBe true
+    decodedTileKeys.forall(tileKey => TsUtils.round(tileKey.tileStartTimestampMillis, dayMillis) == tileKey.tileStartTimestampMillis) shouldBe true
+
+    val decodedEntityKeys = decodedTileKeys.map { tileKey =>
+      val keyBytes = tileKey.keyBytes.toScala.toArray.map(_.asInstanceOf[Byte])
+      val record = groupByServingInfoParsed.keyCodec.decode(keyBytes)
+      record.get("id").toString
+    }
+    decodedEntityKeys.distinct shouldBe Seq("id1")
+
+    val decodedSums = writeResponses
+      .zip(decodedTileKeys)
+      .filter { case (_, tileKey) => tileKey.tileStartTimestampMillis == dayStart }
+      .map(_._1)
+      .map(response => groupByServingInfoParsed.megaTileCodec.decode(response.valueBytes))
+      .map(ir => groupByServingInfoParsed.megaTileCodec.rowAggregator.finalize(ir).head.asInstanceOf[Double])
+      .sorted
+
+    decodedSums.head shouldBe 1.5
+    decodedSums.last shouldBe 3.5
+  }
+
+  it should "mega tiled flink job drops events older than yesterday" in {
+    implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(1)
+
+    val currentDayEventTs = 1712277000000L // 2024-04-05T00:30:00Z
+    val staleEventTs = currentDayEventTs - 2 * new Window(1, TimeUnit.DAYS).millis
+    val elements = Seq(
+      E2ETestEvent(id = "id1", int_val = 1, double_val = 2.0, created = currentDayEventTs),
+      E2ETestEvent(id = "id1", int_val = 2, double_val = 9.5, created = staleEventTs)
+    )
+
+    val groupBy = FlinkTestUtils.makeGroupBy(Seq("id"))
+    groupBy.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
+    val (job, groupByServingInfoParsed) = buildFlinkJob(groupBy, elements)
+
+    job.runMegaTiledGroupByJob(env).addSink(new CollectSink)
+    env.execute("MegaTiledFlinkJobDropsStaleEventsTest")
+
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val currentDayStart = TsUtils.round(currentDayEventTs, dayMillis)
+    val currentDaySums = CollectSink.values.toScala
+      .filter(_.status)
+      .filter { response =>
+        TilingUtils.deserializeTileKey(response.keyBytes).tileStartTimestampMillis == currentDayStart
+      }
+      .map(response => groupByServingInfoParsed.megaTileCodec.decode(response.valueBytes))
+      .map(ir => groupByServingInfoParsed.megaTileCodec.rowAggregator.finalize(ir).head.asInstanceOf[Double])
+      .distinct
+
+    currentDaySums shouldBe Seq(2.0)
+  }
+
+  it should "mega tiled flink job watermark strategy models stale UTC-midnight catchup" in {
+    val strategy = FlinkJob.watermarkStrategy
+    val assigner = strategy.createTimestampAssigner(WatermarkTestContext)
+    val generator = strategy.createWatermarkGenerator(WatermarkTestContext)
+    val output = new RecordingWatermarkOutput
+
+    val beforeMidnight =
+      ProjectedEvent(Map(Constants.TimeColumn -> toMillis("2026-04-11T23:59:00Z")), 0L)
+    val beforeMidnightTs = assigner.extractTimestamp(beforeMidnight, -1L)
+    beforeMidnightTs shouldBe toMillis("2026-04-11T23:59:00Z")
+    generator.onEvent(beforeMidnight, beforeMidnightTs, output)
+    generator.onPeriodicEmit(output)
+
+    output.lastWatermarkTimestamp shouldBe toMillis("2026-04-11T23:54:00Z") - 1L
+
+    val afterMidnight =
+      ProjectedEvent(Map(Constants.TimeColumn -> toMillis("2026-04-12T00:06:00Z")), 0L)
+    val afterMidnightTs = assigner.extractTimestamp(afterMidnight, -1L)
+    afterMidnightTs shouldBe toMillis("2026-04-12T00:06:00Z")
+    generator.onEvent(afterMidnight, afterMidnightTs, output)
+    generator.onPeriodicEmit(output)
+
+    output.lastWatermarkTimestamp shouldBe toMillis("2026-04-12T00:01:00Z") - 1L
+  }
+
+  it should "mega tiled flink job writes mixed small and large window daily snapshots" in {
+    implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(1)
+
+    val elements = Seq(
+      E2ETestEvent(id = "id1", int_val = 1, double_val = 1.5, created = 1712277000000L),
+      E2ETestEvent(id = "id1", int_val = 2, double_val = 2.0, created = 1712277900000L)
+    )
+
+    val groupBy = Builders.GroupBy(
+      sources = Seq(
+        Builders.Source.events(
+          table = "events.my_stream_raw",
+          topic = "events.my_stream",
+          query = Builders.Query(
+            selects = Map(
+              "id" -> "id",
+              "int_val" -> "int_val",
+              "double_val" -> "double_val"
+            ),
+            timeColumn = "created",
+            startPartition = "20231106"
+          )
+        )
+      ),
+      keyColumns = Seq("id"),
+      aggregations = Seq(
+        Builders.Aggregation(
+          operation = Operation.SUM,
+          inputColumn = "double_val",
+          windows = Seq(new Window(1, TimeUnit.HOURS), new Window(1, TimeUnit.DAYS), new Window(3, TimeUnit.DAYS))
+        )
+      ),
+      metaData = Builders.MetaData(name = "e2e-mixed-megatile"),
+      accuracy = Accuracy.TEMPORAL
+    )
+    groupBy.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
+    val (job, groupByServingInfoParsed) = buildFlinkJob(groupBy, elements)
+
+    job.runMegaTiledGroupByJob(env).addSink(new CollectSink)
+    env.execute("MegaTiledFlinkJobMixedWindowsTest")
+
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val dayStart = TsUtils.round(elements.head.created, dayMillis)
+    val decodedValues = CollectSink.values.toScala
+      .filter(_.status)
+      .filter(response => TilingUtils.deserializeTileKey(response.keyBytes).tileStartTimestampMillis == dayStart)
+      .map(response => groupByServingInfoParsed.megaTileCodec.decode(response.valueBytes))
+      .map(ir => groupByServingInfoParsed.megaTileCodec.rowAggregator.finalize(ir).toSeq)
+      .sortBy(_.head.asInstanceOf[Double])
+
+    decodedValues.head shouldBe Seq(1.5, 1.5, 1.5)
+    decodedValues.last shouldBe Seq(3.5, 3.5, 3.5)
+  }
+
   it should "align a native daily tile with an offset daily batch boundary" in {
     implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
 
@@ -218,5 +383,29 @@ class FlinkJobEventIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
                   props = Map.empty,
                   topicInfo = topicInfo),
      groupByServingInfoParsed)
+  }
+
+  private def toMillis(iso: String): Long =
+    Instant.parse(iso).toEpochMilli
+
+  private object WatermarkTestContext
+      extends TimestampAssignerSupplier.Context
+      with WatermarkGeneratorSupplier.Context {
+    override def getMetricGroup: MetricGroup =
+      UnregisteredMetricGroups.createUnregisteredOperatorMetricGroup()
+  }
+
+  final private class RecordingWatermarkOutput extends WatermarkOutput {
+    private var emittedWatermarkTimestamps: List[Long] = Nil
+
+    override def emitWatermark(watermark: Watermark): Unit =
+      emittedWatermarkTimestamps = emittedWatermarkTimestamps :+ watermark.getTimestamp
+
+    override def markIdle(): Unit = ()
+
+    override def markActive(): Unit = ()
+
+    def lastWatermarkTimestamp: Long =
+      emittedWatermarkTimestamps.last
   }
 }

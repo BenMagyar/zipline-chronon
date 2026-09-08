@@ -57,6 +57,21 @@ object FlinkUtils {
         else java.lang.Math.multiplyExact(defaultSeconds, 1000L)
       }
   }
+
+  def getNonNegativeLongProperty(key: String, props: Map[String, String], topicInfo: TopicInfo): Long = {
+    getProperty(key, props, topicInfo)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map { value =>
+        val parsed = Try(value.toLong).getOrElse {
+          throw new IllegalArgumentException(
+            s"FlinkUtils.getNonNegativeLongProperty: invalid $key value '$value', must be a valid integer"
+          )
+        }
+        if (parsed < 0L) 0L else parsed
+      }
+      .getOrElse(0L)
+  }
 }
 
 /** This was moved to flink-rpc-akka in Flink 1.16 and made private, so we reproduce the direct execution context here

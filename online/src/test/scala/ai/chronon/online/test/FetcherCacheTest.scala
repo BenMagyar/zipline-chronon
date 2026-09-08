@@ -152,7 +152,7 @@ class FetcherCacheTest extends AnyFlatSpec with MockitoHelper {
     val request = Request("req_name", keys, Some(eventTs), Some(mock[Context]))
     val getRequest = KVStore.GetRequest("key".getBytes, dataset, Some(eventTs))
     val requestMeta =
-      LambdaKvRequest(mockGroupByServingInfoParsed, request, getRequest, Some(getRequest), Some(eventTs), mockContext)
+      LambdaKvRequest(mockGroupByServingInfoParsed, request, getRequest, Some(getRequest), None, Some(eventTs), mockContext)
     val groupByRequestToKvRequest: Seq[(Request, Try[LambdaKvRequest])] = Seq((request, Success(requestMeta)))
 
     // getCachedRequests should return an empty list when the cache is empty
@@ -187,7 +187,7 @@ class FetcherCacheTest extends AnyFlatSpec with MockitoHelper {
     val request = Request("req_name", keys, Some(eventTs))
     val getRequest = KVStore.GetRequest("key".getBytes, dataset, Some(eventTs))
     val requestMeta =
-      LambdaKvRequest(mockGroupByServingInfoParsed, request, getRequest, Some(getRequest), Some(eventTs), mockContext)
+      LambdaKvRequest(mockGroupByServingInfoParsed, request, getRequest, Some(getRequest), None, Some(eventTs), mockContext)
     val groupByRequestToKvRequest: Seq[(Request, Try[LambdaKvRequest])] = Seq((request, Success(requestMeta)))
 
     val cachedRequests = fetcherCache.getCachedRequests(groupByRequestToKvRequest)

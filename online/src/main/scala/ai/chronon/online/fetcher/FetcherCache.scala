@@ -136,7 +136,7 @@ trait FetcherCache {
     groupByRequestToKvRequest
       .map {
 
-        case (request, Success(LambdaKvRequest(servingInfo, _, batchRequest, _, _, _)))
+        case (request, Success(LambdaKvRequest(servingInfo, _, batchRequest, _, _, _, _)))
             if isCachingEnabled(servingInfo.groupBy) =>
           val batchRequestCacheKey =
             BatchIrCache.Key(batchRequest.dataset, request.keys, servingInfo.batchEndTsMillis)

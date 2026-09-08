@@ -1,7 +1,7 @@
 package ai.chronon.online.fetcher
 import ai.chronon.aggregator.windowing
 import ai.chronon.aggregator.windowing.{FinalBatchIr, SawtoothOnlineAggregator, TiledIr}
-import ai.chronon.api.Extensions.WindowOps
+import ai.chronon.api.Extensions.{GroupByOps, WindowOps}
 import ai.chronon.api.ScalaJavaConversions.{IteratorOps, JMapOps}
 import ai.chronon.api.{DataModel, Row, Window}
 import ai.chronon.online.serde.AvroConversions
@@ -33,6 +33,7 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
 
   def decodeAndMerge(batchResponses: BatchResponses,
                      streamingResponsesOpt: Option[Seq[TimedValue]],
+                     megaTileHistoricalResponses: Seq[(Long, Seq[TimedValue])] = Seq.empty,
                      requestContext: RequestContext): Map[String, AnyRef] = {
 
     val newServingInfo = getServingInfo(requestContext.servingInfo, batchResponses)
@@ -64,11 +65,19 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
 
       } else { // temporal accurate
 
+        val updatedContext = requestContext.copy(servingInfo = newServingInfo)
         val streamingResponses = streamingResponsesOpt.get
-        val output: Array[Any] = mergeWithStreaming(batchResponses,
-                                                    streamingResponses,
-                                                    batchBytes,
-                                                    requestContext.copy(servingInfo = newServingInfo))
+        val output: Array[Any] =
+          if (newServingInfo.groupByOps.isMegaTilingEnabled) {
+            mergeMegaTilesFromStreaming(updatedContext,
+                                        newServingInfo,
+                                        batchResponses,
+                                        streamingResponses,
+                                        megaTileHistoricalResponses,
+                                        batchBytes)
+          } else {
+            mergeWithStreaming(batchResponses, streamingResponses, batchBytes, updatedContext)
+          }
 
         val fieldNames = newServingInfo.outputCodec.fieldNames
         if (output != null) {
@@ -260,6 +269,84 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     requestContext.metricsContext.distribution("group_by.aggregator.latency.millis",
                                                System.currentTimeMillis() - aggregatorStartTime)
     result
+  }
+
+  private def mergeMegaTilesFromStreaming(requestContext: RequestContext,
+                                          servingInfo: GroupByServingInfoParsed,
+                                          batchResponses: BatchResponses,
+                                          todayResponses: Seq[TimedValue],
+                                          megaTileHistoricalResponses: Seq[(Long, Seq[TimedValue])],
+                                          batchBytes: Array[Byte]): Array[Any] = {
+    val hasNoHistoricalData = megaTileHistoricalResponses.forall { case (_, responses) =>
+      responses == null || responses.isEmpty
+    }
+    if (
+      (todayResponses == null || todayResponses.isEmpty) &&
+      hasNoHistoricalData &&
+      batchResponses.isInstanceOf[KvStoreBatchResponse] &&
+      batchBytes == null
+    ) {
+      if (fetchContext.debug) {
+        logger.info("Batch, today's streaming data, and historical streaming data are all null")
+      }
+      return null
+    }
+
+    val allStreamingResponses =
+      Option(todayResponses).getOrElse(Seq.empty) ++
+        megaTileHistoricalResponses.flatMap { case (_, responses) => Option(responses).getOrElse(Seq.empty) }
+    reportKvResponse(requestContext.metricsContext.withSuffix("streaming"),
+                     allStreamingResponses,
+                     requestContext.queryTimeMs)
+
+    val batchIrDecodeStartTime = System.currentTimeMillis()
+    val batchIr = getBatchIrFromBatchResponse(batchResponses, batchBytes, servingInfo, toBatchIr, requestContext.keys)
+    requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
+                                               System.currentTimeMillis() - batchIrDecodeStartTime)
+
+    val allStreamingIrDecodeStartTime = System.currentTimeMillis()
+    val todayStart = servingInfo.megaTileMerger.streamingDayKeys(requestContext.queryTimeMs)._1
+    val dailyTileIrs =
+      (Seq(todayStart -> todayResponses) ++ megaTileHistoricalResponses).map { case (dayStart, responses) =>
+        dayStart -> decodeLatestMegaTile(responses, servingInfo)
+      }
+    requestContext.metricsContext.distribution("group_by.all_streamingir_decode.latency.millis",
+                                               System.currentTimeMillis() - allStreamingIrDecodeStartTime)
+
+    if (fetchContext.debug) {
+      val gson = new Gson()
+      logger.info(s"""
+                     |batch ir: ${gson.toJson(batchIr)}
+                     |dailyTileIrs: ${gson.toJson(dailyTileIrs)}
+                     |batchEnd in millis: ${servingInfo.batchEndTsMillis}
+                     |queryTime in millis: ${requestContext.queryTimeMs}
+                     |""".stripMargin)
+    }
+
+    val aggregatorStartTime = System.currentTimeMillis()
+    val result =
+      servingInfo.megaTileMerger.merge(batchIr, dailyTileIrs, requestContext.queryTimeMs, servingInfo.batchEndTsMillis)
+    requestContext.metricsContext.distribution("group_by.aggregator.latency.millis",
+                                               System.currentTimeMillis() - aggregatorStartTime)
+    result
+  }
+
+  private def decodeLatestMegaTile(responses: Seq[TimedValue], servingInfo: GroupByServingInfoParsed): Array[Any] = {
+    if (responses == null || responses.isEmpty) return null
+    val latest = responses.maxBy(_.millis)
+    Try(servingInfo.megaTileCodec.decode(latest.bytes)) match {
+      case Success(ir) => ir
+      case Failure(_) =>
+        logger.error(
+          s"Failed to decode mega tile ir for groupBy ${servingInfo.groupByOps.metaData.getName}" +
+            "Streaming mega tile IRs will be ignored")
+        if (servingInfo.groupByOps.dontThrowOnDecodeFailFlag) {
+          null
+        } else {
+          throw new RuntimeException(
+            s"Failed to decode mega tile ir for groupBy ${servingInfo.groupByOps.metaData.getName}")
+        }
+    }
   }
 
   private def reportKvResponse(ctx: Metrics.Context, response: Seq[TimedValue], queryTsMillis: Long): Unit = {
