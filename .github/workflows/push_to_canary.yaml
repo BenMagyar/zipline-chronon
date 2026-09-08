@@ -677,6 +677,69 @@ jobs:
           gcloud storage cp connectors_pubsub_deploy.jar gs://zipline-artifacts-canary/release/latest/jars/connectors_pubsub_deploy.jar
           gcloud storage objects update gs://zipline-artifacts-canary/release/latest/jars/connectors_pubsub_deploy.jar --custom-metadata="updated_date=$(date),commit=${{ github.sha }},branch=${{ github.ref_name }}"
 
+  update_gcp_canary_fetcher:
+    needs: [build_and_push, run_aws_integration_tests, run_gcp_integration_tests, run_fetcher_integration_tests, build_and_push_fetcher_image]
+    runs-on: ubuntu-latest
+    environment: gcp
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure GCP Credentials for Canary Project
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{secrets.GCP_CANARY_PROJECT_ID}}
+          workload_identity_provider: projects/${{secrets.GCP_CANARY_PROJECT_NUMBER}}/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: github-actions@${{secrets.GCP_CANARY_PROJECT_ID}}.iam.gserviceaccount.com
+
+
+      - name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run services describe canary-zipline-chronon-fetcher \
+          --region=${{ secrets.GCP_REGION }} \
+          --project=${{ secrets.GCP_CANARY_PROJECT_ID }} \
+          --format="export" > current-service.yaml
+
+          yq eval '(.spec.template.spec.containers[] | select(.name == "chronon-fetcher") | .image) = "us-central1-docker.pkg.dev/${{secrets.GCP_CANARY_PROJECT_ID}}/canary-zipline-docker-hub-proxy/ziplineai/chronon-fetcher:${{ github.sha }}"' -i current-service.yaml
+
+          # Deploy the updated service
+          gcloud run services replace current-service.yaml \
+          --region=${{ secrets.GCP_REGION }} \
+          --project=${{ secrets.GCP_CANARY_PROJECT_ID }}
+
+  update_gcp_ci_fetcher:
+    needs: [build_and_push, run_aws_integration_tests, run_gcp_integration_tests, run_fetcher_integration_tests, build_and_push_fetcher_image]
+    runs-on: ubuntu-latest
+    environment: gcp
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure GCP Credentials for Canary Project
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{secrets.GCP_CANARY_PROJECT_ID}}
+          workload_identity_provider: projects/${{secrets.GCP_CANARY_PROJECT_NUMBER}}/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: github-actions@${{secrets.GCP_CANARY_PROJECT_ID}}.iam.gserviceaccount.com
+
+
+      - name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run services describe ci-zipline-chronon-fetcher \
+          --region=${{ secrets.GCP_REGION }} \
+          --project=${{ secrets.GCP_CANARY_PROJECT_ID }} \
+          --format="export" > current-service.yaml
+
+          yq eval '(.spec.template.spec.containers[] | select(.name == "chronon-fetcher") | .image) = "us-central1-docker.pkg.dev/${{secrets.GCP_CANARY_PROJECT_ID}}/canary-zipline-docker-hub-proxy/ziplineai/chronon-fetcher:${{ github.sha }}"' -i current-service.yaml
+
+          # Deploy the updated service
+          gcloud run services replace current-service.yaml \
+          --region=${{ secrets.GCP_REGION }} \
+          --project=${{ secrets.GCP_CANARY_PROJECT_ID }}
 
   push_to_azure_passing:
     needs: [build_and_push, run_aws_integration_tests, run_gcp_integration_tests, run_fetcher_integration_tests]
@@ -868,7 +931,7 @@ jobs:
 
 
   on_fail_notify_slack:
-    needs: [canary_compile_check, run_aws_integration_tests, run_gcp_integration_tests, run_fetcher_integration_tests, merge_to_main-passing-tests]
+    needs: [canary_compile_check, run_aws_integration_tests, run_gcp_integration_tests, run_fetcher_integration_tests, merge_to_main-passing-tests, update_gcp_canary_fetcher, update_gcp_ci_fetcher]
     if: failure()
     runs-on: ubuntu-latest
 
@@ -914,6 +977,8 @@ jobs:
           GCP_TESTS_RESULT: ${{ needs.run_gcp_integration_tests.result }}
           FETCHER_TESTS_RESULT: ${{ needs.run_fetcher_integration_tests.result }}
           MERGE_RESULT: ${{ needs.merge_to_main-passing-tests.result }}
+          GCP_CANARY_FETCHER_RESULT: ${{ needs.update_gcp_canary_fetcher.result }}
+          GCP_CI_FETCHER_RESULT: ${{ needs.update_gcp_ci_fetcher.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
@@ -952,6 +1017,8 @@ jobs:
               ('GCP_TESTS_RESULT', 'GCP Integration Tests'),
               ('FETCHER_TESTS_RESULT', 'Fetcher Integration Tests'),
               ('MERGE_RESULT', 'Merge to main-passing-tests'),
+              ('GCP_CANARY_FETCHER_RESULT', 'Update GCP Canary Fetcher'),
+              ('GCP_CI_FETCHER_RESULT', 'Update GCP Ci Fetcher'),
           ]
 
           failed = []
