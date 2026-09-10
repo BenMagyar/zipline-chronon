@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
@@ -86,6 +87,12 @@ public class ChrononServiceLauncher extends Launcher {
                 // Emit exponential histograms so backends can compute server-side percentiles
                 case "otlp.histogramFlavor":
                     return "BASE2_EXPONENTIAL";
+                // Honor the same opt-in temporality knob as the OTel-SDK pipeline. Defaults to
+                // CUMULATIVE; set ai.chronon.metrics.temporality=delta only for rate-oriented
+                // backends (e.g. CloudWatch via the ADOT awsemf exporter) that need per-interval
+                // counters and histogram min/max/percentiles.
+                case "otlp.aggregationTemporality":
+                    return OtelMetricsReporter.getMetricsTemporality().toUpperCase(Locale.ROOT);
                 default:
                     return null;
             }

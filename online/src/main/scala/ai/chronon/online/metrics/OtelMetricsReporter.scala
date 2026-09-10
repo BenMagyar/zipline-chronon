@@ -11,10 +11,11 @@ import io.opentelemetry.exporter.otlp.metrics.OtlpGrpcMetricExporter
 import io.opentelemetry.exporter.prometheus.PrometheusHttpServer
 import io.opentelemetry.sdk.OpenTelemetrySdk
 import io.opentelemetry.sdk.metrics.SdkMeterProvider
-import io.opentelemetry.sdk.metrics.export.{MetricReader, PeriodicMetricReader}
+import io.opentelemetry.sdk.metrics.export.{AggregationTemporalitySelector, MetricReader, PeriodicMetricReader}
 import io.opentelemetry.sdk.resources.Resource
 
 import java.time.Duration
+import java.util.Locale
 import scala.collection.concurrent.TrieMap
 
 class OtelMetricsReporter(openTelemetry: OpenTelemetry) extends MetricsReporter {
@@ -107,6 +108,7 @@ object OtelMetricsReporter {
   val MetricsExporterPrometheusPortKey = "ai.chronon.metrics.exporter.port"
   val MetricsExporterResourceKey = "ai.chronon.metrics.exporter.resources"
   val MetricsExporterIntervalKey = "ai.chronon.metrics.exporter.interval"
+  val MetricsTemporalityKey = "ai.chronon.metrics.temporality"
 
   val MetricsReaderGrpc = "grpc"
   val MetricsReaderHttp = "http"
@@ -114,6 +116,13 @@ object OtelMetricsReporter {
   val MetricsExporterInterval = "PT15s"
   val MetricsExporterUrlDefault = "http://localhost:4318"
   val MetricsExporterPrometheusPortDefault = "8905"
+
+  // Opt-in knob. Default stays CUMULATIVE to preserve existing behavior; set to "delta" only for
+  // rate-oriented backends (e.g. CloudWatch via the ADOT awsemf exporter) that need per-interval
+  // counters and histogram min/max/percentiles — cumulative histograms carry no per-interval
+  // min/max, so those statistics read as 0 there.
+  val MetricsTemporalityCumulative = "cumulative"
+  val MetricsTemporalityDelta = "delta"
 
   def getExporterUrl: String = {
     System.getProperty(MetricsExporterUrlKey, MetricsExporterUrlDefault)
@@ -127,17 +136,45 @@ object OtelMetricsReporter {
     System.getProperty(MetricsExporterIntervalKey, MetricsExporterInterval)
   }
 
+  // Returns the validated, normalized temporality so both the OTel SDK and
+  // Vert.x/Micrometer pipelines honor the same configuration contract.
+  def getMetricsTemporality: String = {
+    val configured = System.getProperty(MetricsTemporalityKey, MetricsTemporalityCumulative)
+    configured.trim.toLowerCase(Locale.ROOT) match {
+      case MetricsTemporalityCumulative => MetricsTemporalityCumulative
+      case MetricsTemporalityDelta      => MetricsTemporalityDelta
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Invalid value '$configured' for $MetricsTemporalityKey; expected '$MetricsTemporalityCumulative' or '$MetricsTemporalityDelta'"
+        )
+    }
+  }
+
+  def getAggregationTemporalitySelector: AggregationTemporalitySelector = {
+    getMetricsTemporality match {
+      case MetricsTemporalityDelta      => AggregationTemporalitySelector.deltaPreferred()
+      case MetricsTemporalityCumulative => AggregationTemporalitySelector.alwaysCumulative()
+    }
+  }
+
   def buildOtelMetricReader(): MetricReader = {
     val metricReader = getMetricsReader
     metricReader.toLowerCase match {
       case MetricsReaderHttp =>
         val exporterUrl = getExporterUrl + "/v1/metrics"
-        val metricExporter = OtlpHttpMetricExporter.builder.setEndpoint(exporterUrl).build
-        // Configure periodic metric reader// Configure periodic metric reader
+        val metricExporter = OtlpHttpMetricExporter.builder
+          .setEndpoint(exporterUrl)
+          .setAggregationTemporalitySelector(getAggregationTemporalitySelector)
+          .build
+        // Configure periodic metric reader
         PeriodicMetricReader.builder(metricExporter).setInterval(Duration.parse(getMetricsExporterInterval)).build
 
       case MetricsReaderGrpc =>
-        val metricExporter = OtlpGrpcMetricExporter.builder().setEndpoint(getExporterUrl).build
+        val metricExporter = OtlpGrpcMetricExporter
+          .builder()
+          .setEndpoint(getExporterUrl)
+          .setAggregationTemporalitySelector(getAggregationTemporalitySelector)
+          .build
         PeriodicMetricReader.builder(metricExporter).setInterval(Duration.parse(getMetricsExporterInterval)).build
 
       case MetricsReaderPrometheus =>
