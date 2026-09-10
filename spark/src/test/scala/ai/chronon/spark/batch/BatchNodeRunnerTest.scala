@@ -1363,6 +1363,29 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     )
   }
 
+  it should "match Iceberg partition keys case-insensitively" in {
+    val runner = makeRunnerForLogTests()
+    implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
+    val range = PartitionRange("2026-06-09", "2026-06-10")(partitionSpec)
+
+    val partitionRowCounts: Map[List[(String, String)], Long] = Map(
+      List("DS" -> "2026-06-09") -> 20L,
+      List("DS" -> "2026-06-10") -> 30L
+    )
+
+    val result = runner.logIcebergPartitionRowCounts(
+      "test_db.output_table",
+      "test_conf",
+      range,
+      partitionRowCounts
+    )
+
+    result.get should contain theSameElementsAs Seq(
+      "DS=2026-06-09" -> 20L,
+      "DS=2026-06-10" -> 30L
+    )
+  }
+
   it should "skip partition keys that lack the partition-spec column" in {
     val runner = makeRunnerForLogTests()
     implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec

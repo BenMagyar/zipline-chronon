@@ -1,11 +1,12 @@
 package ai.chronon.spark.catalog
 
 import ai.chronon.api.PartitionSpec
-import org.apache.iceberg.{DataFile, TableScan}
+import org.apache.iceberg.{DataFile, Schema, TableScan}
 import org.apache.iceberg.expressions.{Expression, Expressions}
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.iceberg.transforms.Transform
 import org.apache.iceberg.types.Type
+import org.apache.iceberg.types.Types.NestedField
 import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.col
@@ -37,6 +38,16 @@ case object Iceberg extends Format {
 
   def qualifyWithCatalog(tableName: String)(implicit sparkSession: SparkSession): String =
     Format.resolveTableName(tableName).quoted
+
+  override protected def resolvePartitionColumn(tableName: String, partitionColumn: String)(implicit
+      sparkSession: SparkSession): String =
+    loadIcebergTable(tableName)
+      .flatMap(table => findFieldCaseInsensitive(table.schema(), partitionColumn))
+      .map(_.name())
+      .getOrElse(partitionColumn)
+
+  private[spark] def findFieldCaseInsensitive(schema: Schema, columnName: String): Option[NestedField] =
+    Option(schema).flatMap(schema => Option(schema.caseInsensitiveFindField(columnName)))
 
   private[spark] def parsePartitionPath(partitionPath: String): PartitionKey =
     partitionPath
@@ -81,16 +92,17 @@ case object Iceberg extends Format {
                                  partitionFilters: String,
                                  subPartitionsFilter: Map[String, String])(implicit
       sparkSession: SparkSession): List[String] = {
+    val effectiveColumn = resolvePartitionColumn(tableName, partitionColumn)
 
     if (!supportSubPartitionsFilter && subPartitionsFilter.nonEmpty) {
       throw new NotImplementedError("subPartitionsFilter is not supported on this format")
     }
 
     def fallback: List[String] =
-      filterStringRange(sparkMetadataPartitions(tableName, partitionColumn),
-                        partitionRange(partitionColumn, partitionFilters))
+      filterStringRange(sparkMetadataPartitions(tableName, effectiveColumn),
+                        partitionRange(effectiveColumn, partitionFilters))
 
-    Try(loadIcebergTable(tableName).flatMap(listPartitions(_, partitionColumn, partitionFilters))) match {
+    Try(loadIcebergTable(tableName).flatMap(listPartitions(_, effectiveColumn, partitionFilters))) match {
       case Success(Some(partitions)) => partitions
       case Success(None)             => fallback
       case Failure(e) =>
@@ -121,18 +133,20 @@ case object Iceberg extends Format {
       throw new IllegalStateException("Could not load Iceberg partition specs")
     }
     val tablePartitionFieldNames = partitionFieldNames(table)
+    val effectivePartitionColumn = tablePartitionFieldNames.find(_.equalsIgnoreCase(partitionColumn))
 
-    if (!tablePartitionFieldNames.contains(partitionColumn)) {
+    if (effectivePartitionColumn.isEmpty) {
       Some(List.empty)
-    } else if (tablePartitionFieldNames.contains("hr")) {
+    } else if (tablePartitionFieldNames.exists(_.equalsIgnoreCase("hr"))) {
       None
     } else {
-      val range = partitionRange(partitionColumn, partitionFilters)
-      Some(currentDataFiles(table, filter = rangeExpression(table, partitionColumn, range)) { files =>
+      val resolvedPartitionColumn = effectivePartitionColumn.get
+      val range = partitionRange(resolvedPartitionColumn, partitionFilters)
+      Some(currentDataFiles(table, filter = rangeExpression(table, resolvedPartitionColumn, range)) { files =>
         val distinctPartitions = mutable.LinkedHashSet.empty[String]
         files.foreach { file =>
           val spec = Option(specs.get(file.specId())).getOrElse(table.spec())
-          partitionFieldValue(spec, file, partitionColumn)
+          partitionFieldValue(spec, file, resolvedPartitionColumn)
             .flatMap(Option(_))
             .foreach(distinctPartitions += _)
         }
@@ -149,7 +163,7 @@ case object Iceberg extends Format {
       throw new IllegalStateException("File partition data is null")
     }
     val fields = spec.fields().asScala
-    val fieldIndex = fields.indexWhere(_.name() == partitionColumn)
+    val fieldIndex = fields.indexWhere(_.name().equalsIgnoreCase(partitionColumn))
 
     if (fieldIndex < 0) None
     else {
@@ -204,39 +218,46 @@ case object Iceberg extends Format {
 
   override def scanDistinctPartitions(tableName: String, partitionColumn: String, partitionFilters: String)(implicit
       sparkSession: SparkSession): List[String] = {
-    Try(loadIcebergTable(tableName).flatMap(listPartitionsByStats(_, partitionColumn, partitionFilters))) match {
+    val effectiveColumn = resolvePartitionColumn(tableName, partitionColumn)
+    Try(loadIcebergTable(tableName).flatMap(listPartitionsByStats(_, effectiveColumn, partitionFilters))) match {
       case Success(Some(partitions)) =>
         logger.info(s"Resolved Iceberg distinct file stats for $tableName.$partitionColumn")
         partitions
       case Success(None) =>
         logger.info(
           s"Iceberg distinct file stats were incomplete for $tableName.$partitionColumn; falling back to scan")
-        super.scanDistinctPartitions(tableName, partitionColumn, partitionFilters)
+        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters)
       case Failure(e) =>
         logger.warn(
           s"Failed to resolve Iceberg distinct file stats for $tableName.$partitionColumn: ${Option(e.getMessage).getOrElse("(no message)")}")
-        super.scanDistinctPartitions(tableName, partitionColumn, partitionFilters)
+        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters)
     }
   }
 
   override def virtualPartitions(tableName: String, timestampColumn: String, partitionSpec: PartitionSpec)(implicit
-      sparkSession: SparkSession): List[String] =
-    metadataPartitions(tableName, timestampColumn)
+      sparkSession: SparkSession): List[String] = {
+    val effectiveColumn = resolvePartitionColumn(tableName, timestampColumn)
+    metadataPartitions(tableName, effectiveColumn)
       .filter(_.nonEmpty)
-      .orElse(statsVirtualPartitions(tableName, timestampColumn, partitionSpec))
-      .getOrElse(super.virtualPartitions(tableName, timestampColumn, partitionSpec))
+      .orElse(statsVirtualPartitions(tableName, effectiveColumn, partitionSpec))
+      .getOrElse(super.virtualPartitions(tableName, effectiveColumn, partitionSpec))
+  }
 
   override def firstAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(
-      implicit sparkSession: SparkSession): Option[String] =
-    metadataFirstAvailablePartition(tableName, partitionColumn)
-      .orElse(statsDateRange(tableName, partitionColumn, partitionSpec).map(_.firstAvailablePartition))
-      .orElse(scanFirstAvailablePartition(tableName, partitionColumn, partitionSpec))
+      implicit sparkSession: SparkSession): Option[String] = {
+    val effectiveColumn = resolvePartitionColumn(tableName, partitionColumn)
+    metadataFirstAvailablePartition(tableName, effectiveColumn)
+      .orElse(statsDateRange(tableName, effectiveColumn, partitionSpec).map(_.firstAvailablePartition))
+      .orElse(scanFirstAvailablePartition(tableName, effectiveColumn, partitionSpec))
+  }
 
   override def lastAvailablePartition(tableName: String, partitionColumn: String, partitionSpec: PartitionSpec)(implicit
-      sparkSession: SparkSession): Option[String] =
-    metadataLastAvailablePartition(tableName, partitionColumn)
-      .orElse(statsLastAvailablePartition(tableName, partitionColumn, partitionSpec))
-      .orElse(scanLastAvailablePartition(tableName, partitionColumn, partitionSpec))
+      sparkSession: SparkSession): Option[String] = {
+    val effectiveColumn = resolvePartitionColumn(tableName, partitionColumn)
+    metadataLastAvailablePartition(tableName, effectiveColumn)
+      .orElse(statsLastAvailablePartition(tableName, effectiveColumn, partitionSpec))
+      .orElse(scanLastAvailablePartition(tableName, effectiveColumn, partitionSpec))
+  }
 
   private def statsLastAvailablePartition(tableName: String, columnName: String, partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): Option[String] =
@@ -262,7 +283,7 @@ case object Iceberg extends Format {
       val table = loadIcebergTable(tableName).getOrElse {
         throw new IllegalStateException(s"Could not load Iceberg table: $tableName")
       }
-      val field = Option(table.schema().findField(columnName)).getOrElse {
+      val field = findFieldCaseInsensitive(table.schema(), columnName).getOrElse {
         throw new IllegalArgumentException(s"Column $columnName not found in Iceberg schema for $tableName")
       }
       val fieldId = field.fieldId().asInstanceOf[java.lang.Integer]
@@ -302,7 +323,7 @@ case object Iceberg extends Format {
   private[catalog] def listPartitionsByStats(table: org.apache.iceberg.Table,
                                              partitionColumn: String,
                                              partitionFilters: String): Option[List[String]] = {
-    val field = Option(table.schema().findField(partitionColumn)).getOrElse {
+    val field = findFieldCaseInsensitive(table.schema(), partitionColumn).getOrElse {
       throw new IllegalArgumentException(s"Column $partitionColumn not found in Iceberg schema")
     }
 
@@ -310,11 +331,7 @@ case object Iceberg extends Format {
       None
     } else {
       val range = partitionRange(partitionColumn, partitionFilters)
-      listPartitionsByStats(table,
-                            partitionColumn,
-                            field.fieldId().asInstanceOf[java.lang.Integer],
-                            field.`type`(),
-                            range)
+      listPartitionsByStats(table, field.name(), field.fieldId().asInstanceOf[java.lang.Integer], field.`type`(), range)
     }
   }
 
@@ -370,15 +387,15 @@ case object Iceberg extends Format {
   private def rangeExpression(table: org.apache.iceberg.Table,
                               columnName: String,
                               range: StringRange): Option[Expression] = {
-    val stringColumn = Option(table.schema().findField(columnName))
-      .exists(field => field.`type`().typeId() == Type.TypeID.STRING)
+    val stringField = findFieldCaseInsensitive(table.schema(), columnName)
+      .filter(field => field.`type`().typeId() == Type.TypeID.STRING)
 
-    if (!stringColumn) None
-    else {
+    stringField.flatMap { field =>
+      val resolvedColumnName = field.name()
       val expressions: Seq[Expression] =
-        range.start.map(Expressions.greaterThanOrEqual(columnName, _)).toSeq ++
-          range.endInclusive.map(Expressions.lessThanOrEqual(columnName, _)).toSeq ++
-          range.endExclusive.map(Expressions.lessThan(columnName, _)).toSeq
+        range.start.map(Expressions.greaterThanOrEqual(resolvedColumnName, _)).toSeq ++
+          range.endInclusive.map(Expressions.lessThanOrEqual(resolvedColumnName, _)).toSeq ++
+          range.endExclusive.map(Expressions.lessThan(resolvedColumnName, _)).toSeq
       expressions.reduceOption((left, right) => Expressions.and(left, right))
     }
   }
@@ -391,7 +408,8 @@ case object Iceberg extends Format {
     val predicates = RangePredicate
       .findAllMatchIn(partitionFilters)
       .collect {
-        case predicate if predicate.group(1) == partitionColumn => predicate.group(2) -> predicate.group(3)
+        case predicate if predicate.group(1).equalsIgnoreCase(partitionColumn) =>
+          predicate.group(2) -> predicate.group(3)
       }
       .toSeq
     StringRange(
@@ -441,21 +459,30 @@ case object Iceberg extends Format {
     val partitionsDf = sparkSession.table(s"${Format.resolveTableName(tableName).quoted}.partitions")
 
     val index = partitionsDf.schema.fieldIndex("partition")
-    if (partitionsDf.schema(index).dataType.asInstanceOf[StructType].fieldNames.contains("hr")) {
-      // Hour filter is currently buggy in iceberg. https://github.com/apache/iceberg/issues/4718
-      // so we collect and then filter.
-      partitionsDf
-        .select(col(s"partition.$partitionColumn").cast("string"), col("partition.hr"))
-        .collect()
-        .filter(_.get(1) == null)
-        .flatMap(row => Option(row.getString(0)))
-        .toList
-    } else {
-      partitionsDf
-        .select(col(s"partition.$partitionColumn").cast("string"))
-        .collect()
-        .flatMap(row => Option(row.getString(0)))
-        .toList
+    val partitionFieldNames = partitionsDf.schema(index).dataType.asInstanceOf[StructType].fieldNames
+    val resolvedPartitionColumn = partitionFieldNames.find(_.equalsIgnoreCase(partitionColumn)).getOrElse {
+      throw new IllegalArgumentException(
+        s"Column $partitionColumn not found in Iceberg partition metadata. Available: ${partitionFieldNames.mkString(", ")}")
+    }
+    val hourColumn = partitionFieldNames.find(_.equalsIgnoreCase("hr"))
+
+    hourColumn match {
+      case Some(resolvedHourColumn) =>
+        // Hour filter is currently buggy in iceberg. https://github.com/apache/iceberg/issues/4718
+        // so we collect and then filter.
+        partitionsDf
+          .select(col("partition").getField(resolvedPartitionColumn).cast("string"),
+                  col("partition").getField(resolvedHourColumn))
+          .collect()
+          .filter(_.get(1) == null)
+          .flatMap(row => Option(row.getString(0)))
+          .toList
+      case None =>
+        partitionsDf
+          .select(col("partition").getField(resolvedPartitionColumn).cast("string"))
+          .collect()
+          .flatMap(row => Option(row.getString(0)))
+          .toList
     }
   }
 

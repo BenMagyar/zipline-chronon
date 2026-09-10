@@ -26,6 +26,9 @@ object IcebergPartitionStatsExtractor {
       partitionRowCounts: Map[PartitionKey, Long]
   )
 
+  private[spark] def partitionValueForColumn(partitionKey: PartitionKey, column: String): Option[String] =
+    partitionKey.collectFirst { case (key, value) if key.equalsIgnoreCase(column) => value }
+
   private[iceberg] def partitionKeyInRange(partitionKey: PartitionKey, requestedRange: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): Boolean =
     requestedRange.forall { range =>
@@ -36,7 +39,7 @@ object IcebergPartitionStatsExtractor {
         .map(end => range.partitionSpec.epochMillis(end) + range.partitionSpec.spanMillis)
         .getOrElse(Long.MaxValue)
 
-      partitionKey.toMap.get(partitionSpec.column).exists { value =>
+      partitionValueForColumn(partitionKey, partitionSpec.column).exists { value =>
         val partitionMillis = partitionSpec.epochMillis(value)
         partitionMillis >= startMillis && partitionMillis < endExclusiveMillis
       }
@@ -46,11 +49,11 @@ object IcebergPartitionStatsExtractor {
       partitionSpec: PartitionSpec): Option[Expression] =
     for {
       requestedRange <- range
-      field <- Option(schema.findField(partitionSpec.column))
-      expression <- buildRangeExpression(requestedRange, field.`type`())
+      field <- Iceberg.findFieldCaseInsensitive(schema, partitionSpec.column)
+      expression <- buildRangeExpression(requestedRange, field.name(), field.`type`())
     } yield expression
 
-  private def buildRangeExpression(range: PartitionRange, fieldType: Type)(implicit
+  private def buildRangeExpression(range: PartitionRange, columnName: String, fieldType: Type)(implicit
       partitionSpec: PartitionSpec): Option[Expression] = {
     // Normalize through millis so mixed PartitionSpec formats still produce one half-open typed Iceberg predicate.
     val lower = Option(range.start).flatMap { start =>
@@ -62,8 +65,8 @@ object IcebergPartitionStatsExtractor {
     }
 
     val predicates = Seq(
-      lower.map(value => Expressions.greaterThanOrEqual[AnyRef](partitionSpec.column, value)),
-      upper.map(value => Expressions.lessThan[AnyRef](partitionSpec.column, value))
+      lower.map(value => Expressions.greaterThanOrEqual[AnyRef](columnName, value)),
+      upper.map(value => Expressions.lessThan[AnyRef](columnName, value))
     ).flatten
 
     predicates.reduceOption(Expressions.and)
@@ -86,15 +89,15 @@ object IcebergPartitionStatsExtractor {
   def extractPartitionMillisFromSlice(slice: String, partitionSpec: PartitionSpec): Long = {
     val partitionPairs =
       try {
-        Iceberg.parsePartitionPath(slice).toMap
+        Iceberg.parsePartitionPath(slice)
       } catch {
         case e: IllegalStateException => throw new IllegalArgumentException(e.getMessage, e)
       }
 
     // Extract the value for the partition column used by PartitionSpec
-    val partitionValue = partitionPairs.getOrElse(
-      partitionSpec.column,
-      throw new IllegalArgumentException(s"Partition column '${partitionSpec.column}' not found in slice: $slice"))
+    val partitionValue = partitionValueForColumn(partitionPairs, partitionSpec.column).getOrElse {
+      throw new IllegalArgumentException(s"Partition column '${partitionSpec.column}' not found in slice: $slice")
+    }
 
     // Convert partition value to millis using PartitionSpec
     partitionSpec.epochMillis(partitionValue)

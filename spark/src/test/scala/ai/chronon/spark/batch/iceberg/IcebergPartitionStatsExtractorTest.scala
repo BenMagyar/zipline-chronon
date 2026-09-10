@@ -183,6 +183,41 @@ class IcebergPartitionStatsExtractorTest
     }
   }
 
+  it should "extract ranged synthetic stats from an uppercase DS column configured as lowercase ds" in {
+    try {
+      spark.sql("""
+        CREATE TABLE test_unpartitioned_uppercase_ds_stats (
+          id BIGINT,
+          DS STRING,
+          value DOUBLE
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full'
+        )
+        """)
+      spark.sql("ALTER TABLE test_unpartitioned_uppercase_ds_stats WRITE ORDERED BY DS")
+      spark.sql("INSERT INTO test_unpartitioned_uppercase_ds_stats VALUES (1, '2024-01-15', 100.0)")
+      spark.sql("INSERT INTO test_unpartitioned_uppercase_ds_stats VALUES (2, '2024-01-16', 200.0)")
+      spark.sql("REFRESH TABLE test_unpartitioned_uppercase_ds_stats")
+
+      val extractor = new IcebergPartitionStatsExtractor(spark)
+      val range = Some(PartitionRange("2024-01-16", "2024-01-16"))
+      val result = extractor
+        .extractPartitionStatsWithRowCounts("spark_catalog.default.test_unpartitioned_uppercase_ds_stats",
+                                            "test_conf",
+                                            range)
+        .get
+
+      result.partitionRowCounts shouldBe Map(List("DS" -> "2024-01-16") -> 1L)
+      result.tileSummaries.keys.map(_.getSlice).toSet shouldBe Set("DS=2024-01-16")
+
+      val table = loadTable("test_unpartitioned_uppercase_ds_stats")
+      plannedFileCount(table, range) should be < plannedFileCount(table, None)
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS test_unpartitioned_uppercase_ds_stats")
+    }
+  }
+
   it should "return None for unpartitioned ds table when file metadata stats are missing" in {
     try {
       spark.sql("""
@@ -826,6 +861,34 @@ class IcebergPartitionStatsExtractorTest
     viaOldApi should be(Some(result.tileSummaries))
   }
 
+  it should "extract ranged partition stats when Iceberg stores uppercase DS" in {
+    spark.sql("""
+      CREATE TABLE test_partitioned_table (
+        id BIGINT,
+        DS STRING,
+        value DOUBLE
+      ) USING iceberg
+      PARTITIONED BY (DS)
+      """)
+
+    spark.sql("""
+      INSERT INTO test_partitioned_table VALUES
+      (1, '2024-01-15', 100.0),
+      (2, '2024-01-16', 200.0)
+      """)
+    spark.sql("REFRESH TABLE test_partitioned_table")
+
+    val extractor = new IcebergPartitionStatsExtractor(spark)
+    val result = extractor
+      .extractPartitionStatsWithRowCounts("spark_catalog.default.test_partitioned_table",
+                                          "test_conf",
+                                          Some(PartitionRange("2024-01-16", "2024-01-16")))
+      .get
+
+    result.partitionRowCounts shouldBe Map(List("DS" -> "2024-01-16") -> 1L)
+    result.tileSummaries.keys.map(_.getSlice).toSet shouldBe Set("DS=2024-01-16")
+  }
+
   it should "aggregate row counts across multiple files in the same partition" in {
     spark.sql("""
       CREATE TABLE test_partitioned_table (
@@ -976,6 +1039,14 @@ class IcebergPartitionStatsExtractorTest
 
     val result = IcebergPartitionStatsExtractor.extractPartitionMillisFromSlice(slice, partitionSpec)
     result should be > 0L
+  }
+
+  it should "match the partition column in a slice case-insensitively" in {
+    val result = IcebergPartitionStatsExtractor.extractPartitionMillisFromSlice(
+      "region=North/DS=2024-01-15",
+      PartitionSpec.daily)
+
+    result shouldBe PartitionSpec.daily.epochMillis("2024-01-15")
   }
 
   it should "handle invalid partition format" in {

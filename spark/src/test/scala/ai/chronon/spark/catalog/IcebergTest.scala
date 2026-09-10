@@ -120,6 +120,70 @@ class IcebergTest extends SparkTestBase with Matchers {
     }
   }
 
+  it should "resolve uppercase DS partition metadata from lowercase ds" in {
+    val tableName = "default.iceberg_uppercase_partition_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          DS STRING
+        ) USING iceberg
+        PARTITIONED BY (DS)
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, '2024-02-01'),
+        (2, '2024-02-02')
+      """)
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      table.schema().findField("DS") should not be null
+      table.schema().findField("ds") shouldBe null
+
+      Iceberg.listPartitions(table, "ds", "").get should contain theSameElementsAs
+        List("2024-02-01", "2024-02-02")
+      Iceberg.primaryPartitions(tableName, "ds", "") should contain theSameElementsAs
+        List("2024-02-01", "2024-02-02")
+      val filter = "ds >= '2024-02-02' AND ds <= '2024-02-02'"
+      Iceberg.primaryPartitions(tableName, "ds", filter) shouldBe List("2024-02-02")
+      Iceberg.firstAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-02-01")
+      Iceberg.lastAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-02-02")
+      TableUtils(spark).dataWatermark(tableName, Some(PartitionSpec.daily)) shouldBe
+        Some("2024-02-02" -> PartitionSpec.daily.partitionEndMillis("2024-02-02"))
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "resolve uppercase DS and HR partition metadata from lowercase names" in {
+    val tableName = "default.iceberg_uppercase_subpartition_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          DS STRING,
+          HR STRING
+        ) USING iceberg
+        PARTITIONED BY (DS, HR)
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, '2024-02-01', NULL),
+        (2, '2024-02-02', '12')
+      """)
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      Iceberg.listPartitions(table, "ds", "") shouldBe None
+      Iceberg.primaryPartitions(tableName, "ds", "") shouldBe List("2024-02-01")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
   it should "normalize timestamp identity partitions for daily readiness" in {
     val tableName = "default.iceberg_timestamp_ds_readiness_test"
     val tableUtils = TableUtils(spark)
@@ -278,6 +342,66 @@ class IcebergTest extends SparkTestBase with Matchers {
       Iceberg.listPartitionsByStats(table, "ds", "(ds >= '2024-02-02') AND (ds < '2024-02-03')").get shouldBe
         List("2024-02-02")
       TableUtils(spark).partitions(tableName, partitionRange = Some(oneDay)) shouldBe List("2024-02-02")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "resolve uppercase DS through the successful file-stats path" in {
+    val tableName = "default.iceberg_uppercase_file_stats_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          DS STRING
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'full'
+        )
+      """)
+      spark.sql(s"INSERT INTO $tableName VALUES (1, '2024-02-01')")
+      spark.sql(s"INSERT INTO $tableName VALUES (2, '2024-02-02')")
+
+      val table = Iceberg.loadIcebergTable(tableName).get
+      val filter = "ds >= '2024-02-02' AND ds <= '2024-02-02'"
+
+      Iceberg.listPartitionsByStats(table, "ds", filter).get shouldBe List("2024-02-02")
+      Iceberg.statsDateRange(tableName, "ds", PartitionSpec.daily) shouldBe
+        Some(StatsDateRange("2024-02-01", "2024-02-02"))
+      TableUtils(spark).dataWatermark(tableName, Some(PartitionSpec.daily)) shouldBe
+        Some("2024-02-02" -> PartitionSpec.daily.partitionEndMillis("2024-02-02"))
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "resolve uppercase DS through the stats-disabled scan fallback" in {
+    val tableName = "default.iceberg_uppercase_scan_fallback_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          DS STRING
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'none'
+        )
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, '2024-03-01'),
+        (2, '2024-03-02')
+      """)
+
+      Iceberg.scanDistinctPartitions(tableName, "ds", "") should contain theSameElementsAs
+        List("2024-03-01", "2024-03-02")
+      Iceberg.virtualPartitions(tableName, "ds", PartitionSpec.daily) shouldBe List("2024-03-01")
+      Iceberg.firstAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-03-01")
+      Iceberg.lastAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-03-02")
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
     }

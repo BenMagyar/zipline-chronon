@@ -424,19 +424,19 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
           s"Skipping Iceberg partition row-count logging for table $outputTable because range [${range.start}, ${range.end}] is not well-defined")
         Some(Seq.empty)
       } else {
-        val col = partitionSpec.column
         val rangeStartMillis = range.startMillis
         val rangeEndStartMillis = partitionSpec.partitionStartMillis(range.end)
         val matched: Seq[(String, Long)] = partitionRowCounts.toSeq
           .flatMap { case (key, rows) =>
-            key.find(_._1 == col).flatMap { case (_, partitionValue) =>
-              Try(partitionSpec.partitionStartMillis(partitionValue)).toOption
-                .filter(partitionMillis =>
-                  partitionMillis >= rangeStartMillis && partitionMillis <= rangeEndStartMillis)
-                .map { _ =>
-                  val pathStr = key.map { case (k, v) => s"$k=$v" }.mkString("/")
-                  pathStr -> rows
-                }
+            IcebergPartitionStatsExtractor.partitionValueForColumn(key, partitionSpec.column).flatMap {
+              partitionValue =>
+                Try(partitionSpec.partitionStartMillis(partitionValue)).toOption
+                  .filter(partitionMillis =>
+                    partitionMillis >= rangeStartMillis && partitionMillis <= rangeEndStartMillis)
+                  .map { _ =>
+                    val pathStr = key.map { case (k, v) => s"$k=$v" }.mkString("/")
+                    pathStr -> rows
+                  }
             }
           }
           .sortBy { case (pathStr, _) => pathStr }

@@ -36,7 +36,7 @@ object IcebergClusteredStatsExtractor {
           s"Cannot extract synthetic partition stats for $fullTableName because the Iceberg schema is missing")
         None
       case Some(schema) =>
-        Option(schema.findField(partitionSpec.column)) match {
+        Iceberg.findFieldCaseInsensitive(schema, partitionSpec.column) match {
           case None =>
             logger.info(
               s"Cannot extract synthetic partition stats for $fullTableName because column ${partitionSpec.column} is missing")
@@ -47,6 +47,7 @@ object IcebergClusteredStatsExtractor {
                                      confName,
                                      schema,
                                      partitionField.fieldId(),
+                                     partitionField.name(),
                                      partitionField.`type`(),
                                      range)
         }
@@ -58,6 +59,7 @@ object IcebergClusteredStatsExtractor {
                                        confName: String,
                                        schema: org.apache.iceberg.Schema,
                                        partitionFieldId: Int,
+                                       partitionFieldName: String,
                                        partitionFieldType: Type,
                                        range: Option[PartitionRange])(implicit
       partitionSpec: PartitionSpec): Option[IcebergPartitionStatsResult] = {
@@ -67,7 +69,7 @@ object IcebergClusteredStatsExtractor {
                         filter = IcebergPartitionStatsExtractor.rangeFilterExpression(table.schema(), range)) { files =>
         val partitionAccumulators = mutable.Map[PartitionKey, PartitionAccumulator]()
         val complete = files.forall { file =>
-          val partitionKey = syntheticPartitionKey(file, partitionFieldId, partitionFieldType)
+          val partitionKey = syntheticPartitionKey(file, partitionFieldId, partitionFieldName, partitionFieldType)
           val columnStats = extractStrictColumnStats(file, schema, Set(partitionFieldId))
 
           (partitionKey, columnStats) match {
@@ -94,13 +96,16 @@ object IcebergClusteredStatsExtractor {
       .getOrElse(Some(IcebergPartitionStatsResult(Map.empty, Map.empty)))
   }
 
-  private def syntheticPartitionKey(file: DataFile, partitionFieldId: Int, partitionFieldType: Type)(implicit
+  private def syntheticPartitionKey(file: DataFile,
+                                    partitionFieldId: Int,
+                                    partitionFieldName: String,
+                                    partitionFieldType: Type)(implicit
       partitionSpec: PartitionSpec): Option[PartitionKey] = {
     for {
       lower <- partitionBoundValue(file.lowerBounds(), partitionFieldId, partitionFieldType)
       upper <- partitionBoundValue(file.upperBounds(), partitionFieldId, partitionFieldType)
       if lower == upper
-    } yield List(partitionSpec.column -> lower)
+    } yield List(partitionFieldName -> lower)
   }
 
   private def partitionBoundValue(bounds: java.util.Map[Integer, java.nio.ByteBuffer],
