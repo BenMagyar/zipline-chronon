@@ -4,19 +4,19 @@ This directory contains Dockerfiles for building Spark images to run Chronon on 
 
 ## Overview
 
-These Docker images extend the official Apache Spark images with cloud-specific dependencies and the Chronon application JAR, enabling Spark workloads to run on managed Kubernetes services like Azure AKS, GCP GKE, and AWS EKS.
+These Docker images extend the official Apache Spark images with cloud-specific dependencies for Kubernetes deployments. Chronon application JARs are downloaded from object storage at submit time.
 
 ## Available Images
 
-### Cross-cloud K8sSubmitter (Dockerfile)
+### Crucible K8sSubmitter (Dockerfile)
 
-Based on `apache/spark:3.5.8-java17`, this image runs Chronon Spark jobs on Kubernetes (EKS / GKE / AKS) via the platform `K8sSubmitter`. Single image serves all clouds; no chronon assembly baked — the per-cloud assembly is downloaded from object storage at submit time.
+Based on `apache/spark:4.1.3-java17`, this image runs Chronon Spark jobs on Crucible via the platform `K8sSubmitter`. No Chronon assembly is baked into the image; Spark 4 assemblies are downloaded from object storage at submit time.
 
 **Key dependencies:**
 - Hadoop 3.4.2 overlay (hadoop-aws, hadoop-azure, gcs-connector)
 - AWS SDK v1 1.12.681 + v2 2.35.5 bundles
-- Unity Catalog jars (custom zipline-ai fork, on system classpath)
-- BigQuery Spark connector 0.41.1
+- Unity Catalog 0.5.1 jars (on the system classpath)
+- BigQuery Spark 4.1 connector 0.44.2-preview
 - Guava 33, Gson 2.11
 - `spark-defaults.conf` mapping `fs.s3.impl` / `fs.gs.impl` / `fs.abfss.impl` so UC + Iceberg metadata paths resolve regardless of cloud
 
@@ -37,7 +37,7 @@ Based on `apache/spark:3.5.3-java17`, this image includes:
 
 ## Building Images
 
-### Cross-cloud K8sSubmitter
+### Crucible K8sSubmitter
 ```bash
 cd docker/spark
 docker buildx build \
@@ -93,22 +93,6 @@ spec:
 
 3. Ensure your AKS cluster has appropriate service account permissions to access ADLS and other Azure resources.
 
-## Application JAR
-
-The `out.jar` file contains the compiled Chronon application code. To update it:
-
-1. Build the Chronon project:
-```bash
-./mill cloud_azure.assembly  # or appropriate module for your cloud
-```
-
-2. Copy the assembled JAR:
-```bash
-cp out/cloud_azure/assembly.dest/out.jar docker/spark/out.jar
-```
-
-3. Rebuild the Docker image with the updated JAR.
-
 ## Adding New Cloud Providers
 
 To add support for additional cloud providers (GCP, AWS, etc.):
@@ -126,7 +110,7 @@ To add support for additional cloud providers (GCP, AWS, etc.):
 When updating dependencies, ensure version compatibility:
 - Spark version must match the base image
 - Hadoop version should align with cloud provider SDK requirements
-- Scala version (2.12) must match Spark's Scala version
+- Scala version must match each image's base Spark distribution (`Dockerfile`: 2.13; `azure.Dockerfile`: 2.12)
 - Keep dependency versions in sync with those in the Chronon build configuration
 
 ## Troubleshooting

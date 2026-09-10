@@ -6,7 +6,6 @@ on:
     paths:
       - 'docker/spark/Dockerfile'
       - 'docker/spark/spark-defaults.conf'
-      - 'docker/spark/unitycatalog-*.jar'
   release:
     types: [published]
   workflow_dispatch:
