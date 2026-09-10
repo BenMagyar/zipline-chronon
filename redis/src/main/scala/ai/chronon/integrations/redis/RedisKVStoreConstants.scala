@@ -28,6 +28,8 @@ object RedisKVStoreConstants {
   val EnvRedisClusterNodes = "REDIS_CLUSTER_NODES" // Comma-separated: "node1:6379,node2:6379,node3:6379"
   val EnvRedisUseSsl = "REDIS_USE_SSL"
   val EnvRedisPassword = "REDIS_PASSWORD"
+  val EnvRedisUsername = "REDIS_USERNAME"
+  val EnvRedisUseSSL = EnvRedisUseSsl
   val EnvRedisKeyPrefix = "REDIS_KEY_PREFIX"
   val EnvRedisMaxConnections = "REDIS_MAX_CONNECTIONS"
   val EnvRedisMinIdleConnections = "REDIS_MIN_IDLE_CONNECTIONS"
@@ -35,11 +37,6 @@ object RedisKVStoreConstants {
   val EnvRedisConnectionTimeoutMs = "REDIS_CONNECTION_TIMEOUT_MS"
   val EnvRedisSoTimeoutMs = "REDIS_SO_TIMEOUT_MS"
   val EnvRedisMaxRedirections = "REDIS_MAX_REDIRECTIONS"
-
-  // Prop keys for create()
-  val PropTTLSeconds = "ttl-seconds"
-  val PropMaxConnections = "max-connections"
-  val PropKeyPrefix = "key-prefix"
 
   /** SSLParameters that disable endpoint identification for ElastiCache cluster mode.
     *
@@ -54,4 +51,24 @@ object RedisKVStoreConstants {
     p.setEndpointIdentificationAlgorithm("")
     p
   }
+
+  // Canonical map/Spark properties. Environment variables above take precedence.
+  val PropRedisClusterNodes = "redis.cluster.nodes"
+  val PropRedisPassword = "redis.password"
+  val PropRedisUsername = "redis.username"
+  val PropRedisSSL = "redis.ssl"
+  val PropRedisKeyPrefix = "redis.key.prefix"
+  val PropRedisMaxConnections = "redis.max.connections"
+  val PropRedisMinIdleConnections = "redis.min.idle.connections"
+  val PropRedisMaxIdleConnections = "redis.max.idle.connections"
+  val PropRedisConnectionTimeoutMs = "redis.connection.timeout.ms"
+  val PropRedisSoTimeoutMs = "redis.so.timeout.ms"
+  val PropRedisMaxRedirections = "redis.max.redirections"
+  val PropRedisBatchMode = "spark.chronon.kv_upload.redis.mode"
+
+  val PropRedisBulkUploadStateRoot = "spark.chronon.kv_upload.redis.state_root"
+  val PropRedisBulkUploadMaxKeysPerSecond = "spark.chronon.kv_upload.redis.max_keys_per_second"
+  val PropRedisBulkUploadWriterPartitions = "spark.chronon.kv_upload.redis.writer_partitions"
+  val PropRedisBulkUploadTTLSeconds = "spark.chronon.kv_upload.redis.ttl_seconds"
+  val PropRedisBulkUploadDeleteOlderVersions = "spark.chronon.kv_upload.redis.delete_older_versions"
 }
