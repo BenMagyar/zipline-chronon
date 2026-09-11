@@ -1,3 +1,7 @@
+---
+title: "Mega Tile Design"
+---
+
 # Mega Tile Design
 
 ## Problem
