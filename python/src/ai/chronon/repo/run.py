@@ -133,6 +133,26 @@ def validate_additional_jars(ctx, param, value):
     return ",".join(jars)
 
 
+def validate_force_overwrite_args(force_overwrite, mode, ds, start_ds, end_ds, conf):
+    if not force_overwrite:
+        return
+
+    if mode != RunMode.BACKFILL:
+        raise click.UsageError("--force-overwrite is only supported for staging query backfills.")
+
+    conf_parts = conf.split("/")
+    if len(conf_parts) < 4 or conf_parts[-3] != "staging_queries":
+        raise click.UsageError("--force-overwrite is only supported for staging query backfills.")
+
+    uses_single_partition = ds is not None
+    uses_range = start_ds is not None or end_ds is not None
+    has_complete_range = start_ds is not None and end_ds is not None
+    if uses_single_partition == uses_range or (uses_range and not has_complete_range):
+        raise click.UsageError(
+            "Pass either --ds or both --start-ds and --end-ds with --force-overwrite."
+        )
+
+
 @click.command(
     name="run",
     context_settings=dict(allow_extra_args=True, ignore_unknown_options=True),
@@ -155,6 +175,12 @@ def validate_additional_jars(ctx, param, value):
 )
 @click.option("--ds", help="the end partition to backfill the data")
 @click.option("--app-name", help="app name. Default to {}".format(APP_NAME_TEMPLATE))
+@click.option(
+    "--force-overwrite",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing partitions for a staging query backfill.",
+)
 @click.option(
     "--start-ds",
     help="override the original start partition for a range backfill. "
@@ -292,6 +318,7 @@ def main(
     mode,
     ds,
     app_name,
+    force_overwrite,
     start_ds,
     end_ds,
     parallelism,
@@ -336,6 +363,7 @@ def main(
     click.echo("Running with args: {}".format(ctx.params))
 
     conf = resolve_conf(repo, conf)
+    validate_force_overwrite_args(force_overwrite, mode, ds, start_ds, end_ds, conf)
     conf_path = os.path.join(repo, conf)
     if not os.path.isfile(conf_path):
         raise ValueError(f"Conf file {conf_path} does not exist.")

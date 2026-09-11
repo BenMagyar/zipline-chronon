@@ -1,17 +1,20 @@
-"""Cloud-agnostic integration test for the full zipline run pipeline.
+"""Cloud-agnostic integration tests for the full zipline run pipeline.
 
 Exercises: compile -> import staging queries -> backfill group_bys -> backfill joins
 -> check partitions -> upload -> upload-to-kv -> metadata-upload
--> staging query -> fetch
+-> staging query -> force-overwrite -> fetch
 
 Replaces the former test_gcp_template_quickstart.py.
 """
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 from click.testing import CliRunner
+
+from ai.chronon import utils
 
 from .helpers.cli import (
     compile_configs,
@@ -23,6 +26,9 @@ from .helpers.cli import (
     submit_upload,
     submit_upload_to_kv,
 )
+
+FORCE_OVERWRITE_BEFORE = "before_force_overwrite"
+FORCE_OVERWRITE_AFTER = "after_force_overwrite"
 
 START_DS = {
     "gcp": "2023-11-01",
@@ -65,6 +71,50 @@ JOIN_KEY = {
     "aws": "compiled/joins/aws/demo.v1__1",
     "azure": "compiled/joins/azure/training_set.v1_test__0",
 }
+
+
+def _read_compiled_conf(chronon_root, conf):
+    conf_path = os.path.join(chronon_root, conf)
+    with open(conf_path) as conf_file:
+        return conf_path, json.load(conf_file)
+
+
+def _write_compiled_conf(conf_path, compiled_conf):
+    with open(conf_path, "w") as conf_file:
+        json.dump(compiled_conf, conf_file)
+
+
+def _output_table(compiled_conf):
+    metadata = compiled_conf["metaData"]
+    return f'{metadata["outputNamespace"]}.{utils.sanitize(metadata["name"])}'
+
+
+def _add_force_overwrite_marker(compiled_conf, marker):
+    query = compiled_conf["query"]
+    assert "SELECT" in query, f"Expected SELECT in staging query:\n{query}"
+    compiled_conf["query"] = query.replace(
+        "SELECT",
+        f"SELECT '{marker}' AS force_overwrite_marker,",
+        1,
+    )
+
+
+def _configure_force_overwrite_verifier(compiled_conf, output_table, start_ds, end_ds):
+    compiled_conf["engineType"] = 0  # Spark
+    compiled_conf["query"] = f"""
+SELECT
+    CAST(assert_true(
+        count(*) > 0 AND
+        count(CASE
+            WHEN force_overwrite_marker = '{FORCE_OVERWRITE_AFTER}' THEN NULL
+            ELSE 1
+        END) = 0,
+        'force overwrite did not replace the existing partition'
+    ) AS STRING) AS force_overwrite_verified,
+    max(ds) AS ds
+FROM {output_table}
+WHERE ds BETWEEN '{start_ds}' AND '{end_ds}'
+"""
 
 
 @pytest.mark.integration
@@ -148,3 +198,57 @@ def test_run_quickstart(test_id, confs, chronon_root, version, cloud):
                               keys='{"user_id":"5"}', name=fetch_name)
         assert "purchase_price_average_7d" in result.output, \
             f"Expected purchase_price_average_7d in fetch output:\n{result.output}"
+
+
+@pytest.mark.integration
+def test_run_quickstart_force_overwrite(confs, chronon_root, version, cloud):
+    """Overwrite an existing staging-query partition through ``zipline run``."""
+    runner = CliRunner()
+    compile_configs(runner, chronon_root)
+
+    ds = END_DS[cloud]
+    source_conf = confs(f"compiled/staging_queries/{cloud}/exports.checkouts__0")
+    source_path, source = _read_compiled_conf(chronon_root, source_conf)
+    output_table = _output_table(source)
+
+    # 1. Seed a single output partition with the original marker.
+    _add_force_overwrite_marker(source, FORCE_OVERWRITE_BEFORE)
+    _write_compiled_conf(source_path, source)
+    submit_run(
+        runner,
+        chronon_root,
+        source_conf,
+        version,
+        start_ds=ds,
+        end_ds=ds,
+    )
+
+    # 2. Change the input and overwrite that partition through the public CLI flag.
+    assert FORCE_OVERWRITE_BEFORE in source["query"]
+    source["query"] = source["query"].replace(
+        FORCE_OVERWRITE_BEFORE,
+        FORCE_OVERWRITE_AFTER,
+        1,
+    )
+    _write_compiled_conf(source_path, source)
+    submit_run(
+        runner,
+        chronon_root,
+        source_conf,
+        version,
+        extra_args=[f"--ds={ds}", "--force-overwrite"],
+    )
+
+    # 3. Fail a separate Spark staging query if any original rows remain.
+    verifier_conf = confs(f"compiled/staging_queries/{cloud}/exports.dim_users__0")
+    verifier_path, verifier = _read_compiled_conf(chronon_root, verifier_conf)
+    _configure_force_overwrite_verifier(verifier, output_table, ds, ds)
+    _write_compiled_conf(verifier_path, verifier)
+    submit_run(
+        runner,
+        chronon_root,
+        verifier_conf,
+        version,
+        start_ds=ds,
+        end_ds=ds,
+    )

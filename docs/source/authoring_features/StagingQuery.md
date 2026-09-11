@@ -117,6 +117,29 @@ Because of this, you often want to write your `StagingQuery` using various templ
 - `'{{ latest_date }}'`: the ds for which computation was requested. If running from the CLI, it defaults to the day before yesterday UTC. If the job gets broken up into smaller chunks due the to `step_days` argument, `latest_date` will be the same in all the runs, and will equal the `end_date` of the last chunk.
 - `'{{ max_date }}'`: the latest existing partition in the table, does not depend on input parameters to the job, but only on available partitions in the source table. It requires the source table as an argument, for example: `'{{ max_date(table=data.some_table) }}'`
 
+## Overwriting Existing Partitions
+
+Staging query backfills normally skip partitions that already exist. Use `--force-overwrite` to recompute a partition whose output is incomplete or incorrect:
+
+```bash
+zipline run compiled/staging_queries/<team>/<conf> \
+  --mode backfill \
+  --ds 2026-09-03 \
+  --force-overwrite
+```
+
+To overwrite a range, pass both boundaries explicitly:
+
+```bash
+zipline run compiled/staging_queries/<team>/<conf> \
+  --mode backfill \
+  --start-ds 2026-09-01 \
+  --end-ds 2026-09-03 \
+  --force-overwrite
+```
+
+The overwrite replaces the partitions returned by the staging query. An empty result does not delete an existing partition. If the output uses additional partition columns, only the returned subpartitions are replaced.
+
 ## `StagingQuery` in Production
 
 Once merged into production, your `StagingQuery` will get scheduled for daily run within your `{team}_staging_queries` DAG in airflow. The compute task will get an upstream `PartitionSensor` for each of your table dependencies, which will wait for that day's partition to land before kicking off the compute. See above for an example of how to set dependencies.

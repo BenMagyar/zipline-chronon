@@ -104,6 +104,31 @@ class StagingQueryTest extends SparkTestBase {
     assertEquals(0, diffWithOverrideStartPartition.count())
   }
 
+  it should "overwrite an existing partition when force overwrite is enabled" in {
+    import spark.implicits._
+
+    val viewName = "test_staging_query_force_overwrite"
+    val stagingQueryConf = Builders.StagingQuery(
+      query = s"select * from $viewName WHERE ds BETWEEN {{ start_date }} AND {{ end_date }}",
+      startPartition = today,
+      metaData = Builders.MetaData(name = "test.staging_force_overwrite", namespace = namespace)
+    )
+    val outputTable = stagingQueryConf.metaData.outputTable
+    spark.sql(s"DROP TABLE IF EXISTS $outputTable")
+
+    Seq(("before", today)).toDF("value", "ds").createOrReplaceTempView(viewName)
+    val stagingQuery = new StagingQuery(stagingQueryConf, today, tableUtils)
+    stagingQuery.computeStagingQuery(overrideStartPartition = Some(today))
+    assertEquals(Seq("before"), tableUtils.sql(s"SELECT value FROM $outputTable").as[String].collect().toSeq)
+
+    Seq(("after", today)).toDF("value", "ds").createOrReplaceTempView(viewName)
+    stagingQuery.computeStagingQuery(overrideStartPartition = Some(today))
+    assertEquals(Seq("before"), tableUtils.sql(s"SELECT value FROM $outputTable").as[String].collect().toSeq)
+
+    stagingQuery.computeStagingQuery(overrideStartPartition = Some(today), forceOverwrite = true)
+    assertEquals(Seq("after"), tableUtils.sql(s"SELECT value FROM $outputTable").as[String].collect().toSeq)
+  }
+
   /** Test Staging Query update with new feature/column added to the query.
     */
   it should "staging query auto expand" in {

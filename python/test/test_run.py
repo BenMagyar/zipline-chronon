@@ -23,6 +23,7 @@ import time
 
 import click
 import pytest
+from click.testing import CliRunner
 
 from ai.chronon.repo import default_runner, run, utils
 from ai.chronon.repo.constants import RunMode
@@ -336,6 +337,131 @@ def test_split_date_range():
 
     result = utils.split_date_range(start_date, end_date, parallelism)
     assert result == expected_result
+
+
+def _runner_args(repo, conf, **overrides):
+    ctx = context()
+    ctx.params.update(
+        {
+            "repo": repo,
+            "conf": conf,
+            "mode": RunMode.BACKFILL,
+            "ds": "2026-09-03",
+            "args": "",
+            "warehouse_bucket": "test-warehouse",
+        }
+    )
+    ctx.params.update(overrides)
+    return ctx.params
+
+
+def test_force_overwrite_is_exposed_in_run_help():
+    result = CliRunner().invoke(run.main, ["--help"])
+
+    assert result.exit_code == 0
+    assert "--force-overwrite" in result.output
+
+
+def test_force_overwrite_defaults_to_the_requested_partition(repo):
+    args = _runner_args(
+        repo,
+        "compiled/staging_queries/sample_team/sample_staging_query.v1__0",
+        force_overwrite=True,
+    )
+
+    runner = default_runner.Runner(args, "some.jar")
+    final_args = runner._gen_final_args(runner.start_ds)
+
+    assert runner.start_ds == "2026-09-03"
+    assert "--start-partition=2026-09-03" in final_args
+    assert "--force-overwrite" in final_args
+
+
+def test_force_overwrite_preserves_an_explicit_range(repo):
+    args = _runner_args(
+        repo,
+        "compiled/staging_queries/sample_team/sample_staging_query.v1__0",
+        ds=None,
+        start_ds="2026-09-01",
+        end_ds="2026-09-03",
+        force_overwrite=True,
+    )
+
+    runner = default_runner.Runner(args, "some.jar")
+    final_args = runner._gen_final_args(runner.start_ds)
+
+    assert runner.start_ds == "2026-09-01"
+    assert runner.ds == "2026-09-03"
+    assert "--start-partition=2026-09-01" in final_args
+    assert "--force-overwrite" in final_args
+
+
+def test_force_overwrite_rejects_non_staging_query_confs(repo, test_conf_location):
+    args = _runner_args(repo, test_conf_location, force_overwrite=True)
+
+    with pytest.raises(ValueError, match="only supported for staging query backfills"):
+        default_runner.Runner(args, "some.jar")
+
+
+def test_force_overwrite_cli_rejects_non_staging_query_confs(repo, test_conf_location):
+    result = CliRunner().invoke(
+        run.main,
+        [
+            test_conf_location,
+            "--chronon-root",
+            repo,
+            "--mode",
+            "backfill",
+            "--ds",
+            "2026-09-03",
+            "--force-overwrite",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "only supported for staging query backfills" in result.output
+
+
+def test_force_overwrite_rejects_non_backfill_modes():
+    result = CliRunner().invoke(
+        run.main,
+        [
+            "compiled/staging_queries/sample_team/sample_staging_query.v1__0",
+            "--mode",
+            "upload",
+            "--ds",
+            "2026-09-03",
+            "--force-overwrite",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "only supported for staging query backfills" in result.output
+
+
+@pytest.mark.parametrize(
+    "date_args",
+    [
+        [],
+        ["--start-ds", "2026-09-03"],
+        ["--end-ds", "2026-09-03"],
+        ["--ds", "2026-09-03", "--start-ds", "2026-09-03", "--end-ds", "2026-09-03"],
+    ],
+)
+def test_force_overwrite_rejects_ambiguous_date_arguments(date_args):
+    result = CliRunner().invoke(
+        run.main,
+        [
+            "compiled/staging_queries/sample_team/sample_staging_query.v1__0",
+            "--mode",
+            "backfill",
+            "--force-overwrite",
+            *date_args,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Pass either --ds or both --start-ds and --end-ds" in result.output
 
 
 @pytest.mark.parametrize(

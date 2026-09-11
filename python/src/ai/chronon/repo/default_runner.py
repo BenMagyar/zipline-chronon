@@ -54,6 +54,7 @@ class Runner:
         self.validate_rows = args.get("validate_rows")
         self.enable_debug = args.get("debug")
         self.uploader = args.get("uploader")
+        self.force_overwrite = bool(args.get("force_overwrite"))
 
         valid_jar = args["online_jar"] and os.path.exists(args["online_jar"])
 
@@ -88,8 +89,15 @@ class Runner:
                 )
             )
 
+        if self.force_overwrite and (
+            self.conf_type != "staging_queries" or self.mode != RunMode.BACKFILL
+        ):
+            raise ValueError("--force-overwrite is only supported for staging query backfills")
+
         self.ds = args["end_ds"] if "end_ds" in args and args["end_ds"] else args["ds"]
         self.start_ds = args["start_ds"] if "start_ds" in args and args["start_ds"] else None
+        if self.force_overwrite and self.start_ds is None:
+            self.start_ds = self.ds
         self.parallelism = (
             int(args["parallelism"]) if "parallelism" in args and args["parallelism"] else 1
         )
@@ -247,6 +255,9 @@ class Runner:
 
         if self.additional_jars:
             submitter_args.append(f"--additional-jars={self.additional_jars}")
+
+        if self.force_overwrite:
+            submitter_args.append("--force-overwrite")
 
         if self.mode != RunMode.FETCH:
             submitter_args.append(" --local-conf-path={conf}".format(conf=self.local_abs_conf_path))
