@@ -207,7 +207,7 @@ def test_run_quickstart_force_overwrite(confs, chronon_root, version, cloud):
     compile_configs(runner, chronon_root)
 
     ds = END_DS[cloud]
-    source_conf = confs(f"compiled/staging_queries/{cloud}/exports.checkouts__0")
+    source_conf = confs(STAGING_QUERY_IMPORT_KEYS[cloud][0])
     source_path, source = _read_compiled_conf(chronon_root, source_conf)
     output_table = _output_table(source)
 
