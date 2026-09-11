@@ -22,6 +22,7 @@ import ai.chronon.api.Constants.{KvTablePrefixArg, MetadataDataset}
 import ai.chronon.api.Extensions.{GroupByOps, JoinPartOps, MetadataOps, SourceOps}
 import ai.chronon.api.planner.RelevantLeftForJoinPart
 import ai.chronon.api.thrift.TBase
+import ai.chronon.online.KVStore.BulkPutRequest
 import ai.chronon.online.{Api, MetadataDirWalker, MetadataEndPoint, TopicChecker}
 import ai.chronon.online.fetcher.{ConfPathOrName, FetchContext, FetcherMain, MetadataStore}
 import ai.chronon.planner.{JoinMergeNode, JoinPartNode, SourceWithFilterNode}
@@ -678,7 +679,10 @@ object Driver {
                     default = Some("bigquery"),
                     descr = "uploader to use when load data to kv store, default is bigquery")
 
-      // Override to add warehouse type to props
+      val timestamp: ScallopOption[Long] =
+        opt[Long](required = false,
+                  descr = "publication timestamp in epoch milliseconds to assign to every uploaded KV value")
+
       override def serializableProps: Map[String, String] =
         super.serializableProps + ("UPLOADER" -> uploader().toLowerCase)
     }
@@ -687,6 +691,7 @@ object Driver {
       val groupByConf = parseConf[api.GroupBy](args.confPath())
       val offlineTable = groupByConf.metaData.uploadTable
       val groupByName = groupByConf.metaData.name
+      val partitionSpec = groupByConf.metaData.partitionSpec(PartitionSpec.daily)
       val startTime = System.currentTimeMillis()
       val uploader = args.uploader()
 
@@ -695,10 +700,12 @@ object Driver {
           s"from table: ${offlineTable} using ${uploader}")
 
       val kvStore = args.api.genKvStore
+      val bulkPutRequest =
+        buildBulkPutRequest(offlineTable, groupByName, args.partitionString(), args.timestamp.toOption, partitionSpec)
 
       try {
         // The kvStore implementation will handle different warehouse types based on the configuration
-        kvStore.bulkPut(offlineTable, groupByName, args.partitionString())
+        kvStore.bulkPut(bulkPutRequest)
       } catch {
         case e: Exception =>
           logger.error(s"Failed to upload GroupBy: ${groupByName} for partition: ${args.partitionString()} " +
@@ -711,6 +718,16 @@ object Driver {
         s"Uploaded GroupByUpload data to KV store for GroupBy: ${groupByName}; partition: " +
           s"${args.partitionString()} in ${(System.currentTimeMillis() - startTime) / 1000} seconds")
     }
+
+    private[spark] def buildBulkPutRequest(sourceOfflineTable: String,
+                                           destinationOnlineDataSet: String,
+                                           partition: String,
+                                           timestamp: Option[Long],
+                                           partitionSpec: PartitionSpec = PartitionSpec.daily): BulkPutRequest =
+      BulkPutRequest(sourceOfflineTable,
+                     destinationOnlineDataSet,
+                     partition,
+                     timestamp.getOrElse(partitionSpec.partitionEndMillis(partition)))
   }
 
   object LogFlattener {

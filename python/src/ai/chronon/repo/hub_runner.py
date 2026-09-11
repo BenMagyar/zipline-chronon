@@ -12,6 +12,7 @@ import click
 import requests
 
 from ai.chronon import windows as window_utils
+from ai.chronon.cli import datetime_utils
 from ai.chronon.cli import options as cli_options
 from ai.chronon.cli.formatter import (
     Format,
@@ -86,74 +87,7 @@ def _validate_at_most_daily_schedule(schedule_expression: str) -> Optional[str]:
     return _validate_supported_schedule(schedule_expression)
 
 
-_PARTITION_DS_FORMATS = (
-    ("%Y-%m-%d", "%Y-%m-%d"),
-    ("%Y/%m/%d", "%Y-%m-%d"),
-    ("%Y-%m-%d-%H", "%Y-%m-%d-%H-00"),
-    ("%Y-%m-%d-%H-%M", "%Y-%m-%d-%H-%M"),
-    ("%Y-%m-%d-%H:%M", "%Y-%m-%d-%H-%M"),
-    ("%Y-%m-%d %H", "%Y-%m-%d-%H-00"),
-    ("%Y-%m-%d %H:%M", "%Y-%m-%d-%H-%M"),
-    ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d-%H-%M"),
-    ("%Y/%m/%d %H", "%Y-%m-%d-%H-00"),
-    ("%Y/%m/%d %H:%M", "%Y-%m-%d-%H-%M"),
-    ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d-%H-%M"),
-    ("%Y-%m-%dT%H", "%Y-%m-%d-%H-00"),
-    ("%Y-%m-%dT%H:%M", "%Y-%m-%d-%H-%M"),
-    ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d-%H-%M"),
-)
-_PARTITION_DS_FORMAT_HELP = "YYYY-MM-DD, YYYY-MM-DD-HH, YYYY-MM-DD-HH-mm, ISO, or space-separated datetime"
 _EPOCH = datetime.datetime(1970, 1, 1)
-
-
-def _validate_partition_ds_precision(parsed, value):
-    if parsed.second != 0 or parsed.microsecond != 0:
-        raise ValueError(f"'{value}' must be aligned to minute precision")
-
-
-def _parse_partition_ds(value):
-    if isinstance(value, datetime.datetime):
-        _validate_partition_ds_precision(value, value)
-        return value
-    if isinstance(value, date):
-        return datetime.datetime.combine(value, datetime.time.min)
-
-    raw = str(value).strip()
-    for date_format, _ in _PARTITION_DS_FORMATS:
-        try:
-            parsed = datetime.datetime.strptime(raw, date_format)
-        except ValueError:
-            continue
-        _validate_partition_ds_precision(parsed, value)
-        return parsed
-    raise ValueError(f"'{value}' does not match any supported date format: {_PARTITION_DS_FORMAT_HELP}")
-
-
-def _format_partition_ds(value):
-    raw = str(value).strip()
-    for date_format, output_format in _PARTITION_DS_FORMATS:
-        try:
-            parsed = datetime.datetime.strptime(raw, date_format)
-        except ValueError:
-            continue
-        _validate_partition_ds_precision(parsed, value)
-        return parsed.strftime(output_format)
-    if isinstance(value, (datetime.datetime, date)):
-        parsed = _parse_partition_ds(value)
-        return parsed.strftime("%Y-%m-%d-%H-%M" if parsed.time() != datetime.time.min else "%Y-%m-%d")
-    raise ValueError(f"'{value}' does not match any supported date format: {_PARTITION_DS_FORMAT_HELP}")
-
-
-def _is_day_partition_value(value):
-    if isinstance(value, datetime.datetime):
-        return value.time() == datetime.time.min
-    if isinstance(value, date):
-        return True
-    raw = str(value).strip()
-    try:
-        return datetime.datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d") == raw
-    except ValueError:
-        return False
 
 
 def _window_json_to_millis(window, default=0):
@@ -174,15 +108,15 @@ def _snap_date_to_grid(value, interval_millis, offset_millis):
         value is None
         or interval_millis is None
         or (interval_millis == window_utils.DAY_MILLIS and offset_millis == 0)
-        or not _is_day_partition_value(value)
+        or not datetime_utils.is_day_partition_value(value)
     ):
         return value
-    millis = int((_parse_partition_ds(value) - _EPOCH).total_seconds() * 1000)
+    millis = int((datetime_utils.parse_partition_ds(value) - _EPOCH).total_seconds() * 1000)
     snapped = (
         ((millis - offset_millis) // interval_millis) * interval_millis
         + offset_millis
     )
-    return _format_partition_ds(_EPOCH + datetime.timedelta(milliseconds=snapped))
+    return datetime_utils.format_partition_ds(_EPOCH + datetime.timedelta(milliseconds=snapped))
 
 
 def _normalize_submission_partitions(repo, conf, start_ds, end_ds):
@@ -205,7 +139,7 @@ class PartitionDsParamType(click.ParamType):
 
     def convert(self, value, param, ctx):
         try:
-            return _format_partition_ds(value)
+            return datetime_utils.format_partition_ds(value)
         except ValueError as e:
             self.fail(str(e), param, ctx)
 
@@ -346,7 +280,7 @@ def ds_option(func):
         "--date",
         "--ds",
         "ds",
-        help=f"End date for the backfill (format: {_PARTITION_DS_FORMAT_HELP}).",
+        help=f"End date for the backfill (format: {datetime_utils.PARTITION_DS_FORMAT_HELP}).",
         type=PARTITION_DS,
     )(func)
 
@@ -357,7 +291,7 @@ def start_ds_option(func):
         "--start-ds",
         "start_ds",
         type=PARTITION_DS,
-        help=f"Start date override for a range backfill (format: {_PARTITION_DS_FORMAT_HELP}). "
+        help=f"Start date override for a range backfill (format: {datetime_utils.PARTITION_DS_FORMAT_HELP}). "
         "Supports staging query, group by, and join jobs. "
         "May leave holes in the output table due to the overridden date range.",
     )(func)
@@ -371,8 +305,8 @@ def validate_end_ds_after_start_ds(start_ds, end_ds):
     """
     if start_ds is None or end_ds is None:
         return
-    start_value = _parse_partition_ds(start_ds)
-    end_value = _parse_partition_ds(end_ds)
+    start_value = datetime_utils.parse_partition_ds(start_ds)
+    end_value = datetime_utils.parse_partition_ds(end_ds)
     if end_value < start_value:
         raise click.BadParameter(
             f"End date {end_ds} is before start date {start_ds}. "
@@ -391,7 +325,7 @@ def confirm_end_ds_not_future(end_ds, assume_yes: bool = False):
     """
     if end_ds is None or assume_yes:
         return
-    end_date_value = _parse_partition_ds(end_ds).date()
+    end_date_value = datetime_utils.parse_partition_ds(end_ds).date()
     today = date.today()
     if end_date_value >= today:
         click.confirm(
@@ -413,7 +347,7 @@ def end_ds_option(func):
         "--end-date",
         "--end-ds",
         "end_ds",
-        help=f"End date for a range backfill (format: {_PARTITION_DS_FORMAT_HELP}).",
+        help=f"End date for a range backfill (format: {datetime_utils.PARTITION_DS_FORMAT_HELP}).",
         type=PARTITION_DS,
         default=str(date.today() - timedelta(days=2)),
         show_default=True,

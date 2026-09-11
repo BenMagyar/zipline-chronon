@@ -6,23 +6,10 @@ from typing import Optional
 import click
 import requests
 
+from ai.chronon.cli.datetime_utils import format_hub_partition as _format_hub_partition
 from ai.chronon.cli.formatter import Format
 from ai.chronon.cli.theme import print_error, print_info, print_warning
 from ai.chronon.repo import utils
-
-
-def _format_hub_partition(value, default_value):
-    if value is None:
-        return default_value
-    if isinstance(value, datetime):
-        if value.second != 0 or value.microsecond != 0:
-            raise ValueError(f"Hub partition {value} must be aligned to minute precision")
-        if value.time() == datetime.min.time():
-            return value.strftime("%Y-%m-%d")
-        return value.strftime("%Y-%m-%d-%H-%M")
-    if isinstance(value, date):
-        return value.strftime("%Y-%m-%d")
-    return str(value)
 
 
 class ZiplineHub:

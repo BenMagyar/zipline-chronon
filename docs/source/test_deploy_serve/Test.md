@@ -137,6 +137,27 @@ and then to actually upload to your KV store:
 zipline run compiled/group_bys/your_group_by.v1 --mode upload-to-kv --ds 2023-12-01
 ```
 
+Every batch upload receives a publication timestamp. Uploads without `--timestamp` use the selected
+partition's end, so a delayed scheduled upload of an older partition cannot replace a newer
+partition's cells. Bigtable assigns that version to every uploaded cell, including
+`group_by_serving_info`, so the latest publication is fetched. To promote an older partition
+intentionally, provide a UTC publication date or time that is newer than the active publication:
+
+```bash
+zipline run compiled/group_bys/your_group_by.v1 \
+  --mode upload-to-kv \
+  --ds 2023-12-01 \
+  --timestamp 2023-12-02-00-01
+```
+
+The CLI accepts `YYYY-MM-DD`, `YYYY-MM-DD-HH`, and `YYYY-MM-DD-HH-mm`, plus the slash,
+space-separated, and ISO-style forms accepted by the Hub backfill CLI. Dates and times resolve in
+UTC and must be aligned to minute precision. Epoch milliseconds remain available for finer
+precision. The timestamp must be at least as new as the currently active Bigtable cells to replace
+their shared key set, or newer to create a new active version. It does not change the selected
+partition's logical batch boundary in `GroupByServingInfo`, so streaming data is still merged from
+that boundary.
+
 The next step is to move the data from these tables into your KV store. For this, you need to use your internal implementation of KV store integration. This should already be what your Airflow jobs are configured to run, so you can always rely on that, or if your Chronon team has provided you with a manual upload command to run you can use that.
 
 ### Deploy Flink streaming job

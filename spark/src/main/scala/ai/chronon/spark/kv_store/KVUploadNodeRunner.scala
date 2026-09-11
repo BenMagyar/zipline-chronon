@@ -5,6 +5,7 @@ import ai.chronon.api.Extensions.{JoinOps, MetadataOps, TableInfoOps}
 import ai.chronon.api._
 import ai.chronon.api.planner.NodeRunner
 import ai.chronon.api.secrets.SecretResolver
+import ai.chronon.online.KVStore.BulkPutRequest
 import ai.chronon.online.Api
 import ai.chronon.online.fetcher.{FetchContext, MetadataStore}
 import ai.chronon.planner.{Node, NodeContent}
@@ -93,16 +94,17 @@ class KVUploadNodeRunner(api: Api) extends NodeRunner {
     val offlineTable = groupBy.metaData.uploadTable
     val groupByName = groupBy.metaData.name
 
-    val partitionString = range.map(_.end).getOrElse {
+    val partitionRange = range.getOrElse {
       throw new IllegalArgumentException("PartitionRange is required for KV upload")
     }
+    val partitionString = partitionRange.end
 
     val startTime = System.currentTimeMillis()
     logger.info(s"Starting KV upload for GroupBy: $groupByName, partition: $partitionString, table: $offlineTable")
 
     try {
       val kvStore = api.genKvStore
-      kvStore.bulkPut(offlineTable, groupByName, partitionString)
+      kvStore.bulkPut(BulkPutRequest(offlineTable, groupByName, partitionString, partitionRange.endMillis))
 
       val duration = (System.currentTimeMillis() - startTime) / 1000
       logger.info(

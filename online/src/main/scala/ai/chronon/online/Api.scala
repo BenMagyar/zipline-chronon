@@ -36,6 +36,15 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
 object KVStore {
+  // 9999-12-31T23:59:59.999Z, the maximum value accepted by BigQuery TIMESTAMP_MILLIS.
+  val MaxPublicationTimestampMillis: Long = 253402300799999L
+
+  def validatePublicationTimestampMillis(timestamp: Long): Unit =
+    require(
+      timestamp >= 0 && timestamp <= MaxPublicationTimestampMillis,
+      s"publicationTimestampMillis must be between 0 and $MaxPublicationTimestampMillis epoch milliseconds"
+    )
+
   // a scan request essentially for the keyBytes
   // startTsMillis - is used to limit the scan to more recent data
   // endTsMillis - end range of the scan (starts from afterTsMillis to endTsMillis)
@@ -51,6 +60,16 @@ object KVStore {
     }
   }
   case class PutRequest(keyBytes: Array[Byte], valueBytes: Array[Byte], dataset: String, tsMillis: Option[Long] = None)
+
+  /** Describes one batch dataset publication. `publicationTimestampMillis` identifies the upload version; it is
+    * independent of the logical batch boundary stored in GroupByServingInfo.
+    */
+  case class BulkPutRequest(sourceOfflineTable: String,
+                            destinationOnlineDataSet: String,
+                            partition: String,
+                            publicationTimestampMillis: Long) {
+    validatePublicationTimestampMillis(publicationTimestampMillis)
+  }
 
   case class ListValue(keyBytes: Array[Byte], valueBytes: Array[Byte])
   case class ListRequest(dataset: String, props: Map[String, Any])
@@ -83,6 +102,13 @@ trait KVStore {
   def multiPut(keyValueDatasets: Seq[PutRequest]): Future[Seq[Boolean]]
 
   def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit
+
+  /** Publishes a batch dataset with a caller-resolved version. Version-aware stores can use the publication timestamp
+    * to select the active upload. The compatibility implementation delegates to the legacy API for stores whose native
+    * publication mechanism does not use per-value versions.
+    */
+  def bulkPut(request: BulkPutRequest): Unit =
+    bulkPut(request.sourceOfflineTable, request.destinationOnlineDataSet, request.partition)
 
   def cleanupTables(request: CleanupRequest): Int = 0
 

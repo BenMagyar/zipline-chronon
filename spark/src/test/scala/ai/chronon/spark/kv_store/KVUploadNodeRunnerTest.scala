@@ -74,24 +74,16 @@ class KVUploadNodeRunnerTest
     val metadata = new MetaData()
     val range = Some(new PartitionRange("2023-01-01", "2023-01-01")(PartitionSpec.daily))
 
-    // Execute
     runner.run(metadata, nodeContent, range)
 
-    // Verify
-    val uploadTableCaptor = ArgumentCaptor.forClass(classOf[String])
-    val groupByNameCaptor = ArgumentCaptor.forClass(classOf[String])
-    val partitionCaptor = ArgumentCaptor.forClass(classOf[String])
+    val requestCaptor = ArgumentCaptor.forClass(classOf[KVStore.BulkPutRequest])
+    verify(kvStore).bulkPut(requestCaptor.capture())
+    val request = requestCaptor.getValue
 
-    verify(kvStore).bulkPut(
-      uploadTableCaptor.capture(),
-      groupByNameCaptor.capture(),
-      partitionCaptor.capture()
-    )
-
-    // The upload table should be derived as: outputNamespace.name_upload
-    uploadTableCaptor.getValue shouldEqual "test_namespace.test_groupby__upload"
-    groupByNameCaptor.getValue shouldEqual "test_groupby"
-    partitionCaptor.getValue shouldEqual "2023-01-01"
+    request.sourceOfflineTable shouldEqual "test_namespace.test_groupby__upload"
+    request.destinationOnlineDataSet shouldEqual "test_groupby"
+    request.partition shouldEqual "2023-01-01"
+    request.publicationTimestampMillis shouldEqual range.get.endMillis
   }
 
   it should "encode the resolved output partition spec into API props" in {
@@ -221,7 +213,7 @@ class KVUploadNodeRunnerTest
 
     // Mock kvStore to throw exception
     val testException = new RuntimeException("KVStore error")
-    when(kvStore.bulkPut(any[String], any[String], any[String])).thenThrow(testException)
+    when(kvStore.bulkPut(any[KVStore.BulkPutRequest])).thenThrow(testException)
 
     // Execute and verify exception is propagated
     val exception = intercept[RuntimeException] {

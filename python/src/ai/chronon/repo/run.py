@@ -22,6 +22,10 @@ from datetime import datetime
 
 import click
 
+from ai.chronon.cli.datetime_utils import (
+    PARTITION_DS_FORMAT_HELP,
+    partition_ds_to_epoch_millis,
+)
 from ai.chronon.cli.options import (
     CHRONON_REPO_PATH_ENVVAR,
     CHRONON_ROOT_ENVVAR,
@@ -119,7 +123,6 @@ ADDITIONAL_JARS_ALLOWED_SCHEMES = (
     "local:",
 )
 
-
 def validate_additional_jars(ctx, param, value):
     if not value:
         return value
@@ -131,6 +134,31 @@ def validate_additional_jars(ctx, param, value):
                 f"{list(ADDITIONAL_JARS_ALLOWED_SCHEMES)}: {jar}"
             )
     return ",".join(jars)
+
+
+def validate_upload_timestamp(mode, timestamp):
+    if timestamp is not None and mode != RunMode.UPLOAD_TO_KV:
+        raise click.UsageError("--timestamp is only supported with --mode=upload-to-kv")
+
+
+def parse_upload_timestamp(ctx, param, value):
+    if value is None:
+        return None
+
+    try:
+        timestamp = int(value)
+    except ValueError:
+        try:
+            timestamp = partition_ds_to_epoch_millis(value)
+        except (OverflowError, OSError, ValueError) as error:
+            raise click.BadParameter(
+                "must be epoch milliseconds or a supported date "
+                f"({PARTITION_DS_FORMAT_HELP}); {error}",
+                ctx=ctx,
+                param=param,
+            ) from None
+
+    return timestamp
 
 
 def validate_force_overwrite_args(force_overwrite, mode, ds, start_ds, end_ds, conf):
@@ -310,6 +338,15 @@ def validate_force_overwrite_args(force_overwrite, mode, ds, start_ds, end_ds, c
     type=click.Choice(["spark", "bigquery"], case_sensitive=False),
     help="Bulk put uploader to use when load data to kv store, applied to upload-to-kv mode",
 )
+@click.option(
+    "--timestamp",
+    callback=parse_upload_timestamp,
+    metavar="PARTITION_DATE|EPOCH_MILLIS",
+    help=(
+        "Publication date/time (UTC) or epoch milliseconds to assign to every uploaded KV value. "
+        f"Date formats: {PARTITION_DS_FORMAT_HELP}."
+    ),
+)
 @click.pass_context
 def main(
     ctx,
@@ -354,6 +391,7 @@ def main(
     flink_deployment_mode,
     debug,
     uploader,
+    timestamp,
 ):
     """Run a Zipline pipeline.
 
@@ -367,6 +405,8 @@ def main(
     conf_path = os.path.join(repo, conf)
     if not os.path.isfile(conf_path):
         raise ValueError(f"Conf file {conf_path} does not exist.")
+
+    validate_upload_timestamp(mode, timestamp)
 
     set_runtime_env_v3(ctx.params, conf)
     set_defaults(ctx)

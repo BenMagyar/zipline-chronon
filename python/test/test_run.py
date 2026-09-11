@@ -258,6 +258,92 @@ def test_render_info(repo, test_conf_location, monkeypatch):
     assert run.RENDER_INFO_DEFAULT_SCRIPT in actual_cmd
 
 
+def test_upload_to_kv_forwards_timestamp(repo, test_online_group_by):
+    ctx = context()
+    run.set_defaults(ctx)
+    ctx.params.update(
+        {
+            "mode": RunMode.UPLOAD_TO_KV,
+            "conf": test_online_group_by,
+            "repo": repo,
+            "online_jar": "online.jar",
+            "online_class": "example.OnlineApi",
+            "warehouse_bucket": "test-warehouse",
+            "args": "",
+            "timestamp": 1788541200000,
+        }
+    )
+
+    runner = default_runner.Runner(ctx.params, "chronon.jar")
+
+    assert "--timestamp=1788541200000" in runner._gen_final_args()
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("2026-09-04", 1788480000000),
+        ("2026/09/04", 1788480000000),
+        ("2026-09-04-01", 1788483600000),
+        ("2026-09-04-01-30", 1788485400000),
+        ("2026-09-04T01:30", 1788485400000),
+        ("2026-09-04 01:30:00", 1788485400000),
+        ("1788541200000", 1788541200000),
+        ("-1", -1),
+        ("253402300800000", 253402300800000),
+    ],
+)
+def test_parse_upload_timestamp_accepts_date_or_epoch_millis(value, expected):
+    assert run.parse_upload_timestamp(None, None, value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-09-04T12:00:00Z",
+    ],
+)
+def test_parse_upload_timestamp_rejects_invalid_values(value):
+    with pytest.raises(click.BadParameter, match="epoch milliseconds or a supported date"):
+        run.parse_upload_timestamp(None, None, value)
+
+
+def test_parse_upload_timestamp_rejects_sub_minute_precision():
+    with pytest.raises(click.BadParameter, match="minute precision"):
+        run.parse_upload_timestamp(None, None, "2026-09-04T00:00:01")
+
+
+def test_upload_to_kv_omits_timestamp_by_default(repo, test_online_group_by):
+    ctx = context()
+    run.set_defaults(ctx)
+    ctx.params.update(
+        {
+            "mode": RunMode.UPLOAD_TO_KV,
+            "conf": test_online_group_by,
+            "repo": repo,
+            "online_jar": "online.jar",
+            "online_class": "example.OnlineApi",
+            "warehouse_bucket": "test-warehouse",
+            "args": "",
+        }
+    )
+
+    runner = default_runner.Runner(ctx.params, "chronon.jar")
+
+    assert "--timestamp=" not in runner._gen_final_args()
+
+
+@pytest.mark.parametrize("timestamp", [None, 1788541200000])
+def test_validate_upload_timestamp_accepts_upload_to_kv(timestamp):
+    run.validate_upload_timestamp(RunMode.UPLOAD_TO_KV, timestamp)
+
+
+def test_validate_upload_timestamp_rejects_other_modes():
+    with pytest.raises(click.UsageError, match="only supported with --mode=upload-to-kv"):
+        run.validate_upload_timestamp(RunMode.UPLOAD, 1788541200000)
+
+
 def test_streaming_client(repo, test_online_group_by, monkeypatch):
     """Test mode compiles properly and uses the same app name by default, killing if necessary."""
     calls = []

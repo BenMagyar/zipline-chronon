@@ -1,7 +1,8 @@
 package ai.chronon.integrations.cloud_gcp
 
 import ai.chronon.api.Constants.{ContinuationKey, GroupByFolder, JoinFolder, ListEntityType, ListLimit}
-import ai.chronon.api.TilingUtils
+import ai.chronon.api.{PartitionSpec, TilingUtils}
+import ai.chronon.online.KVStore
 import ai.chronon.online.KVStore.GetRequest
 import ai.chronon.online.KVStore.GetResponse
 import ai.chronon.online.KVStore.ListRequest
@@ -15,7 +16,7 @@ import com.google.cloud.bigtable.data.v2.BigtableDataClient
 import com.google.cloud.bigtable.data.v2.BigtableDataSettings
 import com.google.cloud.bigtable.data.v2.models.{Query, Row, RowMutation}
 import com.google.cloud.bigtable.emulator.v2.Emulator
-import com.google.cloud.bigquery.{BigQuery, JobInfo}
+import com.google.cloud.bigquery.{BigQuery, JobInfo, QueryJobConfiguration}
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{when, withSettings}
@@ -785,13 +786,25 @@ class BigTableKVStoreTest extends AnyFlatSpec with BeforeAndAfter {
   // Captures the JobInfo submitted by bulkPut so callers can assert on its location.
   // We short-circuit the BQ flow by throwing from create(); the JobInfo is captured before
   // the throw, and bulkPut swallows the exception via its metrics path.
-  private def captureBulkPutJobInfo(conf: Map[String, String]): JobInfo = {
+  private def captureBulkPutJobInfo(conf: Map[String, String], timestamp: Option[Long] = None): JobInfo = {
     val bigQueryClient = mock[BigQuery]
     when(bigQueryClient.create(any[JobInfo])).thenThrow(new RuntimeException("short-circuit"))
 
     val kvStore =
       new BigTableKVStoreImpl(dataClient, adminClient, maybeBigQueryClient = Some(bigQueryClient), conf = conf)
-    try kvStore.bulkPut("project.dataset.source_tbl", "test_dataset", "2026-06-11")
+    try {
+      timestamp match {
+        case Some(publicationTimestampMillis) =>
+          kvStore.bulkPut(
+            KVStore.BulkPutRequest(
+              "project.dataset.source_tbl",
+              "test_dataset",
+              "2026-06-11",
+              publicationTimestampMillis
+            ))
+        case None => kvStore.bulkPut("project.dataset.source_tbl", "test_dataset", "2026-06-11")
+      }
+    }
     catch { case _: RuntimeException => () }
 
     val captor = ArgumentCaptor.forClass(classOf[JobInfo])
@@ -818,6 +831,23 @@ class BigTableKVStoreTest extends AnyFlatSpec with BeforeAndAfter {
   it should "default bulkPut export job location to null when GCP_LOCATION is absent" in {
     val jobInfo = captureBulkPutJobInfo(Map.empty)
     jobInfo.getJobId.getLocation shouldBe null
+  }
+
+  it should "use an explicit bulkPut timestamp to promote an older partition" in {
+    val timestamp = 1788541200000L
+    val jobInfo = captureBulkPutJobInfo(Map.empty, Some(timestamp))
+    val query = jobInfo.getConfiguration[QueryJobConfiguration].getQuery
+
+    query.contains(s"TIMESTAMP_MILLIS($timestamp) as _CHANGE_TIMESTAMP") shouldBe true
+    query.contains("WHERE ds = '2026-06-11'") shouldBe true
+  }
+
+  it should "use the daily partition end as the bulkPut timestamp by default" in {
+    val jobInfo = captureBulkPutJobInfo(Map.empty)
+    val query = jobInfo.getConfiguration[QueryJobConfiguration].getQuery
+    val timestamp = "TIMESTAMP_MILLIS\\((\\d+)\\)".r.findFirstMatchIn(query).get.group(1).toLong
+
+    timestamp shouldBe PartitionSpec.daily.partitionEndMillis("2026-06-11")
   }
 
   // Mutates the JVM's view of System.getenv() for the duration of `body`, then restores the

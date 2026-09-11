@@ -1,10 +1,10 @@
 package ai.chronon.integrations.cloud_gcp
 
 import ai.chronon.api.Constants.{ContinuationKey, ListEntityType, ListLimit, MetadataDataset}
-import ai.chronon.api.Extensions.{GroupByOps, StringOps, WindowOps, WindowUtils}
+import ai.chronon.api.Extensions.{GroupByOps, StringOps}
 import ai.chronon.api.{GroupBy, MetaData, PartitionSpec, TilingUtils}
 import ai.chronon.online.KVStore
-import ai.chronon.online.KVStore.{GetRequest, ListRequest, ListResponse, ListValue}
+import ai.chronon.online.KVStore.{BulkPutRequest, GetRequest, ListRequest, ListResponse, ListValue}
 import ai.chronon.online.metrics.Metrics
 import com.google.api.core.ApiFuture
 import com.google.cloud.RetryOption
@@ -438,11 +438,19 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
   }
 
   override def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit = {
+    bulkPut(
+      BulkPutRequest(sourceOfflineTable,
+                     destinationOnlineDataSet,
+                     partition,
+                     PartitionSpec.daily.partitionEndMillis(partition)))
+  }
+
+  override def bulkPut(request: BulkPutRequest): Unit = {
     val uploader = conf.getOrElse("UPLOADER", "bigquery")
 
     uploader match {
-      case "spark"    => bulkPutFromSpark(sourceOfflineTable, destinationOnlineDataSet, partition)
-      case "bigquery" => bulkPutFromBigQuery(sourceOfflineTable, destinationOnlineDataSet, partition)
+      case "spark"    => bulkPutFromSpark(request)
+      case "bigquery" => bulkPutFromBigQuery(request)
       case other =>
         logger.error(s"Unsupported uploader: $other")
         metricsContext.increment("bulkPut.failures", Map("exception" -> "unsupported_uploader"))
@@ -450,29 +458,18 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
     }
   }
 
-  private def bulkPutFromSpark(sourceOfflineTable: String,
-                               destinationOnlineDataSet: String,
-                               partition: String): Unit = {
+  private def bulkPutFromSpark(request: BulkPutRequest): Unit = {
     val startTs = System.currentTimeMillis()
 
     logger.info(
-      s"Triggering Spark-based bulk load for dataset: $destinationOnlineDataSet, " +
-        s"table: $sourceOfflineTable, partition: $partition")
+      s"Triggering Spark-based bulk load for dataset: ${request.destinationOnlineDataSet}, " +
+        s"table: ${request.sourceOfflineTable}, partition: ${request.partition}, " +
+        s"publication timestamp: ${request.publicationTimestampMillis}")
 
     try {
       // Use Spark2BigTableLoader to load data from Hive/Delta tables
-      val loaderArgs = Array(
-        "--table-name",
-        sourceOfflineTable,
-        "--dataset",
-        destinationOnlineDataSet,
-        "--end-ds",
-        partition,
-        "--project-id",
-        adminClient.getProjectId,
-        "--instance-id",
-        adminClient.getInstanceId
-      )
+      val loaderArgs =
+        sparkLoaderArgs(request, adminClient.getProjectId, adminClient.getInstanceId)
 
       // Run the Spark job
       Spark2BigTableLoader.main(loaderArgs)
@@ -482,15 +479,13 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
       metricsContext.increment("bulkPut.successes")
     } catch {
       case e: Exception =>
-        logger.error(s"Failed to run Spark-based bulk load for $sourceOfflineTable", e)
+        logger.error(s"Failed to run Spark-based bulk load for ${request.sourceOfflineTable}", e)
         metricsContext.increment("bulkPut.failures", Map("exception" -> e.getClass.getName))
         throw e
     }
   }
 
-  private def bulkPutFromBigQuery(sourceOfflineTable: String,
-                                  destinationOnlineDataSet: String,
-                                  partition: String): Unit = {
+  private def bulkPutFromBigQuery(request: BulkPutRequest): Unit = {
     if (maybeBigQueryClient.isEmpty) {
       logger.error("Need the BigQuery client available to export data to BigTable")
       metricsContext.increment("bulkPut.failures", Map("exception" -> "missinguploadclients"))
@@ -500,14 +495,9 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
     // we write groupby data to 1 large multi use-case table
     val batchTable = "GROUPBY_BATCH"
 
-    // we use the endDs + span to indicate the timestamp of all the cell data we upload for endDs
-    // this is used in the KV store multiget calls
-    val partitionSpec = PartitionSpec("ds", "yyyy-MM-dd", WindowUtils.Day.millis)
-    val endDsPlusOne = partitionSpec.epochMillis(partition) + partitionSpec.spanMillis
-
     // we need to sanitize and append the batch suffix to the groupBy name as that's
     // what we use to look things up while fetching
-    val groupBy = new GroupBy().setMetaData(new MetaData().setName(destinationOnlineDataSet))
+    val groupBy = new GroupBy().setMetaData(new MetaData().setName(request.destinationOnlineDataSet))
     val datasetName = groupBy.batchDataset
 
     val exportQuery =
@@ -531,9 +521,9 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
          |SELECT
          |  CONCAT(CAST(CONCAT('$datasetName', '#') AS BYTES), key_bytes) as rowkey,
          |  value_bytes as cf,
-         |  TIMESTAMP_MILLIS($endDsPlusOne) as _CHANGE_TIMESTAMP
-         |FROM $sourceOfflineTable
-         |WHERE ds = '$partition'
+         |  TIMESTAMP_MILLIS(${request.publicationTimestampMillis}) as _CHANGE_TIMESTAMP
+         |FROM ${request.sourceOfflineTable}
+         |WHERE ds = '${request.partition}'
          |""".stripMargin
     logger.info(s"Kicking off bulkLoad with query:\n$exportQuery")
 
@@ -552,13 +542,13 @@ class BigTableKVStoreImpl(dataClient: BigtableDataClient,
           .fold({
             logger.warn(s"GCP_LOCATION is not set, starting job without specifying location.")
             JobId.of(adminClient.getProjectId,
-                     s"export_${sourceOfflineTable.sanitize}_to_bigtable_${partition}_$startTs")
+                     s"export_${request.sourceOfflineTable.sanitize}_to_bigtable_${request.partition}_$startTs")
           })(bqLocation =>
             JobId
               .newBuilder()
               .setProject(adminClient.getProjectId)
               .setLocation(bqLocation)
-              .setJob(s"export_${sourceOfflineTable.sanitize}_to_bigtable_${partition}_$startTs")
+              .setJob(s"export_${request.sourceOfflineTable.sanitize}_to_bigtable_${request.partition}_$startTs")
               .build())
       }
       val job: Job = bigQueryClient.create(JobInfo.newBuilder(queryConfig).setJobId(jobId).build())
@@ -706,4 +696,22 @@ object BigTableKVStore {
   val ColumnFamilyString: String = "cf"
   val ColumnFamilyQualifierString: String = "value"
   val ColumnFamilyQualifier: ByteString = ByteString.copyFromUtf8(ColumnFamilyQualifierString)
+
+  private[cloud_gcp] def sparkLoaderArgs(request: BulkPutRequest,
+                                         projectId: String,
+                                         instanceId: String): Array[String] =
+    Array(
+      "--table-name",
+      request.sourceOfflineTable,
+      "--dataset",
+      request.destinationOnlineDataSet,
+      "--end-ds",
+      request.partition,
+      "--project-id",
+      projectId,
+      "--instance-id",
+      instanceId,
+      "--timestamp",
+      request.publicationTimestampMillis.toString
+    )
 }

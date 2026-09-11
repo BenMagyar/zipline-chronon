@@ -5,6 +5,7 @@ import ai.chronon.api.GroupBy
 import ai.chronon.api.MetaData
 import ai.chronon.integrations.cloud_gcp.BigTableKVStore.ColumnFamilyQualifierString
 import ai.chronon.integrations.cloud_gcp.BigTableKVStore.ColumnFamilyString
+import ai.chronon.online.KVStore
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.submission.SparkSessionBuilder
 import org.apache.spark.sql.functions
@@ -14,9 +15,8 @@ import org.rogach.scallop.ScallopOption
 import org.slf4j.LoggerFactory
 
 /** This Spark app handles loading data via Spark's BigTable connector (https://github.com/GoogleCloudDataproc/spark-bigtable-connector) into BigTable.
-  * At the moment this uses the DF support in the BT connector. A limitation with this connector is that it does not support
-  * setting the timestamp on the individual cells we write out. For GroupBy Uploads, this is fine as we can set the timestamp
-  * to that of the endDs + span. If we need to tweak this behavior, we'll need to reach for the RDD version of these connector classes (BigtableRDD.writeRDD).
+  * The DataFrame connector applies one publication timestamp to every cell in an upload. Per-cell timestamps would require
+  * the RDD connector (BigtableRDD.writeRDD).
   */
 object Spark2BigTableLoader {
 
@@ -52,6 +52,12 @@ object Spark2BigTableLoader {
       name = "instance-id",
       descr = "BigTable instance ID",
       required = true
+    )
+
+    val timestamp: ScallopOption[Long] = opt[Long](
+      name = "timestamp",
+      descr = "Publication timestamp in epoch milliseconds to assign to every uploaded Bigtable cell",
+      required = false
     )
 
     verify()
@@ -98,9 +104,9 @@ object Spark2BigTableLoader {
     // filter to only include data for the specified end date
     val partitionFilter = s"WHERE ds = '$endDate'"
 
-    // we use the endDs + span to indicate the timestamp of all the cell data we upload for endDs
-    // this is used in the KV store multiget calls
-    val endDsPlusOne = tableUtils.partitionSpec.epochMillis(endDate) + tableUtils.partitionSpec.spanMillis
+    // BigTableKVStoreImpl normally resolves this once per publication and forwards it. Preserve
+    // partition-end behavior for direct invocations that do not supply an explicit timestamp.
+    val timestamp = writeTimestamp(config.timestamp.toOption, tableUtils.partitionSpec.partitionEndMillis(endDate))
 
     // we need to sanitize and append the batch suffix to the groupBy name as that's
     // what we use to look things up while fetching
@@ -129,8 +135,14 @@ object Spark2BigTableLoader {
       .option("spark.bigtable.instance.id", instanceId)
       .option("spark.bigtable.create.new.table", false.toString) // we expect the table to be created already
       .option("spark.bigtable.write.timestamp.milliseconds",
-              endDsPlusOne
+              timestamp
       ) // the BT ingest sets timestamp of all cells to this
       .save()
+  }
+
+  private[cloud_gcp] def writeTimestamp(timestamp: Option[Long], partitionEndMillis: => Long): Long = {
+    val resolvedTimestamp = timestamp.getOrElse(partitionEndMillis)
+    KVStore.validatePublicationTimestampMillis(resolvedTimestamp)
+    resolvedTimestamp
   }
 }

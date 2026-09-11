@@ -54,6 +54,7 @@ class Runner:
         self.validate_rows = args.get("validate_rows")
         self.enable_debug = args.get("debug")
         self.uploader = args.get("uploader")
+        self.timestamp = args.get("timestamp")
         self.force_overwrite = bool(args.get("force_overwrite"))
 
         valid_jar = args["online_jar"] and os.path.exists(args["online_jar"])
@@ -252,6 +253,9 @@ class Runner:
 
         if self.uploader:
             submitter_args.append(f"--uploader={self.uploader}")
+
+        if self.timestamp is not None:
+            submitter_args.append(f"--timestamp={self.timestamp}")
 
         if self.additional_jars:
             submitter_args.append(f"--additional-jars={self.additional_jars}")
