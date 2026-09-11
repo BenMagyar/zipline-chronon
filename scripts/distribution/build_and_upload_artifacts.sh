@@ -7,6 +7,11 @@ function print_usage() {
     echo "  --gcp       Build and upload only GCP artifacts"
     echo "  --aws       Build and upload only AWS artifacts"
     echo "  --azure     Build and upload only Azure artifacts"
+    echo "  --spark4    Build and upload the Spark 4 / Scala 2.13 cloud_aws jar to AWS."
+    echo "              Uses chronon.spark.profile=spark4 in a --no-daemon mill run."
+    echo "              Uploads as cloud_aws_lib_spark4_deploy.jar under the customer prefix."
+    echo "              Defaults --customer_ids to 'crucible' (Spark 4 is Crucible-only)."
+    echo "              Mutually exclusive with --all/--gcp/--aws/--azure."
     echo "  --customer_ids <customer_id>  Specify customer IDs to upload artifacts to."
     echo "  -h, --help  Show this help message"
     echo "  --skip-checks  Skip git checks (not recommended)"
@@ -22,6 +27,7 @@ fi
 BUILD_AWS=false
 BUILD_GCP=false
 BUILD_AZURE=false
+BUILD_SPARK4=false
 SKIP_GIT_CHECKS=false
 SKIP_WHEEL=false
 
@@ -43,6 +49,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --azure)
             BUILD_AZURE=true
+            shift
+            ;;
+        --spark4)
+            BUILD_SPARK4=true
             shift
             ;;
         -h|--help)
@@ -74,6 +84,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+
+if [ "$BUILD_SPARK4" = true ] && { [ "$BUILD_AWS" = true ] || [ "$BUILD_GCP" = true ] || [ "$BUILD_AZURE" = true ]; }; then
+    echo "Error: --spark4 is mutually exclusive with --all/--gcp/--aws/--azure"
+    exit 1
+fi
+
+if [ "$BUILD_SPARK4" = true ]; then
+    # Wheel is Python-only; the Spark 4 jar can be published on its own.
+    SKIP_WHEEL=true
+fi
 
 if [[ "$SKIP_GIT_CHECKS" != "true" && -n $(git diff HEAD) ]]; then
     echo "Error: You have uncommitted changes. Please commit and push them to git so we can track them."
@@ -134,6 +154,44 @@ else
     echo "Skipping wheel build"
 fi
 
+
+if [ "$BUILD_SPARK4" = true ]; then
+    if [ -z "${INPUT_CUSTOMER_IDS+x}" ] || [ ${#INPUT_CUSTOMER_IDS[@]} -eq 0 ]; then
+        # Spark 4 is Crucible-only per build.mill; default the bucket accordingly.
+        INPUT_CUSTOMER_IDS=("crucible")
+        echo "No --customer_ids provided; defaulting to: ${INPUT_CUSTOMER_IDS[*]}"
+    fi
+
+    echo "Building Spark 4 (Scala 2.13.17) cloud_aws assembly"
+    ./mill --no-daemon --define chronon.spark.profile=spark4 'cloud_aws[2.13.17].assembly'
+
+    SRC_CLOUD_AWS_SPARK4_JAR="$CHRONON_ROOT_DIR/out/cloud_aws/2.13.17/assembly.dest/out.jar"
+    if [ ! -f "$SRC_CLOUD_AWS_SPARK4_JAR" ]; then
+        echo "$SRC_CLOUD_AWS_SPARK4_JAR not found"
+        exit 1
+    fi
+
+    CLOUD_AWS_SPARK4_JAR="cloud_aws_lib_spark4_deploy.jar"
+    echo "Are you sure you want to upload the Spark 4 cloud_aws jar to these customer ids: ${INPUT_CUSTOMER_IDS[*]}"
+    select yn in "Yes" "No"; do
+        case $yn in
+            Yes )
+                set -euxo pipefail
+                for element in "${INPUT_CUSTOMER_IDS[@]}"
+                do
+                    NEW_ELEMENT_JAR_PATH=s3://zipline-artifacts-$element/release/$CHRONON_VERSION/jars
+                    aws s3 cp "$SRC_CLOUD_AWS_SPARK4_JAR" "$NEW_ELEMENT_JAR_PATH/$CLOUD_AWS_SPARK4_JAR" \
+                        --metadata="zipline_user=$USER,updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD),spark_profile=spark4,scala_version=2.13.17"
+                done
+                echo "Succeeded"
+                break;;
+            No ) break;;
+        esac
+    done
+
+    echo "Built and uploaded Spark 4 $CHRONON_VERSION"
+    exit 0
+fi
 
 echo "Building jars"
 

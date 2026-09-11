@@ -1,7 +1,7 @@
 from group_bys.aws_databricks import dim_listings, user_activities
 from staging_queries.aws_databricks import exports
 
-from ai.chronon.types import EntitySource, EventSource, Join, JoinPart, Query, selects
+from ai.chronon.types import Derivation, EntitySource, EventSource, Join, JoinPart, Query, selects
 
 v1 = Join(
     left=dim_listings.source,
@@ -67,6 +67,58 @@ unpartitioned_sparse_v1 = Join(
     online=False,
     output_namespace="workspace_iceberg.poc",
     step_days=30,
+)
+
+# Mirrors joins/aws/demo.derivations_v1 on the aws_databricks stack: same left
+# source (user_activities events) and right parts (dim_listings + user_activities),
+# with derivations exercising Spark expressions over the joined listing columns.
+# Uses the same workspace.demo.user_activities table as adhoc_v1 below to keep
+# both event-source joins pointing at a single Kinesis-fed table.
+derivations_v1 = Join(
+    left=EventSource(
+        table="workspace.demo.user_activities",
+        query=Query(
+            selects=selects(
+                user_id="user_id",
+                listing_id="listing_id",
+                row_id="event_id",
+            ),
+            time_column="event_time_ms",
+        ),
+    ),
+    row_ids=["event_id"],
+    right_parts=[
+        JoinPart(group_by=dim_listings.adhoc_v1),
+        JoinPart(group_by=user_activities.v1),
+    ],
+    derivations=[
+        Derivation(
+            name="is_listing_heavy",
+            expression="IF(listing_id_weight_grams > 1000, 1, 0)",
+        ),
+        Derivation(
+            name="is_item_handmade",
+            expression="array_contains(split(listing_id_tags, ','), 'handmade')",
+        ),
+        Derivation(name="price_log", expression="log1p(listing_id_price_cents)"),
+        Derivation(
+            name="price_bucket",
+            expression="""
+                CASE
+                    WHEN listing_id_price_cents < 1000 THEN 0
+                    WHEN listing_id_price_cents < 5000 THEN 1
+                    WHEN listing_id_price_cents < 10000 THEN 2
+                    WHEN listing_id_price_cents < 50000 THEN 3
+                    ELSE 4
+                END
+            """,
+        ),
+        Derivation(name="*", expression="*"),
+    ],
+    version=1,
+    online=False,
+    output_namespace="workspace_iceberg.poc",
+    step_days=10,
 )
 
 # Event-source join for run-adhoc streaming integration tests.
