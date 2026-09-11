@@ -7,9 +7,9 @@ function print_usage() {
     echo "  --gcp       Build and upload only GCP artifacts"
     echo "  --aws       Build and upload only AWS artifacts"
     echo "  --azure     Build and upload only Azure artifacts"
-    echo "  --spark4    Build and upload the Spark 4 / Scala 2.13 cloud_aws jar to AWS."
+    echo "  --spark4    Build and upload the Spark 4 / Scala 2.13 Crucible jars to AWS."
     echo "              Uses chronon.spark.profile=spark4 in a --no-daemon mill run."
-    echo "              Uploads as cloud_aws_lib_spark4_deploy.jar under the customer prefix."
+    echo "              Uploads the cloud_aws, Flink, and Kinesis jars under the customer prefix."
     echo "              Defaults --customer_ids to 'crucible' (Spark 4 is Crucible-only)."
     echo "              Mutually exclusive with --all/--gcp/--aws/--azure."
     echo "  --customer_ids <customer_id>  Specify customer IDs to upload artifacts to."
@@ -162,17 +162,29 @@ if [ "$BUILD_SPARK4" = true ]; then
         echo "No --customer_ids provided; defaulting to: ${INPUT_CUSTOMER_IDS[*]}"
     fi
 
-    echo "Building Spark 4 (Scala 2.13.17) cloud_aws assembly"
-    ./mill --no-daemon --define chronon.spark.profile=spark4 'cloud_aws[2.13.17].assembly'
+    echo "Building Spark 4 (Scala 2.13.17) Crucible assemblies"
+    ./mill --no-daemon --define chronon.spark.profile=spark4 'artifacts[2.13.17].all'
 
     SRC_CLOUD_AWS_SPARK4_JAR="$CHRONON_ROOT_DIR/out/cloud_aws/2.13.17/assembly.dest/out.jar"
+    SRC_FLINK_SPARK4_JAR="$CHRONON_ROOT_DIR/out/flink/2.13.17/assembly.dest/out.jar"
+    SRC_FLINK_KINESIS_SPARK4_JAR="$CHRONON_ROOT_DIR/out/flink_connectors/kinesis/2.13.17/assembly.dest/out.jar"
     if [ ! -f "$SRC_CLOUD_AWS_SPARK4_JAR" ]; then
         echo "$SRC_CLOUD_AWS_SPARK4_JAR not found"
         exit 1
     fi
+    if [ ! -f "$SRC_FLINK_SPARK4_JAR" ]; then
+        echo "$SRC_FLINK_SPARK4_JAR not found"
+        exit 1
+    fi
+    if [ ! -f "$SRC_FLINK_KINESIS_SPARK4_JAR" ]; then
+        echo "$SRC_FLINK_KINESIS_SPARK4_JAR not found"
+        exit 1
+    fi
 
     CLOUD_AWS_SPARK4_JAR="cloud_aws_lib_spark4_deploy.jar"
-    echo "Are you sure you want to upload the Spark 4 cloud_aws jar to these customer ids: ${INPUT_CUSTOMER_IDS[*]}"
+    FLINK_SPARK4_JAR="flink_assembly_spark4_deploy.jar"
+    FLINK_KINESIS_SPARK4_JAR="connectors_kinesis_spark4_deploy.jar"
+    echo "Are you sure you want to upload the Spark 4 Crucible jars to these customer ids: ${INPUT_CUSTOMER_IDS[*]}"
     select yn in "Yes" "No"; do
         case $yn in
             Yes )
@@ -181,6 +193,10 @@ if [ "$BUILD_SPARK4" = true ]; then
                 do
                     NEW_ELEMENT_JAR_PATH=s3://zipline-artifacts-$element/release/$CHRONON_VERSION/jars
                     aws s3 cp "$SRC_CLOUD_AWS_SPARK4_JAR" "$NEW_ELEMENT_JAR_PATH/$CLOUD_AWS_SPARK4_JAR" \
+                        --metadata="zipline_user=$USER,updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD),spark_profile=spark4,scala_version=2.13.17"
+                    aws s3 cp "$SRC_FLINK_SPARK4_JAR" "$NEW_ELEMENT_JAR_PATH/$FLINK_SPARK4_JAR" \
+                        --metadata="zipline_user=$USER,updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD),spark_profile=spark4,scala_version=2.13.17"
+                    aws s3 cp "$SRC_FLINK_KINESIS_SPARK4_JAR" "$NEW_ELEMENT_JAR_PATH/$FLINK_KINESIS_SPARK4_JAR" \
                         --metadata="zipline_user=$USER,updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD),spark_profile=spark4,scala_version=2.13.17"
                 done
                 echo "Succeeded"

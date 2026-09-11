@@ -86,7 +86,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
       .exclude("org.apache.zookeeper" -> "zookeeper")
       .exclude("org.apache.zookeeper" -> "zookeeper-jute")
       .exclude("org.rocksdb" -> "rocksdbjni"),
-  ).map(_.forceVersion())
+  ).map(_.forceVersion()) ++ build.Constants.spark4NettyTcnativeDeps
 
   // RocksDB must be provided by the Flink cluster's flink-statebackend-rocksdb plugin.
   // Bundling a different version breaks the JNI ABI (remove() was dropped in RocksDB 7+).

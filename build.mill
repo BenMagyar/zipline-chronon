@@ -249,6 +249,18 @@ object Constants {
   val protobufVersion = sparkProfile.protobufVersion
   val jettyVersion = sparkProfile.jettyVersion
   val nettyVersion = sparkProfile.nettyVersion
+
+  // Spark 4.1.3's dependency management pins tcnative 2.0.74, but Netty 4.2.17
+  // is compiled against the 2.0.81 API. Keep Spark 3's resolved runtime unchanged.
+  def spark4NettyTcnativeDeps =
+    if (sparkProfileName == "spark4") {
+      Seq(
+        mvn"io.netty:netty-tcnative-boringssl-static:2.0.81.Final",
+        mvn"io.netty:netty-tcnative-classes:2.0.81.Final"
+      ).map(_.forceVersion())
+    } else {
+      Seq.empty
+    }
   
   // Common JVM arguments for all test modules
   def commonTestForkArgs = Seq(
