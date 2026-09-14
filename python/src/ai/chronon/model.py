@@ -14,6 +14,7 @@ from ai.chronon.utils import ANY_SOURCE_TYPE, normalize_source, normalize_source
 class ModelBackend:
     VERTEXAI = ttypes.ModelBackend.VertexAI
     SAGEMAKER = ttypes.ModelBackend.SageMaker
+    RAY = ttypes.ModelBackend.Ray
 
 
 class DeploymentStrategyType:

@@ -6,6 +6,8 @@ Tests:
     - test_hub_run_adhoc.py — run-adhoc (streaming deploy) and cancel
     - test_hub_eval.py      — compile → upload diffs → eval (schema + test-data)
     - test_run_quickstart.py — full zipline run pipeline (compile → fetch)
+    - test_hub_train_hello_world.py — AWS TRAIN_MODEL hello-world via Crucible/Ray
+      (gated by ZIPLINE_RAY_TRAINING_E2E)
 
 Environment variables:
     HUB_URL         Hub / orchestrator base URL (default: http://localhost:3903)
@@ -16,6 +18,8 @@ Environment variables:
     Auth — pick one:
     ZIPLINE_TOKEN + ZIPLINE_AUTH_URL   service-principal or short-lived JWT
     GCP_ID_TOKEN                       cloud IAM identity token
+    ZIPLINE_RAY_TRAINING_E2E           set to 1/true to run test_hub_train_hello_world
+                                       (AWS Hub with KubeRay)
 
 Usage::
 

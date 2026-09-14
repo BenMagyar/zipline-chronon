@@ -114,6 +114,40 @@ def test_team_default_namespace_inheritance_per_conf_type(
     )
 
 
+def test_aws_hello_world_model_compiles_stdlib_entrypoint(canary):
+    """AWS Ray smoke configuration compiles without serving configuration."""
+    _compile_canary(canary)
+
+    path = os.path.join(canary, "compiled/models/aws_databricks/hello_world.hello_world_model__1.0")
+    assert os.path.exists(path), f"Expected compiled hello-world model at {path}"
+
+    payload = json.loads(open(path).read())
+    spec = payload["trainingConf"]
+    assert spec["pythonModule"] == "this"
+    assert spec["image"] == "rayproject/ray:2.55.1"
+    assert spec["resourceConfig"]["minReplicaCount"] == 0
+    assert spec["resourceConfig"]["maxReplicaCount"] == 0
+    assert payload["inferenceSpec"]["modelBackend"] == 2
+    assert payload["inferenceSpec"]["modelBackendParams"]["model_name"] == "hello_world_model"
+    assert payload["metaData"]["outputNamespace"] == "workspace_iceberg.poc"
+    assert "modelArtifactBaseUri" not in payload
+    assert "deploymentConf" not in payload
+
+    canary_path = os.path.join(
+        canary,
+        "compiled_canary/models/aws_databricks/hello_world.hello_world_model__1.0",
+    )
+    assert os.path.exists(canary_path), f"Expected canary compiled hello-world model at {canary_path}"
+    canary_payload = json.loads(open(canary_path).read())
+    assert canary_payload["trainingConf"]["pythonModule"] == "this"
+    assert canary_payload["inferenceSpec"]["modelBackend"] == 2
+    assert canary_payload["metaData"]["executionInfo"]["env"]["common"]["WAREHOUSE_PREFIX"] == (
+        "s3://zipline-warehouse-crucible"
+    )
+    assert "modelArtifactBaseUri" not in canary_payload
+    assert "deploymentConf" not in canary_payload
+
+
 def test_team_default_placeholder_resolves_through_cross_config_table_refs(canary):
     """When a consumer config captures a producer's `.table` at Python authoring time and
     the producer had no `output_namespace=` set, the compile pipeline's placeholder pass

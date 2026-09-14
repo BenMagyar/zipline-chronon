@@ -623,6 +623,7 @@ struct Model {
 enum ModelBackend {
     VertexAI = 0
     SageMaker = 1
+    Ray = 2
     // other backends that we support will go here
 }
 
