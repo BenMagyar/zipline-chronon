@@ -608,6 +608,9 @@ object Extensions {
     def isMegaTilingEnabled: Boolean =
       groupBy.onlineStrategy == OnlineStrategy.STREAMING_MEGATILES
 
+    def isPushEnabled: Boolean =
+      groupBy.onlineStrategy == OnlineStrategy.PUSH
+
     // keyFilter only shrinks batch uploads - it never changes what a groupBy computes, so it
     // must not participate in any semantic hash (offline join parts included). Recurses into
     // JoinSource-embedded joins. Mutates in place - use on deepCopy-ied objects only.
@@ -669,6 +672,10 @@ object Extensions {
 
     lazy val batchDataset: String = s"${groupBy.metaData.cleanName.toUpperCase()}_BATCH"
     lazy val streamingDataset: String = s"${groupBy.metaData.cleanName.toUpperCase()}_STREAMING"
+    // PUSH dataset: simple key→value (no sort key, no time-series).
+    // Name intentionally avoids _STREAMING suffix so DynamoDB creates it without sort key,
+    // BigTable reads use cellsPerRow(1), and Redis uses simple setex/get.
+    lazy val pushDataset: String = s"${groupBy.metaData.cleanName.toUpperCase()}_PUSH"
 
     def kvTable: String = s"${groupBy.metaData.outputTable}_upload"
 

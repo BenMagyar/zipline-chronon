@@ -22,7 +22,7 @@ import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, QueryOps, SourceOps, 
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api._
 import ai.chronon.online.Extensions.ChrononStructTypeOps
-import ai.chronon.online.GroupByServingInfoParsed
+import ai.chronon.online.{GroupByServingInfoParsed, KVStore}
 import ai.chronon.online.metrics.Metrics
 import ai.chronon.online.serde.{AvroConversions, SparkConversions}
 import ai.chronon.spark.Extensions._
@@ -36,6 +36,7 @@ import org.apache.spark.sql.{DataFrame, Encoder, Encoders, Row, SparkSession}
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.collection.mutable
+import scala.concurrent.{Await, ExecutionContext}
 import scala.concurrent.duration.DurationInt
 import scala.util.Try
 
@@ -557,7 +558,8 @@ object GroupByUpload {
           endDs: String,
           tableUtilsOpt: Option[TableUtils] = None,
           showDf: Boolean = false,
-          jsonPercent: Int = 1): Unit = {
+          jsonPercent: Int = 1,
+          apiOpt: Option[ai.chronon.online.Api] = None): Unit = {
     import ai.chronon.spark.submission.SparkSessionBuilder
     val tableUtils: TableUtils =
       tableUtilsOpt.getOrElse {
@@ -642,6 +644,36 @@ object GroupByUpload {
       context.gauge(Metrics.Name.KeyBytes, metricRow(0).getDouble(0).toLong)
       context.gauge(Metrics.Name.ValueBytes, metricRow(0).getDouble(1).toLong)
       context.gauge(Metrics.Name.RowCount, metricRow(0).getLong(2))
+    }
+
+    // For PUSH GroupBys, write GroupByServingInfo directly to KV.
+    // The KVUploadNodeRunner (bulkPut) is being disabled for PUSH — Flink reads entity
+    // batch IRs from Iceberg, not KV. But the serving info metadata must still reach KV
+    // so the Flink job and fetcher can discover schemas and batchEndDate.
+    if (new GroupByOps(groupByConf).isPushEnabled) {
+      apiOpt match {
+        case Some(onlineApi) =>
+          val kvStore = onlineApi.genKvStore
+          val dataset = groupByConf.batchDataset
+          kvStore.create(dataset)
+          val servingInfoKey = Constants.GroupByServingInfoKey.getBytes(Constants.UTF8)
+          val servingInfoValue = ThriftJsonCodec.toJsonStr(groupByServingInfo).getBytes(Constants.UTF8)
+          val putRequest = KVStore.PutRequest(servingInfoKey, servingInfoValue, dataset)
+          implicit val ec: ExecutionContext = ExecutionContext.global
+          val success = Await.result(kvStore.put(putRequest), 1.hour)
+          // The streaming/deploy node's orchestrator dependency is on this upload node succeeding
+          // (see GroupByPlanner.streamingNode) — FlinkJob reads GroupByServingInfo once at startup
+          // and fails immediately if it's absent, so a silently-failed write here would surface much
+          // later and less legibly as a Flink launch failure instead of an upload job failure.
+          if (!success) {
+            throw new RuntimeException(s"PUSH GroupBy: failed to write GroupByServingInfo to KV dataset=$dataset")
+          }
+          logger.info(s"PUSH GroupBy: wrote GroupByServingInfo directly to KV dataset=$dataset")
+        case None =>
+          throw new IllegalArgumentException(
+            "PUSH GroupBy requires apiOpt to publish GroupByServingInfo to KV. " +
+              "Pass apiOpt to GroupByUpload.run().")
+      }
     }
 
     val jobDuration = (System.currentTimeMillis() - startTs) / 1000

@@ -637,6 +637,34 @@ class GroupByPlannerTest extends AnyFlatSpec with Matchers {
     val deployTerminalNodeName = plan.terminalNodeNames.asScala(ai.chronon.planner.Mode.DEPLOY)
     deployTerminalNodeName should include("uploadToKV")
   }
+
+  it should "PUSH streaming node should depend on uploadNode, not uploadToKVNode" in {
+    import ai.chronon.api.OnlineStrategy
+
+    val pushGb = buildGroupBy(includeTopic = true)
+    pushGb.setOnlineStrategy(OnlineStrategy.PUSH)
+
+    val planner = GroupByPlanner(pushGb)
+    val plan = planner.buildPlan
+
+    // PUSH skips uploadToKV entirely (see buildPlan) — nothing should produce that table.
+    val uploadToKVNodes = plan.nodes.asScala.count(_.content.isSetGroupByUploadToKV)
+    uploadToKVNodes should be(0)
+
+    val streamingNode = plan.nodes.asScala.find(_.content.isSetGroupByStreaming)
+    streamingNode should be(defined)
+
+    val streamingTableDeps = streamingNode.get.metaData.executionInfo.tableDependencies.asScala
+    streamingTableDeps.size should be(1)
+
+    // Should depend on uploadNode's output table (where GroupByUpload publishes GroupByServingInfo
+    // for PUSH), not on uploadToKV's — no scheduled node produces the latter for PUSH.
+    val uploadDep = streamingTableDeps.find(_.tableInfo.table.contains("user_charges__upload"))
+    uploadDep should be(defined)
+
+    val uploadToKVDep = streamingTableDeps.find(_.tableInfo.table.contains("uploadToKV"))
+    uploadToKVDep should be(empty)
+  }
 }
 
 object GroupByPlannerTest {

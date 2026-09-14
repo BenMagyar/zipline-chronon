@@ -286,7 +286,8 @@ enum Accuracy {
 
 enum OnlineStrategy {
     DEFAULT = 0,
-    STREAMING_MEGATILES = 1
+    STREAMING_MEGATILES = 1,
+    PUSH = 2
 }
 
 enum EngineType {

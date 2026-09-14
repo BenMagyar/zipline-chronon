@@ -143,10 +143,15 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
 
   def streamingNode: Option[Node] = {
     groupBy.streamingSource.map { _ =>
-      // Streaming node has table dependency on the upload to KV
+      // Streaming node depends on whichever node actually produces the data (and, for PUSH,
+      // the GroupByServingInfo) it needs before it can safely start. For PUSH, uploadToKVNode
+      // is never scheduled (see buildPlan) and GroupByUpload publishes serving info directly
+      // from uploadNode, so the dependency must point there instead of at uploadToKVNode.
+      val groupByOps = new GroupByOps(groupBy)
+      val upstreamNode = if (groupByOps.isPushEnabled) uploadNode else uploadToKVNode
       val uploadToKVDep = new TableDependency()
         .setTableInfo(
-          new TableInfo().setTable(uploadToKVNode.metaData.outputTable).withSpec(confOutputPartitionSpec)
+          new TableInfo().setTable(upstreamNode.metaData.outputTable).withSpec(confOutputPartitionSpec)
         )
         .setStartOffset(WindowUtils.zero())
         .setEndOffset(WindowUtils.zero())
@@ -178,9 +183,15 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
       .map { es =>
         toNode(es.metaData, _.setExternalSourceSensor(es), es)
       }
-    val allNodes = Seq(backfill, uploadNode, uploadToKVNode) ++ sensorNodes ++ streamingNode.toSeq
+    // PUSH GroupBys write serving info to KV directly from GroupByUpload — skip the
+    // KVUploadNodeRunner step (which would bulkPut entity rows that Flink reads from Iceberg).
+    val groupByOps = new GroupByOps(groupBy)
+    val kvUploadNodes = if (groupByOps.isPushEnabled) Seq.empty else Seq(uploadToKVNode)
+    val allNodes = Seq(backfill, uploadNode) ++ kvUploadNodes ++ sensorNodes ++ streamingNode.toSeq
 
-    val deployTerminalNode = streamingNode.map(_.metaData.name).getOrElse(uploadToKVNode.metaData.name)
+    val deployTerminalNode = streamingNode
+      .map(_.metaData.name)
+      .getOrElse(if (kvUploadNodes.nonEmpty) uploadToKVNode.metaData.name else uploadNode.metaData.name)
 
     val terminalNodeNames = Map(
       ai.chronon.planner.Mode.BACKFILL -> backfill.metaData.name,

@@ -113,6 +113,33 @@ class MegaTileAggregator(aggregations: Seq[Aggregation],
     windowedAggregator.finalize(resultIr)
   }
 
+  // Expose protected fields from SawtoothAggregator for use by GigaTileStreamProcessor
+  val tailHopIndicesArray: Array[Int] = tailHopIndices
+  val hopSizesArray: Array[Long] = hopSizes
+  val baseIrIndicesArray: Array[Int] = baseIrIndices
+
+  /** Largest retention horizon across all columns, in millis. Used by GigaTile to bound daily-
+    * slot retention. Unwindowed columns retain uncovered slots until a later batch includes them,
+    * so their horizon is intentionally unbounded.
+    */
+  val maxWindowMillis: Long = {
+    var m: Long = 0L
+    var hasUnwindowedColumn = false
+    var i = 0
+    while (i < windowMappings.length) {
+      val w = windowMappings(i).aggregationPart.window
+      if (w == null) hasUnwindowedColumn = true
+      else if (w.millis > m) m = w.millis
+      i += 1
+    }
+    if (hasUnwindowedColumn) Long.MaxValue else m
+  }
+
+  /** Per-windowed-column window in millis. -1 for unwindowed columns (which always include the slot). */
+  val columnWindowMillis: Array[Long] = windowMappings.map { mapping =>
+    Option(mapping.aggregationPart.window).map(_.millis).getOrElse(-1L)
+  }
+
   // Like mergeTailHops but skips NO BATCH columns (window <= tailBuffer)
   private[windowing] def mergeTailHopsForBatchColumns(ir: Array[Any],
                                                       queryTs: Long,

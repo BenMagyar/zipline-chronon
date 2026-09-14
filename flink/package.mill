@@ -13,6 +13,13 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.aggregator(crossValue), build.api(crossValue), build.online(crossValue))
 
   def compileMvnDeps = build.Constants.providedFlinkDeps ++ Seq(
+    mvn"org.apache.flink:flink-table-common:${build.Constants.flinkVersion}",
+    // Iceberg Flink runtime: provided at compile time for BatchIrSourceBuilder.
+    // In production, deployed to Flink cluster's lib/ directory.
+    // In tests, this causes signer conflicts with flink-test-utils (Iceberg's shaded
+    // uber-jar bundles signed janino classes). The Iceberg integration test
+    // (IcebergBatchIrSourceIntegrationTest) is marked @Ignore and must run in isolation.
+    mvn"org.apache.iceberg:iceberg-flink-runtime-1.17:1.6.1",
     mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}"
       .exclude("org.rocksdb" -> "rocksdbjni"),
     mvn"org.apache.spark::spark-sql:${build.Constants.sparkVersion}"

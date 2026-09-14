@@ -100,6 +100,7 @@ class KVUploadNodeRunner(api: Api) extends NodeRunner {
     val partitionString = partitionRange.end
 
     val startTime = System.currentTimeMillis()
+
     logger.info(s"Starting KV upload for GroupBy: $groupByName, partition: $partitionString, table: $offlineTable")
 
     try {

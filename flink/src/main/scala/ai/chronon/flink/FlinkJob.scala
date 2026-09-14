@@ -1,5 +1,6 @@
 package ai.chronon.flink
 
+import ai.chronon.aggregator.windowing.ResolutionUtils
 import ai.chronon.api.Constants.MetadataDataset
 import ai.chronon.api.DataType
 import ai.chronon.api.Extensions.{GroupByOps, SourceOps}
@@ -9,13 +10,14 @@ import ai.chronon.flink.{AsyncKVStoreWriter, FlinkGroupByStreamingJob}
 import ai.chronon.flink.deser.{DeserializationSchemaBuilder, FlinkSerDeProvider, ProjectedEvent, SourceProjection}
 import ai.chronon.flink.chaining.ChainedGroupByJob
 import ai.chronon.flink.source.FlinkSourceProvider
-import ai.chronon.flink.types.{AvroCodecOutput, TimestampedTile, WriteResponse}
+import ai.chronon.flink.types.{AvroCodecOutput, BatchIrRow, TimestampedTile, WriteResponse}
 import ai.chronon.flink.validation.ValidationFlinkJob
 import ai.chronon.flink.window.{
   AlwaysFireOnElementTrigger,
   BufferedProcessingTimeTrigger,
   FlinkRowAggProcessFunction,
   FlinkRowAggregationFunction,
+  GigaTileProcessFunction,
   KeySelectorBuilder,
   MegaTileEmissionPolicy,
   MegaTileProcessFunction
@@ -78,6 +80,11 @@ abstract class BaseFlinkJob {
         "subclass dispatched for it doesn't support mega-tiled execution. Override " +
         "runMegaTiledGroupByJob to opt in, or unset STREAMING_MEGATILES on this GroupBy."
     )
+
+  /** Run the streaming job with giga tiling (push-based) enabled.
+    * Emits finalized feature vectors — fetcher does a single point get.
+    */
+  def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse]
 
   /** Shared tail for tiled pipeline: keyBy → window aggregate → tile codec → KV write.
     * Both FlinkGroupByStreamingJob and ChainedGroupByJob use this with their respective
@@ -173,6 +180,51 @@ abstract class BaseFlinkJob {
 
     AsyncKVStoreWriter.withUnorderedWaits(putRecordDS, sinkFn, groupByName, capacity = kvStoreCapacity)
   }
+
+  /** Shared tail for giga tiled pipeline: connect event + batch streams → GigaTileProcessFunction → codec → KV write.
+    * Emits finalized feature vectors with plain entity keys.
+    *
+    * @param batchIrStream batch IR rows from Iceberg upload table (keyed by entity).
+    *                      Use an idle/empty stream if Iceberg source is not yet configured.
+    */
+  protected def buildGigaTiledTail(
+      preparedStream: DataStream[ProjectedEvent],
+      batchIrStream: DataStream[BatchIrRow],
+      schema: Seq[(String, DataType)],
+      parallelism: Int,
+      sinkFn: RichAsyncFunction[AvroCodecOutput, WriteResponse],
+      kvStoreCapacity: Int,
+      enableDebug: Boolean,
+      bufferingOutputTimeMillis: Long,
+      firstSeenKeyGraceMillis: Long
+  ): DataStream[WriteResponse] = {
+    val eventKeySelector = KeySelectorBuilder.build(groupByServingInfoParsed.groupBy)
+    val batchKeySelector = new org.apache.flink.api.java.functions.KeySelector[BatchIrRow, java.util.List[Any]] {
+      override def getKey(row: BatchIrRow): java.util.List[Any] = row.entityKeys
+    }
+
+    val gigaTileDS = preparedStream
+      .connect(batchIrStream)
+      .keyBy(eventKeySelector, batchKeySelector)
+      .process(new GigaTileProcessFunction(
+        groupByServingInfoParsed.groupBy,
+        schema,
+        enableDebug = enableDebug,
+        bufferingOutputTimeMillis = bufferingOutputTimeMillis,
+        firstSeenKeyGraceMillis = firstSeenKeyGraceMillis
+      ))
+      .uid(s"giga-tiling-$groupByName")
+      .name(s"Giga Tiling for $groupByName")
+      .setParallelism(parallelism)
+
+    val putRecordDS = gigaTileDS
+      .flatMap(GigaTileAvroCodecFn(groupByServingInfoParsed, enableDebug))
+      .uid(s"giga-avro-conversion-$groupByName")
+      .name(s"Giga Tile Avro conversion for $groupByName")
+      .setParallelism(parallelism)
+
+    AsyncKVStoreWriter.withUnorderedWaits(putRecordDS, sinkFn, groupByName, capacity = kvStoreCapacity)
+  }
 }
 
 object FlinkJob {
@@ -243,6 +295,16 @@ object FlinkJob {
   val AllowedOutOfOrderness: Duration = Duration.ofMinutes(5)
 
   val CatchupWatermarkLagSlackMillis: Long = 30 * 1000L
+
+  // The event-source watermark already trails the newest observed event by AllowedOutOfOrderness
+  // (Flink emits maxEventTs - ooo - 1). Because this tolerance also includes AllowedOutOfOrderness,
+  // that term cancels in the Live check `processingTime > watermark + tolerance`: publication flips
+  // to Live once the true ingestion lag beyond the ooo-trailing is within CatchupWatermarkLagSlackMillis.
+  // AllowedOutOfOrderness is therefore included only to offset the watermark's own trailing, not as an
+  // independent readiness knob; only the slack governs the gate. Aggregation hop sizes do not describe
+  // source readiness.
+  val LiveWatermarkLagToleranceMillis: Long =
+    AllowedOutOfOrderness.toMillis + CatchupWatermarkLagSlackMillis
 
   // Set an idleness timeout to keep time moving in case of very low traffic event streams as well as late events during
   // large backlog catchups
@@ -333,7 +395,10 @@ object FlinkJob {
       maybeServingInfo
         .map { servingInfo =>
           // create the groupby dataset on the KV store if it doesn't exist prior to starting up the job
-          kvStore.create(servingInfo.groupBy.streamingDataset)
+          if (new GroupByOps(servingInfo.groupBy).isPushEnabled)
+            kvStore.create(servingInfo.groupByOps.pushDataset)
+          else
+            kvStore.create(servingInfo.groupBy.streamingDataset)
           buildFlinkJob(groupByName, props, api, servingInfo, enableDebug, jobArgs.topicOverride.toOption)
         }
         .recover { case e: Exception =>
@@ -378,9 +443,10 @@ object FlinkJob {
       FlinkJob.runWriteInternalManifestJob(env, jobArgs.streamingManifestPath(), maybeParentJobId.get, groupByName)
     }
 
-    val isMegaTiling = new GroupByOps(flinkJob.groupByServingInfoParsed.groupBy).isMegaTilingEnabled
+    val groupByOpsVal = new GroupByOps(flinkJob.groupByServingInfoParsed.groupBy)
     val jobDatastream =
-      if (isMegaTiling) flinkJob.runMegaTiledGroupByJob(env)
+      if (groupByOpsVal.isPushEnabled) flinkJob.runGigaTiledGroupByJob(env)
+      else if (groupByOpsVal.isMegaTilingEnabled) flinkJob.runMegaTiledGroupByJob(env)
       else flinkJob.runTiledGroupByJob(env)
 
     jobDatastream

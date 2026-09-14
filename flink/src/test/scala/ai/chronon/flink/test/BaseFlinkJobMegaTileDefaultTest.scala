@@ -14,6 +14,7 @@ import org.scalatest.matchers.should.Matchers
 private class LegacyOnlyFlinkJob(val groupByName: String) extends BaseFlinkJob {
   override def groupByServingInfoParsed: GroupByServingInfoParsed = null
   override def runTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = null
+  override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = null
 }
 
 class BaseFlinkJobMegaTileDefaultTest extends AnyFlatSpec with Matchers {
@@ -35,6 +36,7 @@ class BaseFlinkJobMegaTileDefaultTest extends AnyFlatSpec with Matchers {
       override def groupByServingInfoParsed: GroupByServingInfoParsed = null
       override def runTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = sentinel
       override def runMegaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = sentinel
+      override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = sentinel
     }
     noException should be thrownBy job.runMegaTiledGroupByJob(StreamExecutionEnvironment.getExecutionEnvironment)
   }

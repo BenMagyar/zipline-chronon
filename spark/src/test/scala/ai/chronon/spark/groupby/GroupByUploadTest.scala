@@ -20,6 +20,7 @@ import ai.chronon.aggregator.test.Column
 import ai.chronon.api.Extensions._
 import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api.{Window, _}
+import ai.chronon.online.KVStore
 import ai.chronon.online.fetcher.Fetcher
 import ai.chronon.aggregator.windowing.{FiveMinuteResolution, SawtoothOnlineAggregator}
 import ai.chronon.online.serde.{AvroCodec, AvroConversions, SparkConversions}
@@ -100,6 +101,112 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         accuracy = Accuracy.TEMPORAL
       )
     GroupByUpload.run(groupByConf, endDs = yesterday)
+  }
+
+  // Api whose KV writes always report failure, without needing a live/fake backing store —
+  // exercises the GroupByUpload path that must fail the job rather than log-and-continue.
+  private class AlwaysFailsPutApi extends ai.chronon.online.Api(null) {
+    override def streamDecoder(groupByServingInfoParsed: ai.chronon.online.GroupByServingInfoParsed): ai.chronon.online.serde.SerDe =
+      throw new UnsupportedOperationException
+    override def genMetricsKvStore(tableBaseName: String): KVStore = throw new UnsupportedOperationException
+    override def genEnhancedStatsKvStore(tableBaseName: String): KVStore = throw new UnsupportedOperationException
+    override def externalRegistry: ai.chronon.online.ExternalSourceRegistry = throw new UnsupportedOperationException
+    override def logResponse(resp: ai.chronon.online.LoggableResponse): Unit = ()
+
+    override def genKvStore: KVStore = new KVStore {
+      override def create(dataset: String): Unit = ()
+      override def multiGet(requests: Seq[KVStore.GetRequest]): scala.concurrent.Future[Seq[KVStore.GetResponse]] =
+        scala.concurrent.Future.successful(requests.map(r => KVStore.GetResponse(r, scala.util.Success(Seq.empty))))
+      override def multiPut(keyValueDatasets: Seq[KVStore.PutRequest]): scala.concurrent.Future[Seq[Boolean]] =
+        scala.concurrent.Future.successful(keyValueDatasets.map(_ => false))
+      override def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit = ()
+    }
+  }
+
+  private def buildPushGroupBy(namespace: String, name: String, eventsTable: String): GroupBy = {
+    val groupByConf =
+      Builders.GroupBy(
+        sources = Seq(Builders.Source.events(Builders.Query(), table = eventsTable)),
+        keyColumns = Seq("user"),
+        aggregations = Seq(Builders.Aggregation(Operation.SUM, "views", Seq(WindowUtils.Unbounded))),
+        metaData = Builders.MetaData(namespace = namespace, name = name),
+        accuracy = Accuracy.TEMPORAL
+      )
+    groupByConf.setOnlineStrategy(OnlineStrategy.PUSH)
+    groupByConf
+  }
+
+  // Regression for GroupByUpload PUSH serving-info publication (GigaTile PR): the orchestrator's
+  // streaming/deploy node dependency is on this upload node succeeding, so a silently-skipped or
+  // silently-failed serving-info write must not report success.
+  it should "fail a PUSH GroupBy upload when no apiOpt is provided" in {
+    val namespace = testNamespace("push_no_api")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "push_no_api_events"
+    val eventDf = DataFrameGen.events(spark, List(Column("user", StringType, 10), Column("views", IntType, 10)),
+                                      count = 100,
+                                      partitions = 5)
+    eventDf.save(s"$namespace.$eventsTable")
+
+    val groupByConf = buildPushGroupBy(namespace, "push_no_api_upload", eventsTable)
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+
+    val error = intercept[IllegalArgumentException] {
+      GroupByUpload.run(groupByConf, endDs = today)
+    }
+    error.getMessage should include("requires apiOpt")
+  }
+
+  it should "fail a PUSH GroupBy upload when the serving-info KV write fails" in {
+    val namespace = testNamespace("push_kv_fail")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "push_kv_fail_events"
+    val eventDf = DataFrameGen.events(spark, List(Column("user", StringType, 10), Column("views", IntType, 10)),
+                                      count = 100,
+                                      partitions = 5)
+    eventDf.save(s"$namespace.$eventsTable")
+
+    val groupByConf = buildPushGroupBy(namespace, "push_kv_fail_upload", eventsTable)
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+
+    val error = intercept[RuntimeException] {
+      GroupByUpload.run(groupByConf, endDs = today, apiOpt = Some(new AlwaysFailsPutApi))
+    }
+    error.getMessage should include("failed to write GroupByServingInfo")
+  }
+
+  it should "publish GroupByServingInfo to KV for a successful PUSH GroupBy upload" in {
+    val namespace = testNamespace("push_success")
+    createDatabase(namespace)
+    tableUtils.sql(s"USE $namespace")
+
+    val eventsTable = "push_success_events"
+    val eventDf = DataFrameGen.events(spark, List(Column("user", StringType, 10), Column("views", IntType, 10)),
+                                      count = 100,
+                                      partitions = 5)
+    eventDf.save(s"$namespace.$eventsTable")
+
+    val groupByConf = buildPushGroupBy(namespace, "push_success_upload", eventsTable)
+    val today = tableUtils.partitionSpec.at(System.currentTimeMillis())
+
+    val kvStoreFunc = () => OnlineUtils.buildInMemoryKVStore("push_success")
+    val api = new MockApi(kvStoreFunc, "push_success")
+
+    noException should be thrownBy {
+      GroupByUpload.run(groupByConf, endDs = today, apiOpt = Some(api))
+    }
+
+    val kvStore = kvStoreFunc()
+    val dataset = groupByConf.batchDataset
+    val servingInfoKey = Constants.GroupByServingInfoKey.getBytes(Constants.UTF8)
+    val response =
+      Await.result(kvStore.multiGet(Seq(KVStore.GetRequest(servingInfoKey, dataset))), 1.hour).head
+    response.values.isSuccess should be(true)
+    response.values.get should not be empty
   }
 
   // Regression: an ion upload with no input data must fail, not silently "succeed". uploadDf always

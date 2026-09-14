@@ -6,9 +6,14 @@ import ai.chronon.api._
 import ai.chronon.flink.{AsyncKVStoreWriter, BaseFlinkJob, FlinkUtils}
 import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
-import ai.chronon.flink.source.FlinkSource
+import ai.chronon.flink.source.{BatchIrSourceBuilder, FlinkSource}
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
-import ai.chronon.flink.window.{AlwaysFireOnElementTrigger, BufferedProcessingTimeTrigger, MegaTileEmissionPolicy}
+import ai.chronon.flink.window.{
+  AlwaysFireOnElementTrigger,
+  BufferedProcessingTimeTrigger,
+  GigaTileProcessFunction,
+  MegaTileEmissionPolicy
+}
 import ai.chronon.online.{Api, GroupByServingInfoParsed, TopicInfo}
 
 import java.util.concurrent.TimeUnit
@@ -73,11 +78,15 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
     FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo)
   private val bufferingOutputJitterMillis =
     FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+  private val firstSeenKeyGraceMillis =
+    FlinkUtils.getNonNegativeLongProperty(GigaTileProcessFunction.FirstSeenKeyGraceMillisConfig, props, topicInfo)
   private val bufferingOutputPolicy =
     FlinkUtils
       .getProperty("buffering_output_policy", props, topicInfo)
       .map(MegaTileEmissionPolicy.fromString)
       .getOrElse(MegaTileEmissionPolicy.Default)
+  private val gigaTileBufferingOutputTimeMillis =
+    FlinkUtils.gigaTileBufferingOutputTimeMillis(bufferingOutputTimeMillis, bufferingOutputPolicy)
 
   /** Build the tiled version of the Flink GroupBy job that chains features using a JoinSource.
     *  The operators are structured as follows:
@@ -120,6 +129,26 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
                        bufferingOutputTimeMillis,
                        bufferingOutputJitterMillis,
                        bufferingOutputPolicy)
+  }
+
+  override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = {
+    logger.info(
+      s"Building giga tiled (push) Flink streaming job for groupBy: $groupByName that chains join: " +
+        s"${joinSource.getJoin.getMetaData.getName} using topic: $topic")
+    val (processedStream, schema) = buildEnrichedStream(env)
+    val batchIrStream = BatchIrSourceBuilder.build(env,
+                                                   groupByServingInfoParsed,
+                                                   props,
+                                                   requireConfiguredBatchSource = firstSeenKeyGraceMillis > 0L)
+    buildGigaTiledTail(processedStream,
+                       batchIrStream,
+                       schema,
+                       parallelism,
+                       sinkFn,
+                       kvStoreCapacity,
+                       enableDebug,
+                       gigaTileBufferingOutputTimeMillis,
+                       firstSeenKeyGraceMillis)
   }
 
   /** Build the source → watermark → enrichment → query transform pipeline.
