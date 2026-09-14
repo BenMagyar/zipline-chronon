@@ -320,6 +320,9 @@ aws_databricks = Team(
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
             "HUB_URL": "https://canary-orch-aws.zipline.ai",
             "ENABLE_KINESIS": "true",
+            # RAY_ prefix is stripped before injection onto Ray pods (see platform #1307).
+            "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+            "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
         },
     ),
     conf=ConfigProperties(
