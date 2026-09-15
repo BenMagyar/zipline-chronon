@@ -51,6 +51,8 @@
           "FETCHER_URL": "http://localhost:9000",
           "FRONTEND_URL": "https://canary-aws.zipline.ai",
           "HUB_URL": "https://canary-orch-aws.zipline.ai",
+          "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+          "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
           "SPARK_CLUSTER_NAME": "zipline-emr-canary",
           "VERSION": "latest",
           "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"

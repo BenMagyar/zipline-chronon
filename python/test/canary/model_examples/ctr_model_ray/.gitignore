@@ -1,0 +1,4 @@
+dist/
+*.egg-info/
+trainer/__pycache__/
+build/

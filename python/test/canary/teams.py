@@ -144,6 +144,10 @@ aws = Team(
             "EVAL_URL": "https://canary-aws.zipline.ai/services/eval",
             "ENABLE_KINESIS": "true",
             "FLINK_JARS_URI": "s3://zipline-artifacts-canary/spark-3.5.3/libs/",
+            # models/aws/ctr_ray.py is this team. RAY_ prefix is stripped onto
+            # Ray pods (platform #1307) so the trainer can auth to UC/Polaris.
+            "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+            "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
         },
         modeEnvironments={
             RunMode.UPLOAD: {

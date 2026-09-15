@@ -34,19 +34,25 @@ def _extract_workflow_id(output: str) -> str:
     return workflow_id
 
 
-def submit_backfill(runner, chronon_root, hub_url, conf, start_ds, end_ds):
+def submit_backfill(
+    runner, chronon_root, hub_url, conf, start_ds, end_ds, skip_compile=False
+):
     """Submit a backfill and return the workflow ID."""
+    args = [
+        "hub",
+        "backfill",
+        conf,
+        f"--chronon-root={chronon_root}",
+        f"--hub-url={hub_url}",
+        f"--start-ds={start_ds}",
+        f"--end-ds={end_ds}",
+        "--format=json",
+    ]
+    if skip_compile:
+        args.append("--skip-compile")
     result = runner.invoke(
         zipline,
-        [
-            "hub", "backfill",
-            conf,
-            f"--chronon-root={chronon_root}",
-            f"--hub-url={hub_url}",
-            f"--start-ds={start_ds}",
-            f"--end-ds={end_ds}",
-            "--format=json",
-        ],
+        args,
         catch_exceptions=False,
     )
     assert result.exit_code == 0, f"backfill failed:\n{result.output}"

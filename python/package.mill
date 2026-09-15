@@ -85,6 +85,16 @@ object `package` extends PythonModule with RuffModule with PublishModule {
 
   }
 
+  /** Mandatory trainer tests run in the same pinned dependency environment that
+    * the Ray working-directory archive declares, without burdening every Python test.
+    */
+  object test_ctr_ray extends PythonTests, TestModule.Pytest {
+    def pythonRequirementFiles =
+      Task.Sources(moduleDir / os.up / "requirements" / "ctr_ray_trainer.txt")
+
+    override def sources = Task.Sources(moduleDir)
+  }
+
   object test_integration extends PythonTests, TestModule.Pytest {
 
     def pythonRequirementFiles = Task.Sources(moduleDir / os.up / "requirements" / "integration.txt")

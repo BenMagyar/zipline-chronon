@@ -472,3 +472,42 @@ def test_canary_mutation_propagates_to_owning_team_configs(canary):
 
     assert canary_env_common.get("DATABRICKS_EXTRA") == "DATABRICKS_EXTRA_1"
     assert "DATABRICKS_EXTRA" not in prod_env_common
+
+
+def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(canary):
+    """The AWS CTR Ray model uses the standard image and immutable trainer URI."""
+    _compile_canary(canary)
+
+    from models.aws.ctr_ray import ctr_ray_model
+    relpath = f"compiled/models/aws/ctr_ray.ctr_ray_model__{ctr_ray_model.metaData.version}"
+    path = os.path.join(canary, relpath)
+    assert os.path.exists(path), f"Expected compiled CTR Ray model at {relpath}"
+
+    payload = json.loads(open(path).read())
+    spec = payload["trainingConf"]
+    assert payload["modelArtifactBaseUri"] == "s3://zipline-warehouse-crucible"
+    assert spec["pythonModule"] == "trainer.train"
+    assert not spec.get("image"), spec.get("image")
+    assert not spec.get("schedule"), spec.get("schedule")
+    assert not payload.get("deploymentConf"), payload.get("deploymentConf")
+    assert spec["resourceConfig"]["minReplicaCount"] == 0
+    assert spec["resourceConfig"]["maxReplicaCount"] == 0
+    assert spec["trainingDataWindow"] == {"length": 4, "timeUnit": 1}
+    assert "synthetic-label" not in spec["jobConfigs"]
+    assert spec["jobConfigs"]["catalog-type"] == "rest"
+    assert spec["jobConfigs"]["warehouse"] == "workspace"
+    assert spec["jobConfigs"]["client-id-env"] == "DATABRICKS_CLIENT_ID"
+    assert spec["jobConfigs"]["vended-credentials"] == "true"
+    assert spec["trainingDataSource"]["events"]["table"] == "poc.aws_databricks_ctr_labels_v1__0"
+    assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_ID"] == "{DATABRICKS_CLIENT_ID}"
+    assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_SECRET"] == "{DATABRICKS_CLIENT_SECRET}"
+    assert payload["inferenceSpec"]["modelBackend"] == 2
+    assert payload["inferenceSpec"]["modelBackendParams"]["model_name"] == "test_ctr_model_ray"
+
+    feature_pairs = [item.split(":") for item in spec["jobConfigs"]["features"].split(",")]
+    selected = spec["trainingDataSource"]["events"]["query"]["selects"]
+    for source, alias in feature_pairs:
+        assert selected[source] == source
+        assert f"'{alias}', {source}" in payload["inputMapping"]["instance"]
+    assert spec["jobConfigs"]["label-column"] == "label"
+    assert spec["jobConfigs"]["partition-column"] == "ds"

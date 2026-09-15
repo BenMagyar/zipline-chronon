@@ -130,6 +130,8 @@
                 "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
                 "FRONTEND_URL": "https://canary-aws.zipline.ai",
                 "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+                "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+                "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
                 "SPARK_CLUSTER_NAME": "zipline-emr-canary",
                 "VERSION": "latest",
                 "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
@@ -147,6 +149,8 @@
                   "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
                   "FRONTEND_URL": "https://canary-aws.zipline.ai",
                   "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+                  "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+                  "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
                   "SPARK_CLUSTER_NAME": "zipline-emr-canary",
                   "VERSION": "latest",
                   "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
@@ -342,6 +346,8 @@
                 "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
                 "FRONTEND_URL": "https://canary-aws.zipline.ai",
                 "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+                "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+                "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
                 "SPARK_CLUSTER_NAME": "zipline-emr-canary",
                 "VERSION": "latest",
                 "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
@@ -359,6 +365,8 @@
                   "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
                   "FRONTEND_URL": "https://canary-aws.zipline.ai",
                   "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+                  "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+                  "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
                   "SPARK_CLUSTER_NAME": "zipline-emr-canary",
                   "VERSION": "latest",
                   "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
@@ -498,6 +506,8 @@
           "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
           "FRONTEND_URL": "https://canary-aws.zipline.ai",
           "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+          "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+          "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
           "SPARK_CLUSTER_NAME": "zipline-emr-canary",
           "VERSION": "latest",
           "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
@@ -515,6 +525,8 @@
             "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
             "HUB_URL": "https://canary-aws.zipline.ai/services/hub",
+            "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
+            "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
             "SPARK_CLUSTER_NAME": "zipline-emr-canary",
             "VERSION": "latest",
             "WAREHOUSE_PREFIX": "s3://zipline-warehouse-canary"
