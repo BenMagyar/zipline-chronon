@@ -143,10 +143,10 @@ object StatsGenerator {
         if (ignoreColumns.contains(name)) {
           Seq.empty
         } else {
-          // Skip complex types (List, Map, Struct) for now - they don't support standard aggregations
+          // Complex types do not support distribution aggregations yet, but top-level nulls are still useful.
           dataType match {
             case _: api.ListType | _: api.MapType | _: api.StructType =>
-              Seq.empty
+              anyTransforms(name)
             case api.DateType | api.TimestampType =>
               anyTransforms(name)
             case _ =>

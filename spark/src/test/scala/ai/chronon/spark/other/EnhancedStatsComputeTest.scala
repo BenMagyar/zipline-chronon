@@ -134,6 +134,42 @@ class EnhancedStatsComputeTest extends SparkTestBase {
     assert(resultDf.count() == 1, "Should compute one daily stats tile")
   }
 
+  it should "compute top-level null stats for complex columns" in {
+    import spark.implicits._
+
+    val df = Seq(
+      (1L, Seq("a", "b"), Map("x" -> 1L), ("ok", 1L)),
+      (2L, null.asInstanceOf[Seq[String]], null.asInstanceOf[Map[String, Long]], null.asInstanceOf[(String, Long)])
+    ).toDF("id", "last_5", "attrs", "details")
+      .withColumn(tableUtils.partitionColumn, lit("2026-04-27"))
+
+    val enhancedStats = new EnhancedStatsCompute(
+      inputDf = df,
+      keys = Seq("id"),
+      name = "complex_stats_test",
+      cardinalityThreshold = 0.01
+    )
+
+    val metricsByColumn = enhancedStats.enhancedMetrics.groupBy(_.name)
+    assert(metricsByColumn("last_5").map(_.suffix) == Seq(StatsGenerator.nullSuffix))
+    assert(metricsByColumn("attrs").map(_.suffix) == Seq(StatsGenerator.nullSuffix))
+    assert(metricsByColumn("details").map(_.suffix) == Seq(StatsGenerator.nullSuffix))
+
+    val (resultDf, _) = enhancedStats.enhancedDailySummary(
+      sample = 1.0,
+      timeBucketMinutes = 0
+    )
+    val columns = resultDf.columns.toSet
+    assert(columns.contains("last_5__null_sum"), "List columns should include top-level null counts")
+    assert(columns.contains("attrs__null_sum"), "Map columns should include top-level null counts")
+    assert(columns.contains("details__null_sum"), "Struct columns should include top-level null counts")
+
+    val result = resultDf.select("last_5__null_sum", "attrs__null_sum", "details__null_sum").head()
+    assert(result.getAs[Long]("last_5__null_sum") == 1L, "List column should count one top-level null")
+    assert(result.getAs[Long]("attrs__null_sum") == 1L, "Map column should count one top-level null")
+    assert(result.getAs[Long]("details__null_sum") == 1L, "Struct column should count one top-level null")
+  }
+
   it should "generate enhanced metrics based on cardinality" in {
     val df = ratingsData
 
