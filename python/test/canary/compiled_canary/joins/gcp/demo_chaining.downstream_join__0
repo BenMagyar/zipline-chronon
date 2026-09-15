@@ -242,10 +242,10 @@
                       "selects": {
                         "listing_id": "listing_id",
                         "row_id": "event_id",
-                        "ts": "unix_millis(TIMESTAMP(event_time_ms))",
+                        "ts": "event_time_ms",
                         "user_id": "user_id"
                       },
-                      "timeColumn": "unix_millis(TIMESTAMP(event_time_ms))"
+                      "timeColumn": "event_time_ms"
                     },
                     "table": "data.gcp_exports_user_activities__0",
                     "topic": "pubsub://user-activities-v2/project=canary-443022/subscription=user-activities-v2-sub/serde=pubsub_schema/schemaId=user-activities"
@@ -364,10 +364,10 @@
         "selects": {
           "listing_id": "listing_id",
           "row_id": "event_id",
-          "ts": "unix_millis(TIMESTAMP(event_time_ms))",
+          "ts": "event_time_ms",
           "user_id": "user_id"
         },
-        "timeColumn": "unix_millis(TIMESTAMP(event_time_ms))"
+        "timeColumn": "event_time_ms"
       },
       "table": "data.gcp_exports_user_activities__0",
       "topic": "pubsub://user-activities-v2/project=canary-443022/subscription=user-activities-v2-sub/serde=pubsub_schema/schemaId=user-activities"
@@ -375,11 +375,11 @@
   },
   "metaData": {
     "columnHashes": {
-      "listing_id": "9daddd896246c830f5116831f5df9c0a",
-      "row_id": "17d1b68983ca3d528c3413540e64be13",
-      "ts": "619a104c27477d21da9cfc2eca48f45e",
-      "user_id": "ee0c3f74c13689caeeb88cd8971d3df2",
-      "user_id_price_cents_last100_7d": "ac24fb3bf350137048765b535ac12587"
+      "listing_id": "47aa3759ce41fc6ccf91367592e35f6d",
+      "row_id": "596506e0a4fef5508ebdcda7e6eb1072",
+      "ts": "d1ae44a8f84a262685dbf1bdb9f8d46e",
+      "user_id": "80c458b68b34de93d3c4c555ef2b2ddc",
+      "user_id_price_cents_last100_7d": "c6323972bd5a0a23b8bfb0f763c2c87e"
     },
     "customJson": "{\"airflowDependencies\": [{\"name\": \"wf_data_gcp_exports_user_activities__0_with_offset_0\", \"spec\": \"data.gcp_exports_user_activities__0/ds={{ macros.ds_add(ds, 0) }}\"}]}",
     "executionInfo": {

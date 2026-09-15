@@ -241,10 +241,10 @@
                 "selects": {
                   "listing_id": "listing_id",
                   "row_id": "event_id",
-                  "ts": "unix_millis(TIMESTAMP(event_time_ms))",
+                  "ts": "event_time_ms",
                   "user_id": "user_id"
                 },
-                "timeColumn": "unix_millis(TIMESTAMP(event_time_ms))"
+                "timeColumn": "event_time_ms"
               },
               "table": "data.gcp_exports_user_activities__0",
               "topic": "pubsub://user-activities-v2/project=canary-443022/subscription=user-activities-v2-sub/serde=pubsub_schema/schemaId=user-activities"

@@ -397,12 +397,140 @@ class IcebergTest extends SparkTestBase with Matchers {
         (2, '2024-03-02')
       """)
 
-      Iceberg.scanDistinctPartitions(tableName, "ds", "") should contain theSameElementsAs
+      Iceberg.scanDistinctPartitions(tableName, "ds", "", PartitionSpec.daily) should contain theSameElementsAs
         List("2024-03-01", "2024-03-02")
       Iceberg.virtualPartitions(tableName, "ds", PartitionSpec.daily) shouldBe List("2024-03-01")
       Iceberg.firstAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-03-01")
       Iceberg.lastAvailablePartition(tableName, "ds", PartitionSpec.daily) shouldBe Some("2024-03-02")
     } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "grid-floor TIMESTAMP ds values through the scan fallback" in {
+    val tableName = "default.iceberg_timestamp_ds_scan_fallback_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds TIMESTAMP
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'none'
+        )
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2024-03-01 00:00:00'),
+        (2, TIMESTAMP '2024-03-02 00:00:00')
+      """)
+
+      Iceberg.scanDistinctPartitions(tableName, "ds", "", PartitionSpec.daily) should contain theSameElementsAs
+        List("2024-03-01", "2024-03-02")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "grid-floor DATE ds independent of session timezone" in {
+    // cast(DateType).cast(TimestampType) resolves midnight in the session timezone, which under
+    // a non-UTC session would land on the previous UTC day. Verify the DateType branch stays
+    // UTC-anchored by pinning the session TZ to LA.
+    val tableName = "default.iceberg_date_ds_nonutc_session_test"
+    val originalTz = spark.conf.get("spark.sql.session.timeZone")
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds DATE
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'none'
+        )
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, DATE '2024-03-01'),
+        (2, DATE '2024-03-02')
+      """)
+
+      Iceberg.scanDistinctPartitions(tableName, "ds", "", PartitionSpec.daily) should contain theSameElementsAs
+        List("2024-03-01", "2024-03-02")
+    } finally {
+      spark.conf.set("spark.sql.session.timeZone", originalTz)
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "drop null partition values in the scan fallback" in {
+    // A null ds row would surface as a null flooredSeconds and crash the primitive Long
+    // decoding. Filter nulls before decoding while keeping every non-null value.
+    val tableName = "default.iceberg_null_ds_scan_fallback_test"
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds TIMESTAMP
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'none'
+        )
+      """)
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2024-03-01 00:00:00'),
+        (2, NULL),
+        (3, TIMESTAMP '2024-03-02 00:00:00')
+      """)
+
+      Iceberg.scanDistinctPartitions(tableName, "ds", "", PartitionSpec.daily) should contain theSameElementsAs
+        List("2024-03-01", "2024-03-02")
+    } finally {
+      spark.sql(s"DROP TABLE IF EXISTS $tableName")
+    }
+  }
+
+  it should "grid-floor TIMESTAMP ds in a non-UTC session timezone at a near-midnight boundary" in {
+    // A UTC-midnight TIMESTAMP rendered in America/Los_Angeles (UTC-8) would land on the
+    // previous calendar day; PartitionSpec.at anchors to UTC. This regression test pins the
+    // session timezone to LA to prove scanDistinctPartitions doesn't rely on session TZ.
+    val tableName = "default.iceberg_timestamp_ds_nonutc_session_test"
+    val originalTz = spark.conf.get("spark.sql.session.timeZone")
+    spark.sql(s"DROP TABLE IF EXISTS $tableName")
+
+    try {
+      spark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+      spark.sql(s"""
+        CREATE TABLE $tableName (
+          id INT,
+          ds TIMESTAMP
+        ) USING iceberg
+        TBLPROPERTIES (
+          'write.metadata.metrics.default' = 'none'
+        )
+      """)
+      // 2024-03-02 00:00:00 UTC == 2024-03-01 16:00:00 America/Los_Angeles
+      spark.sql(s"""
+        INSERT INTO $tableName VALUES
+        (1, TIMESTAMP '2024-03-01 00:00:00Z'),
+        (2, TIMESTAMP '2024-03-02 00:00:00Z')
+      """)
+
+      val partitions = Iceberg.scanDistinctPartitions(tableName, "ds", "", PartitionSpec.daily)
+      partitions should contain theSameElementsAs List(
+        PartitionSpec.daily.at(java.time.Instant.parse("2024-03-01T00:00:00Z").toEpochMilli),
+        PartitionSpec.daily.at(java.time.Instant.parse("2024-03-02T00:00:00Z").toEpochMilli)
+      )
+      partitions should contain theSameElementsAs List("2024-03-01", "2024-03-02")
+    } finally {
+      spark.conf.set("spark.sql.session.timeZone", originalTz)
       spark.sql(s"DROP TABLE IF EXISTS $tableName")
     }
   }

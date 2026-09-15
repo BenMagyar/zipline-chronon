@@ -5,7 +5,7 @@ import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.util.QuotingUtils
 import org.apache.spark.sql.connector.catalog.Identifier
-import org.apache.spark.sql.functions.{col, lit, min, max}
+import org.apache.spark.sql.functions.{col, lit, min, max, pmod, unix_date}
 import org.apache.spark.sql.types.{DataType, DateType, LongType, NumericType, StringType, StructType, TimestampType}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -142,19 +142,44 @@ trait Format {
     * (unfilledRanges, step runners) needs the SET of partitions, not just boundaries - an
     * empty catalog listing would otherwise read as "everything missing" and force full
     * recomputes of join-part/output tables that are fully populated. This is a single
-    * distinct aggregation and only runs on the empty-catalog path; string columns only,
-    * since timestamp-backed tables go through the timePartitioned/virtualPartitions path.
+    * distinct aggregation and only runs on the empty-catalog path. Timestamp/date/numeric
+    * columns are grid-floored to the target spec before deduping so downstream string
+    * comparisons see canonical ds values.
     */
-  def scanDistinctPartitions(tableName: String, partitionColumn: String, partitionFilters: String)(implicit
-      sparkSession: SparkSession): List[String] = {
+  def scanDistinctPartitions(tableName: String,
+                             partitionColumn: String,
+                             partitionFilters: String,
+                             partitionSpec: PartitionSpec)(implicit sparkSession: SparkSession): List[String] = {
     import sparkSession.implicits._
     Try {
       val df = sparkSession.read.table(tableName)
+      val filtered = if (partitionFilters.isEmpty) df else df.where(partitionFilters)
       df.schema(partitionColumn).dataType match {
         case StringType =>
-          val filtered = if (partitionFilters.isEmpty) df else df.where(partitionFilters)
           filtered.select(col(partitionColumn)).distinct().as[String].collect().toList
-        case _ => List.empty
+        case dt =>
+          // Emit floored epoch-millis in Spark, then format on the driver via PartitionSpec.at.
+          // Spark's date/time functions render in the session timeZone, which is not guaranteed
+          // to be UTC; PartitionSpec.at always uses UTC. Do the format Scala-side to match.
+          val secondsCol = dt match {
+            case _: NumericType => (col(partitionColumn).cast(LongType) / 1000).cast(LongType)
+            case DateType       =>
+              // cast(DateType).cast(TimestampType) uses session-TZ midnight, which is wrong under
+              // non-UTC sessions. unix_date returns UTC-anchored epoch days for a DATE.
+              unix_date(col(partitionColumn)).cast(LongType) * lit(86400L)
+            case _ => col(partitionColumn).cast(TimestampType).cast(LongType)
+          }
+          val spanSeconds = partitionSpec.spanMillis / 1000
+          val offsetSeconds = Math.floorMod(partitionSpec.offsetMillis, partitionSpec.spanMillis) / 1000
+          val flooredSeconds = secondsCol - pmod(secondsCol - lit(offsetSeconds), lit(spanSeconds))
+          filtered
+            .where(col(partitionColumn).isNotNull)
+            .select(flooredSeconds)
+            .distinct()
+            .as[Long]
+            .collect()
+            .toList
+            .map(sec => partitionSpec.at(sec * 1000L))
       }
     } match {
       case Success(result) => result

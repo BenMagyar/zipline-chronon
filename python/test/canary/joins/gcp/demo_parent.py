@@ -10,7 +10,7 @@ source = EventSource(
     topic="pubsub://user-activities-v2/project=canary-443022/subscription=user-activities-v2-sub/serde=pubsub_schema/schemaId=user-activities",
     query=Query(
         selects=selects(user_id="user_id", listing_id="listing_id", row_id="event_id"),
-        time_column="unix_millis(TIMESTAMP(event_time_ms))",
+        time_column="event_time_ms",
     ),
 )
 

@@ -216,7 +216,10 @@ case object Iceberg extends Format {
       .flatMap(table => Try(Option(table.spec()).toSeq.flatMap(_.fields().asScala.map(_.name()))).toOption)
       .getOrElse(Seq.empty)
 
-  override def scanDistinctPartitions(tableName: String, partitionColumn: String, partitionFilters: String)(implicit
+  override def scanDistinctPartitions(tableName: String,
+                                      partitionColumn: String,
+                                      partitionFilters: String,
+                                      partitionSpec: PartitionSpec)(implicit
       sparkSession: SparkSession): List[String] = {
     val effectiveColumn = resolvePartitionColumn(tableName, partitionColumn)
     Try(loadIcebergTable(tableName).flatMap(listPartitionsByStats(_, effectiveColumn, partitionFilters))) match {
@@ -226,11 +229,11 @@ case object Iceberg extends Format {
       case Success(None) =>
         logger.info(
           s"Iceberg distinct file stats were incomplete for $tableName.$partitionColumn; falling back to scan")
-        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters)
+        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters, partitionSpec)
       case Failure(e) =>
         logger.warn(
           s"Failed to resolve Iceberg distinct file stats for $tableName.$partitionColumn: ${Option(e.getMessage).getOrElse("(no message)")}")
-        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters)
+        super.scanDistinctPartitions(tableName, effectiveColumn, partitionFilters, partitionSpec)
     }
   }
 

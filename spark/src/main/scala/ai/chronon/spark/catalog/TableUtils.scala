@@ -147,7 +147,7 @@ class TableUtils(@transient val sparkSession: SparkSession, partitionSpecOverrid
           // Some tables do not expose catalog partitions. In that case, use the distinct
           // values in the partition column. Sub-partition filters are not supported there.
           if (catalogPartitions.nonEmpty || subPartitionsFilter.nonEmpty) catalogPartitions
-          else format.scanDistinctPartitions(tableName, effectivePartColumn, rangeWheres)(sparkSession)
+          else format.scanDistinctPartitions(tableName, effectivePartColumn, rangeWheres, effectiveSpec)(sparkSession)
         }
       })
       .map { partitions =>
