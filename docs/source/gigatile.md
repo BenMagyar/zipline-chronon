@@ -1,3 +1,7 @@
+---
+title: "Giga Tile Design"
+---
+
 # Giga Tile Design
 
 ## Problem

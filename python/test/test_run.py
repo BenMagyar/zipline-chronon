@@ -279,6 +279,14 @@ def test_upload_to_kv_forwards_timestamp(repo, test_online_group_by):
     assert "--timestamp=1788541200000" in runner._gen_final_args()
 
 
+def test_upload_to_kv_exposes_publish_timestamp_option():
+    result = CliRunner().invoke(run.main, ["--help"])
+
+    assert result.exit_code == 0
+    assert "--publish-timestamp" in result.output
+    assert "--timestamp PARTITION_DATE" not in result.output
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -340,7 +348,10 @@ def test_validate_upload_timestamp_accepts_upload_to_kv(timestamp):
 
 
 def test_validate_upload_timestamp_rejects_other_modes():
-    with pytest.raises(click.UsageError, match="only supported with --mode=upload-to-kv"):
+    with pytest.raises(
+        click.UsageError,
+        match="--publish-timestamp is only supported with --mode=upload-to-kv",
+    ):
         run.validate_upload_timestamp(RunMode.UPLOAD, 1788541200000)
 
 

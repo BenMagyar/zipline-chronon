@@ -10,12 +10,14 @@ Replaces the former test_gcp_template_quickstart.py.
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 
 import pytest
 from click.testing import CliRunner
 
 from ai.chronon import utils
 
+from .helpers import cli as cli_helpers
 from .helpers.cli import (
     compile_configs,
     submit_check_partitions,
@@ -71,6 +73,37 @@ JOIN_KEY = {
     "aws": "compiled/joins/aws/demo.v1__1",
     "azure": "compiled/joins/azure/training_set.v1_test__0",
 }
+
+
+@pytest.mark.parametrize(
+    "publish_timestamp,expected_extra_args",
+    [
+        (None, ["--ds=2026-09-04"]),
+        ("2026-09-05", ["--ds=2026-09-04", "--publish-timestamp=2026-09-05"]),
+        (0, ["--ds=2026-09-04", "--publish-timestamp=0"]),
+    ],
+)
+def test_submit_upload_to_kv_publish_timestamp(
+    monkeypatch, publish_timestamp, expected_extra_args
+):
+    submitted = {}
+
+    def fake_submit_run(*args, **kwargs):
+        submitted.update(kwargs)
+
+    monkeypatch.setattr(cli_helpers, "submit_run", fake_submit_run)
+
+    cli_helpers.submit_upload_to_kv(
+        runner=None,
+        chronon_root="/tmp/chronon",
+        conf="compiled/group_bys/test/example",
+        version="test-version",
+        ds="2026-09-04",
+        publish_timestamp=publish_timestamp,
+    )
+
+    assert submitted["mode"] == "upload-to-kv"
+    assert submitted["extra_args"] == expected_extra_args
 
 
 def _read_compiled_conf(chronon_root, conf):
@@ -181,8 +214,16 @@ def test_run_quickstart(test_id, confs, chronon_root, version, cloud):
         # 5. Upload
         submit_upload(runner, chronon_root, gb_conf, version, ds=end_ds)
 
-        # 6. Upload to KV
-        submit_upload_to_kv(runner, chronon_root, gb_conf, version, ds=end_ds)
+        # 6. Upload to KV with an explicit publication timestamp.
+        publish_timestamp = (date.fromisoformat(end_ds) + timedelta(days=1)).isoformat()
+        submit_upload_to_kv(
+            runner,
+            chronon_root,
+            gb_conf,
+            version,
+            ds=end_ds,
+            publish_timestamp=publish_timestamp,
+        )
 
         # 7. Metadata upload
         submit_metadata_upload(runner, chronon_root, gb_conf, version)

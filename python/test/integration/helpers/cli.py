@@ -161,9 +161,21 @@ def submit_upload(runner, chronon_root, conf, version, ds):
     return submit_run(runner, chronon_root, conf, version, mode="upload", extra_args=[f"--ds={ds}"])
 
 
-def submit_upload_to_kv(runner, chronon_root, conf, version, ds):
+def submit_upload_to_kv(
+    runner, chronon_root, conf, version, ds, publish_timestamp=None
+):
     """Invoke ``zipline run`` in upload-to-kv mode."""
-    return submit_run(runner, chronon_root, conf, version, mode="upload-to-kv", extra_args=[f"--ds={ds}"])
+    extra_args = [f"--ds={ds}"]
+    if publish_timestamp is not None:
+        extra_args.append(f"--publish-timestamp={publish_timestamp}")
+    return submit_run(
+        runner,
+        chronon_root,
+        conf,
+        version,
+        mode="upload-to-kv",
+        extra_args=extra_args,
+    )
 
 
 def submit_metadata_upload(runner, chronon_root, conf, version):

@@ -138,7 +138,9 @@ def validate_additional_jars(ctx, param, value):
 
 def validate_upload_timestamp(mode, timestamp):
     if timestamp is not None and mode != RunMode.UPLOAD_TO_KV:
-        raise click.UsageError("--timestamp is only supported with --mode=upload-to-kv")
+        raise click.UsageError(
+            "--publish-timestamp is only supported with --mode=upload-to-kv"
+        )
 
 
 def parse_upload_timestamp(ctx, param, value):
@@ -339,7 +341,8 @@ def validate_force_overwrite_args(force_overwrite, mode, ds, start_ds, end_ds, c
     help="Bulk put uploader to use when load data to kv store, applied to upload-to-kv mode",
 )
 @click.option(
-    "--timestamp",
+    "--publish-timestamp",
+    "timestamp",
     callback=parse_upload_timestamp,
     metavar="PARTITION_DATE|EPOCH_MILLIS",
     help=(

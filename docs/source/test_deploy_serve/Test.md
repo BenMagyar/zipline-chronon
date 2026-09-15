@@ -137,7 +137,7 @@ and then to actually upload to your KV store:
 zipline run compiled/group_bys/your_group_by.v1 --mode upload-to-kv --ds 2023-12-01
 ```
 
-Every batch upload receives a publication timestamp. Uploads without `--timestamp` use the selected
+Every batch upload receives a publication timestamp. Uploads without `--publish-timestamp` use the selected
 partition's end, so a delayed scheduled upload of an older partition cannot replace a newer
 partition's cells. Bigtable assigns that version to every uploaded cell, including
 `group_by_serving_info`, so the latest publication is fetched. To promote an older partition
@@ -147,7 +147,7 @@ intentionally, provide a UTC publication date or time that is newer than the act
 zipline run compiled/group_bys/your_group_by.v1 \
   --mode upload-to-kv \
   --ds 2023-12-01 \
-  --timestamp 2023-12-02-00-01
+  --publish-timestamp 2023-12-02-00-01
 ```
 
 The CLI accepts `YYYY-MM-DD`, `YYYY-MM-DD-HH`, and `YYYY-MM-DD-HH-mm`, plus the slash,
