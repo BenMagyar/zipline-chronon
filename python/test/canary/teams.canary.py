@@ -201,9 +201,7 @@ aws_databricks_env.common['WAREHOUSE_PREFIX'] = "s3://zipline-warehouse-crucible
 aws_databricks_env.common['FRONTEND_URL'] = "https://crucible-aws.zipline.ai"
 aws_databricks_env.common['HUB_URL'] = "https://crucible-aws.zipline.ai/services/hub"
 
-aws_databricks_env.common['FLINK_JARS_URI'] = "s3://zipline-spark-libs/spark-3.5.3/libs/"
-# Spark 4 rollout:
-# aws_databricks_env.common['FLINK_JARS_URI'] = "s3://zipline-spark-libs/spark-4.1.3/libs/"
+aws_databricks_env.common['FLINK_JARS_URI'] = "s3://zipline-spark-libs/spark-4.1.3/libs/"
 aws_databricks_env.common['FLINK_STATE_URI'] = "s3://zipline-warehouse-crucible/flink-state"
 
 aws_databricks.conf.common['spark.sql.warehouse.dir'] = "s3://zipline-warehouse-crucible/data/uc-poc/warehouse/"

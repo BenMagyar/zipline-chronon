@@ -447,6 +447,10 @@ def test_canary_mutation_to_imported_team_lands_in_canary_only(canary):
         f"{prod_env_common.get('DATABRICKS_EXTRA')!r}. The canary mutation was "
         "supposed to be isolated by import_module_from_file re-execing teams.py."
     )
+    assert canary_env_common.get("FLINK_JARS_URI") == (
+        "s3://zipline-spark-libs/spark-4.1.3/libs/"
+    )
+    assert "FLINK_JARS_URI" not in prod_env_common
 
 
 def test_canary_mutation_propagates_to_owning_team_configs(canary):
