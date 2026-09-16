@@ -8,6 +8,8 @@ so Crucible uses the configured standard Ray image and fetches trainer code from
 ``{model_artifact_base_uri}/builds/test_ctr_model_ray-{version}.zip``.
 """
 
+from staging_queries.aws_databricks import ctr_labels
+
 from ai.chronon.data_types import DataType
 from ai.chronon.types import (
     EventSource,
@@ -32,7 +34,9 @@ _features = [
 ]
 _label_column = "label"
 _partition_column = "ds"
-_training_table = "poc.aws_databricks_ctr_labels_v1__0"
+# Use the versioned staging-query table. Iceberg REST expects namespace.table;
+# the Spark catalog qualifier is supplied separately via the REST warehouse.
+_training_table = ".".join(ctr_labels.v1.table.split(".")[-2:])
 _artifact_base = "s3://zipline-warehouse-crucible"
 _databricks_host = "https://dbc-050d6f00-dcb3.cloud.databricks.com"
 _training_source = EventSource(

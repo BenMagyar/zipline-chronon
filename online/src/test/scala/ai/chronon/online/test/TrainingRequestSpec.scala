@@ -59,7 +59,7 @@ class TrainingRequestSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "fail when the date is missing or empty" in {
-    Seq(null, "").foreach { date =>
+    Seq(null, "", " ", "\t\n").foreach { date =>
       val exception = intercept[IllegalArgumentException](TrainingRequest.fromModel(model(trainingSpec()), date))
       exception.getMessage should include("training date is required")
     }

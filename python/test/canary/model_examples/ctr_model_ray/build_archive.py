@@ -14,6 +14,7 @@ def _archive_bytes(path: Path) -> None:
         for source in ARCHIVE_SOURCES:
             relative = source.relative_to(ROOT).as_posix()
             info = ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3  # Unix metadata on every host, including Windows.
             info.compress_type = ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
             archive.writestr(info, source.read_bytes(), compress_type=ZIP_DEFLATED, compresslevel=9)

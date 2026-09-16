@@ -511,3 +511,30 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
         assert f"'{alias}', {source}" in payload["inputMapping"]["instance"]
     assert spec["jobConfigs"]["label-column"] == "label"
     assert spec["jobConfigs"]["partition-column"] == "ds"
+
+
+def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
+    """Changing the upstream version must change the REST input identifier."""
+    import shutil
+    import subprocess
+    import sys
+
+    root = tmp_path / "canary"
+    shutil.copytree(canary, root, ignore=shutil.ignore_patterns(
+        "compiled", "compiled_canary", "__pycache__", "dist"))
+    source = root / "staging_queries/aws_databricks/ctr_labels.py"
+    original = source.read_text()
+    assert "version=0" in original
+    source.write_text(original.replace("version=0", "version=7"))
+    # A fresh interpreter models a new compile after editing the Python source.
+    result = subprocess.run(
+        [sys.executable, "-c", "from ai.chronon.repo.compile import compile; compile()",
+         "--chronon-root", str(root), "--force"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for directory in ("compiled", "compiled_canary"):
+        model_file = next((root / directory / "models/aws").glob("ctr_ray.*"))
+        model = json.loads(model_file.read_text())
+        assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
+            "poc.aws_databricks_ctr_labels_v1__7"

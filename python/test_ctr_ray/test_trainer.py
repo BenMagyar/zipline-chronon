@@ -182,7 +182,7 @@ def test_empty_scan_has_a_descriptive_error(trainer_modules):
         )
 
 
-def test_archive_build_is_deterministic_and_contains_only_runtime_sources(tmp_path):
+def test_archive_build_is_deterministic_and_contains_only_runtime_sources(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "ctr_ray_build_archive", TRAINER_ROOT / "build_archive.py"
     )
@@ -193,6 +193,12 @@ def test_archive_build_is_deterministic_and_contains_only_runtime_sources(tmp_pa
     first = tmp_path / "first.zip"
     second = tmp_path / "second.zip"
     builder._archive_bytes(first)
+    original_zip_info = builder.ZipInfo
+    def windows_zip_info(*args, **kwargs):
+        info = original_zip_info(*args, **kwargs)
+        info.create_system = 0
+        return info
+    monkeypatch.setattr(builder, "ZipInfo", windows_zip_info)
     builder._archive_bytes(second)
 
     assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(

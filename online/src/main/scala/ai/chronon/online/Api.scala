@@ -364,7 +364,7 @@ object TrainingRequest {
     require(model != null, "A model is required to build a TrainingRequest")
     require(model.getTrainingConf != null,
             s"Model ${modelName(model)} has no trainingConf to build a TrainingRequest from")
-    require(Option(date).exists(_.nonEmpty), s"A training date is required for model ${modelName(model)}")
+    require(Option(date).exists(_.trim.nonEmpty), s"A training date is required for model ${modelName(model)}")
 
     val trainingConf = model.getTrainingConf
     TrainingRequest(
