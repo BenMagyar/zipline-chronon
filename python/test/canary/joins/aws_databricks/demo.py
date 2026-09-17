@@ -89,7 +89,7 @@ derivations_v1 = Join(
     row_ids=["event_id"],
     right_parts=[
         JoinPart(group_by=dim_listings.adhoc_v1),
-        JoinPart(group_by=user_activities.v2),
+        JoinPart(group_by=user_activities.v1),
     ],
     derivations=[
         Derivation(

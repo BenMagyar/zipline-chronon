@@ -25,9 +25,12 @@ source = EventSource(
                 is_desktop="IF(device_type = 'desktop', 1, 0)",
                 is_tablet="IF(device_type = 'tablet', 1, 0)",
                 # Activity structs for last_k tracking
-                user_event_struct="STRUCT(event_type, listing_id, unix_millis(TIMESTAMP(event_time_ms)) as timestamp)",
+                # event_time_ms is already epoch milliseconds. TIMESTAMP(<number>)
+                # reads seconds, which moved every event ~1000x into the future and
+                # left temporal join windows empty.
+                user_event_struct="STRUCT(event_type, listing_id, event_time_ms as timestamp)",
             ),
-            time_column="unix_millis(TIMESTAMP(event_time_ms))",
+            time_column="event_time_ms",
     ),
 )
 
@@ -68,7 +71,7 @@ v1 = GroupBy(
     sources=[source],
     keys=["user_id"],  # Aggregate by user
     online=False,
-    version=1,
+    version=2,
     aggregations=aggregations,
     step_days=10,
     env_vars=EnvironmentVariables(
@@ -76,27 +79,4 @@ v1 = GroupBy(
             "CHRONON_ONLINE_ARGS": "-Ztasks=1",
         }
     ),
-)
-
-# The source schema declares event_time_ms as epoch milliseconds. Spark's
-# TIMESTAMP(number) interprets seconds, so v1 moves events 1000x into the future
-# and leaves temporal join windows empty. Keep v1 intact for existing consumers.
-v2 = GroupBy(
-    sources=[EventSource(
-        table=source.events.table,
-        topic=source.events.topic,
-        query=Query(
-            selects={
-                **source.events.query.selects,
-                "user_event_struct": "STRUCT(event_type, listing_id, event_time_ms as timestamp)",
-            },
-            time_column="event_time_ms",
-        ),
-    )],
-    keys=["user_id"],
-    online=False,
-    version=2,
-    aggregations=aggregations,
-    step_days=10,
-    env_vars=EnvironmentVariables(common={"CHRONON_ONLINE_ARGS": "-Ztasks=1"}),
 )

@@ -558,10 +558,16 @@ def test_ctr_click_history_preserves_epoch_milliseconds_through_pipeline(canary,
     # history outside every join window; both clocks must use the source Long.
     assert join["left"]["events"]["query"]["timeColumn"] == query["timeColumn"] == "event_time_ms"
     assert query["selects"]["user_event_struct"] == "STRUCT(event_type, listing_id, event_time_ms as timestamp)"
-    assert activity["metaData"]["name"] == "aws_databricks.user_activities.v2__2"
+    assert activity["metaData"]["name"] == "aws_databricks.user_activities.v1__2"
     assert "FROM workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3" in labels["query"]
     assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
         "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
 
-    old = json.loads((root / "group_bys/aws_databricks/user_activities.v1__1").read_text())
-    assert old["sources"][0]["events"]["query"]["timeColumn"] == "unix_millis(TIMESTAMP(event_time_ms))"
+    # Corrected at the source and version-bumped rather than forked, so the other
+    # consumer of this GroupBy picks the fix up too.
+    adhoc = json.loads((root / "joins/aws_databricks/demo.adhoc_v1__1").read_text())
+    adhoc_activity = next(part["groupBy"] for part in adhoc["joinParts"]
+                          if part["groupBy"]["metaData"]["name"].startswith("aws_databricks.user_activities"))
+    assert adhoc_activity["metaData"]["name"] == "aws_databricks.user_activities.v1__2"
+    assert adhoc_activity["sources"][0]["events"]["query"]["timeColumn"] == "event_time_ms"
+    assert not (root / "group_bys/aws_databricks/user_activities.v2__2").exists()
