@@ -498,7 +498,7 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
     assert spec["jobConfigs"]["warehouse"] == "workspace"
     assert spec["jobConfigs"]["client-id-env"] == "DATABRICKS_CLIENT_ID"
     assert spec["jobConfigs"]["vended-credentials"] == "true"
-    assert spec["trainingDataSource"]["events"]["table"] == "poc.aws_databricks_ctr_labels_v1__0"
+    assert spec["trainingDataSource"]["events"]["table"] == "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_ID"] == "{DATABRICKS_CLIENT_ID}"
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_SECRET"] == "{DATABRICKS_CLIENT_SECRET}"
     assert payload["inferenceSpec"]["modelBackend"] == 2
@@ -514,7 +514,8 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
 
 
 def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
-    """Changing the upstream version must change the REST input identifier."""
+    """Changing the upstream version must change the model's training table, and the
+    table must stay the staging query's Spark name so Hub links the model to its producer."""
     import shutil
     import subprocess
     import sys
@@ -524,8 +525,8 @@ def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
         "compiled", "compiled_canary", "__pycache__", "dist"))
     source = root / "staging_queries/aws_databricks/ctr_labels.py"
     original = source.read_text()
-    assert "version=0" in original
-    source.write_text(original.replace("version=0", "version=7"))
+    assert "version=2" in original
+    source.write_text(original.replace("version=2", "version=7"))
     # A fresh interpreter models a new compile after editing the Python source.
     result = subprocess.run(
         [sys.executable, "-c", "from ai.chronon.repo.compile import compile; compile()",
@@ -537,4 +538,30 @@ def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
         model_file = next((root / directory / "models/aws").glob("ctr_ray.*"))
         model = json.loads(model_file.read_text())
         assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
-            "poc.aws_databricks_ctr_labels_v1__7"
+            "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__7"
+
+
+@pytest.mark.parametrize("directory", ["compiled", "compiled_canary"])
+def test_ctr_click_history_preserves_epoch_milliseconds_through_pipeline(canary, directory):
+    """The model's producer must use the corrected event clock, without changing v1 consumers."""
+    from pathlib import Path
+
+    _compile_canary(canary)
+    root = Path(canary) / directory
+    join = json.loads((root / "joins/aws_databricks/demo.derivations_v1__3").read_text())
+    labels = json.loads((root / "staging_queries/aws_databricks/ctr_labels.v1__2").read_text())
+    model = json.loads(next((root / "models/aws").glob("ctr_ray.ctr_ray_model__*")).read_text())
+    activity = join["joinParts"][1]["groupBy"]
+    query = activity["sources"][0]["events"]["query"]
+
+    # A numeric TIMESTAMP cast treats epoch milliseconds as seconds and moves
+    # history outside every join window; both clocks must use the source Long.
+    assert join["left"]["events"]["query"]["timeColumn"] == query["timeColumn"] == "event_time_ms"
+    assert query["selects"]["user_event_struct"] == "STRUCT(event_type, listing_id, event_time_ms as timestamp)"
+    assert activity["metaData"]["name"] == "aws_databricks.user_activities.v2__2"
+    assert "FROM workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3" in labels["query"]
+    assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
+        "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
+
+    old = json.loads((root / "group_bys/aws_databricks/user_activities.v1__1").read_text())
+    assert old["sources"][0]["events"]["query"]["timeColumn"] == "unix_millis(TIMESTAMP(event_time_ms))"

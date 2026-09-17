@@ -89,7 +89,7 @@ derivations_v1 = Join(
     row_ids=["event_id"],
     right_parts=[
         JoinPart(group_by=dim_listings.adhoc_v1),
-        JoinPart(group_by=user_activities.v1),
+        JoinPart(group_by=user_activities.v2),
     ],
     derivations=[
         Derivation(
@@ -113,9 +113,14 @@ derivations_v1 = Join(
                 END
             """,
         ),
+        Derivation(name="inventory_log", expression="log1p(listing_id_inventory_count)"),
+        Derivation(
+            name="price_per_kg",
+            expression="listing_id_price_cents * 1000.0 / NULLIF(listing_id_weight_grams, 0)",
+        ),
         Derivation(name="*", expression="*"),
     ],
-    version=1,
+    version=3,
     online=False,
     output_namespace="workspace_iceberg.poc",
     step_days=10,

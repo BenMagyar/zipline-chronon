@@ -7,7 +7,7 @@
     }
   },
   "inputMapping": {
-    "instance": "named_struct('user_id_click_event_average_7d', user_id_click_event_average_7d, 'listing_price_cents', listing_id_price_cents, 'price_log', price_log, 'price_bucket', price_bucket)"
+    "instance": "named_struct('user_id_click_event_average_7d', user_id_click_event_average_7d, 'listing_price_cents', listing_id_price_cents, 'price_log', price_log, 'price_bucket', price_bucket, 'inventory_count', listing_id_inventory_count, 'weight_grams', listing_id_weight_grams, 'is_in_stock', listing_id_is_in_stock, 'is_listing_heavy', is_listing_heavy, 'inventory_log', inventory_log, 'price_per_kg', price_per_kg)"
   },
   "metaData": {
     "executionInfo": {
@@ -111,11 +111,11 @@
         }
       }
     },
-    "name": "aws.ctr_ray.ctr_ray_model__e0d0bdb95370",
+    "name": "aws.ctr_ray.ctr_ray_model__be42a6772745",
     "outputNamespace": "data",
     "sourceFile": "models/aws/ctr_ray.py",
     "team": "aws",
-    "version": "e0d0bdb95370"
+    "version": "be42a6772745"
   },
   "modelArtifactBaseUri": "s3://zipline-warehouse-crucible",
   "outputMapping": {
@@ -128,7 +128,7 @@
       "client-id-env": "DATABRICKS_CLIENT_ID",
       "client-secret-env": "DATABRICKS_CLIENT_SECRET",
       "eta": "0.1",
-      "features": "user_id_click_event_average_7d:user_id_click_event_average_7d,listing_id_price_cents:listing_price_cents,price_log:price_log,price_bucket:price_bucket",
+      "features": "user_id_click_event_average_7d:user_id_click_event_average_7d,listing_id_price_cents:listing_price_cents,price_log:price_log,price_bucket:price_bucket,listing_id_inventory_count:inventory_count,listing_id_weight_grams:weight_grams,listing_id_is_in_stock:is_in_stock,is_listing_heavy:is_listing_heavy,inventory_log:inventory_log,price_per_kg:price_per_kg",
       "label-column": "label",
       "max-depth": "4",
       "model-dir": "s3://zipline-warehouse-crucible/models/test_ctr_model_ray",
@@ -150,15 +150,21 @@
         "query": {
           "selects": {
             "ds": "ds",
+            "inventory_log": "inventory_log",
+            "is_listing_heavy": "is_listing_heavy",
             "label": "label",
+            "listing_id_inventory_count": "listing_id_inventory_count",
+            "listing_id_is_in_stock": "listing_id_is_in_stock",
             "listing_id_price_cents": "listing_id_price_cents",
+            "listing_id_weight_grams": "listing_id_weight_grams",
             "price_bucket": "price_bucket",
             "price_log": "price_log",
+            "price_per_kg": "price_per_kg",
             "user_id_click_event_average_7d": "user_id_click_event_average_7d"
           },
           "startPartition": "2025-07-01"
         },
-        "table": "poc.aws_databricks_ctr_labels_v1__0"
+        "table": "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
       }
     },
     "trainingDataWindow": {

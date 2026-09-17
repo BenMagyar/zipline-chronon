@@ -61,6 +61,13 @@ def shape_training_frame(
     return x_train_df, labels.astype(int).tolist()
 
 
+def rest_identifier(table: str) -> str:
+    # Hub links a model to its upstream staging query by the Spark table name
+    # (catalog.namespace.table), but the Iceberg REST catalog addresses the same
+    # table as namespace.table inside the configured warehouse.
+    parts = table.split(".")
+    return ".".join(parts[-2:]) if len(parts) > 2 else table
+
 
 def get_training_data_df(
     catalog,
@@ -78,7 +85,7 @@ def get_training_data_df(
     features = features if features is not None else parse_features(DEFAULT_FEATURES)
     selected = list(dict.fromkeys([source for source, _ in features] + [partition_column, label_column]))
 
-    table = catalog.load_table(input_table)
+    table = catalog.load_table(rest_identifier(input_table))
     arrow_tbl = table.scan(
         row_filter=And(
             GreaterThanOrEqual(partition_column, start_ds),

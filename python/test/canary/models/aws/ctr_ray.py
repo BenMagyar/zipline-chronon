@@ -1,10 +1,10 @@
 """CTR trainer submitted through Hub TRAIN_MODEL on the standard Ray image.
 
-Reads a real labeled dataset from Databricks Unity Catalog via the
-Iceberg REST catalog: ``poc.aws_databricks_ctr_labels_v1__0`` already carries
-the derivation feature columns plus a materialized ``label`` column, so the
-trainer no longer generates synthetic labels. ``TrainingSpec.image`` is omitted
-so Crucible uses the configured standard Ray image and fetches trainer code from
+Reads a real labeled dataset from Databricks Unity Catalog via the Iceberg REST
+catalog: the ``ctr_labels`` staging query already carries the derivation feature
+columns plus a materialized ``label`` column, so the trainer no longer generates
+synthetic labels. ``TrainingSpec.image`` is omitted so Crucible uses the
+configured standard Ray image and fetches trainer code from
 ``{model_artifact_base_uri}/builds/test_ctr_model_ray-{version}.zip``.
 """
 
@@ -31,12 +31,19 @@ _features = [
     ("listing_id_price_cents", "listing_price_cents"),
     ("price_log", "price_log"),
     ("price_bucket", "price_bucket"),
+    ("listing_id_inventory_count", "inventory_count"),
+    ("listing_id_weight_grams", "weight_grams"),
+    ("listing_id_is_in_stock", "is_in_stock"),
+    ("is_listing_heavy", "is_listing_heavy"),
+    ("inventory_log", "inventory_log"),
+    ("price_per_kg", "price_per_kg"),
 ]
 _label_column = "label"
 _partition_column = "ds"
-# Use the versioned staging-query table. Iceberg REST expects namespace.table;
-# the Spark catalog qualifier is supplied separately via the REST warehouse.
-_training_table = ".".join(ctr_labels.v1.table.split(".")[-2:])
+# Keep the staging query's Spark name: Hub links the model to its producer by exact
+# table name, so a model backfill recomputes the join and labels first. The trainer
+# strips the catalog qualifier for the Iceberg REST lookup.
+_training_table = ctr_labels.v1.table
 _artifact_base = "s3://zipline-warehouse-crucible"
 _databricks_host = "https://dbc-050d6f00-dcb3.cloud.databricks.com"
 _training_source = EventSource(
@@ -51,7 +58,7 @@ _training_source = EventSource(
 ctr_ray_model = Model(
     # Content address of the deterministic trainer archive; never reuse it for
     # different trainer bytes.
-    version="e0d0bdb95370",
+    version="be42a6772745",
     inference_spec=InferenceSpec(
         model_backend=ModelBackend.RAY,
         model_backend_params={

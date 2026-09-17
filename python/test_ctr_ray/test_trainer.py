@@ -294,6 +294,28 @@ def test_alternate_scan_projection_and_dates(trainer_modules):
     assert x.attrs["training_data"]["observed_start_ds"] == "2026-09-01"
 
 
+def test_spark_qualified_table_loads_by_rest_identifier(trainer_modules):
+    import pyarrow as pa
+    cli, train = trainer_modules
+    loaded = []
+    class Table:
+        def scan(self, **_kwargs):
+            return self
+        def to_arrow(self):
+            return pa.Table.from_pydict({"a": [1, 2], "label": [0, 1], "ds": ["2026-08-24"] * 2})
+    class Catalog:
+        def load_table(self, name):
+            loaded.append(name)
+            return Table()
+    x, _ = train.get_training_data_df(Catalog(), "workspace_iceberg.poc.labels_v1__1",
+                                      "2026-08-24", "2026-08-24", cli.parse_features("a"))
+    train.get_training_data_df(Catalog(), "poc.labels", "2026-08-24", "2026-08-24",
+                               cli.parse_features("a"))
+    assert loaded == ["poc.labels_v1__1", "poc.labels"]
+    # Metadata keeps the Spark name so it matches the Hub-linked upstream table.
+    assert x.attrs["training_data"]["input_table"] == "workspace_iceberg.poc.labels_v1__1"
+
+
 @pytest.mark.parametrize("labels", [[0, None], [0, 0.5], [0, 2]])
 def test_invalid_binary_labels(labels, trainer_modules):
     cli, train = trainer_modules

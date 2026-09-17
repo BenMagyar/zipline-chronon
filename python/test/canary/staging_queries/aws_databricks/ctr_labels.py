@@ -14,5 +14,5 @@ WHERE ds BETWEEN {{{{ start_date }}}} AND {{{{ end_date }}}}
     dependencies=[
         TableDependency(table=demo.derivations_v1.table, partition_column="ds", start_offset=0, end_offset=0),
     ],
-    version=0,
+    version=2,
 )

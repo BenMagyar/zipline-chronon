@@ -77,3 +77,26 @@ v1 = GroupBy(
         }
     ),
 )
+
+# The source schema declares event_time_ms as epoch milliseconds. Spark's
+# TIMESTAMP(number) interprets seconds, so v1 moves events 1000x into the future
+# and leaves temporal join windows empty. Keep v1 intact for existing consumers.
+v2 = GroupBy(
+    sources=[EventSource(
+        table=source.events.table,
+        topic=source.events.topic,
+        query=Query(
+            selects={
+                **source.events.query.selects,
+                "user_event_struct": "STRUCT(event_type, listing_id, event_time_ms as timestamp)",
+            },
+            time_column="event_time_ms",
+        ),
+    )],
+    keys=["user_id"],
+    online=False,
+    version=2,
+    aggregations=aggregations,
+    step_days=10,
+    env_vars=EnvironmentVariables(common={"CHRONON_ONLINE_ARGS": "-Ztasks=1"}),
+)
