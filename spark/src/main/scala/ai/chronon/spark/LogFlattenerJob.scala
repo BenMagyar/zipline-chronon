@@ -121,7 +121,7 @@ class LogFlattenerJob(session: SparkSession,
     fieldsBuilder.map(f => StructField(f._1, f._2))
   }
 
-  private def flattenKeyValueBytes(rawDf: Dataset[Row], schemaMap: Map[String, LoggingSchema]): DataFrame = {
+  private[spark] def flattenKeyValueBytes(rawDf: Dataset[Row], schemaMap: Map[String, LoggingSchema]): DataFrame = {
 
     val allDataFields = dedupeFields(schemaMap.values.flatMap(_.keyFields) ++ schemaMap.values.flatMap(_.valueFields))
     // contextual features are logged twice in keys and values, where values are prefixed with ext_contextual
@@ -141,6 +141,13 @@ class LogFlattenerJob(session: SparkSession,
       .flatMap { row =>
         if (row.isNullAt(schemaHashIdx)) {
           // ignore older logs that do not have schema_hash info
+          None
+        } else if (!schemaMap.contains(row.getString(schemaHashIdx))) {
+          // schema_hash has no matching schema. This happens when a logged record is corrupted (e.g. a
+          // concurrent-encode race in the fetcher garbles the schema_hash into unprintable bytes) or the
+          // schema is missing from the schema table. Skip the row and count it instead of failing the whole
+          // job on an unguarded map lookup.
+          metrics.increment(Metrics.Name.Exception, Map("cause" -> "unknown_schema_hash"))
           None
         } else {
           val joinCodec = schemaMap(row.getString(schemaHashIdx))
