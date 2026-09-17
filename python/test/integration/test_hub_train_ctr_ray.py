@@ -20,6 +20,13 @@ _MODEL_CONF = os.environ.get("ZIPLINE_CTR_MODEL_CONF")
 _END_DS = os.environ.get("ZIPLINE_CTR_END_DS", "2026-08-24")
 
 
+def _strict_loads(payload):
+    """Reject NaN/Infinity: an artifact must parse for non-Python readers too."""
+    def reject(constant):
+        raise AssertionError(f"non-finite JSON constant in artifact: {constant}")
+    return json.loads(payload, parse_constant=reject)
+
+
 def _ctr_ray_e2e_enabled() -> bool:
     return os.environ.get("ZIPLINE_CTR_RAY_E2E", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -59,7 +66,11 @@ def test_hub_train_ctr_ray(chronon_root, hub_url, cloud):
 
     run_conf_relative = str(run_conf.relative_to(chronon_root))
     s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-west-2")))
-    artifact_keys = [f"{prefix}/model.joblib", f"{prefix}/metadata.json"]
+    artifact_keys = [
+        f"{prefix}/model.joblib",
+        f"{prefix}/metadata.json",
+        f"{prefix}/experiment_report.json",
+    ]
     try:
         training_workflow_id = submit_backfill(
             runner,
@@ -75,7 +86,8 @@ def test_hub_train_ctr_ray(chronon_root, hub_url, cloud):
         for key in artifact_keys:
             artifact = s3.head_object(Bucket=bucket, Key=key)
             assert artifact["ContentLength"] > 0
-        metadata = json.loads(s3.get_object(Bucket=bucket, Key=artifact_keys[1])["Body"].read())
+        metadata = _strict_loads(s3.get_object(Bucket=bucket, Key=artifact_keys[1])["Body"].read())
+        report = _strict_loads(s3.get_object(Bucket=bucket, Key=artifact_keys[2])["Body"].read())
         expected_features = [feature.split(":")[-1] for feature in job_configs["features"].split(",")]
         assert metadata["feature_names"] == expected_features
         assert metadata["num_features"] == len(expected_features)
@@ -90,6 +102,21 @@ def test_hub_train_ctr_ray(chronon_root, hub_url, cloud):
         assert metadata["training_data"]["row_count"] > 0
         assert metadata["training_data"]["start_ds"] <= metadata["training_data"]["observed_start_ds"]
         assert metadata["training_data"]["observed_end_ds"] <= _END_DS
+
+        # The default multi-day window must actually score a holdout: a run that
+        # silently fell back to training-only metrics is not a valid result here.
+        split = report["split"]
+        assert report["evaluation_status"] == "evaluated", report["evaluation_status"]
+        assert split["train_end_ds"] < split["eval_start_ds"]
+        assert split["eval_end_ds"] == metadata["training_data"]["observed_end_ds"]
+        metrics = report["metrics"]
+        for key in ("validation_auc", "validation_logloss", "validation_precision",
+                    "training_rows", "validation_rows"):
+            assert key in metrics, f"{key} missing from {sorted(metrics)}"
+        assert metrics["training_rows"] + metrics["validation_rows"] == \
+            metadata["training_data"]["row_count"]
+        assert report["feature_names"] == expected_features
+        assert report["precision_recall_curve"], "expected a precision-recall curve"
     finally:
         run_conf.unlink(missing_ok=True)
         s3.delete_objects(

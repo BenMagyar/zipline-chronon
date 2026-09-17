@@ -114,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument("--eta", type=float, default=0.1)
     parser.add_argument("--num-boost-round", type=int, default=50)
+    # Held out by date, never at random: the rows are time-ordered, so a random
+    # split trains on rows that come after the ones it is scored against.
+    parser.add_argument("--eval-days", type=int, default=1,
+                        help="trailing ds partitions held out for evaluation; 0 trains without metrics")
+    parser.add_argument("--pr-curve-points", type=int, default=101)
     parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR"), required=os.environ.get("MODEL_DIR") is None)
     return parser
 
@@ -128,4 +133,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error(str(error))
     if any(source in {args.label_column, args.partition_column} for source, _ in args.features):
         parser.error("label and partition columns must not be used as features")
+    if args.eval_days < 0:
+        parser.error("--eval-days must not be negative")
+    if args.pr_curve_points < 2:
+        parser.error("--pr-curve-points must be at least 2")
     return args

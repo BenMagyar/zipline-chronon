@@ -316,6 +316,159 @@ def test_spark_qualified_table_loads_by_rest_identifier(trainer_modules):
     assert x.attrs["training_data"]["input_table"] == "workspace_iceberg.poc.labels_v1__1"
 
 
+def _strict_loads(text):
+    """Reject NaN/Infinity the way a non-Python reader would."""
+    def reject(constant):
+        raise ValueError(f"non-finite JSON constant: {constant}")
+    return json.loads(text, parse_constant=reject)
+
+
+def _labeled_frame(partitions, labels, values=None):
+    values = values if values is not None else list(range(len(labels)))
+    return pd.DataFrame({"a": values, "label": labels, "ds": partitions})
+
+
+def test_split_holds_out_the_last_days_without_overlap(trainer_modules):
+    cli, train = trainer_modules
+    # Deliberately unsorted: Iceberg returns rows in no particular order, and a
+    # prefix check against the original partition list would pass on sorted input
+    # even if the wrong rows were selected.
+    frame = _labeled_frame(
+        ["2026-08-24", "2026-08-20", "2026-08-23", "2026-08-22", "2026-08-24", "2026-08-21"],
+        [1, 0, 1, 0, 1, 0],
+        values=[24, 20, 23, 22, 240, 21],
+    )
+    x, y = train.shape_training_frame(frame, cli.parse_features("a"), "label", "ds")
+    x_train, y_train, x_eval, y_eval, split = train.split_by_date(x, y, eval_days=2)
+
+    assert split["evaluation_status"] == "evaluated"
+    assert split["train_start_ds"] == "2026-08-20" and split["train_end_ds"] == "2026-08-22"
+    assert split["eval_start_ds"] == "2026-08-23" and split["eval_end_ds"] == "2026-08-24"
+    assert split["train_rows"] == 3 and split["eval_rows"] == 3
+    # The rows themselves must be the earlier days, and each side must carry only
+    # its own partitions.
+    assert sorted(x_train["a"].tolist()) == [20, 21, 22]
+    assert sorted(x_eval["a"].tolist()) == [23, 24, 240]
+    assert sorted(y_train) == [0, 0, 0] and sorted(y_eval) == [1, 1, 1]
+    assert set(x_train.attrs["partitions"]) == {"2026-08-20", "2026-08-21", "2026-08-22"}
+    assert set(x_eval.attrs["partitions"]) == {"2026-08-23", "2026-08-24"}
+    assert len(x_train.attrs["partitions"]) == 3 and len(x_eval.attrs["partitions"]) == 3
+
+
+@pytest.mark.parametrize(
+    "eval_days,partitions,reason,status",
+    [
+        (0, ["2026-08-20", "2026-08-21"], "eval-days is 0", "disabled"),
+        (1, ["2026-08-24", "2026-08-24"], "only 1 partition", "insufficient_partitions"),
+    ],
+)
+def test_split_falls_back_instead_of_emptying_training(trainer_modules, eval_days, partitions, reason, status):
+    cli, train = trainer_modules
+    frame = _labeled_frame(partitions, [0, 1])
+    x, y = train.shape_training_frame(frame, cli.parse_features("a"), "label", "ds")
+    x_train, y_train, x_eval, y_eval, split = train.split_by_date(x, y, eval_days=eval_days)
+
+    assert len(x_train) == 2 and len(y_train) == 2
+    assert len(x_eval) == 0 and y_eval == []
+    assert reason in split["skipped"]
+    assert split["evaluation_status"] == status
+
+
+def test_binary_metrics_match_a_hand_computed_confusion_matrix(trainer_modules):
+    _, train = trainer_modules
+    # Predictions at 0.5 are [1, 1, 1, 0, 0]: two true positives, one false
+    # positive, one false negative, one true negative.
+    labels = [1, 1, 0, 1, 0]
+    probabilities = [0.9, 0.8, 0.7, 0.2, 0.1]
+    metrics = train._binary_classification_metrics(labels, probabilities, threshold=0.5)
+
+    assert (metrics["true_positives"], metrics["false_positives"]) == (2, 1)
+    assert (metrics["false_negatives"], metrics["true_negatives"]) == (1, 1)
+    assert metrics["precision"] == pytest.approx(2 / 3)
+    assert metrics["recall"] == pytest.approx(2 / 3)
+    assert metrics["f1"] == pytest.approx(2 / 3)
+    assert metrics["accuracy"] == pytest.approx(0.6)
+
+
+def test_precision_recall_curve_spans_thresholds(trainer_modules):
+    _, train = trainer_modules
+    curve = train._precision_recall_curve([1, 0, 1, 0], [0.9, 0.6, 0.4, 0.1], point_count=11)
+    assert len(curve) == 11
+    assert curve[0]["threshold"] == pytest.approx(1.0)
+    assert curve[-1]["threshold"] == pytest.approx(0.0)
+    # At threshold 0 everything is predicted positive, so recall is complete.
+    assert curve[-1]["recall"] == pytest.approx(1.0)
+
+
+def test_metrics_and_report_reach_the_saved_artifacts(tmp_path, trainer_modules):
+    cli, train = trainer_modules
+    frame = _labeled_frame(
+        ["2026-08-20"] * 4 + ["2026-08-21"] * 4,
+        [0, 1, 0, 1, 0, 1, 0, 1],
+        values=[1, 9, 2, 8, 1, 9, 2, 8],
+    )
+    x, y = train.shape_training_frame(frame, cli.parse_features("a"), "label", "ds")
+    x_train, y_train, x_eval, y_eval, split = train.split_by_date(x, y, eval_days=1)
+    model = train.train_model(x_train, y_train, num_boost_round=3, X_eval=x_eval, y_eval=y_eval,
+                              split=split, pr_curve_points=11)
+    train.save_model(model, str(tmp_path))
+
+    metadata = _strict_loads((tmp_path / "metadata.json").read_text())
+    report = _strict_loads((tmp_path / "experiment_report.json").read_text())
+
+    assert metadata["split"]["eval_start_ds"] == "2026-08-21"
+    assert "validation_logloss" in metadata["validation_metrics"]
+    assert metadata["validation_metrics"]["validation_recall"] >= 0.0
+    assert metadata["feature_importance"][0]["rank"] == 1
+    assert report["metrics"] == metadata["validation_metrics"]
+    assert len(report["precision_recall_curve"]) == 11
+    # Sample sizes the experiment UI reads, and the status that says whether a
+    # holdout was scored at all.
+    metrics = report["metrics"]
+    assert metrics["training_rows"] == split["train_rows"] == 4
+    assert metrics["validation_rows"] == split["eval_rows"] == 4
+    assert "train_precision" in metrics and "validation_precision" in metrics
+    assert report["evaluation_status"] == "evaluated"
+    assert report["split"]["train_end_ds"] < report["split"]["eval_start_ds"]
+
+
+def test_training_without_a_holdout_still_saves(tmp_path, trainer_modules):
+    cli, train = trainer_modules
+    frame = _labeled_frame(["2026-08-24"] * 4, [0, 1, 0, 1])
+    x, y = train.shape_training_frame(frame, cli.parse_features("a"), "label", "ds")
+    x_train, y_train, x_eval, y_eval, split = train.split_by_date(x, y, eval_days=1)
+    model = train.train_model(x_train, y_train, num_boost_round=2, X_eval=x_eval, y_eval=y_eval, split=split)
+    train.save_model(model, str(tmp_path))
+
+    report = _strict_loads((tmp_path / "experiment_report.json").read_text())
+    assert report["precision_recall_curve"] == []
+    assert "train_logloss" in report["metrics"]
+    assert not any(key.startswith("validation_") for key in report["metrics"])
+    assert report["evaluation_status"] == "insufficient_partitions"
+
+
+def test_single_class_holdout_omits_auc_and_stays_strict_json(tmp_path, trainer_modules):
+    cli, train = trainer_modules
+    # A low-click day is realistic: the holdout has negatives only, so AUC is
+    # undefined and XGBoost would report NaN.
+    frame = _labeled_frame(["2026-08-20"] * 4 + ["2026-08-21"] * 2,
+                           [0, 1, 0, 1, 0, 0], values=[1, 9, 2, 8, 3, 4])
+    x, y = train.shape_training_frame(frame, cli.parse_features("a"), "label", "ds")
+    x_train, y_train, x_eval, y_eval, split = train.split_by_date(x, y, eval_days=1)
+    assert len(set(y_eval)) == 1
+    model = train.train_model(x_train, y_train, num_boost_round=2, X_eval=x_eval, y_eval=y_eval,
+                              split=split, pr_curve_points=5)
+    train.save_model(model, str(tmp_path))
+
+    report = _strict_loads((tmp_path / "experiment_report.json").read_text())
+    _strict_loads((tmp_path / "metadata.json").read_text())
+    assert report["evaluation_status"] == "single_class_holdout"
+    assert "validation_auc" not in report["metrics"] and "train_auc" not in report["metrics"]
+    # Metrics that remain defined are still reported.
+    assert "validation_logloss" in report["metrics"]
+    assert report["metrics"]["validation_rows"] == 2
+
+
 @pytest.mark.parametrize("labels", [[0, None], [0, 0.5], [0, 2]])
 def test_invalid_binary_labels(labels, trainer_modules):
     cli, train = trainer_modules

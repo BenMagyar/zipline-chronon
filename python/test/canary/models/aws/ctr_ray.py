@@ -58,7 +58,7 @@ _training_source = EventSource(
 ctr_ray_model = Model(
     # Content address of the deterministic trainer archive; never reuse it for
     # different trainer bytes.
-    version="be42a6772745",
+    version="d59accfdd831",
     inference_spec=InferenceSpec(
         model_backend=ModelBackend.RAY,
         model_backend_params={
@@ -97,6 +97,9 @@ ctr_ray_model = Model(
             "max-depth": "4",
             "model-dir": f"{_artifact_base}/models/test_ctr_model_ray",
             "num-boost-round": "50",
+            # Hold out the last partition for evaluation. The trainer splits by
+            # date, never at random, so it cannot score against rows it trained on.
+            "eval-days": "1",
         },
     ),
 )

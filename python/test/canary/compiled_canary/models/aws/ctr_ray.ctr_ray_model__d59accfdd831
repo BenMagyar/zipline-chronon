@@ -70,14 +70,13 @@
       },
       "env": {
         "common": {
-          "ARTIFACT_PREFIX": "s3://zipline-artifacts-canary",
+          "ARTIFACT_PREFIX": "s3://zipline-artifacts-canary-aws",
           "AWS_REGION": "us-west-2",
           "CHRONON_ONLINE_ARGS": " -Ztasks=1",
           "CLOUD_PROVIDER": "aws",
           "CUSTOMER_ID": "canary",
           "ENABLE_KINESIS": "true",
           "EVAL_URL": "https://canary-aws.zipline.ai/services/eval",
-          "FETCHER_URL": "http://localhost:9000",
           "FLINK_JARS_URI": "s3://zipline-artifacts-canary/spark-3.5.3/libs/",
           "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
           "FRONTEND_URL": "https://canary-aws.zipline.ai",
@@ -90,14 +89,13 @@
         },
         "modeEnvironments": {
           "upload": {
-            "ARTIFACT_PREFIX": "s3://zipline-artifacts-canary",
+            "ARTIFACT_PREFIX": "s3://zipline-artifacts-canary-aws",
             "AWS_REGION": "us-west-2",
             "CHRONON_ONLINE_ARGS": " -Ztasks=1",
             "CLOUD_PROVIDER": "aws",
             "CUSTOMER_ID": "canary",
             "ENABLE_KINESIS": "true",
             "EVAL_URL": "https://canary-aws.zipline.ai/services/eval",
-            "FETCHER_URL": "http://localhost:9000",
             "FLINK_JARS_URI": "s3://zipline-artifacts-canary/spark-3.5.3/libs/",
             "FLINK_STATE_URI": "s3://zipline-warehouse-canary/flink-state",
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
@@ -111,11 +109,11 @@
         }
       }
     },
-    "name": "aws.ctr_ray.ctr_ray_model__be42a6772745",
+    "name": "aws.ctr_ray.ctr_ray_model__d59accfdd831",
     "outputNamespace": "data",
     "sourceFile": "models/aws/ctr_ray.py",
     "team": "aws",
-    "version": "be42a6772745"
+    "version": "d59accfdd831"
   },
   "modelArtifactBaseUri": "s3://zipline-warehouse-crucible",
   "outputMapping": {
@@ -128,6 +126,7 @@
       "client-id-env": "DATABRICKS_CLIENT_ID",
       "client-secret-env": "DATABRICKS_CLIENT_SECRET",
       "eta": "0.1",
+      "eval-days": "1",
       "features": "user_id_click_event_average_7d:user_id_click_event_average_7d,listing_id_price_cents:listing_price_cents,price_log:price_log,price_bucket:price_bucket,listing_id_inventory_count:inventory_count,listing_id_weight_grams:weight_grams,listing_id_is_in_stock:is_in_stock,is_listing_heavy:is_listing_heavy,inventory_log:inventory_log,price_per_kg:price_per_kg",
       "label-column": "label",
       "max-depth": "4",
