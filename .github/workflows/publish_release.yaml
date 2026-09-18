@@ -151,6 +151,25 @@ jobs:
           name: passing-candidate-aws-jars
           path: aws-jars/
 
+      - name: Download Spark 4 AWS JARs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aws-spark4-jars
+          for jar in \
+            cloud_aws_lib_spark4_deploy.jar \
+            flink_assembly_spark4_deploy.jar \
+            connectors_kinesis_spark4_deploy.jar; do
+            aws s3 cp \
+              "s3://zipline-artifacts-crucible/release/passing-candidate/jars/$jar" \
+              "aws-spark4-jars/$jar"
+          done
+
+      - name: Upload Spark 4 AWS JARs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: passing-candidate-aws-spark4-jars
+          path: aws-spark4-jars/
 
   download_passing_candidate_jars_azure:
     runs-on: ubuntu-latest
@@ -484,6 +503,32 @@ jobs:
           name: passing-candidate-${{ matrix.cloud }}-jars
           path: build_output/engine/
 
+      - name: Download Spark 4 AWS JARs
+        if: matrix.cloud == 'aws'
+        uses: actions/download-artifact@v4
+        with:
+          name: passing-candidate-aws-spark4-jars
+          path: build_output/engine/
+
+      - name: Verify AWS engine JAR inventory
+        if: matrix.cloud == 'aws'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for jar in \
+            cloud_aws_lib_deploy.jar \
+            flink_assembly_deploy.jar \
+            connectors_kinesis_deploy.jar \
+            service_assembly_deploy.jar \
+            cloud_aws_lib_spark4_deploy.jar \
+            flink_assembly_spark4_deploy.jar \
+            connectors_kinesis_spark4_deploy.jar; do
+            test -f "build_output/engine/$jar" || {
+              echo "Missing required AWS engine JAR: $jar" >&2
+              exit 1
+            }
+          done
+
       - name: Create engine manifest
         run: |
           echo '{"version": "${{ needs.check_if_latest.outputs.version_no_v }}", "cloud": "${{ matrix.cloud }}", "commit": "${{ github.sha }}"}' > build_output/engine_manifest.json
@@ -739,4 +784,5 @@ jobs:
             zipline-ai-wheel
             passing-candidate-gcp-jars
             passing-candidate-aws-jars
+            passing-candidate-aws-spark4-jars
             passing-candidate-azure-jars

@@ -32,6 +32,8 @@ zipline admin install aws --api-token <DOCKER_TOKEN> --release <release> --artif
 
 Replace `<DOCKER_TOKEN>` with the shared Zipline docker access token, `<release>` with the target version (e.g. `1.7.0`) and `<S3_Bucket>` with your bucket name.
 
+For AWS, the engine image contains the Spark 3 and Spark 4 engine, Flink, and Kinesis JARs under distinct filenames. The install command uploads both sets to the same release directory. Spark 3 deployments continue to use the existing filenames, while Crucible deployments use the filenames ending in `_spark4_deploy.jar`.
+
 ---
 
 ## Step 3: Upgrade Control Plane Services

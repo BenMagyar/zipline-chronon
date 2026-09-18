@@ -648,24 +648,35 @@ class TestUploadScriptsToStore:
 
 
 class TestExtractJarsFromOciArchive:
-    def test_extracts_both_jars_and_scripts(self, tmp_path):
-        archive_path = tmp_path / "engine-gcp.tar"
+    def test_extracts_both_spark_profiles_and_scripts(self, tmp_path):
+        archive_path = tmp_path / "engine-aws.tar"
         oci_dir = tmp_path / "oci_build"
         oci_dir.mkdir()
 
         jars_dir = tmp_path / "jars_build"
         jars_dir.mkdir()
-        (jars_dir / "engine.jar").write_text("fake jar content")
+        jar_names = [
+            "cloud_aws_lib_deploy.jar",
+            "flink_assembly_deploy.jar",
+            "connectors_kinesis_deploy.jar",
+            "service_assembly_deploy.jar",
+            "cloud_aws_lib_spark4_deploy.jar",
+            "flink_assembly_spark4_deploy.jar",
+            "connectors_kinesis_spark4_deploy.jar",
+        ]
+        for jar_name in jar_names:
+            (jars_dir / jar_name).write_text(f"fake {jar_name} content")
 
         scripts_build = tmp_path / "scripts_build"
-        scripts_gcp = scripts_build / "gcp"
-        scripts_gcp.mkdir(parents=True)
-        (scripts_gcp / "opsagent_setup.sh").write_text("#!/bin/bash\nstart")
+        scripts_aws = scripts_build / "aws"
+        scripts_aws.mkdir(parents=True)
+        (scripts_aws / "opsagent_setup.sh").write_text("#!/bin/bash\nstart")
 
         layer_tar = oci_dir / "layer.tar"
         with tarfile.open(layer_tar, "w") as tar:
-            tar.add(jars_dir / "engine.jar", arcname="jars/engine.jar")
-            tar.add(scripts_gcp / "opsagent_setup.sh", arcname="scripts/gcp/opsagent_setup.sh")
+            for jar_name in jar_names:
+                tar.add(jars_dir / jar_name, arcname=f"jars/{jar_name}")
+            tar.add(scripts_aws / "opsagent_setup.sh", arcname="scripts/aws/opsagent_setup.sh")
 
         manifest = [{"Layers": ["layer.tar"]}]
         (oci_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -676,12 +687,13 @@ class TestExtractJarsFromOciArchive:
 
         with patch("ai.chronon.repo.admin.upload_to_blob_store") as mock_upload:
             results = _extract_jars_from_oci_archive(
-                str(archive_path), "gcp", "1.0.0", "gs://bucket/zipline"
+                str(archive_path), "aws", "1.0.0", "s3://bucket/zipline"
             )
 
         uploaded_paths = [call_args[0][1] for call_args in mock_upload.call_args_list]
-        assert any("jars/engine.jar" in path for path in uploaded_paths)
-        assert any("scripts/gcp/opsagent_setup.sh" in path for path in uploaded_paths)
+        for jar_name in jar_names:
+            assert f"s3://bucket/zipline/release/1.0.0/jars/{jar_name}" in uploaded_paths
+        assert "s3://bucket/zipline/release/1.0.0/scripts/aws/opsagent_setup.sh" in uploaded_paths
         assert all(status == "ok" for _, _, _, status in results)
 
     def test_handles_no_manifests(self, tmp_path):
