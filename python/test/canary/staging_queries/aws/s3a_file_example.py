@@ -1,9 +1,10 @@
 from ai.chronon.types import EngineType, StagingQuery
 
-
+# This object is a CI-owned fixture outside the Iceberg-managed data/table paths.
+# Keep it stable: the AWS integration test depends on it for S3A file access.
 PARQUET_URI = (
-    "s3a://zipline-warehouse/data/tables/demo/dim_listings/data/"
-    "ds=2026-09-17/00000-0-f9a51a3f-a9b4-457e-9895-f40daa553b00.parquet"
+    "s3a://zipline-warehouse-canary/integration-test-fixtures/"
+    "s3a-file-example/dim-listings.parquet"
 )
 
 setup = f"""

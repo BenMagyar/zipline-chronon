@@ -111,7 +111,7 @@
   },
   "query": "\n        SELECT *\n        FROM s3a_file_example\n    ",
   "setups": [
-    "\n    CREATE OR REPLACE TEMPORARY VIEW s3a_file_example\n    USING parquet\n    OPTIONS (path 's3a://zipline-warehouse/data/tables/demo/dim_listings/data/ds=2026-09-17/00000-0-f9a51a3f-a9b4-457e-9895-f40daa553b00.parquet')\n"
+    "\n    CREATE OR REPLACE TEMPORARY VIEW s3a_file_example\n    USING parquet\n    OPTIONS (path 's3a://zipline-warehouse-canary/integration-test-fixtures/s3a-file-example/dim-listings.parquet')\n"
   ],
   "tableDependencies": []
 }
