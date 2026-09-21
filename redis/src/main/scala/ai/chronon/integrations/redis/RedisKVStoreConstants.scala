@@ -49,9 +49,9 @@ object RedisKVStoreConstants {
   val DefaultRedisReadControlQueueTimeoutMs = 2000
   val RedisReadTimeoutCooldownMs = 5000L
 
-  // After deterministic process-global and per-worker codec preparation, representative V2 traffic compiles the
-  // GLIDE response/decode/fan-out hot path. Run it at the same concurrency enforced by admission, without queueing.
-  val DefaultGlideStartupWarmupMinimumRequestsPerJoin = 1000
+  // GLIDE serving needs at least one V2 request per join before readiness so the response/decode/fan-out path is
+  // compiled and the admission path exercised; the floor is one and the repeat count comes from the warmup config.
+  val DefaultGlideStartupWarmupMinimumRequestsPerJoin = 1
   val DefaultGlideStartupWarmupConcurrency = DefaultRedisReadMaxInflightBatches
   val DefaultGlideStartupWarmupRequestBatchSize = 50
 
