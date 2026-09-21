@@ -18,7 +18,7 @@ package ai.chronon.api.test
 
 import ai.chronon.api.Extensions._
 import ai.chronon.api.ScalaJavaConversions._
-import ai.chronon.api.{Accuracy, Builders, ConfigProperties, Constants, ExecutionInfo, GroupBy}
+import ai.chronon.api.{Accuracy, Builders, ConfigProperties, Constants, DataModel, ExecutionInfo, GroupBy}
 import org.junit.Assert.{assertEquals, assertFalse, assertTrue}
 import org.mockito.Mockito.{spy, when}
 import org.scalatest.flatspec.AnyFlatSpec
@@ -234,4 +234,24 @@ class ExtensionsTest extends AnyFlatSpec {
     assertTrue(leftJoinBefore.joinParts.get(0).groupBy.metaData.isSetExecutionInfo)
   }
 
+  it should "SourceOps accessors recurse into a ModelTransforms inner source" in {
+    val eventSource = Builders.Source.events(
+      query = Builders.Query(selects = Map("user_id" -> "user_id"), timeColumn = "created"),
+      table = "db.events_table",
+      topic = "kafka://events_topic"
+    )
+    val mt = new ai.chronon.api.ModelTransforms()
+    mt.setSources(Seq(eventSource).toJava)
+    mt.setMetaData(Builders.MetaData(name = "test_mt"))
+    val source = new ai.chronon.api.Source()
+    source.setModelTransforms(mt)
+
+    assertEquals("kafka://events_topic", source.topic)
+    assertEquals(DataModel.EVENTS, source.dataModel)
+    assertEquals("db.events_table", source.rootTable)
+    assertEquals("db.events_table", source.rawTable)
+    assertEquals("created", source.query.timeColumn)
+    assertEquals("user_id", source.rootQuery.selects.get("user_id"))
+    assertFalse(source.mutationsTable.isDefined)
+  }
 }

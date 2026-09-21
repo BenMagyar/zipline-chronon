@@ -8,8 +8,9 @@ import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.FlinkSource
 import ai.chronon.flink.test.{CollectSink, MockAsyncKVStoreWriter}
 import ai.chronon.flink.types.WriteResponse
+import ai.chronon.flink.test.FlinkTestUtils
+import ai.chronon.online.{GroupByServingInfoParsed, KVStore, TopicInfo}
 import ai.chronon.online.serde.SparkConversions
-import ai.chronon.online.{KVStore, TopicInfo}
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.utils.MockApi
@@ -154,6 +155,23 @@ object FetcherFlinkTestUtils {
     spark.createDataFrame(mutationRows.toJava, SparkConversions.fromChrononSchema(mutationSchema))
          .save(s"$ns.${mutationSchema.name}")
   }
+
+  // Chronon-typed adapters over FlinkTestUtils.makeTestGroupByServingInfoParsed for tests that don't want to
+  // hand-roll Spark StructTypes.
+  def makeTestGroupByServingInfoParsed(groupBy: GroupBy,
+                                       inputSchema: Seq[(String, DataType)]): GroupByServingInfoParsed = {
+    val sparkSchema = SparkConversions.fromChrononSchema(inputSchema)
+    FlinkTestUtils.makeTestGroupByServingInfoParsed(groupBy, sparkSchema, sparkSchema)
+  }
+
+  def makeTestGroupByServingInfoParsed(groupBy: GroupBy,
+                                       inputSchema: Seq[(String, DataType)],
+                                       outputSchemaSpark: org.apache.spark.sql.types.StructType): GroupByServingInfoParsed =
+    FlinkTestUtils.makeTestGroupByServingInfoParsed(
+      groupBy, SparkConversions.fromChrononSchema(inputSchema), outputSchemaSpark)
+
+  def toSparkStructType(inputSchema: Seq[(String, DataType)]): org.apache.spark.sql.types.StructType =
+    SparkConversions.fromChrononSchema(inputSchema)
 
   /** Runs FlinkGroupByStreamingJob in tiled mode over flinkMutationEvents, returns WriteResponses. */
   def runFlinkTiledJob(groupBy: GroupBy, mockApi: MockApi): Seq[WriteResponse] = {

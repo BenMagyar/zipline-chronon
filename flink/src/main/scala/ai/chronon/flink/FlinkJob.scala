@@ -4,11 +4,12 @@ import ai.chronon.aggregator.windowing.ResolutionUtils
 import ai.chronon.api.Constants.MetadataDataset
 import ai.chronon.api.DataType
 import ai.chronon.api.Extensions.{GroupByOps, SourceOps}
+import ai.chronon.api.ScalaJavaConversions.IterableOps
 import ai.chronon.api.{Constants, DataModel}
 import ai.chronon.online.serde.DebeziumMutationMapper
 import ai.chronon.flink.{AsyncKVStoreWriter, FlinkGroupByStreamingJob}
 import ai.chronon.flink.deser.{DeserializationSchemaBuilder, FlinkSerDeProvider, ProjectedEvent, SourceProjection}
-import ai.chronon.flink.chaining.ChainedGroupByJob
+import ai.chronon.flink.chaining.{ChainedGroupByJob, ModelTransformsSourceFlinkJob}
 import ai.chronon.flink.source.FlinkSourceProvider
 import ai.chronon.flink.types.{AvroCodecOutput, BatchIrRow, TimestampedTile, WriteResponse}
 import ai.chronon.flink.validation.ValidationFlinkJob
@@ -465,7 +466,9 @@ object FlinkJob {
                             enableDebug: Boolean = false,
                             maybeTopicOverride: Option[String] = None): BaseFlinkJob = {
     val streamingSource = servingInfo.groupBy.streamingSource.get
-    if (streamingSource.isSetJoinSource) {
+    if (streamingSource.isSetModelTransforms) {
+      buildModelTransformsSourceFlinkJob(groupByName, props, api, servingInfo, enableDebug, maybeTopicOverride)
+    } else if (streamingSource.isSetJoinSource) {
       buildJoinSourceFlinkJob(groupByName, props, api, servingInfo, enableDebug, maybeTopicOverride)
     } else if (streamingSource.isSetEntities) {
       buildGroupByStreamingJob(groupByName,
@@ -544,6 +547,103 @@ object FlinkJob {
       inputSchema = projectedSchema,
       sinkFn = sinkFn,
       groupByServingInfoParsed = servingInfo,
+      parallelism = source.parallelism,
+      props = props,
+      topicInfo = topicInfo,
+      api = api,
+      enableDebug = enableDebug
+    )
+  }
+
+  private def buildModelTransformsSourceFlinkJob(
+      groupByName: String,
+      props: Map[String, String],
+      api: Api,
+      servingInfo: GroupByServingInfoParsed,
+      enableDebug: Boolean,
+      maybeTopicOverride: Option[String] = None): ModelTransformsSourceFlinkJob = {
+    val logger = LoggerFactory.getLogger(getClass)
+
+    val streamingSource = servingInfo.groupBy.streamingSource.get
+    val modelTransforms = streamingSource.getModelTransforms
+
+    // Guard the exactly-one-source invariant BEFORE reading sources.get(0); otherwise a null or
+    // empty sources list would throw an opaque NPE / IndexOutOfBoundsException and the require
+    // messages below never fire. Mirrors the same guard in ModelTransformsSourceFlinkJob's ctor.
+    require(
+      Option(modelTransforms.sources).exists(_.size() == 1),
+      s"ModelTransforms must have exactly one inner source (v1) for groupBy: $groupByName"
+    )
+    val innerSource = modelTransforms.sources.get(0)
+
+    require(
+      innerSource.isSetJoinSource || innerSource.isSetEvents,
+      s"Only JoinSource or EventSource inner sources are supported (v1) for ModelTransforms streaming. " +
+        s"Found: ${innerSource.getSetField} for groupBy: $groupByName"
+    )
+    require(
+      !innerSource.isSetJoinSource || innerSource.getJoinSource.getJoin.getLeft.dataModel == DataModel.EVENTS,
+      s"Data model on the left source for ModelTransforms JoinSource inner must be EVENTS. " +
+        s"Found: ${innerSource.getJoinSource.getJoin.getLeft.dataModel} for groupBy: $groupByName"
+    )
+
+    // The topic we consume is the inner source's topic (SourceOps recursion resolves it transitively for
+    // JoinSource inners via join.left.topic).
+    val rawTopic = maybeTopicOverride.getOrElse(innerSource.topic)
+    val topicInfo = TopicInfo.parse(rawTopic)
+    val schemaProvider = FlinkSerDeProvider.build(topicInfo)
+
+    // Deserialization query: for a JoinSource inner we drive off the join's left source query (mirrors
+    // buildJoinSourceFlinkJob); for an Events inner we use the inner source's own query.
+    val deserQuery =
+      if (innerSource.isSetJoinSource) innerSource.getJoinSource.getJoin.getLeft.query
+      else innerSource.getEvents.query
+    val deserGroupByName = if (innerSource.isSetJoinSource) {
+      s"left_source_${innerSource.getJoinSource.getJoin.getMetaData.getName}"
+    } else {
+      s"model_transforms_source_${modelTransforms.metaData.name}"
+    }
+
+    val deserializationSchema = DeserializationSchemaBuilder.buildSourceProjectionDeserSchema(
+      schemaProvider,
+      deserQuery,
+      deserGroupByName,
+      DataModel.EVENTS,
+      enableDebug
+    )
+
+    require(
+      deserializationSchema.isInstanceOf[SourceProjection],
+      s"Expect created deserialization schema for ${deserGroupByName} with $topicInfo to mixin SourceProjection. " +
+        s"We got: ${deserializationSchema.getClass.getSimpleName}"
+    )
+
+    val projectedSchema =
+      try {
+        deserializationSchema.asInstanceOf[SourceProjection].projectedSchema
+      } catch {
+        case _: Exception =>
+          throw new RuntimeException(
+            s"Failed to perform projection via Spark SQL eval for groupBy: $groupByName. Retrieved event schema: \n${schemaProvider.schema}\n" +
+              s"Make sure the Spark SQL expressions are valid (e.g. column names match the source event schema).")
+      }
+
+    val source = FlinkSourceProvider.build(props, deserializationSchema, topicInfo)
+    val sinkFn = new AsyncKVStoreWriter(api, servingInfo.groupBy.metaData.name, enableDebug)
+
+    logger.info(s"Building ModelTransforms GroupBy: $groupByName. Using ModelTransformsSourceFlinkJob.")
+    val passthroughFields =
+      Option(modelTransforms.passthroughFields).map(_.toScala.toSeq).getOrElse(Seq.empty)
+    val models = Option(modelTransforms.models).map(_.toScala.toSeq).getOrElse(Seq.empty)
+    new ModelTransformsSourceFlinkJob(
+      eventSrc = source,
+      inputSchema = projectedSchema,
+      sinkFn = sinkFn,
+      groupByServingInfoParsed = servingInfo,
+      modelTransformsName = modelTransforms.metaData.name,
+      passthroughFields = passthroughFields,
+      models = models,
+      innerSource = innerSource,
       parallelism = source.parallelism,
       props = props,
       topicInfo = topicInfo,

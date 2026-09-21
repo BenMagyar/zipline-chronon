@@ -444,11 +444,18 @@ object Extensions {
   }
 
   implicit class SourceOps(source: Source) {
+    // ModelTransforms is a source-union arm that wraps exactly one inner source (v1 requires size == 1,
+    // mirroring ModelTransformsJob.readSource). All accessors recurse into that inner source so a
+    // ModelTransforms-backed Source behaves transparently like its inner source.
+    private def innerSource(mt: ModelTransforms): Source = mt.sources.get(0)
+
     def dataModel: DataModel = {
-      assert(source.isSetEntities || source.isSetEvents || source.isSetJoinSource, "Source type is not specified")
+      assert(source.isSetEntities || source.isSetEvents || source.isSetJoinSource || source.isSetModelTransforms,
+             "Source type is not specified")
       if (source.isSetEntities) ENTITIES
       else if (source.isSetEvents) EVENTS
-      else source.getJoinSource.getJoin.left.dataModel
+      else if (source.isSetJoinSource) source.getJoinSource.getJoin.left.dataModel
+      else source.getModelTransforms.innerSource.dataModel
     }
 
     def rootQuery: Query = {
@@ -456,8 +463,10 @@ object Extensions {
         source.getEntities.query
       } else if (source.isSetEvents) {
         source.getEvents.query
-      } else {
+      } else if (source.isSetJoinSource) {
         source.getJoinSource.getJoin.getLeft.query
+      } else {
+        source.getModelTransforms.innerSource.rootQuery
       }
     }
 
@@ -466,8 +475,10 @@ object Extensions {
         source.getEntities.query
       } else if (source.isSetEvents) {
         source.getEvents.query
-      } else {
+      } else if (source.isSetJoinSource) {
         source.getJoinSource.query
+      } else {
+        source.getModelTransforms.innerSource.query
       }
     }
 
@@ -476,15 +487,18 @@ object Extensions {
         source.getEntities.getSnapshotTable
       } else if (source.isSetEvents) {
         source.getEvents.getTable
-      } else {
+      } else if (source.isSetJoinSource) {
         source.getJoinSource.getJoin.left.table
+      } else {
+        source.getModelTransforms.innerSource.rootTable
       }
     }
 
     lazy val rawTable: String = {
       if (source.isSetEntities) { source.getEntities.getSnapshotTable }
       else if (source.isSetEvents) { source.getEvents.getTable }
-      else { source.getJoinSource.getJoin.finalOutputTable }
+      else if (source.isSetJoinSource) { source.getJoinSource.getJoin.finalOutputTable }
+      else { source.getModelTransforms.innerSource.rawTable }
     }
 
     def mutationsTable: Option[String] = {
@@ -497,6 +511,8 @@ object Extensions {
           Option(current.getJoinSource)
             .flatMap(joinSource => Option(joinSource.getJoin))
             .flatMap(join => mutationsTableFor(join.getLeft))
+        } else if (current.isSetModelTransforms) {
+          mutationsTableFor(current.getModelTransforms.innerSource)
         } else {
           None
         }
@@ -508,11 +524,18 @@ object Extensions {
     def overwriteTable(table: String): Unit = {
       if (source.isSetEntities) { source.getEntities.setSnapshotTable(table) }
       else if (source.isSetEvents) { source.getEvents.setTable(table) }
-      else {
+      else if (source.isSetJoinSource) {
         val metadata = source.getJoinSource.getJoin.getMetaData
         val Array(namespace, tableName) = table.split(".")
         metadata.setOutputNamespace(namespace)
         metadata.setName(tableName)
+      } else if (source.isSetModelTransforms) {
+        // Rewriting the inner source's table silently would break the ModelTransforms conf identity —
+        // callers should set the inner source's table directly instead.
+        throw new UnsupportedOperationException(
+          "overwriteTable is not supported on ModelTransforms sources: set the inner source's table directly.")
+      } else {
+        throw new IllegalStateException("Source type not specified")
       }
     }
 
@@ -540,7 +563,8 @@ object Extensions {
     def isCumulative: Boolean = {
       if (source.isSetEntities) false
       else if (source.isSetEvents) source.getEvents.isCumulative
-      else source.getJoinSource.getJoin.left.isCumulative
+      else if (source.isSetJoinSource) source.getJoinSource.getJoin.left.isCumulative
+      else source.getModelTransforms.innerSource.isCumulative
     }
 
     def topic: String = {
@@ -550,6 +574,8 @@ object Extensions {
         source.getEvents.getTopic
       } else if (source.isSetJoinSource) {
         source.getJoinSource.getJoin.getLeft.topic
+      } else if (source.isSetModelTransforms) {
+        source.getModelTransforms.innerSource.topic
       } else {
         null
       }
@@ -1569,5 +1595,8 @@ object Extensions {
         .getOrElse(Seq.empty)
         .find(_.isSetJoinSource)
         .map(_.getJoinSource)
+
+    // v1 supports exactly one inner source (mirrors ModelTransformsJob.readSource)
+    def innerSource: Source = transforms.sources.get(0)
   }
 }
