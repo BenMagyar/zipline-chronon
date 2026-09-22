@@ -301,7 +301,7 @@ class GroupByFetcher(fetchContext: FetchContext, metadataStore: MetadataStore)
 
               }
 
-            if (groupByServingInfo.groupBy.hasDerivations) {
+            if (groupByServingInfo.groupByOps.hasDerivations) {
               attemptDerivations(castedRequest, groupByResponse, requestContext = requestContext)
             } else {
               groupByResponse
