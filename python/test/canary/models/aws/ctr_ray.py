@@ -5,7 +5,7 @@ catalog: the ``ctr_labels`` staging query already carries the derivation feature
 columns plus a materialized ``label`` column, so the trainer no longer generates
 synthetic labels. ``TrainingSpec.image`` is omitted so Crucible uses the
 configured standard Ray image and fetches trainer code from
-``{model_artifact_base_uri}/builds/test_ctr_model_ray-{version}.zip``.
+``{model_artifact_base_uri}/builds/listing_ctr_model-{version}.zip``.
 """
 
 from staging_queries.aws_databricks import ctr_labels
@@ -58,11 +58,11 @@ _training_source = EventSource(
 ctr_ray_model = Model(
     # Content address of the deterministic trainer archive; never reuse it for
     # different trainer bytes.
-    version="d59accfdd831",
+    version="afce3c0e00af",
     inference_spec=InferenceSpec(
         model_backend=ModelBackend.RAY,
         model_backend_params={
-            "model_name": "test_ctr_model_ray",
+            "model_name": "listing_ctr_model",
             "model_type": "custom",
         },
     ),
@@ -95,7 +95,7 @@ ctr_ray_model = Model(
             "vended-credentials": "true",
             "eta": "0.1",
             "max-depth": "4",
-            "model-dir": f"{_artifact_base}/models/test_ctr_model_ray",
+            "model-dir": f"{_artifact_base}/models/listing_ctr_model",
             "num-boost-round": "50",
             # Hold out the last partition for evaluation. The trainer splits by
             # date, never at random, so it cannot score against rows it trained on.

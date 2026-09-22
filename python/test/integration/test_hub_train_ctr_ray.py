@@ -43,7 +43,7 @@ def test_hub_train_ctr_ray(chronon_root, hub_url, cloud):
     compile_configs(runner, chronon_root)
 
     invocation_id = uuid4().hex
-    prefix = f"models/test_ctr_model_ray/e2e/{invocation_id}"
+    prefix = f"models/listing_ctr_model/e2e/{invocation_id}"
     if _MODEL_CONF:
         model_conf = _MODEL_CONF
     else:

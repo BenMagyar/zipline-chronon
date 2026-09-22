@@ -22,10 +22,10 @@ def _archive_bytes(path: Path) -> None:
 
 def main() -> None:
     DIST.mkdir(exist_ok=True)
-    temporary = DIST / "test_ctr_model_ray.building.zip"
+    temporary = DIST / "listing_ctr_model.building.zip"
     _archive_bytes(temporary)
     digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-    target = DIST / f"test_ctr_model_ray-{digest[:12]}.zip"
+    target = DIST / f"listing_ctr_model-{digest[:12]}.zip"
     temporary.replace(target)
     (DIST / f"{target.name}.sha256").write_text(f"{digest}  {target.name}\n")
     print(target)

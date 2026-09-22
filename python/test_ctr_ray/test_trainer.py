@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 TRAINER_ROOT = (
-    Path(__file__).parents[1] / "test" / "canary" / "model_examples" / "ctr_model_ray"
+    Path(__file__).parents[1] / "test" / "canary" / "model_examples" / "listing_ctr_model"
 )
 
 

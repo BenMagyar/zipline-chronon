@@ -502,7 +502,7 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_ID"] == "{DATABRICKS_CLIENT_ID}"
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_SECRET"] == "{DATABRICKS_CLIENT_SECRET}"
     assert payload["inferenceSpec"]["modelBackend"] == 2
-    assert payload["inferenceSpec"]["modelBackendParams"]["model_name"] == "test_ctr_model_ray"
+    assert payload["inferenceSpec"]["modelBackendParams"]["model_name"] == "listing_ctr_model"
 
     feature_pairs = [item.split(":") for item in spec["jobConfigs"]["features"].split(",")]
     selected = spec["trainingDataSource"]["events"]["query"]["selects"]

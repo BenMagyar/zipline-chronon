@@ -35,7 +35,7 @@ Run `./mill python.test_ctr_ray`. For a local synthetic smoke run:
 Build with `python build_archive.py`. Upload the printed archive to the configured
 artifact base under `builds/`, preserving its filename. Use the printed SHA prefix as
 Model.version. Never overwrite a published archive with different bytes. The builder
-currently names this example `test_ctr_model_ray`; keep model_name consistent.
+currently names this example `test_listing_ctr_model`; keep model_name consistent.
 
 Platform #1307 is required, including comma-safe feature argument validation.
 Without TrainingSpec.image, Crucible uses its standard Ray image. A custom image still
