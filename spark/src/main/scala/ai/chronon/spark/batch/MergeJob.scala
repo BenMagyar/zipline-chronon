@@ -121,10 +121,7 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
       val joinedDfTry =
         try {
           Success(
-            rightPartsData
-              .foldLeft(leftDf) { case (partialDf, (rightPart, rightDf)) =>
-                joinWithLeft(partialDf, rightDf, rightPart)
-              }
+            joinAllParts(leftDf, rightPartsData)
               // drop all processing metadata columns
               .drop(Constants.MatchedHashes, Constants.TimePartitionColumn))
         } catch {
@@ -179,6 +176,32 @@ class MergeJob(node: JoinMergeNode, metaData: MetaData, range: DateRange, joinPa
       logger.info(s"Pulling data from joinPart table with: $sql")
       (joinPart, tableUtils.scanDfBase(null, partTable, List.empty, wheres, None))
     }.toSeq
+  }
+
+  /** Left-joins every part table onto the left in sequence.
+    *
+    * Every temporal part joins on (part keys, ts, ds), so the key set changes from part to part and a plain chain
+    * of sort-merge joins re-shuffles the accumulating left for almost every part. Partitioning the left by ts
+    * once, and letting Spark accept a subset of the clustering keys as co-partitioned, keeps the left in place for
+    * the whole chain: one shuffle for the left plus one per part. Snapshot parts join on ts_ds instead, so they go
+    * last where they can no longer disturb the temporal chain.
+    */
+  private[batch] def joinAllParts(leftDf: DataFrame, rightPartsData: Seq[(JoinPart, DataFrame)]): DataFrame = {
+    val coPartition = join.left.dataModel == DataModel.EVENTS &&
+      tableUtils.sparkSession.conf.get("spark.chronon.join.merge.copartition_on_ts", "true").toBoolean
+    val (chainLeft, orderedParts) = if (coPartition) {
+      tableUtils.sparkSession.conf.set("spark.sql.requireAllClusterKeysForCoPartition", "false")
+      val (temporal, snapshot) = rightPartsData.partition(_._1.groupBy.inferredAccuracy == Accuracy.TEMPORAL)
+      // explicit partition count: a column-only repartition is AQE-coalesced on the narrow left, and that
+      // (possibly tiny) partition count would then be carried through every join in the chain
+      val partitions = tableUtils.sparkSession.conf.get("spark.sql.shuffle.partitions").toInt
+      (leftDf.repartition(partitions, col(Constants.TimeColumn)), temporal ++ snapshot)
+    } else {
+      (leftDf, rightPartsData)
+    }
+    orderedParts.foldLeft(chainLeft) { case (partialDf, (rightPart, rightDf)) =>
+      joinWithLeft(partialDf, rightDf, rightPart)
+    }
   }
 
   def joinWithLeft(leftDf: DataFrame, rightDf: DataFrame, joinPart: JoinPart): DataFrame = {
