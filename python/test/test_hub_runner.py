@@ -1964,3 +1964,67 @@ class TestEnvironmentValidation:
             convert_environments_to_enum(['staging'])
         assert "Invalid environment 'staging'" in str(exc_info.value)
         assert "Must be one of: ['prod', 'canary']" in str(exc_info.value)
+
+
+class TestGitGuardrailIntegration:
+    """Verify that hub upload commands invoke assert_git_clean and that a
+    dirty non-TTY state blocks the upload before any HTTP call is made."""
+
+    @patch("ai.chronon.repo.hub_runner.assert_git_clean")
+    @patch("requests.post")
+    @patch("ai.chronon.repo.hub_runner.get_current_branch", return_value="main")
+    def test_backfill_calls_guardrail(
+        self, mock_branch, mock_post, mock_guardrail, canary, online_join_conf
+    ):
+        mock_post.return_value = Mock(json=lambda: {"workflowId": "1"})
+        runner = CliRunner()
+        runner.invoke(hub, [
+            "backfill", online_join_conf,
+            "--chronon-root", canary,
+            "--no-use-auth",
+            "--start-ds", "2024-01-01",
+            "--end-ds", "2024-01-31",
+        ])
+        mock_guardrail.assert_called_once()
+
+    @patch("ai.chronon.repo.hub_runner.assert_git_clean")
+    @patch("requests.post")
+    @patch("ai.chronon.repo.hub_runner.get_current_branch", return_value="main")
+    def test_schedule_calls_guardrail(
+        self, mock_branch, mock_post, mock_guardrail, canary, online_join_conf
+    ):
+        mock_post.return_value = Mock(
+            json=lambda: {"schedules": {"0": {"scheduleInterval": "@daily", "state": "ACTIVE"}}}
+        )
+        runner = CliRunner()
+        runner.invoke(hub, [
+            "schedule", online_join_conf,
+            "--chronon-root", canary,
+            "--no-use-auth",
+        ])
+        mock_guardrail.assert_called_once()
+
+    @patch("ai.chronon.cli.git_utils._get_dirty_files", return_value=[" M x.py"])
+    @patch("ai.chronon.cli.git_utils._get_unpushed_commits", return_value=[])
+    @patch("subprocess.check_output", return_value=b"abc123")
+    @patch("requests.post")
+    @patch("ai.chronon.repo.hub_runner.get_current_branch", return_value="main")
+    def test_dirty_non_tty_blocks_backfill_before_upload(
+        self, mock_branch, mock_post, mock_rev_parse, mock_unpushed, mock_dirty,
+        monkeypatch, canary, online_join_conf
+    ):
+        """A dirty working tree with no TTY must exit non-zero without making any HTTP calls."""
+        from ai.chronon.cli.git_utils import _ALLOW_DIRTY_ENV_VAR
+        monkeypatch.delenv(_ALLOW_DIRTY_ENV_VAR, raising=False)
+        # CliRunner does not allocate a TTY by default, so sys.stdin.isatty() → False.
+        runner = CliRunner()
+        result = runner.invoke(hub, [
+            "backfill", online_join_conf,
+            "--chronon-root", canary,
+            "--no-use-auth",
+            "--start-ds", "2024-01-01",
+            "--end-ds", "2024-01-31",
+        ])
+        assert result.exit_code != 0
+        mock_post.assert_not_called()
+

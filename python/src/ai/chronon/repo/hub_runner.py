@@ -19,7 +19,7 @@ from ai.chronon.cli.formatter import (
     format_print,
     jsonify_exceptions_if_json_format,
 )
-from ai.chronon.cli.git_utils import get_current_branch
+from ai.chronon.cli.git_utils import assert_git_clean, get_current_branch
 from ai.chronon.cli.theme import (
     console,
     print_error,
@@ -435,10 +435,11 @@ def redeploy_streaming(repo, confs, hub_url=None, use_auth=True, format: Format 
 
     hub_conf = hub_confs[0]
     zipline_hub = _get_zipline_hub(hub_url, hub_conf, use_auth, format)
+    branch = get_current_branch(repo)
+    assert_git_clean(repo)
 
     with status_spinner("Computing local conf hashes...", format=format):
         conf_name_to_hash_dict = hub_uploader.build_local_repo_hashmap(root_dir=repo, env=env)
-    branch = get_current_branch()
     with status_spinner("Syncing confs with Hub...", format=format):
         hub_uploader.compute_and_upload_diffs(
             branch, zipline_hub=zipline_hub, local_repo_confs=conf_name_to_hash_dict, format=format
@@ -485,11 +486,11 @@ def submit_schedule_all(
         use_auth,
         format,
     )
+    branch = get_current_branch(repo)
+    assert_git_clean(repo)
 
     with status_spinner("Computing local conf hashes...", format=format):
         conf_name_to_obj_dict = hub_uploader.build_local_repo_hashmap(root_dir=repo, env=env)
-
-    branch = get_current_branch()
 
     with status_spinner("Syncing confs with Hub...", format=format):
         # Upload any changed confs to Hub
@@ -687,12 +688,13 @@ def submit_workflow(
 ):
     hub_conf = get_hub_conf(conf, root_dir=repo)
     zipline_hub = _get_zipline_hub(hub_url, hub_conf, use_auth, format)
+    branch = get_current_branch(repo)
+    assert_git_clean(repo)
 
     with status_spinner("Computing local conf hashes...", format=format):
         conf_name_to_hash_dict = hub_uploader.build_local_repo_hashmap(
             root_dir=repo, env=_env_from_conf_path(conf)
         )
-    branch = get_current_branch()
     start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
     with status_spinner("Syncing confs with Hub...", format=format):
@@ -744,13 +746,13 @@ def submit_schedule(
 ):
     hub_conf = get_hub_conf(conf, root_dir=repo)
     zipline_hub = _get_zipline_hub(hub_url, hub_conf, use_auth, format)
+    branch = get_current_branch(repo)
+    assert_git_clean(repo)
 
     with status_spinner("Computing local conf hashes...", format=format):
         conf_name_to_obj_dict = hub_uploader.build_local_repo_hashmap(
             root_dir=repo, env=_env_from_conf_path(conf)
         )
-    branch = get_current_branch()
-
     with status_spinner("Syncing confs with Hub...", format=format):
         hub_uploader.compute_and_upload_diffs(
             branch,
@@ -1003,7 +1005,7 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
     zipline_hub = _get_zipline_hub(hub_url, hub_conf, use_auth, format)
 
     conf_name = utils.get_metadata_name_from_conf(repo, conf)
-    branch = get_current_branch()
+    branch = get_current_branch(repo)
     user = get_user_email()
     start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
@@ -1227,6 +1229,8 @@ def eval(
         scope = hub_conf.auth_scope
     elif hub_conf.cloud_provider == "azure" and hub_conf.customer_id is not None:
         scope = f"api://{hub_conf.customer_id}-zipline-auth"
+    branch = get_current_branch(repo)
+    assert_git_clean(repo)
     zipline_hub = ZiplineHub(
         base_url=hub_url or hub_conf.hub_url,
         sa_name=hub_conf.sa_name,
@@ -1240,7 +1244,6 @@ def eval(
     conf_name_to_hash_dict = hub_uploader.build_local_repo_hashmap(
         root_dir=repo, env=_env_from_conf_path(conf)
     )
-    branch = get_current_branch()
     if test_data_path:
         # Upload the test data skeleton to the bucket.
         if hub_conf.cloud_provider != "gcp":
