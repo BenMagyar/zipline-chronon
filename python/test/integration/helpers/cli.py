@@ -8,6 +8,8 @@ import sys
 
 from ai.chronon.repo.zipline import zipline
 
+from .output import extract_workflow_id as _extract_workflow_id
+
 
 def compile_configs(runner, chronon_root, clean=True):
     """Compile canary configs, optionally from a clean state."""
@@ -22,16 +24,6 @@ def compile_configs(runner, chronon_root, clean=True):
         catch_exceptions=False,
     )
     assert result.exit_code == 0, f"compile failed:\n{result.output}"
-
-
-def _extract_workflow_id(output: str) -> str:
-    """Extract the workflowId from CLI JSON output."""
-    json_start = output.rfind("{")
-    assert json_start != -1, f"No JSON in output:\n{output}"
-    response = json.loads(output[json_start:])
-    workflow_id = response.get("workflowId")
-    assert workflow_id, f"No workflowId in response:\n{output}"
-    return workflow_id
 
 
 def submit_backfill(
