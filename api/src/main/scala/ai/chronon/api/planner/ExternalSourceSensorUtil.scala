@@ -1,7 +1,7 @@
 package ai.chronon.api.planner
 
 import ai.chronon.api.Extensions._
-import ai.chronon.api.{MetaData, PartitionGrid, PartitionSpec}
+import ai.chronon.api.{MetaData, PartitionGrid, PartitionSpec, TableDependency}
 import ai.chronon.planner.ExternalSourceSensorNode
 
 import scala.collection.JavaConverters._
@@ -24,16 +24,31 @@ object ExternalSourceSensorUtil {
     "spark.sql.shuffle.partitions" -> "2"
   )
 
-  // Sensor node names must be unique per (table, dependency grid): two confs watching the same
-  // table on different grids (e.g. a 3h@1h staging query and a 1d@1h groupBy) would otherwise
-  // emit sensors with the same name, and the hub keys nodes by name per branch — one grid
-  // clobbers the other and the losing conf fails its partition-grid check every run. Plain daily
-  // keeps the legacy suffix so existing sensors aren't renamed on upgrade.
+  // Sensors share compute across configurations and cron schedules when they sense the same table
+  // with the same semantics. A node has one grid for its step labels, so sensors on different grids
+  // need distinct logical names; otherwise the branch's single current hash for that name makes one
+  // scheduled configuration use the other configuration's grid. Plain daily keeps the legacy suffix
+  // so existing sensors are not renamed on upgrade.
   private[planner] def sensorName(table: String, grid: PartitionGrid): String = {
     def compact(millis: Long): String = WindowUtils.fromMillis(millis).str
     if (grid.isDaily) s"${table}__sensor"
     else if (grid.offsetMillis == 0) s"${table}__${compact(grid.spanMillis)}__sensor"
     else s"${table}__${compact(grid.spanMillis)}-${compact(grid.offsetMillis)}__sensor"
+  }
+
+  /** The consumer dependency maps a consumer range onto the source table's range. The orchestrator
+    * applies that mapping before it creates a sensor step, so the sensor receives a range that is
+    * already expressed on the source table. Its executable dependency must therefore be an identity
+    * mapping; retaining offsets or cutoffs would apply the consumer mapping a second time and would
+    * also prevent two consumers from sharing sensor work over overlapping source ranges.
+    */
+  private[planner] def resolvedSensorDependency(tableDependency: TableDependency): TableDependency = {
+    val resolved = tableDependency.deepCopy()
+    resolved.setStartOffset(WindowUtils.zero())
+    resolved.setEndOffset(WindowUtils.zero())
+    resolved.unsetStartCutOff()
+    resolved.unsetEndCutOff()
+    resolved
   }
 
   def sensorNodes(metaData: MetaData)(implicit spec: PartitionSpec): Seq[ExternalSourceSensorNode] = {
@@ -63,7 +78,7 @@ object ExternalSourceSensorUtil {
         // interval doesn't divide the span (e.g. a 9m grid polling every 2m)
         val retryCount = (spanMinutes + retryIntervalMin - 1) / retryIntervalMin
         new ExternalSourceSensorNode()
-          .setSourceTableDependency(td)
+          .setSourceTableDependency(resolvedSensorDependency(td))
           .setMetaData(sensorMd)
           .setRetryCount(retryCount)
           .setRetryIntervalMin(retryIntervalMin)

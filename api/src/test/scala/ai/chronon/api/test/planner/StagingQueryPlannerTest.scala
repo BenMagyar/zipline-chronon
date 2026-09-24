@@ -1,6 +1,6 @@
 package ai.chronon.api.test.planner
 
-import ai.chronon.api.{EngineType, ExecutionInfo, PartitionSpec}
+import ai.chronon.api.{EngineType, ExecutionInfo, PartitionSpec, ThriftJsonCodec, Window}
 import ai.chronon.api.Extensions.WindowUtils
 import ai.chronon.api.planner.{LocalRunner, StagingQueryPlanner}
 import ai.chronon.api.Builders.{MetaData, StagingQuery}
@@ -285,6 +285,69 @@ class StagingQueryPlannerTest extends AnyFlatSpec with Matchers {
     val firstSemanticHashes = firstPlan.nodes.asScala.map(_.semanticHash)
     val secondSemanticHashes = secondPlan.nodes.asScala.map(_.semanticHash)
     firstSemanticHashes should equal(secondSemanticHashes)
+  }
+
+  it should "keep sensor identity for the same table and grid while hashing partition column changes" in {
+    def plannedSensor(partitionColumn: String) = {
+      val tableInfo = new TableInfo()
+        .setTable("rain_focus.fact_rf_attendee_snp_hrl")
+        .setPartitionColumn(partitionColumn)
+        .setPartitionFormat("yyyy-MM-dd")
+        .setPartitionInterval(WindowUtils.Day)
+      val dependency = new TableDependency()
+        .setTableInfo(tableInfo)
+        .setStartOffset(WindowUtils.zero())
+        .setEndOffset(WindowUtils.zero())
+      val stagingQuery = StagingQuery(
+        query = "SELECT * FROM rain_focus.fact_rf_attendee_snp_hrl",
+        metaData = MetaData(name = s"rain_focus.object_$partitionColumn"),
+        engineType = EngineType.SPARK,
+        tableDependencies = Seq(dependency)
+      )
+
+      new StagingQueryPlanner(stagingQuery).buildPlan.nodes.asScala.find(_.content.isSetExternalSourceSensor).get
+    }
+
+    val lowerCase = plannedSensor("ds")
+    val upperCase = plannedSensor("DS")
+
+    lowerCase.metaData.name shouldBe "rain_focus.fact_rf_attendee_snp_hrl__sensor"
+    upperCase.metaData.name shouldBe lowerCase.metaData.name
+    upperCase.semanticHash should not equal lowerCase.semanticHash
+    ThriftJsonCodec.hexDigest(upperCase) should not equal ThriftJsonCodec.hexDigest(lowerCase)
+    lowerCase.content.getExternalSourceSensor.sourceTableDependency.tableInfo.partitionColumn shouldBe "ds"
+    upperCase.content.getExternalSourceSensor.sourceTableDependency.tableInfo.partitionColumn shouldBe "DS"
+  }
+
+  it should "share sensor semantics across dependency range changes" in {
+    def plannedSensor(startOffset: Window, endOffset: Window) = {
+      val tableInfo = new TableInfo()
+        .setTable("data.events")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd")
+        .setPartitionInterval(WindowUtils.Day)
+      val dependency = new TableDependency()
+        .setTableInfo(tableInfo)
+        .setStartOffset(startOffset)
+        .setEndOffset(endOffset)
+      val stagingQuery = StagingQuery(
+        query = "SELECT * FROM data.events",
+        metaData = MetaData(name = s"events_${startOffset.length}_${endOffset.length}"),
+        engineType = EngineType.SPARK,
+        tableDependencies = Seq(dependency)
+      )
+
+      new StagingQueryPlanner(stagingQuery).buildPlan.nodes.asScala.find(_.content.isSetExternalSourceSensor).get
+    }
+
+    val currentDay = plannedSensor(WindowUtils.zero(), WindowUtils.zero())
+    val sevenDayLookback = plannedSensor(new Window(7, ai.chronon.api.TimeUnit.DAYS), WindowUtils.zero())
+    val oneDayLag = plannedSensor(WindowUtils.zero(), WindowUtils.Day)
+    val sensors = Seq(currentDay, sevenDayLookback, oneDayLag)
+
+    sensors.map(_.metaData.name).distinct shouldBe Seq("data.events__sensor")
+    sensors.map(ThriftJsonCodec.hexDigest(_)).distinct should have size sensors.size
+    sensors.map(_.semanticHash).distinct should have size 1
   }
 
   it should "staging query planner should produce exactly one node wrapping a StagingQuery for canary confs" in {

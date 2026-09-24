@@ -1611,23 +1611,23 @@ class BatchNodeRunnerTest extends SparkTestBase with Matchers with BeforeAndAfte
     }
   }
 
-  it should "use the dependency input range end for readiness" in {
+  it should "treat the supplied sensor range as already resolved" in {
     createSubDailyPartsTable()
-    // one-interval partition lag: the 09:00 fire only requires the 06:00 input partition
+    // The orchestrator has already applied this one-interval lag when it creates the sensor step.
+    // Keeping the lag in the executable sensor must not shift that resolved step a second time.
     val laggedQuery = subDailyQuery().setPartitionLag(new Window(3, TimeUnit.HOURS))
     val laggedDep = TableDependencies.fromTable("test_db.subdaily_parts", laggedQuery)
-    val unlaggedDep = TableDependencies.fromTable("test_db.subdaily_parts", subDailyQuery())
     val runner = defaultRunner()
 
-    val nineOClockFire = PartitionRange("2024-01-01-09-00", "2024-01-01-09-00")(threeHourSpec)
-
-    runner.checkPartitions(sensorFor(laggedDep), nineOClockFire) match {
-      case Success(_) => // input range end is 06:00, which exists
-      case Failure(e) => fail(s"lagged dependency should be ready: ${e.getMessage}")
+    val resolvedSixOClockRange = PartitionRange("2024-01-01-06-00", "2024-01-01-06-00")(threeHourSpec)
+    runner.checkPartitions(sensorFor(laggedDep), resolvedSixOClockRange) match {
+      case Success(_) => // 06:00 exists
+      case Failure(e) => fail(s"resolved 06:00 sensor range should be ready: ${e.getMessage}")
     }
 
-    runner.checkPartitions(sensorFor(unlaggedDep), nineOClockFire) match {
-      case Success(_) => fail("unlagged dependency requires the missing 09:00 partition")
+    val resolvedNineOClockRange = PartitionRange("2024-01-01-09-00", "2024-01-01-09-00")(threeHourSpec)
+    runner.checkPartitions(sensorFor(laggedDep), resolvedNineOClockRange) match {
+      case Success(_) => fail("resolved 09:00 sensor range must not be shifted back to the available 06:00 partition")
       case Failure(e) => assertTrue(e.getMessage.contains("Sensor"))
     }
   }

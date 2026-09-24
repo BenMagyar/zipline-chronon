@@ -1,9 +1,9 @@
 package ai.chronon.api.test.planner
 
-import ai.chronon.api.planner.ExternalSourceSensorUtil
+import ai.chronon.api.planner.{ConfPlanner, ExternalSourceSensorUtil}
 import ai.chronon.api._
 import ai.chronon.api.Extensions.WindowUtils
-import ai.chronon.planner.ExternalSourceSensorNode
+import ai.chronon.planner.{ConfPlan, ExternalSourceSensorNode}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -12,6 +12,29 @@ import scala.collection.JavaConverters._
 class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
 
   private implicit val testPartitionSpec: PartitionSpec = PartitionSpec.daily
+
+  private def semanticHash(sensor: ExternalSourceSensorNode): String = {
+    val planner = new ConfPlanner[ExternalSourceSensorNode](sensor) {
+      override def buildPlan: ConfPlan = throw new UnsupportedOperationException("not used by this test")
+    }
+    planner.toNode(sensor.metaData, _.setExternalSourceSensor(sensor), sensor).semanticHash
+  }
+
+  private def sensorFor(tableInfo: TableInfo,
+                        startOffset: Window = WindowUtils.zero(),
+                        endOffset: Window = WindowUtils.zero()): ExternalSourceSensorNode = {
+    val dependency = new TableDependency()
+      .setTableInfo(tableInfo)
+      .setStartOffset(startOffset)
+      .setEndOffset(endOffset)
+    val executionInfo = new ExecutionInfo().setTableDependencies(List(dependency).asJava)
+    val metaData = new MetaData()
+      .setName("test_entity")
+      .setTeam("test_team")
+      .setVersion("1")
+      .setExecutionInfo(executionInfo)
+    ExternalSourceSensorUtil.sensorNodes(metaData).head
+  }
 
   // sensors used to be hashed through a metaData-erasing copy; the digest strips metaData itself
   // now, so the property to hold is the hash, not the shape of some intermediate copy
@@ -213,26 +236,28 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
         .setPartitionInterval(WindowUtils.fromMillis(intervalMillis))
       if (offsetMillis != 0L) tableInfo.setPartitionOffset(WindowUtils.fromMillis(offsetMillis))
       val executionInfo = new ExecutionInfo()
-        .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+        .setTableDependencies(
+          List(
+            new TableDependency()
+              .setTableInfo(tableInfo)
+              .setStartOffset(WindowUtils.zero())
+              .setEndOffset(WindowUtils.zero())).asJava)
       new MetaData().setName(name).setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
     }
 
-    // Two confs watching the same table on different grids (a 3h@1h staging query and a 1d@1h
-    // groupBy) used to emit sensors with the SAME node name. branch_nodes keys nodes by name, so
-    // whichever conf synced last clobbered the other's sensor grid and the loser failed its
-    // partition-grid check every run.
     val hourMillis = 60 * 60 * 1000L
     val threeHourly =
       ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.sq__3", 3 * hourMillis, hourMillis)).head
     val dailyOffset =
       ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.gb__1", 24 * hourMillis, hourMillis)).head
 
-    threeHourly.metaData.name should not equal dailyOffset.metaData.name
     threeHourly.metaData.name shouldBe "data.table_a__3h-1h__sensor"
     dailyOffset.metaData.name shouldBe "data.table_a__1d-1h__sensor"
+    threeHourly.metaData.name should not equal dailyOffset.metaData.name
+    semanticHash(threeHourly) should not equal semanticHash(dailyOffset)
   }
 
-  it should "use the interval-only qualifier when the offset is zero" in {
+  it should "use the interval-only qualifier when a sub-daily grid has no offset" in {
     val hourMillis = 60 * 60 * 1000L
     val tableInfo = new TableInfo()
       .setTable("data.table_a")
@@ -240,7 +265,12 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
       .setPartitionFormat("yyyy-MM-dd-HH-mm")
       .setPartitionInterval(WindowUtils.fromMillis(3 * hourMillis))
     val executionInfo = new ExecutionInfo()
-      .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+      .setTableDependencies(
+        List(
+          new TableDependency()
+            .setTableInfo(tableInfo)
+            .setStartOffset(WindowUtils.zero())
+            .setEndOffset(WindowUtils.zero())).asJava)
     val metaData =
       new MetaData().setName("test_team.sq__3").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
 
@@ -248,21 +278,180 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
     sensor.metaData.name shouldBe "data.table_a__3h__sensor"
   }
 
-  it should "keep the legacy name for plain daily dependencies" in {
+  it should "keep the legacy name for plain daily dependencies with zero range offsets" in {
     val tableInfo = new TableInfo()
       .setTable("data.table_a")
       .setPartitionColumn("ds")
       .setPartitionFormat("yyyy-MM-dd")
 
     val executionInfo = new ExecutionInfo()
+      .setTableDependencies(
+        List(
+          new TableDependency()
+            .setTableInfo(tableInfo)
+            .setStartOffset(WindowUtils.zero())
+            .setEndOffset(WindowUtils.zero())).asJava)
+    val metaData =
+      new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    // Daily with a zero dependency range is the overwhelmingly common case. Its sensor names must
+    // not change, or every existing customer's sensors would be renamed on upgrade.
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+    sensor.metaData.name shouldBe "data.table_a__sensor"
+  }
+
+  it should "keep the table identity when offsets are absent" in {
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd")
+    val executionInfo = new ExecutionInfo()
       .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
     val metaData =
       new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
 
-    // Daily-no-offset is the overwhelmingly common case — its sensor names must not change, or
-    // every existing customer's sensors would be renamed on upgrade.
     val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+
     sensor.metaData.name shouldBe "data.table_a__sensor"
+    semanticHash(sensor) shouldBe semanticHash(sensorFor(tableInfo.deepCopy()))
+  }
+
+  it should "reuse one semantic identity across different dependency ranges" in {
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd-HH-mm")
+      .setPartitionInterval(new Window(3, TimeUnit.HOURS))
+      .setPartitionOffset(WindowUtils.Hour)
+
+    val sevenDays = new Window(7, TimeUnit.DAYS)
+    val dependencies = Seq(
+      new TableDependency()
+        .setTableInfo(tableInfo.deepCopy())
+        .setStartOffset(sevenDays)
+        .setEndOffset(WindowUtils.zero()),
+      new TableDependency()
+        .setTableInfo(tableInfo.deepCopy())
+        .setStartOffset(sevenDays)
+        .setEndOffset(WindowUtils.Day),
+      new TableDependency()
+        .setTableInfo(tableInfo.deepCopy())
+        .setStartOffset(new Window(14, TimeUnit.DAYS))
+        .setEndOffset(WindowUtils.zero()),
+      new TableDependency()
+        .setTableInfo(tableInfo.deepCopy())
+        .setStartOffset(WindowUtils.zero())
+        .setEndOffset(WindowUtils.zero())
+        .setStartCutOff("2024-01-01")
+        .setEndCutOff("2024-12-31")
+    )
+    val executionInfo = new ExecutionInfo().setTableDependencies(dependencies.asJava)
+    val metaData =
+      new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    val sensors = ExternalSourceSensorUtil.sensorNodes(metaData)
+
+    sensors.map(_.metaData.name).distinct shouldBe Seq("data.table_a__3h-1h__sensor")
+    sensors.map(semanticHash).distinct should have size 1
+  }
+
+  it should "share one identity across cron schedules when the table and grid match" in {
+    def scheduledSensor(confName: String, schedule: String): ExternalSourceSensorNode = {
+      val tableInfo = new TableInfo()
+        .setTable("data.table_a")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH-mm")
+        .setPartitionInterval(new Window(3, TimeUnit.HOURS))
+        .setPartitionOffset(WindowUtils.Hour)
+      val executionInfo = new ExecutionInfo()
+        .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+        .setOfflineSchedule(schedule)
+      val metaData = new MetaData()
+        .setName(confName)
+        .setTeam("test_team")
+        .setVersion("1")
+        .setExecutionInfo(executionInfo)
+      ExternalSourceSensorUtil.sensorNodes(metaData).head
+    }
+
+    val onTheHour = scheduledSensor("test_team.staging", "0 */3 * * *")
+    val delayed = scheduledSensor("test_team.group_by", "20 */3 * * *")
+
+    onTheHour.metaData.name shouldBe "data.table_a__3h-1h__sensor"
+    delayed.metaData.name shouldBe onTheHour.metaData.name
+    semanticHash(delayed) shouldBe semanticHash(onTheHour)
+  }
+
+  it should "keep range mapping on the consumer dependency instead of the generated sensor" in {
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd")
+    val dependency = new TableDependency()
+      .setTableInfo(tableInfo)
+      .setStartOffset(new Window(7, TimeUnit.DAYS))
+      .setEndOffset(WindowUtils.Day)
+      .setStartCutOff("2024-01-01")
+      .setEndCutOff("2024-12-31")
+    val executionInfo = new ExecutionInfo().setTableDependencies(List(dependency).asJava)
+    val metaData =
+      new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    val sensorDependency = ExternalSourceSensorUtil.sensorNodes(metaData).head.sourceTableDependency
+
+    // The consumer still owns the mapping from its range to the input-table range.
+    dependency.startOffset shouldBe new Window(7, TimeUnit.DAYS)
+    dependency.endOffset shouldBe WindowUtils.Day
+    dependency.startCutOff shouldBe "2024-01-01"
+    dependency.endCutOff shouldBe "2024-12-31"
+
+    // A sensor step is already expressed on the input table's range, so its executable copy is identity.
+    sensorDependency.tableInfo shouldBe tableInfo
+    sensorDependency.startOffset shouldBe WindowUtils.zero()
+    sensorDependency.endOffset shouldBe WindowUtils.zero()
+    sensorDependency.isSetStartCutOff shouldBe false
+    sensorDependency.isSetEndCutOff shouldBe false
+  }
+
+  it should "put non-grid sensing semantics in the semantic hash instead of the name" in {
+    val baseInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd-HH-mm")
+      .setPartitionInterval(WindowUtils.Day)
+
+    val base = sensorFor(baseInfo.deepCopy())
+    val sameGridSensingVariations = Seq(
+      sensorFor(baseInfo.deepCopy().setPartitionColumn("DS")),
+      sensorFor(baseInfo.deepCopy().setPartitionFormat("yyyyMMddHHmm")),
+      sensorFor(baseInfo.deepCopy().setTimePartitioned(true)),
+      sensorFor(baseInfo.deepCopy().setIsCumulative(true)),
+      sensorFor(baseInfo.deepCopy().setTriggerExpr("MAX(ds)"))
+    )
+    val gridVariations = Seq(
+      sensorFor(baseInfo.deepCopy().setPartitionInterval(new Window(12, TimeUnit.HOURS))),
+      sensorFor(baseInfo.deepCopy().setPartitionOffset(WindowUtils.Hour))
+    )
+    val rangeVariations = Seq(
+      sensorFor(baseInfo.deepCopy(), startOffset = new Window(7, TimeUnit.DAYS)),
+      sensorFor(baseInfo.deepCopy(), endOffset = WindowUtils.Day)
+    )
+
+    sameGridSensingVariations.foreach { changed =>
+      changed.metaData.name shouldBe base.metaData.name
+      semanticHash(changed) should not equal semanticHash(base)
+    }
+    sameGridSensingVariations.map(semanticHash).distinct should have size sameGridSensingVariations.size
+
+    gridVariations.foreach { changed =>
+      changed.metaData.name should not equal base.metaData.name
+      semanticHash(changed) should not equal semanticHash(base)
+    }
+
+    rangeVariations.foreach { changed =>
+      changed.metaData.name shouldBe base.metaData.name
+      semanticHash(changed) shouldBe semanticHash(base)
+    }
   }
 
   "sensorNodes" should "set correct sensor metadata for grouped dependencies" in {

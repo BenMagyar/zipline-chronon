@@ -71,9 +71,9 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     val tableInfo = conf.sourceTableDependency.tableInfo
     val hasPartitionColumn = Option(tableInfo.partitionColumn).isDefined
     val hasTriggerExpr = Option(tableInfo.triggerExpr).isDefined
-    val requiredRange = DependencyResolver
-      .computeInputRange(range, conf.sourceTableDependency)
-      .getOrElse(range)
+    // Sensor steps are already expressed on the source table's range. The consumer dependency
+    // mapping is applied by the planner/orchestrator before the step reaches this runner.
+    val requiredRange = range
 
     // Case 1: triggerExpr overrides — user-defined readiness check
     if (hasTriggerExpr) {
