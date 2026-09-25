@@ -1,6 +1,7 @@
 package ai.chronon.integrations.aws
 
 import ai.chronon.api.JobStatusType
+import ai.chronon.api.secrets.Redaction
 import ai.chronon.integrations.cloud_k8s.K8sFlinkSubmitter
 import ai.chronon.spark.submission
 import ai.chronon.spark.submission.JobSubmitterConstants._
@@ -15,6 +16,15 @@ import org.scalatestplus.mockito.MockitoSugar
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.emrserverless.EmrServerlessClient
 import software.amazon.awssdk.services.emrserverless.model._
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient
+import software.amazon.awssdk.services.secretsmanager.model.{
+  CreateSecretRequest,
+  GetSecretValueRequest,
+  GetSecretValueResponse,
+  PutResourcePolicyRequest,
+  PutSecretValueRequest,
+  ResourceNotFoundException
+}
 
 import scala.jdk.CollectionConverters._
 
@@ -62,7 +72,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       kvStoreApiProperties: Map[String, String] = Map(
         "AWS_DEFAULT_REGION" -> "us-east-1"
       ),
-      s3Client: Option[software.amazon.awssdk.services.s3.S3Client] = None
+      s3Client: Option[software.amazon.awssdk.services.s3.S3Client] = None,
+      secretStore: Option[EmrSecretStore] = None
   ): EmrServerlessSubmitter = {
     new EmrServerlessSubmitter(
       mockClient,
@@ -76,7 +87,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       emrStudioId = emrStudioId,
       applicationName = applicationName,
       kvStoreApiProperties = kvStoreApiProperties,
-      s3Client = s3Client
+      s3Client = s3Client,
+      secretStore = secretStore
     )
   }
 
@@ -1337,6 +1349,190 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     val props = requestCaptor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
     props.get("spark.executor.memory") shouldBe "4g"
     props.get("spark.driver.cores") shouldBe "2"
+  }
+
+  private def submittedProps(mockClient: EmrServerlessClient): Map[String, String] = {
+    val requestCaptor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
+    verify(mockClient).startJobRun(requestCaptor.capture())
+    val request = requestCaptor.getValue
+    val inline = request.configurationOverrides().applicationConfiguration().asScala.flatMap(_.properties().asScala)
+    val overflow = request.jobDriver().sparkSubmit().sparkSubmitParameters().split(" --conf ").drop(1).map { kv =>
+      val idx = kv.indexOf('=')
+      kv.substring(0, idx) -> kv.substring(idx + 1)
+    }
+    (inline ++ overflow).toMap
+  }
+
+  private def submitWithSecrets(mockClient: EmrServerlessClient,
+                                applicationId: String,
+                                jobProperties: Map[String, String],
+                                envVars: Map[String, String],
+                                secretStore: Option[EmrSecretStore]): Map[String, String] = {
+    when(mockClient.startJobRun(any[StartJobRunRequest]))
+      .thenReturn(StartJobRunResponse.builder().applicationId(applicationId).jobRunId("job-secrets").build())
+    val submitter = createSubmitter(mockClient, secretStore = secretStore)
+    submitter.submit(
+      submission.SparkJob,
+      Map(
+        MainClass -> "ai.chronon.spark.Driver",
+        JarURI -> "s3://bucket/jar.jar",
+        JobId -> "test-secrets",
+        submitter.clusterIdentifierKey -> applicationId
+      ),
+      jobProperties,
+      List.empty,
+      Map.empty,
+      envVars
+    )
+    submittedProps(mockClient)
+  }
+
+  "protectSecrets" should "reference injected values that match the redaction regex and leave literals alone" in {
+    val smClient = mock[SecretsManagerClient]
+    when(smClient.getSecretValue(any[GetSecretValueRequest]))
+      .thenThrow(ResourceNotFoundException.builder().message("missing").build())
+    val store = new EmrSecretStore(smClient, "kms-key", "chronon", "us-east-1", "123456789012")
+    val appId = "app-secrets-1"
+
+    val props = submitWithSecrets(
+      mock[EmrServerlessClient],
+      appId,
+      Map(
+        // placeholders expand from the submitter process env; HOME is present everywhere
+        "spark.sql.catalog.uc.auth.oauth.clientSecret" -> "{HOME}",
+        "spark.sql.catalog.uc.auth.oauth.clientId" -> "{HOME}",
+        "spark.sql.catalog.uc.token-exchange-enabled" -> "false",
+        "spark.redaction.regex" -> "(?i)secret|password|token|access[.]key|credential|jaas",
+        "spark.some.credential" -> "literal-credential-in-conf"
+      ),
+      Map(
+        "DATABRICKS_CLIENT_SECRET" -> "s3cr3t-value",
+        "FLINK_SASL_JAAS_CONFIG" -> "org.apache.kafka.common.security.scram.ScramLoginModule required username=\"u\" password=\"p\";",
+        "FLINK_SASL_JAAS_CONFIG_VAULT_URI" -> "arn:aws:secretsmanager:us-east-1:123456789012:secret:jaas-abc",
+        "KV_STORE_TYPE" -> "redis"
+      ),
+      Some(store)
+    )
+
+    val clientSecretRef = s"EMR.secret@${store.secretName(appId, "spark.sql.catalog.uc.auth.oauth.clientSecret")}"
+    props("spark.sql.catalog.uc.auth.oauth.clientSecret") shouldBe clientSecretRef
+    props("spark.emr-serverless.driverEnv.FLINK_SASL_JAAS_CONFIG") shouldBe
+      s"EMR.secret@${store.secretName(appId, "spark.emr-serverless.driverEnv.FLINK_SASL_JAAS_CONFIG")}"
+    props("spark.executorEnv.FLINK_SASL_JAAS_CONFIG") shouldBe
+      s"EMR.secret@${store.secretName(appId, "spark.executorEnv.FLINK_SASL_JAAS_CONFIG")}"
+
+    props("spark.sql.catalog.uc.auth.oauth.clientId") shouldBe sys.env("HOME")
+    props("spark.some.credential") shouldBe "literal-credential-in-conf"
+    props("spark.sql.catalog.uc.token-exchange-enabled") shouldBe "false"
+    props("spark.redaction.regex") shouldBe "(?i)secret|password|token|access[.]key|credential|jaas"
+    props("spark.emr-serverless.driverEnv.FLINK_SASL_JAAS_CONFIG_VAULT_URI") shouldBe
+      "arn:aws:secretsmanager:us-east-1:123456789012:secret:jaas-abc"
+    props("spark.emr-serverless.driverEnv.KV_STORE_TYPE") shouldBe "redis"
+
+    props.values.exists(_.contains("s3cr3t-value")) shouldBe false
+    props.values.exists(_.contains("password=")) shouldBe false
+
+    // env vars fan out to driverEnv + executorEnv, so injected env secrets cost two references each
+    val expectedSecretKeys = Set(
+      "spark.sql.catalog.uc.auth.oauth.clientSecret",
+      "spark.emr-serverless.driverEnv.FLINK_SASL_JAAS_CONFIG",
+      "spark.executorEnv.FLINK_SASL_JAAS_CONFIG",
+      "spark.emr-serverless.driverEnv.DATABRICKS_CLIENT_SECRET",
+      "spark.executorEnv.DATABRICKS_CLIENT_SECRET"
+    )
+    expectedSecretKeys.foreach(k => props(k) shouldBe s"EMR.secret@${store.secretName(appId, k)}")
+
+    val created = ArgumentCaptor.forClass(classOf[CreateSecretRequest])
+    verify(smClient, times(expectedSecretKeys.size)).createSecret(created.capture())
+    created.getAllValues.asScala.map(_.name()).toSet shouldBe expectedSecretKeys.map(store.secretName(appId, _))
+    all(created.getAllValues.asScala.map(_.kmsKeyId())) shouldBe "kms-key"
+    created.getAllValues.asScala
+      .find(_.name() == clientSecretRef.stripPrefix("EMR.secret@"))
+      .get
+      .secretString() shouldBe sys.env("HOME")
+
+    val policies = ArgumentCaptor.forClass(classOf[PutResourcePolicyRequest])
+    verify(smClient, times(expectedSecretKeys.size)).putResourcePolicy(policies.capture())
+    all(policies.getAllValues.asScala.map(_.resourcePolicy())) should include(
+      s"arn:aws:emr-serverless:us-east-1:123456789012:/applications/$appId")
+    all(policies.getAllValues.asScala.map(_.blockPublicPolicy())) shouldBe true
+    verify(smClient, never()).putSecretValue(any[PutSecretValueRequest])
+  }
+
+  it should "fall back to plaintext when no secret store is configured" in {
+    val props = submitWithSecrets(
+      mock[EmrServerlessClient],
+      "app-secrets-2",
+      Map("spark.sql.catalog.uc.auth.oauth.clientSecret" -> "{HOME}"),
+      Map.empty,
+      None
+    )
+    props("spark.sql.catalog.uc.auth.oauth.clientSecret") shouldBe sys.env("HOME")
+  }
+
+  it should "use Spark's default redaction regex when the job does not set one" in {
+    val smClient = mock[SecretsManagerClient]
+    when(smClient.getSecretValue(any[GetSecretValueRequest]))
+      .thenThrow(ResourceNotFoundException.builder().message("missing").build())
+    val store = new EmrSecretStore(smClient, "kms-key", "chronon", "us-east-1", "123456789012")
+    val appId = "app-secrets-3"
+
+    val props = submitWithSecrets(
+      mock[EmrServerlessClient],
+      appId,
+      Map("spark.a.credential" -> "{HOME}", "spark.a.password" -> "{HOME}"),
+      Map.empty,
+      Some(store)
+    )
+    // "credential" is not in Spark's default regex; "password" is
+    props("spark.a.credential") shouldBe sys.env("HOME")
+    props("spark.a.password") shouldBe s"EMR.secret@${store.secretName(appId, "spark.a.password")}"
+  }
+
+  "EmrSecretStore" should "create once, skip unchanged values and rewrite changed ones" in {
+    val smClient = mock[SecretsManagerClient]
+    val store = new EmrSecretStore(smClient, "kms-key", "chronon", "us-east-1", "123456789012")
+    val name = store.secretName("app-x", "spark.k")
+    name should startWith("chronon/app-x/")
+    name.stripPrefix("chronon/app-x/") should have length 24
+
+    when(smClient.getSecretValue(any[GetSecretValueRequest]))
+      .thenThrow(ResourceNotFoundException.builder().message("missing").build())
+    store.reference("app-x", "spark.k", "v1") shouldBe s"EMR.secret@$name"
+    verify(smClient, times(1)).createSecret(any[CreateSecretRequest])
+    verify(smClient, times(1)).putResourcePolicy(any[PutResourcePolicyRequest])
+
+    // same value: cached, no calls at all
+    store.reference("app-x", "spark.k", "v1") shouldBe s"EMR.secret@$name"
+    verify(smClient, times(1)).getSecretValue(any[GetSecretValueRequest])
+
+    // changed value: fetch, differs, rewrite
+    reset(smClient)
+    when(smClient.getSecretValue(any[GetSecretValueRequest]))
+      .thenReturn(GetSecretValueResponse.builder().secretString("v1").build())
+    store.reference("app-x", "spark.k", "v2") shouldBe s"EMR.secret@$name"
+    val put = ArgumentCaptor.forClass(classOf[PutSecretValueRequest])
+    verify(smClient).putSecretValue(put.capture())
+    put.getValue.secretString() shouldBe "v2"
+    verify(smClient, never()).createSecret(any[CreateSecretRequest])
+
+    // fresh store, remote already holds the value: no write
+    val fresh = new EmrSecretStore(smClient, "kms-key", "chronon", "us-east-1", "123456789012")
+    reset(smClient)
+    when(smClient.getSecretValue(any[GetSecretValueRequest]))
+      .thenReturn(GetSecretValueResponse.builder().secretString("v2").build())
+    fresh.reference("app-x", "spark.k", "v2")
+    verify(smClient, never()).putSecretValue(any[PutSecretValueRequest])
+    verify(smClient, never()).createSecret(any[CreateSecretRequest])
+  }
+
+  it should "derive the account from the execution role and reject malformed ARNs" in {
+    an[IllegalArgumentException] should be thrownBy EmrSecretStore("k", "chronon", "us-east-1", "not-an-arn")
+    Redaction.isSensitive("(?i)secret".r, "spark.redaction.regex", "(?i)secret") shouldBe false
+    Redaction.isSensitive("(?i)secret".r, "spark.executorEnv.X_VAULT_URI", "arn:...:secret:x") shouldBe false
+    Redaction.isSensitive("(?i)secret".r, "spark.x", "EMR.secret@chronon/app/abc") shouldBe false
+    Redaction.isSensitive("(?i)secret".r, "spark.x.clientSecret", "abc") shouldBe true
+    Redaction.isSensitive("(?i)secret".r, "spark.x", "my secret") shouldBe true
   }
 
   it should "keep spark-defaults at <=100 and spill the rest into --conf on sparkSubmitParameters" in {

@@ -1,6 +1,7 @@
 package ai.chronon.integrations.aws
 
 import ai.chronon.api.JobStatusType
+import ai.chronon.api.secrets.Redaction
 import ai.chronon.integrations.cloud_k8s.{K8sFlinkStatusProvider, K8sFlinkSubmitter}
 import ai.chronon.spark.submission.JobSubmitterConstants._
 import ai.chronon.spark.submission.{
@@ -20,6 +21,7 @@ import software.amazon.awssdk.services.s3.S3Client
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.regex.Matcher
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext}
 import scala.jdk.CollectionConverters._
@@ -42,7 +44,8 @@ class EmrServerlessSubmitter(
     flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
     s3Client: Option[S3Client] = None,
     cloudWatchLogGroupName: Option[String] = None,
-    applicationName: String = EmrServerlessSubmitter.DefaultApplicationName
+    applicationName: String = EmrServerlessSubmitter.DefaultApplicationName,
+    secretStore: Option[EmrSecretStore] = None
 ) extends JobSubmitter {
 
   // Cache of jobRunId → appId for reverse lookups in status/kill/URL
@@ -50,14 +53,49 @@ class EmrServerlessSubmitter(
 
   private val EnvVarPattern = """\{([A-Z_][A-Z0-9_]*)\}""".r
 
-  private def resolveEnvVars(properties: Map[String, String]): Map[String, String] =
+  // value after placeholder expansion, and whether the submitter injected any of it
+  // from its own environment (as opposed to a literal committed in the conf)
+  private case class Resolved(value: String, injected: Boolean)
+
+  private def resolveEnvVars(properties: Map[String, String], env: Map[String, String]): Map[String, Resolved] =
     properties.map { case (k, v) =>
-      k -> EnvVarPattern.replaceAllIn(v,
-                                      m => {
-                                        val varName = m.group(1)
-                                        sys.env.getOrElse(varName, m.matched)
-                                      })
+      var injected = false
+      val resolved = EnvVarPattern.replaceAllIn(
+        v,
+        m => {
+          val varName = m.group(1)
+          env.get(varName) match {
+            case Some(value) =>
+              injected = true
+              Matcher.quoteReplacement(value)
+            case None => Matcher.quoteReplacement(m.matched)
+          }
+        }
+      )
+      k -> Resolved(resolved, injected)
     }
+
+  // Anything the submitter injected that Spark itself would redact must not travel in
+  // the StartJobRun request, which GetJobRun echoes verbatim. Literals from the conf are
+  // already committed to git and pass through untouched.
+  private def protectSecrets(appId: String, properties: Map[String, Resolved]): Map[String, String] = {
+    val regex = Redaction.regex(properties.map { case (k, r) => k -> r.value })
+    val sensitive = properties.collect {
+      case (k, Resolved(v, true)) if Redaction.isSensitive(regex, k, v) => k
+    }.toSet
+    secretStore match {
+      case Some(store) =>
+        properties.map { case (k, Resolved(v, _)) =>
+          k -> (if (sensitive(k)) store.reference(appId, k, v) else v)
+        }
+      case None =>
+        if (sensitive.nonEmpty)
+          logger.warn(
+            s"${sensitive.size} injected properties match ${Redaction.Key} but ${EmrSecretStore.KmsKeyIdEnvVar} " +
+              s"is not set; they will be visible in plaintext via GetJobRun: ${sensitive.toSeq.sorted.mkString(", ")}")
+        properties.map { case (k, Resolved(v, _)) => k -> v }
+    }
+  }
 
   // EMR Serverless-specific env var expansion. Unlike YARN/K8s setups, driver env vars
   // must use spark.emr-serverless.driverEnv.<KEY> — see
@@ -196,7 +234,11 @@ class EmrServerlessSubmitter(
     // without the console-side property-count limit).
     // envVars get expanded into EMR-Serverless-specific driver/executor Spark props here
     // (see envVarsToSparkProperties) and merged with caller-provided jobProperties.
-    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars))
+    val env = sys.env.toMap
+    val envProps = resolveEnvVars(envVarsToSparkProperties(envVars), env).map { case (k, r) =>
+      k -> r.copy(injected = true)
+    }
+    val resolvedProps = protectSecrets(appId, resolveEnvVars(jobProperties, env) ++ envProps)
     val (inlineProps, overflowProps) = EmrServerlessSubmitter.splitForConfigCap(resolvedProps)
     if (overflowProps.nonEmpty) {
       logger.warn(
@@ -618,7 +660,8 @@ object EmrServerlessSubmitter {
       flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
       s3Client: Option[S3Client] = None,
       applicationName: String = DefaultApplicationName,
-      kvStoreApiProperties: Map[String, String] = Map.empty
+      kvStoreApiProperties: Map[String, String] = Map.empty,
+      secretStore: Option[EmrSecretStore] = None
   ): EmrServerlessSubmitter = {
     val client = EmrServerlessClient
       .builder()
@@ -644,7 +687,8 @@ object EmrServerlessSubmitter {
       s3Client = s3Client,
       cloudWatchLogGroupName = cloudWatchLogGroupName,
       applicationName = applicationName,
-      kvStoreApiProperties = kvStoreApiProperties
+      kvStoreApiProperties = kvStoreApiProperties,
+      secretStore = secretStore.orElse(EmrSecretStore.fromEnv(awsRegion, executionRoleArn))
     )
   }
 
