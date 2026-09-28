@@ -47,15 +47,15 @@ def test_hub_train_ctr_ray(chronon_root, hub_url, cloud):
     if _MODEL_CONF:
         model_conf = _MODEL_CONF
     else:
-        from models.aws.ctr_ray import ctr_ray_model
-        model_conf = f"{_COMPILED_DIR}/models/aws/ctr_ray.ctr_ray_model__{ctr_ray_model.metaData.version}"
+        from models.aws_databricks.ctr_ray import ctr_ray_model
+        model_conf = f"{_COMPILED_DIR}/models/aws_databricks/ctr_ray.ctr_ray_model__{ctr_ray_model.metaData.version}"
     source_conf = Path(chronon_root) / model_conf
     run_conf = source_conf.with_name(f"{source_conf.name}__e2e_{invocation_id}")
     compiled_model = json.loads(source_conf.read_text())
     # Hub indexes compiled configs by metadata name, not file path. Give this
     # invocation its own identity so the base config cannot win the hash-map
     # collision and silently restore the shared model-dir.
-    compiled_model["metaData"]["name"] = f"models.aws.ctr_ray_e2e_{invocation_id}"
+    compiled_model["metaData"]["name"] = f"models.aws_databricks.ctr_ray_e2e_{invocation_id}"
     job_configs = compiled_model["trainingConf"]["jobConfigs"]
     destination = urlparse(os.environ.get("ZIPLINE_CTR_ARTIFACT_BASE_URI", compiled_model["modelArtifactBaseUri"]))
     assert destination.scheme == "s3" and destination.netloc, "AWS E2E requires an s3 artifact base"

@@ -144,8 +144,7 @@ aws = Team(
             "EVAL_URL": "https://canary-aws.zipline.ai/services/eval",
             "ENABLE_KINESIS": "true",
             "FLINK_JARS_URI": "s3://zipline-artifacts-canary/spark-3.5.3/libs/",
-            # models/aws/ctr_ray.py is this team. RAY_ prefix is stripped onto
-            # Ray pods (platform #1307) so the trainer can auth to UC/Polaris.
+            # RAY_ prefix is stripped before injection onto Ray pods (see platform #1307).
             "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
             "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
         },
@@ -324,7 +323,9 @@ aws_databricks = Team(
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
             "HUB_URL": "https://canary-orch-aws.zipline.ai",
             "ENABLE_KINESIS": "true",
-            # RAY_ prefix is stripped before injection onto Ray pods (see platform #1307).
+            # models/aws_databricks/ctr_ray.py is this team; the RAY_ prefix is stripped
+            # before injection onto Ray pods (see platform #1307) so the trainer can
+            # authenticate to Unity Catalog.
             "RAY_DATABRICKS_CLIENT_ID": "{DATABRICKS_CLIENT_ID}",
             "RAY_DATABRICKS_CLIENT_SECRET": "{DATABRICKS_CLIENT_SECRET}",
         },

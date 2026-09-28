@@ -478,8 +478,8 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
     """The AWS CTR Ray model uses the standard image and immutable trainer URI."""
     _compile_canary(canary)
 
-    from models.aws.ctr_ray import ctr_ray_model
-    relpath = f"compiled/models/aws/ctr_ray.ctr_ray_model__{ctr_ray_model.metaData.version}"
+    from models.aws_databricks.ctr_ray import ctr_ray_model
+    relpath = f"compiled/models/aws_databricks/ctr_ray.ctr_ray_model__{ctr_ray_model.metaData.version}"
     path = os.path.join(canary, relpath)
     assert os.path.exists(path), f"Expected compiled CTR Ray model at {relpath}"
 
@@ -535,7 +535,7 @@ def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     for directory in ("compiled", "compiled_canary"):
-        model_file = next((root / directory / "models/aws").glob("ctr_ray.*"))
+        model_file = next((root / directory / "models/aws_databricks").glob("ctr_ray.*"))
         model = json.loads(model_file.read_text())
         assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
             "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__7"
@@ -550,7 +550,7 @@ def test_ctr_click_history_preserves_epoch_milliseconds_through_pipeline(canary,
     root = Path(canary) / directory
     join = json.loads((root / "joins/aws_databricks/demo.derivations_v1__3").read_text())
     labels = json.loads((root / "staging_queries/aws_databricks/ctr_labels.v1__2").read_text())
-    model = json.loads(next((root / "models/aws").glob("ctr_ray.ctr_ray_model__*")).read_text())
+    model = json.loads(next((root / "models/aws_databricks").glob("ctr_ray.ctr_ray_model__*")).read_text())
     activity = join["joinParts"][1]["groupBy"]
     query = activity["sources"][0]["events"]["query"]
 

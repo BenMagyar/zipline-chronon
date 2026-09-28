@@ -95,7 +95,6 @@ ctr_ray_model = Model(
             "vended-credentials": "true",
             "eta": "0.1",
             "max-depth": "4",
-            "model-dir": f"{_artifact_base}/models/listing_ctr_model",
             "num-boost-round": "50",
             # Hold out the last partition for evaluation. The trainer splits by
             # date, never at random, so it cannot score against rows it trained on.
