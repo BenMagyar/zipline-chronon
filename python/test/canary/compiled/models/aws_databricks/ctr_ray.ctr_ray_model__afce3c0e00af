@@ -88,7 +88,6 @@
       "features": "user_id_click_event_average_7d:user_id_click_event_average_7d,listing_id_price_cents:listing_price_cents,price_log:price_log,price_bucket:price_bucket,listing_id_inventory_count:inventory_count,listing_id_weight_grams:weight_grams,listing_id_is_in_stock:is_in_stock,is_listing_heavy:is_listing_heavy,inventory_log:inventory_log,price_per_kg:price_per_kg",
       "label-column": "label",
       "max-depth": "4",
-      "model-dir": "s3://zipline-warehouse-crucible/models/listing_ctr_model",
       "num-boost-round": "50",
       "oauth2-server-uri": "https://dbc-050d6f00-dcb3.cloud.databricks.com/oidc/v1/token",
       "partition-column": "ds",
@@ -121,7 +120,7 @@
           },
           "startPartition": "2025-07-01"
         },
-        "table": "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
+        "table": "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__3"
       }
     },
     "trainingDataWindow": {

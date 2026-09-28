@@ -13,6 +13,7 @@ Kept in the unit suite (not `test/integration/`) so PR CI runs them via
 """
 
 import json
+import re
 import os
 
 import pytest
@@ -498,7 +499,8 @@ def test_aws_ctr_ray_model_uses_standard_image_and_content_addressed_archive(can
     assert spec["jobConfigs"]["warehouse"] == "workspace"
     assert spec["jobConfigs"]["client-id-env"] == "DATABRICKS_CLIENT_ID"
     assert spec["jobConfigs"]["vended-credentials"] == "true"
-    assert spec["trainingDataSource"]["events"]["table"] == "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
+    assert spec["trainingDataSource"]["events"]["table"].startswith(
+        "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__")
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_ID"] == "{DATABRICKS_CLIENT_ID}"
     assert payload["metaData"]["executionInfo"]["env"]["common"]["RAY_DATABRICKS_CLIENT_SECRET"] == "{DATABRICKS_CLIENT_SECRET}"
     assert payload["inferenceSpec"]["modelBackend"] == 2
@@ -525,8 +527,9 @@ def test_ctr_ray_source_tracks_staging_query_version(canary, tmp_path):
         "compiled", "compiled_canary", "__pycache__", "dist"))
     source = root / "staging_queries/aws_databricks/ctr_labels.py"
     original = source.read_text()
-    assert "version=2" in original
-    source.write_text(original.replace("version=2", "version=7"))
+    current = re.search(r"version=(\d+)", original)
+    assert current, "ctr_labels should declare a version"
+    source.write_text(original.replace(current.group(0), "version=7"))
     # A fresh interpreter models a new compile after editing the Python source.
     result = subprocess.run(
         [sys.executable, "-c", "from ai.chronon.repo.compile import compile; compile()",
@@ -549,7 +552,8 @@ def test_ctr_click_history_preserves_epoch_milliseconds_through_pipeline(canary,
     _compile_canary(canary)
     root = Path(canary) / directory
     join = json.loads((root / "joins/aws_databricks/demo.derivations_v1__3").read_text())
-    labels = json.loads((root / "staging_queries/aws_databricks/ctr_labels.v1__2").read_text())
+    labels_file = next((root / "staging_queries/aws_databricks").glob("ctr_labels.v1__*"))
+    labels = json.loads(labels_file.read_text())
     model = json.loads(next((root / "models/aws_databricks").glob("ctr_ray.ctr_ray_model__*")).read_text())
     activity = join["joinParts"][1]["groupBy"]
     query = activity["sources"][0]["events"]["query"]
@@ -560,8 +564,9 @@ def test_ctr_click_history_preserves_epoch_milliseconds_through_pipeline(canary,
     assert query["selects"]["user_event_struct"] == "STRUCT(event_type, listing_id, event_time_ms as timestamp)"
     assert activity["metaData"]["name"] == "aws_databricks.user_activities.v1__2"
     assert "FROM workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3" in labels["query"]
+    # The model must read whatever version of the labels compiled, not a pinned one.
     assert model["trainingConf"]["trainingDataSource"]["events"]["table"] == \
-        "workspace_iceberg.poc.aws_databricks_ctr_labels_v1__2"
+        f"workspace_iceberg.poc.aws_databricks_{labels_file.name.replace('.', '_')}"
 
     # Corrected at the source and version-bumped rather than forked, so the other
     # consumer of this GroupBy picks the fix up too.

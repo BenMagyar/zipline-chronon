@@ -1,6 +1,6 @@
 {
   "metaData": {
-    "customJson": "{\"airflowDependencies\": [{\"name\": \"wf_workspace_iceberg_poc_aws_databricks_demo_derivations_v1__3_with_offset_0\", \"spec\": \"workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3/ds={{ macros.ds_add(ds, 0) }}\"}]}",
+    "customJson": "{\"airflowDependencies\": [{\"name\": \"wf_workspace_iceberg_poc_aws_databricks_demo_derivations_v1__3_with_offset_0\", \"spec\": \"workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3/ds={{ macros.ds_add(ds, 0) }}\"}, {\"name\": \"wf_workspace_demo_user_activities_with_offset_0\", \"spec\": \"workspace.demo.user_activities/ds={{ macros.ds_add(ds, 0) }}\"}]}",
     "executionInfo": {
       "clusterConf": {
         "common": {
@@ -59,13 +59,13 @@
       },
       "offlineSchedule": "@daily"
     },
-    "name": "aws_databricks.ctr_labels.v1__2",
+    "name": "aws_databricks.ctr_labels.v1__3",
     "outputNamespace": "workspace_iceberg.poc",
     "sourceFile": "staging_queries/aws_databricks/ctr_labels.py",
     "team": "aws_databricks",
-    "version": "2"
+    "version": "3"
   },
-  "query": "\nSELECT\n    *,\n    case when rand() < 0.5 then 0 else 1 end as label\nFROM workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3\nWHERE ds BETWEEN {{ start_date }} AND {{ end_date }}\n",
+  "query": "\nSELECT\n    joined.*,\n    IF(activity.event_type IN ('click', 'purchase', 'favorite', 'add_to_cart'), 1, 0) AS label\nFROM workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3 joined\nJOIN workspace.demo.user_activities activity\n  ON joined.row_id = activity.event_id\n AND joined.ds = activity.ds\nWHERE joined.ds BETWEEN {{ start_date }} AND {{ end_date }}\n",
   "tableDependencies": [
     {
       "endOffset": {
@@ -83,6 +83,24 @@
           "timeUnit": 1
         },
         "table": "workspace_iceberg.poc.aws_databricks_demo_derivations_v1__3"
+      }
+    },
+    {
+      "endOffset": {
+        "length": 0,
+        "timeUnit": 1
+      },
+      "startOffset": {
+        "length": 0,
+        "timeUnit": 1
+      },
+      "tableInfo": {
+        "partitionColumn": "ds",
+        "partitionInterval": {
+          "length": 1,
+          "timeUnit": 1
+        },
+        "table": "workspace.demo.user_activities"
       }
     }
   ]
