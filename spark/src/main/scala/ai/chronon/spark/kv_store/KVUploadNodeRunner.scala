@@ -4,11 +4,11 @@ import ai.chronon.api.Constants.MetadataDataset
 import ai.chronon.api.Extensions.{JoinOps, MetadataOps, TableInfoOps}
 import ai.chronon.api._
 import ai.chronon.api.planner.NodeRunner
-import ai.chronon.api.secrets.SecretResolver
 import ai.chronon.online.KVStore.BulkPutRequest
 import ai.chronon.online.Api
 import ai.chronon.online.fetcher.{FetchContext, MetadataStore}
 import ai.chronon.planner.{Node, NodeContent}
+import ai.chronon.spark.batch.JobSecrets
 import ai.chronon.spark.submission.NodeConfReader
 import org.apache.spark.SparkConf
 import org.rogach.scallop.ScallopConf
@@ -142,9 +142,8 @@ object KVUploadNodeRunner {
     try {
       val kvArgs = new KVUploadNodeRunnerArgs(args)
 
-      val resolvedEnv = SecretResolver.resolveVaultUris(sys.env.toMap)
-      val driverSecrets = resolvedEnv -- sys.env.keySet
-      val props = kvArgs.apiProps.map(identity) ++ driverSecrets
+      // No Spark session here, so only the Api props need secrets.
+      val props = kvArgs.apiProps.map(identity) ++ JobSecrets.resolve(sys.env.toMap, Map.empty).secrets
       runFromArgs(kvArgs.confPath(), kvArgs.endDs(), kvArgs.onlineClass(), props) match {
         case Success(_) =>
           println("KV upload node runner completed successfully")

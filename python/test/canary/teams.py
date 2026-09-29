@@ -323,6 +323,10 @@ aws_databricks = Team(
             "FRONTEND_URL": "https://canary-aws.zipline.ai",
             "HUB_URL": "https://canary-orch-aws.zipline.ai",
             "ENABLE_KINESIS": "true",
+            # The job resolves the *_VAULT_URI refs at startup to fill the secret {DATABRICKS_*}
+            # catalog placeholders below; the hub fills {DATABRICKS_CLIENT_ID} from its own env.
+            "DATABRICKS_CLIENT_SECRET_VAULT_URI": "arn:aws:secretsmanager:us-west-2:345594603419:secret:canary-zipline-databricks-client-secret-QdusGl",
+            "DATABRICKS_CREDENTIAL_VAULT_URI": "arn:aws:secretsmanager:us-west-2:345594603419:secret:canary-zipline-databricks-credential-4n6Nhd",
             # models/aws_databricks/ctr_ray.py is this team; the RAY_ prefix is stripped
             # before injection onto Ray pods (see platform #1307) so the trainer can
             # authenticate to Unity Catalog.

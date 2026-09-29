@@ -82,6 +82,9 @@ object SparkSessionBuilder {
   private val warehouseId = java.util.UUID.randomUUID().toString.takeRight(6)
   private val DefaultWarehouseDir = new File("/tmp/chronon/spark-warehouse_" + warehouseId)
 
+  // Spark's default plus `credential`, which holds the resolved Iceberg REST catalog client_id:secret.
+  val DefaultRedactionRegex: String = "(?i)secret|password|token|access[.]key|credential"
+
   def expandUser(path: String): String = path.replaceFirst("~", System.getProperty("user.home"))
   // we would want to share locally generated warehouse during CI testing
   def build(name: String,
@@ -101,6 +104,7 @@ object SparkSessionBuilder {
       "spark.sql.session.timeZone" -> existingConf.get("spark.sql.session.timeZone", "UTC"),
       // Spark 4 enables ANSI mode by default; preserve Chronon's existing null-on-error semantics.
       "spark.sql.ansi.enabled" -> existingConf.get("spark.sql.ansi.enabled", "false"),
+      "spark.redaction.regex" -> existingConf.get("spark.redaction.regex", DefaultRedactionRegex),
       // needs to be uppercase until https://github.com/GoogleCloudDataproc/spark-bigquery-connector/pull/1313 is available
       "spark.sql.sources.partitionOverwriteMode" -> "DYNAMIC",
       "hive.exec.dynamic.partition" -> "true",

@@ -3,7 +3,6 @@ package ai.chronon.spark.batch
 import ai.chronon.api.Extensions._
 import ai.chronon.api._
 import ai.chronon.api.planner.{DependencyResolver, NodeRunner}
-import ai.chronon.api.secrets.SecretResolver
 import ai.chronon.observability.{TileStats, TileStatsType}
 import ai.chronon.online.{Api, KVStore}
 import ai.chronon.planner._
@@ -15,6 +14,7 @@ import ai.chronon.spark.join.UnionJoin
 import ai.chronon.spark.submission.{NodeConfReader, SparkSessionBuilder}
 import ai.chronon.spark.utils.SemanticUtils
 import ai.chronon.spark.{GroupBy, GroupByUpload, Join, ModelTransformsJob, RunnerUtils}
+import org.apache.spark.SparkConf
 import org.rogach.scallop.{ScallopConf, ScallopOption}
 import org.slf4j.{Logger, LoggerFactory}
 
@@ -809,12 +809,13 @@ object BatchNodeRunner {
 
   def main(args: Array[String]): Unit = {
     val batchArgs = new BatchNodeRunnerArgs(args)
-    val resolvedEnv = SecretResolver.resolveVaultUris(sys.env.toMap)
-    val driverSecrets = resolvedEnv -- sys.env.keySet
+    // Catalog credentials are read when the session starts, so placeholders must be filled first.
+    val secrets = JobSecrets.resolve(sys.env.toMap, new SparkConf().getAll.toMap)
     val node = NodeConfReader.read(batchArgs.confPath())
-    val sparkSession = SparkSessionBuilder.build(s"batch-node-runner-${node.metaData.name}")
+    val sparkSession = SparkSessionBuilder.build(s"batch-node-runner-${node.metaData.name}",
+                                                 additionalConfig = Some(secrets.sparkConfOverrides))
     val tableUtils = RunnerUtils.tableUtilsForMetadata(sparkSession, node.metaData)
-    val api = instantiateApi(batchArgs.onlineClass(), batchArgs.apiProps ++ driverSecrets)
+    val api = instantiateApi(batchArgs.onlineClass(), batchArgs.apiProps ++ secrets.secrets)
     val runner = new BatchNodeRunner(node, tableUtils, api)
     val exitCode =
       runner.runFromArgs(batchArgs.startDs(), batchArgs.endDs(), batchArgs.tableStatsDataset.toOption)

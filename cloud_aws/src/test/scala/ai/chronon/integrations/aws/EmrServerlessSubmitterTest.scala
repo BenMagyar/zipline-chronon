@@ -1518,6 +1518,55 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     props.get("spark.some.token") shouldBe "{CHRONON_NONEXISTENT_VAR_XYZ}"
   }
 
+  private def submitAndCaptureProps(jobProperties: Map[String, String],
+                                    envVars: Map[String, String]): java.util.Map[String, String] = {
+    val mockClient = mock[EmrServerlessClient]
+    when(mockClient.startJobRun(any[StartJobRunRequest]))
+      .thenReturn(StartJobRunResponse.builder().applicationId("app-env").jobRunId("job-env").build())
+    val submitter = createSubmitter(mockClient)
+    submitter.submit(
+      submission.SparkJob,
+      Map(
+        MainClass -> "ai.chronon.spark.batch.BatchNodeRunner",
+        JarURI -> "s3://bucket/jar.jar",
+        JobId -> "test-env",
+        submitter.clusterIdentifierKey -> "app-env"
+      ),
+      jobProperties,
+      List.empty,
+      Map.empty,
+      envVars
+    )
+    val captor = ArgumentCaptor.forClass(classOf[StartJobRunRequest])
+    verify(mockClient).startJobRun(captor.capture())
+    captor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
+  }
+
+  it should "fill {VAR} from the job env ahead of the hub env" in {
+    // HOME is set in every environment, so it stands in for a hub env value.
+    val props = submitAndCaptureProps(Map("spark.some.config" -> "{HOME}/data"), Map("HOME" -> "/job-home"))
+    props.get("spark.some.config") shouldBe "/job-home/data"
+    props.get("spark.emr-serverless.driverEnv.HOME") shouldBe "/job-home"
+  }
+
+  it should "leave a placeholder unfilled when its env value is empty" in {
+    // docker compose passes an unset ${VAR:-} through as an empty string.
+    val props = submitAndCaptureProps(Map("spark.catalog.x.credential" -> "{CHRONON_TEST_EMPTY}"),
+                                      Map("CHRONON_TEST_EMPTY" -> ""))
+    props.get("spark.catalog.x.credential") shouldBe "{CHRONON_TEST_EMPTY}"
+  }
+
+  it should "send vault refs and leave their placeholders for the job" in {
+    val arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:catalog-token"
+    val props = submitAndCaptureProps(
+      Map("spark.sql.catalog.c.token" -> "{CHRONON_TEST_CATALOG_TOKEN}"),
+      Map("CHRONON_TEST_CATALOG_TOKEN_VAULT_URI" -> arn, "AWS_REGION" -> "us-west-2")
+    )
+    props.get("spark.sql.catalog.c.token") shouldBe "{CHRONON_TEST_CATALOG_TOKEN}"
+    props.get("spark.emr-serverless.driverEnv.CHRONON_TEST_CATALOG_TOKEN_VAULT_URI") shouldBe arn
+    props.get("spark.executorEnv.CHRONON_TEST_CATALOG_TOKEN_VAULT_URI") shouldBe arn
+  }
+
   "getLatestCheckpointPath" should "return the highest-numbered checkpoint" in {
     val mockStorageClient = mock[StorageClient]
     val flinkJobId = "abc123"

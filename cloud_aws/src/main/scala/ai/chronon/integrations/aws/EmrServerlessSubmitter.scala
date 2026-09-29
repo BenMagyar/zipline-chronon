@@ -50,14 +50,18 @@ class EmrServerlessSubmitter(
 
   private val EnvVarPattern = """\{([A-Z_][A-Z0-9_]*)\}""".r
 
-  private def resolveEnvVars(properties: Map[String, String]): Map[String, String] =
+  // Job env wins over the hub env so submitted properties match the driver env. Empty values
+  // count as unset (compose passes unset vars as ""), so the placeholder stays for the job to fill.
+  private def resolveEnvVars(properties: Map[String, String], envVars: Map[String, String]): Map[String, String] = {
+    val env = (sys.env ++ envVars).filter { case (_, value) => value.nonEmpty }
     properties.map { case (k, v) =>
       k -> EnvVarPattern.replaceAllIn(v,
                                       m => {
                                         val varName = m.group(1)
-                                        sys.env.getOrElse(varName, m.matched)
+                                        env.getOrElse(varName, m.matched)
                                       })
     }
+  }
 
   // EMR Serverless-specific env var expansion. Unlike YARN/K8s setups, driver env vars
   // must use spark.emr-serverless.driverEnv.<KEY> — see
@@ -196,7 +200,7 @@ class EmrServerlessSubmitter(
     // without the console-side property-count limit).
     // envVars get expanded into EMR-Serverless-specific driver/executor Spark props here
     // (see envVarsToSparkProperties) and merged with caller-provided jobProperties.
-    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars))
+    val resolvedProps = resolveEnvVars(jobProperties ++ envVarsToSparkProperties(envVars), envVars)
     val (inlineProps, overflowProps) = EmrServerlessSubmitter.splitForConfigCap(resolvedProps)
     if (overflowProps.nonEmpty) {
       logger.warn(

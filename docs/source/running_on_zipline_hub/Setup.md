@@ -192,6 +192,8 @@ This uses two named catalogs:
 - `workspace` — reads existing Delta tables via Unity Catalog's `UCSingleCatalog`
 - `workspace_iceberg` — writes Iceberg tables via Unity Catalog's Iceberg REST API
 
+On EMR Serverless, the job fills placeholders at startup, so secret values never appear in the `StartJobRun` request. Keep secrets out of the Hub's environment and reference each one from the team's `env` as `NAME_VAULT_URI`, set to the secret's AWS Secrets Manager ARN (or Azure Key Vault / GCP Secret Manager URI). For the example above, set `DATABRICKS_CLIENT_SECRET_VAULT_URI` and `DATABRICKS_CREDENTIAL_VAULT_URI` (a secret holding `client_id:client_secret`); the Zipline Terraform module creates both secrets and outputs their ARNs. `DATABRICKS_CLIENT_ID` isn't a secret and comes from the Hub's environment. The EMR Serverless execution role needs `secretsmanager:GetSecretValue` on those secrets. The job fails at startup if a referenced secret can't be read.
+
 ## Environment Variables
 
 Use `EnvironmentVariables` to configure cloud-specific settings, service URLs, and storage paths. These are passed to job executors at runtime.

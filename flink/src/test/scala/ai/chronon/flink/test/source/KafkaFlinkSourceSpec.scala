@@ -99,6 +99,28 @@ class KafkaFlinkSourceSpec extends AnyFlatSpec {
     resolved should not contain key("sasl.jaas.config")
   }
 
+  it should "fetch sasl.jaas.config from SASL_JAAS_CONFIG_VAULT_URI when the plain env var is not set" in {
+    val arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:kafka-jaas"
+    val params = Map("security.protocol" -> "SASL_SSL")
+    val env = Map("SASL_JAAS_CONFIG_VAULT_URI" -> arn)
+    val resolved = KafkaFlinkSource.resolveSaslJaasConfig(params, env.get, uri => s"jaas-from-$uri")
+    resolved("sasl.jaas.config") shouldBe s"jaas-from-$arn"
+  }
+
+  it should "prefer SASL_JAAS_CONFIG over the vault ref" in {
+    val params = Map("security.protocol" -> "SASL_SSL")
+    val env = Map("SASL_JAAS_CONFIG" -> "plain-jaas", "SASL_JAAS_CONFIG_VAULT_URI" -> "arn:unused")
+    val resolved = KafkaFlinkSource.resolveSaslJaasConfig(params, env.get, _ => fail("should not fetch"))
+    resolved("sasl.jaas.config") shouldBe "plain-jaas"
+  }
+
+  it should "fail when the vault ref cannot be fetched" in {
+    val params = Map("security.protocol" -> "SASL_SSL")
+    val env = Map("SASL_JAAS_CONFIG_VAULT_URI" -> "arn:aws:secretsmanager:us-west-2:1:secret:missing")
+    an[RuntimeException] should be thrownBy
+      KafkaFlinkSource.resolveSaslJaasConfig(params, env.get, _ => throw new RuntimeException("AccessDenied"))
+  }
+
   it should "inject sasl.jaas.config from env when existing value is empty" in {
     val params = Map("security.protocol" -> "SASL_SSL", "sasl.jaas.config" -> "")
     val resolved = KafkaFlinkSource.resolveSaslJaasConfig(params, _ => Some("injected-jaas"))

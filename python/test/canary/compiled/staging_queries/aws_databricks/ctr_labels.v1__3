@@ -45,6 +45,8 @@
           "AWS_REGION": "us-west-2",
           "CLOUD_PROVIDER": "aws",
           "CUSTOMER_ID": "dev",
+          "DATABRICKS_CLIENT_SECRET_VAULT_URI": "arn:aws:secretsmanager:us-west-2:345594603419:secret:canary-zipline-databricks-client-secret-QdusGl",
+          "DATABRICKS_CREDENTIAL_VAULT_URI": "arn:aws:secretsmanager:us-west-2:345594603419:secret:canary-zipline-databricks-credential-4n6Nhd",
           "ENABLE_KINESIS": "true",
           "EVAL_URL": "http://localhost:3904",
           "FETCHER_URL": "http://localhost:9000",

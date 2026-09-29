@@ -5,6 +5,7 @@ import ai.chronon.api.Extensions.{MetadataOps, TableInfoOps}
 import ai.chronon.api.planner.NodeRunner
 import ai.chronon.online._
 import ai.chronon.planner.{Node, NodeContent}
+import ai.chronon.spark.batch.JobSecrets
 import ai.chronon.spark.submission.NodeConfReader
 import org.rogach.scallop.ScallopConf
 import org.slf4j.{Logger, LoggerFactory}
@@ -226,7 +227,8 @@ object ModelNodeRunner {
     try {
       val modelArgs = new ModelNodeRunnerArgs(args)
 
-      val props = modelArgs.apiProps.map(identity)
+      // No Spark session here, so only the Api props need secrets.
+      val props = modelArgs.apiProps.map(identity) ++ JobSecrets.resolve(sys.env.toMap, Map.empty).secrets
       runFromArgs(modelArgs.confPath(), modelArgs.endDs(), modelArgs.onlineClass(), props) match {
         case Success(_) =>
           println("Model node runner completed successfully")
