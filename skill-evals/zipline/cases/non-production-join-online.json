@@ -1,0 +1,30 @@
+{
+  "id": "non-production-join-online",
+  "description": "Ensure a development-only Join is not enabled for online serving.",
+  "tags": ["integration", "authoring", "join", "online-safety"],
+  "prompt": "Add a new development-only version of the GCP purchases training-set Join in python/test/canary/joins/gcp/training_set.py. Reuse the existing checkout source and purchases development GroupBy, preserve user_id as the row ID, and keep the change focused on an offline experiment. This Join is not production ready and will not serve traffic. Compile it and validate it with the Zipline eval command. Do not modify unrelated configurations.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_changed_globs": [
+      "python/test/canary/joins/gcp/training_set.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "^\\+(?!\\+\\+\\+).*online\\s*=\\s*True",
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The new development-only Join does not set online=True because it is not production ready or serving traffic.",
+      "The Join reuses the existing checkout source and development purchases GroupBy, with user_id retained as the row ID.",
+      "The change follows repository conventions and avoids unrelated edits.",
+      "Compilation and eval outcomes are reported accurately."
+    ]
+  }
+}

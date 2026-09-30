@@ -1,0 +1,24 @@
+{
+  "id": "groupby-backfill-invalid-range",
+  "description": "Reject reversed historical date bounds without silently changing the requested range.",
+  "tags": [
+    "offline",
+    "original-context",
+    "operations",
+    "groupby",
+    "backfill",
+    "clarification",
+    "no-write"
+  ],
+  "prompt": "Prepare a historical backfill of group_bys.gcp.purchases.v1_dev with start date 2025-01-17 and end date 2025-01-10. Inspect the repository if needed, but do not edit files or submit anything. Tell me whether this is ready to run.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent explicitly identifies that the end date precedes the start date and says the request is not ready to submit.",
+      "The agent asks for corrected date bounds; it does not silently swap the dates or present an executable command as if a corrected interval were confirmed.",
+      "The response stays focused on the date problem and avoids unrelated config-authoring questions.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

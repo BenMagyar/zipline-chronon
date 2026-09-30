@@ -1,0 +1,18 @@
+{
+  "id": "unrelated-python-change",
+  "description": "Negative control for Zipline-specific behavior on an unrelated repository task.",
+  "tags": ["offline", "negative-control", "no-write"],
+  "prompt": "Review python/src/ai/chronon/repo/init_agent.py for ordinary Python readability issues. Do not edit it; give me at most three concise suggestions.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": false,
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The response stays focused on ordinary Python readability rather than launching a Chronon feature-authoring workflow.",
+      "The response does not run Zipline compile or eval commands for this unrelated review.",
+      "No files are modified."
+    ]
+  }
+}

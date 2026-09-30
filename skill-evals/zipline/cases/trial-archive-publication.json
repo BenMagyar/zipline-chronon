@@ -1,0 +1,21 @@
+{
+  "id": "trial-archive-publication",
+  "description": "Prepare archives for new model names and distinguish configuration from trainer-code changes.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "Review two proposed CTR variants before training. Both have new model names. Variant A changes only configuration; variant B also changes trainer source. The only published archive is s3://example-artifacts/builds/ctr_baseline-abc123.zip for the unchanged baseline trainer. The draft gives both variants version abc123 and submits them without publishing anything. Explain the required artifact preparation and how to avoid a missing-archive failure. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Explains that each new model name requires its own builds/{model_name}-{version}.zip even when the trainer bytes are identical.",
+      "For A, copies the unchanged archive to the verified new model name with the same abc123 content version rather than fabricating a new version or needlessly rebuilding.",
+      "For B, rebuilds and publishes the changed trainer and uses its actual content-derived version, rather than copying baseline bytes or reusing abc123 for different code.",
+      "Distinguishes trainer archive paths from models/{model_name}/{version} output/report paths and verifies the actual names/locations before publishing or submitting.",
+      "Notes that B changes trainer code as well as configuration, affecting controlled comparison interpretation; does not claim artifacts were published or training ran."
+    ]
+  }
+}

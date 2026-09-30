@@ -1,0 +1,24 @@
+{
+  "id": "staging-query-dependencies",
+  "description": "Review bounded warehouse preprocessing with complete dependencies and correct execution engine.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "staging-query",
+    "warehouse",
+    "no-write"
+  ],
+  "prompt": "Review an offline GCP StagingQuery draft that joins BigQuery demo.checkouts to demo.dim_listings on listing_id to select checkout user_id and the listing price. Both tables and keys are confirmed; checkouts has ts as a millisecond long and _PARTITIONTIME as a TIMESTAMP, and dim_listings has ds as a DATE and one row per listing_id per daily snapshot. The draft has engine_type=EngineType.SPARK, no dependencies, and no date predicates on either table. Show a corrected SQL/config sketch for a date-bounded export, using one latest available listing snapshot, and explain how a downstream Spark EventSource would consume it. Do not edit files or contact services.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent inspects nearby GCP exports and selects EngineType.BIGQUERY, a repository-appropriate output namespace, and version/step settings supported by the API.",
+      "The sketch declares both TableDependency entries with the correct partition columns, bounds checkout partitions with date templates, and selects a single listing snapshot using supported latest/max-date syntax instead of joining every snapshot and duplicating events.",
+      "The downstream source references the StagingQuery .table and exposes the needed keys/input columns; the already-millisecond ts is not double-converted.",
+      "The response explains compile/eval ordering and flags any unresolved template or SQL detail as needing validation instead of claiming the sketch ran.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

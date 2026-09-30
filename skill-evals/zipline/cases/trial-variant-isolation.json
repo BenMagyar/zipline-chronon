@@ -1,0 +1,21 @@
+{
+  "id": "trial-variant-isolation",
+  "description": "Diagnose two experiments resolving to the same training report.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "A baseline and a 30-day candidate have different experiment IDs in one trial, but both were run with model name ctr_shared and trainer version abc123. Only job configuration changed. Hub rejects metrics for the candidate because s3://example-artifacts/models/ctr_shared/abc123/experiment_report.json is already attached to the baseline. Explain the cause and a repair plan that keeps the comparison valid. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Identifies shared model identity/output location as the cause; distinct experiment IDs or titles do not isolate reports, and configuration changes need not change the trainer content hash.",
+      "Gives the candidate a distinct model name/config and report location while retaining the content version when trainer bytes are unchanged; does not fake a new version or delete/relabel baseline metrics.",
+      "Includes publishing the existing trainer archive under the candidate model name, then validating the new config and recording the candidate before rerunning its training.",
+      "Retrieves candidate metrics only from the candidate rerun report and checks whether the shared output overwrote the baseline report, rerunning baseline if independent provenance can no longer be established.",
+      "Reports the current comparison as invalid/incomplete, uses supported command shapes or marked placeholders, and performs no remote repair during this review."
+    ]
+  }
+}

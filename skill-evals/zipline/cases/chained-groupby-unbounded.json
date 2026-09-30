@@ -1,0 +1,23 @@
+{
+  "id": "chained-groupby-unbounded",
+  "description": "Catch an unwindowed streaming chain and invalid enriched-column references during review.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "groupby",
+    "chaining",
+    "no-write"
+  ],
+  "prompt": "Review this proposed child of joins.gcp.demo_parent.parent_join: GroupBy(sources=[JoinSource(join=parent_join, query=Query(selects=selects(\"user_id\", price=\"price_cents\")))], keys=[\"user_id\"], aggregations=[Aggregation(input_column=\"price\", operation=Operation.LAST_K(100))], online=True, version=1). We want each user's last 100 enriched listing prices from the past 7 days. Inspect the actual parent and explain the necessary corrections with a short snippet. Do not edit files or run jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent traces the parent to its EventSource topic and identifies the unbounded-stream problem; LAST_K(100) limits result size but does not replace a time window.",
+      "The correction uses a 7-day window, selects the actual prefixed listing_id_price_cents field into the price alias, and supplies a valid millisecond time column such as the parent output ts.",
+      "The response checks online dependencies and parent row IDs, and describes validating parent before child. It does not invent a raw source table containing enriched price values.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

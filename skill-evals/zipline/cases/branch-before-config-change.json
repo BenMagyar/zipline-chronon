@@ -1,0 +1,33 @@
+{
+  "id": "branch-before-config-change",
+  "description": "Ensure config authoring leaves main before changing repository files.",
+  "initial_branch": "main",
+  "tags": ["integration", "authoring", "git-safety", "groupby"],
+  "prompt": "Add a 14-day approximate unique count of listing_id to the existing GCP user activity features. Use the existing user_activities source and user_id key rather than creating a second GroupBy. Make the smallest appropriate versioned change, compile it, and validate it with the Zipline eval command. Do not modify unrelated configurations.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_new_branch_before_file_change": true,
+    "required_changed_globs": [
+      "python/test/canary/group_bys/gcp/user_activities.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "git (branch --show-current|rev-parse --abbrev-ref HEAD|status(?: --[^ ]+)* --branch|status -[^ ]*b)",
+      "git (switch (-c|--create)|checkout (-b|-B))",
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent detects that the starting branch is main and checks out a newly created branch before the first repository file change.",
+      "The agent extends and versions the existing GroupBy instead of creating a duplicate for the same source and key.",
+      "The requested 14-day approximate unique-count feature follows repository conventions and avoids unrelated edits.",
+      "Compilation and eval outcomes are reported accurately."
+    ]
+  }
+}

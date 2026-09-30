@@ -1,0 +1,20 @@
+{
+  "id": "trial-not-needed",
+  "description": "Avoid creating comparison records for a smoke run or an unrelated historical backfill.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "I need plans for two independent maintenance tasks: one smoke-training run of models/aws_databricks/ctr_ray.py just to confirm the trainer starts, and a bounded historical GroupBy backfill. There is no tuning, baseline/candidate comparison, or model selection. Explain the appropriate workflow for each; do not run either. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Does not introduce a trial or experiment-comparison workflow for the single smoke-training run or standalone GroupBy backfill.",
+      "Distinguishes a compiled-model training backfill from a GroupBy historical-data backfill and includes validation plus explicit bounds in the proposed commands.",
+      "Does not invent exact missing GroupBy targets/date ranges; asks for those details or uses clearly marked placeholders, without blocking the explanation of the two workflows.",
+      "Makes no file changes, service calls, job submissions, or claims that either task has completed."
+    ]
+  }
+}

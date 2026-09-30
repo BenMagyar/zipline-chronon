@@ -1,0 +1,24 @@
+{
+  "id": "join-key-mapping-derivations",
+  "description": "Preserve Join columns while adding a derivation and correctly map differently named keys.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "join",
+    "derivations",
+    "no-write"
+  ],
+  "prompt": "Review a Join design using confirmed schemas: the left query exposes event_id STRING, buyer_id LONG, and item_id LONG; user_features is keyed by user_id LONG and item_features by id LONG. We need both lookups, event_id as the row identity, all original columns, and a new price_dollars column from the item price_cents feature. Show the Join/JoinPart/Derivation structure using symbolic source and GroupBy variables, and explain what would change if no derived column were needed. Inspect the public API for mapping direction and output naming. Do not edit files or contact services.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "key_mapping maps left names to right keys: buyer_id to user_id and item_id to id. The agent checks type compatibility and retains row_ids=[event_id] with event_id exposed on the left.",
+      "The agent resolves the actual right output name from the API, including explicit prefixes if used, and derives price_dollars from the selected item price field.",
+      "The derivations contain both the computed expression and wildcard passthrough because all original columns are required.",
+      "Without computed columns the response omits derivations entirely instead of adding a redundant passthrough-only derivation.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

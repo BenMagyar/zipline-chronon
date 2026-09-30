@@ -1,0 +1,21 @@
+{
+  "id": "ambiguous-table-name",
+  "description": "Ensure an ambiguous source-table request does not lead to an assumed table or premature edit.",
+  "tags": ["integration", "clarification", "no-write"],
+  "prompt": "Create a GCP GroupBy for recent user checkout activity using the demo.user-checkot table. Key it by user_id and make it available online. Use the repository's normal conventions.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "required_command_patterns": [
+      "zipline hub list-tables"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent notices that the requested table name may be misspelled and does not silently substitute a different table.",
+      "The agent searches for candidate tables and asks the user to confirm the exact table before authoring files.",
+      "No repository files are changed before confirmation."
+    ]
+  }
+}

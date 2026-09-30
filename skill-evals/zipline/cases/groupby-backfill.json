@@ -1,0 +1,30 @@
+{
+  "id": "groupby-backfill",
+  "description": "Prepare a bounded GroupBy historical backfill using the correct CLI operation and dependency lookback.",
+  "tags": [
+    "offline",
+    "original-context",
+    "operations",
+    "groupby",
+    "backfill",
+    "no-write"
+  ],
+  "prompt": "I need offline historical output for group_bys.gcp.purchases.v1_dev from 2025-01-10 through 2025-01-17. Inspect the source, existing compiled config, and CLI, then give me the exact preparation and submission commands plus how to check completion and output. Explain what source history is needed. This is a plan only: do not edit files, compile, contact services, submit jobs, or change schedules.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "required_response_patterns": [
+      "zipline hub backfill",
+      "2025-01-10",
+      "2025-01-17"
+    ],
+    "judge_criteria": [
+      "The response runs commands from python/test/canary and resolves the actual compiled purchases.v1_dev path/version from repository evidence rather than guessing a suffix.",
+      "The plan compiles and evaluates the intended config before zipline hub backfill with the positional compiled GroupBy path and explicit start/end bounds of 2025-01-10 and 2025-01-17.",
+      "The agent distinguishes offline backfill from run-adhoc online deployment and recurring schedule. It does not propose either as the requested historical batch operation.",
+      "The agent inspects purchases_import and the query start partition, covers the longest finite window, and notices the unwindowed LAST_K may require older source history rather than assuming 7 days suffices for all features.",
+      "The response identifies how to inspect workflow status and the resolved output table/partitions, distinguishes submission from completion, and does not say online serving was updated by the offline backfill.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

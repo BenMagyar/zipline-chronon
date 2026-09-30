@@ -1,0 +1,29 @@
+{
+  "id": "add-groupby-feature",
+  "description": "Extend an existing GroupBy instead of creating a duplicate configuration.",
+  "tags": ["integration", "authoring", "groupby"],
+  "prompt": "Add a 7-day approximate unique count of listing_id to the existing GCP user activity features. Use the existing user_activities source and user_id key rather than creating a second GroupBy. Make the smallest appropriate versioned change, compile it, and validate it with the Zipline eval command. Do not modify unrelated configurations.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_changed_globs": [
+      "python/test/canary/group_bys/gcp/user_activities.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent extends and versions the existing GroupBy instead of creating a duplicate for the same source and key.",
+      "The aggregation input is a selected column and uses an approximate distinct-count operation with a 7-day window.",
+      "The change follows the surrounding repository style and avoids unrelated edits.",
+      "Compilation and eval outcomes are reported accurately."
+    ]
+  }
+}

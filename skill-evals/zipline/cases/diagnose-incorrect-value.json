@@ -1,0 +1,24 @@
+{
+  "id": "diagnose-incorrect-value",
+  "description": "Investigate a wrong non-null aggregate using actual samples, key normalization, and window boundaries.",
+  "tags": [
+    "offline",
+    "original-context",
+    "diagnosis",
+    "groupby",
+    "data-correctness",
+    "no-write"
+  ],
+  "prompt": "A 7-day purchase_price SUM from the GCP purchases GroupBy is non-null but roughly twice what we expect for one user at a checkout timestamp in joins/gcp/training_set.py. Inspect the Join, GroupBy, and staging definitions and give a focused investigation plan with exact SQL/checks for that user and timestamp, which you may leave as clearly marked parameters. Do not edit files or contact services; distinguish repository findings from hypotheses.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent follows the actual purchases and checkout staging sources and timestamp/key expressions rather than assuming the cause from the reported factor of two.",
+      "The plan checks key types/formatting and timestamp units, then recomputes the feature for the specific key and timestamp using the actual query filters and correct 7-day point-in-time bounds.",
+      "The investigation checks duplicate raw rows, duplicate exports or repeated partitions, and aggregation semantics; it does not recommend DISTINCT as an unconditional fix that might remove legitimate equal-valued purchases.",
+      "SQL uses verified source/column names or clearly marked parameters, and the response separates checks requiring data access from facts established by reading code.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

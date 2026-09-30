@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zipline.ai/schemas/skill-eval-case.json",
+  "title": "Zipline skill evaluation case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "description", "prompt", "tags", "expectations"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "description": { "type": "string", "minLength": 1 },
+    "enabled": { "type": "boolean", "default": true },
+    "base_ref": { "type": "string", "default": "HEAD" },
+    "fixture_patch": { "type": "string" },
+    "initial_branch": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Create an isolated clone whose checked-out branch has this name before the agent runs."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "prompt": { "type": "string", "minLength": 1 },
+    "expectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_file_changes", "judge_criteria"],
+      "properties": {
+        "allow_file_changes": { "type": "boolean" },
+        "skill_should_be_loaded": { "type": "boolean" },
+        "required_new_branch_before_file_change": { "type": "boolean" },
+        "required_changed_globs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_changed_globs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "required_command_patterns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_diff_patterns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "required_response_patterns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "judge_criteria": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      }
+    }
+  }
+}

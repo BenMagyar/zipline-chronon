@@ -1,0 +1,21 @@
+{
+  "id": "trial-summary-journal",
+  "description": "Ground a completed comparison and retrospective in distinct retrieved reports.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "Review this completed trial and draft the final Hub handoff without executing it. Trial ID is trial-42; both workflows succeeded with the same held-out data and no other uncontrolled changes. The actual `experiments metrics` responses were: {\"experimentId\":\"exp-baseline\",\"reportUri\":\"s3://example-artifacts/models/ctr_baseline/abc123/experiment_report.json\",\"metrics\":{\"auc\":0.71}} and {\"experimentId\":\"exp-candidate\",\"reportUri\":\"s3://example-artifacts/models/ctr_purchase/abc123/experiment_report.json\",\"metrics\":{\"auc\":0.74}}. The candidate adds purchase-history features. Include a concise conclusion, state updates, and a useful handoff for the next investigator. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Bases the conclusion on the supplied Hub report responses with distinct model/report locations; accurately reports a 0.03 absolute AUC improvement without inventing other metrics or statistical significance.",
+      "Keeps the existing trial-42, proposes inspecting the experiment list, and writes a report-grounded trial summary and an appropriate SUCCEEDED status rather than creating another attempt.",
+      "Appends a journal retrospective capturing the feature change, measured outcome, and limits or untested follow-ups so another investigator can find the result.",
+      "Does not manually re-ingest the provided numbers through experiments record or invent metric flags; distinguishes summarizing measurements from submitting them.",
+      "Does not deploy the candidate, rerun training, change files, contact services, or claim the proposed updates have already been saved."
+    ]
+  }
+}

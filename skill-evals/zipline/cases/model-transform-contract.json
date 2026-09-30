@@ -1,0 +1,25 @@
+{
+  "id": "model-transform-contract",
+  "description": "Catch a bare GroupBy model input and incorrect inference request/response mappings.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "models",
+    "model-transforms",
+    "no-write"
+  ],
+  "prompt": "Review a proposed embedding pipeline using group_bys.gcp.dim_listings.v1. The draft passes that GroupBy directly to ModelTransforms.sources, wraps input_mapping[\"instance\"] inside another \"instances\" object, and defines value_fields=[(\"values\", LIST(DOUBLE))]. The confirmed model returns each prediction as {\"embeddings\": {\"values\": [0.1, 0.2]}}. We want item_embedding to be that vector. Inspect the existing GCP listing Model/ModelTransforms examples and explain the necessary changes, including the output_mapping field path. Do not edit files, invoke the model, or deploy anything.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent explains that ModelTransforms takes JoinSource, reuses a suitable Join or sketches a wrapper Join with valid keys/row IDs, then references it through JoinSource rather than consuming a bare GroupBy.",
+      "input_mapping[instance] produces one raw inference instance; the response removes an extra instances wrapper and does not invent a different backend payload.",
+      "value_fields describes the embeddings struct containing values, matching the supplied response rather than flattening it incorrectly.",
+      "output_mapping navigates the generated parsed embeddings field and its .values child. The agent resolves the field naming from the actual example/API and notes when renaming/versioning a Model changes that prefix.",
+      "The response uses confirmed model facts and repository examples and does not fabricate an endpoint, deployed schema, or successful inference result.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

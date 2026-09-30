@@ -1,0 +1,24 @@
+{
+  "id": "tecton-migration",
+  "description": "Translate a small feature service bottom-up while preserving windows, conditional averages, and buckets.",
+  "tags": [
+    "offline",
+    "original-context",
+    "migration",
+    "tecton",
+    "no-write"
+  ],
+  "prompt": "Sketch a Chronon migration for this Tecton design: transaction events keyed by user_id with merchant_id, amount, event_type, and event_seconds (epoch seconds); 1-day and 7-day sum(amount); 7-day count-distinct merchant_id; 7-day purchase-only average(amount); and 7-day sum(amount) with merchant_id as secondary_key. A batch user-profile dimension supplies country. A feature service combines both and adds an on-demand ratio of 1-day spend to 7-day spend, retaining the original features. Source schemas and the description are confirmed; infrastructure table/topic names are intentionally not supplied. Inspect local API/examples and show symbolic config fragments plus the migration/validation order. Do not edit files or contact services.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The migration maps event and dimension sources to EventSource and EntitySource respectively, keys to user_id, converts seconds to millisecond time, and expresses 1d/7d windows in supported Chronon form.",
+      "The agent uses SUM, a scalable approximate distinct-count operation, and AVERAGE over a named conditional selection that yields NULL for non-purchases.",
+      "The secondary_key feature uses buckets=[merchant_id] rather than changing the primary key set and feature-service lookup contract.",
+      "The feature service becomes a Join with JoinParts, suitable row IDs, and a SQL Derivation for the ratio with zero-denominator handling and passthrough of original features.",
+      "The response works bottom-up from sources to leaf GroupBys to the Join, compiles/evaluates each authored component before continuing, and keeps unknown infrastructure identifiers symbolic instead of inventing them.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

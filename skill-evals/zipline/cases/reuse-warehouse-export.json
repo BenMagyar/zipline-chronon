@@ -1,0 +1,36 @@
+{
+  "id": "reuse-warehouse-export",
+  "description": "Reuse and version existing listing features backed by a warehouse export.",
+  "tags": [
+    "integration",
+    "original-context",
+    "authoring",
+    "groupby",
+    "warehouse"
+  ],
+  "prompt": "We need an online GCP listing feature is_budget_listing: 1 when price_cents < 5000, otherwise 0, keyed by listing_id. The confirmed source table is demo.dim_listings. Add it following repository conventions, preserve current published versions, and compile and evaluate the result. Avoid unrelated edits.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_changed_globs": [
+      "python/test/canary/group_bys/gcp/dim_listings.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent searches group_bys/gcp and staging_queries/gcp, finds the existing listing dimension GroupBy and export, and extends the existing GroupBy with a new version rather than duplicating the source/key pair.",
+      "The new EntitySource reuses the existing StagingQuery .table export rather than reading BigQuery directly from Spark or creating a redundant export.",
+      "The agent validates the confirmed warehouse table metadata and adds the row-level is_budget_listing expression to selects without inventing aggregation windows, mutation topics, or timestamp requirements for this snapshot passthrough.",
+      "The agent preserves existing config variables and shared source/aggregation objects when creating a new version, avoiding indirect changes to production configs.",
+      "The agent compiles and evaluates each changed config before editing the next config. The final response names changed files and accurately distinguishes passed validation from attempted commands or external blockers."
+    ]
+  }
+}

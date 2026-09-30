@@ -1,0 +1,24 @@
+{
+  "id": "time-column-formats",
+  "description": "Choose epoch-millisecond expressions from supplied seconds, timestamp-string, and millisecond schemas.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "groupby",
+    "timestamps",
+    "no-write"
+  ],
+  "prompt": "Review three proposed time_column expressions for temporal, windowed Spark EventSources. A: event_seconds is BIGINT with sample 1735689600 and time_column=\"event_seconds\". B: event_text is STRING with sample \"2025-01-01 00:00:00\", the documented source timezone is UTC, and time_column=\"event_text\". C: event_time_ms is BIGINT with sample 1735689600123 and time_column=\"unix_millis(TIMESTAMP(event_time_ms))\". Give corrected expressions and a small SQL sanity check for each. These schemas and samples are confirmed. Do not edit files or contact a warehouse.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "A is converted from seconds to epoch milliseconds as a long, without interpreting the integer as a timestamp in an engine-dependent way.",
+      "B is parsed according to the supplied string format and UTC timezone, then converted to epoch milliseconds; the agent does not leave a raw string as the temporal time_column.",
+      "C uses event_time_ms directly, preserving the 123 millisecond remainder and avoiding a second conversion or multiplication.",
+      "The sanity checks show reasonable 2025-01-01 UTC dates and expected millisecond values/types. The agent uses Spark-compatible SQL and does not ask the user for units already supplied.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

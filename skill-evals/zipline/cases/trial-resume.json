@@ -1,0 +1,21 @@
+{
+  "id": "trial-resume",
+  "description": "Continue an existing attempt instead of silently starting another under the same run name.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "Continue planning the ctr-features investigation. We already have trial trial-42 under run name ctr-features in this repository. A teammate proposes `zipline hub trial start ctr-features` to resume it, then launches each command in a fresh shell. Explain how to inspect and continue the existing attempt, and how to check whether another team has tried the same question. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Explains that trial start with the same run name creates a new attempt, so continuing trial-42 uses its existing ID and show/experiments list rather than another start.",
+      "Uses ZIPLINE_TRIAL_ID or optional positional trial IDs with valid CLI syntax and explains that exports in one isolated shell do not automatically reach later tool calls.",
+      "Preserves the matching ZIPLINE_EXPERIMENT_ID on each later training submission instead of accidentally attributing a new variant to a stale experiment.",
+      "Uses trial journal list --run-name ctr-features to search across scopes, and uses --format json when parsing results.",
+      "Preserves repository scope and the existing model binding, starting a fresh trial only for a genuinely new attempt/question; does not actually resume or submit anything during planning."
+    ]
+  }
+}

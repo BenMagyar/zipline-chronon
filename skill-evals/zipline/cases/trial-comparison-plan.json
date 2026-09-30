@@ -1,0 +1,22 @@
+{
+  "id": "trial-comparison-plan",
+  "description": "Recognize an implicit modelling comparison and plan a durable trial before training.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "Would adding purchase-history features improve the CTR model in models/aws_databricks/ctr_ray.py? Give me an operational plan to compare the current baseline against that variant on the same date range and held-out evaluation data. I want the result to be reproducible and reviewable later, but do not run it yet. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Recognizes the comparison as trial-shaped without requiring the user to request a trial; starts the proposed workflow with a cross-scope journal search for earlier attempts.",
+      "Proposes one trial for the question and supplies a real existing model conf for trial start --model, verified from repository source or compiled metadata rather than an invented family identifier.",
+      "Plans distinct model names/configs and report locations for baseline and candidate; accounts for publishing each required trainer archive and validating each config before training.",
+      "Records each experiment before its training submission, and propagates ZIPLINE_TRIAL_ID plus the matching ZIPLINE_EXPERIMENT_ID to each training process, including across separate shells.",
+      "Uses zipline hub trial commands and exact compiled model backfill targets with date bounds; retrieves metrics from each finished trainer report before comparing, updating summary/status, and appending a journal entry.",
+      "Keeps training data, held-out evaluation, and other controls comparable, labels proposed names as new variants, and does not invent measurements or execute the plan."
+    ]
+  }
+}

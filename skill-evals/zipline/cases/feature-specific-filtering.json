@@ -1,0 +1,37 @@
+{
+  "id": "feature-specific-filtering",
+  "description": "Add a conditional activity feature without filtering other features or mutating the existing source.",
+  "tags": [
+    "integration",
+    "original-context",
+    "authoring",
+    "groupby",
+    "filtering"
+  ],
+  "prompt": "Add a new version of the GCP user_activities GroupBy that counts mobile view events per user over 7 days. Keep the existing all-device view, click, purchase, and other features in the new version. Exclude rows with null user_id from all features in the new version. Existing published variables must keep their behavior. Compile and evaluate the changed config; avoid unrelated edits.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_changed_globs": [
+      "python/test/canary/group_bys/gcp/user_activities.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent adds a named selected flag for device_type = mobile AND event_type = view and sums that flag over 7 days, instead of putting SQL in Aggregation.input_column.",
+      "Only the null-user predicate is a shared row filter. The agent does not add a mobile-only or view-only wheres predicate that changes other feature populations.",
+      "The new version preserves the existing all-device features and does not mutate shared source or aggregation objects used by the old version.",
+      "The agent checks source metadata, timestamp units, topic, and existing export rather than copying a suspicious timestamp conversion without investigation.",
+      "The agent preserves existing config variables and shared source/aggregation objects when creating a new version, avoiding indirect changes to production configs.",
+      "The agent compiles and evaluates each changed config before editing the next config. The final response names changed files and accurately distinguishes passed validation from attempted commands or external blockers."
+    ]
+  }
+}

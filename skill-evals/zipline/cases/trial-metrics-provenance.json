@@ -1,0 +1,21 @@
+{
+  "id": "trial-metrics-provenance",
+  "description": "Reject self-reported metric values and wait for trainer reports.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "Review this handoff for trial trial-42. The logs say baseline AUC is about 0.71 and candidate AUC is about 0.76. Both training workflows are still RUNNING and neither experiment_report.json exists yet. The proposed shortcut is `zipline hub trial experiments record exp-candidate --metrics '{\"auc\": 0.76}'`, followed by a summary declaring the candidate the winner. Tell me what should happen next and show the correct command shape. The candidate model name must be resolved from its experiment record. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Rejects the invented --metrics input on experiments record and does not suggest direct API/report edits as a workaround for recording numbers from logs.",
+      "Explains that experiments metrics takes --model-conf-name and Hub reads the trainer report; resolves or proposes inspecting the experiment record for the exact model rather than guessing it.",
+      "Waits for completed training and an available report before retrieving measurements; does not treat RUNNING logs or estimated values as completed comparative evidence.",
+      "Keeps the trial scoped to trial-42 using an explicit argument or ZIPLINE_TRIAL_ID and avoids marking it SUCCEEDED or naming a winner prematurely.",
+      "Provides a read-only correction without submitting commands or claiming the suggested values were measured."
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "entity-mutations",
+  "description": "Distinguish snapshot passthrough from temporal entity updates and validate mutation semantics.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "groupby",
+    "entity",
+    "no-write"
+  ],
+  "prompt": "Compare two listing features. A needs yesterday's listing attributes by listing_id with no live updates. B needs point-in-time listing lookups reflecting updates throughout the day and live serving. B has a confirmed snapshot export, mutation-history export, and Pub/Sub mutation topic; mutation rows contain all listing fields, updated_at_ms LONG, and before_image BOOLEAN. Describe the source and Query settings for each using symbolic table/topic variables and the public API, including timestamp and reversal semantics. Inspect the existing GCP dimension examples. Do not create files or contact services.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "A uses an EntitySource snapshot passthrough without inventing a mutation table/topic or adding a time column solely for a non-windowed snapshot lookup.",
+      "B uses EntitySource with the supplied snapshot_table, mutation_table, and mutation_topic, temporal accuracy, and explicit Query mutation_time_column=updated_at_ms and reversal_column=before_image (or equivalent expressions).",
+      "The response preserves millisecond mutation time and explains before-image versus after-image semantics rather than treating mutations as independent append-only events.",
+      "The agent separates event time from mutation time, validates schema/key consistency and topic compatibility, and does not replace supplied infrastructure facts with invented identifiers.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

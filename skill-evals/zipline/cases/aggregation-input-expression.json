@@ -1,0 +1,24 @@
+{
+  "id": "aggregation-input-expression",
+  "description": "Move row-level calculations into selects and preserve conditional-average semantics.",
+  "tags": [
+    "offline",
+    "original-context",
+    "review",
+    "groupby",
+    "aggregations",
+    "filtering",
+    "no-write"
+  ],
+  "prompt": "Review this draft 7-day user purchase feature for a Spark EventSource: Query(selects=selects(\"user_id\", \"event_type\", \"price\", \"quantity\"), time_column=\"ts\") with Aggregation(input_column=\"IF(event_type = 'purchase', price * quantity, 0)\", operation=Operation.AVERAGE, windows=[\"7d\"]). We need the average purchase revenue per user, excluding non-purchase rows only from this feature because other features use them. The source columns are confirmed and ts is a millisecond long. Explain and show the corrected Query and Aggregation fragments without editing files or running services.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "The agent identifies that Aggregation.input_column must reference a selected column, then puts the conditional price * quantity calculation into a named selects expression and aggregates that alias.",
+      "Excluded non-purchases yield NULL for the average, not zero; the response explains that zero would change the average denominator.",
+      "The correction preserves user_id, the millisecond timestamp, and the 7-day window. It does not filter all non-purchases out with query-level wheres.",
+      "The agent does not edit repository files, submit jobs, or claim live validation; it answers using the supplied facts and repository evidence."
+    ]
+  }
+}

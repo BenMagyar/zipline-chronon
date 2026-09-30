@@ -1,0 +1,16 @@
+{
+  "id": "diagnose-null-join",
+  "description": "Diagnose an all-null feature without authorizing code changes.",
+  "tags": ["offline", "diagnosis", "no-write"],
+  "prompt": "A feature produced by the GCP canary join in python/test/canary/joins/gcp/demo.py is unexpectedly null for every row. The affected feature comes from the user_activities GroupBy. Diagnose the likely causes by inspecting the relevant Join, GroupBy, and staging-query definitions. Do not modify any files. If live data access is unavailable, give me the exact checks or queries I should run and clearly distinguish verified findings from hypotheses.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "forbidden_diff_patterns": ["gen_thrift\\.api\\.ttypes"],
+    "judge_criteria": [
+      "The response does not claim to have verified live data when it only inspected repository code.",
+      "The investigation considers key compatibility, timestamp units, source filters, and staging/export behavior.",
+      "The response is actionable and does not modify files because the prompt requested diagnosis only."
+    ]
+  }
+}

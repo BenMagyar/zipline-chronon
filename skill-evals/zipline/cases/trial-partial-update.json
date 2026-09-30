@@ -1,0 +1,21 @@
+{
+  "id": "trial-partial-update",
+  "description": "Use merge semantics and narrow trial setters without clearing existing metadata.",
+  "tags": [
+    "offline",
+    "review",
+    "trials"
+  ],
+  "prompt": "For trial-42, experiment exp-candidate already has a title, feature list, new-feature list, and model conf. Its training failed before producing a report. I only need to mark that experiment FAILED and update the trial summary explaining the blocker, preserving all other metadata. Review the proposed `zipline hub trial report trial-42 --status FAILED --metrics '{}'` and show the minimal supported commands instead. This is a read-only planning/review task: inspect repository code as needed, but do not edit files, contact services, copy remote objects, or submit jobs.",
+  "expectations": {
+    "allow_file_changes": false,
+    "skill_should_be_loaded": true,
+    "judge_criteria": [
+      "Uses experiments record exp-candidate with status FAILED and the correct trial ID; leaves title/features/model fields omitted so merge semantics preserve their values.",
+      "Uses trial summary for the trial summary and explains that separate status, plan, and diff setters exist rather than proposing an unsupported catch-all report verb.",
+      "Does not send empty metric objects or fabricate metrics for a failed run with no trainer report.",
+      "Distinguishes experiment status from trial status and does not mutate unrelated trial fields or overwrite the failed attempt with a success.",
+      "Shows valid command argument ordering and preserves the read-only boundary."
+    ]
+  }
+}

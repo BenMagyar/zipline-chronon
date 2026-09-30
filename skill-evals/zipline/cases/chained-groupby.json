@@ -1,0 +1,37 @@
+{
+  "id": "chained-groupby",
+  "description": "Extend an enriched activity GroupBy while preserving its parent dependency and bounded streaming aggregation.",
+  "tags": [
+    "integration",
+    "original-context",
+    "authoring",
+    "groupby",
+    "chaining"
+  ],
+  "prompt": "Extend the GCP chained user activity features in python/test/canary/group_bys/gcp/user_activities_chained.py with the average listing price a user interacted with over the last 14 days. The price must be the listing attribute from the existing enrichment, not a field invented on the raw activity stream. Keep this feature available online and preserve existing versions. Compile and evaluate the change; avoid unrelated edits.",
+  "expectations": {
+    "allow_file_changes": true,
+    "skill_should_be_loaded": true,
+    "required_changed_globs": [
+      "python/test/canary/group_bys/gcp/user_activities_chained.py"
+    ],
+    "forbidden_changed_globs": [
+      "python/src/ai/chronon/resources/agent_context.md"
+    ],
+    "required_command_patterns": [
+      "zipline compile",
+      "zipline hub eval"
+    ],
+    "forbidden_diff_patterns": [
+      "gen_thrift\\.api\\.ttypes"
+    ],
+    "judge_criteria": [
+      "The agent inspects user_activities_chained.py, joins/gcp/demo_parent.py, and the listing dimension GroupBy before changing the child.",
+      "The new version reuses the existing parent Join through JoinSource (directly or via upstream_join_source), selects the real listing_id_price_cents output as price_cents, and aggregates that selected alias by user_id.",
+      "The average uses a 14-day window and a millisecond time column from the parent output. Existing LAST_K features retain their windows because the parent is streaming.",
+      "The agent checks that the parent and upstream dependencies support online serving and that parent row IDs are exposed by its left query. Existing parent defects are reported or fixed narrowly with separate validation, not silently treated as valid.",
+      "The agent preserves existing config variables and shared source/aggregation objects when creating a new version, avoiding indirect changes to production configs.",
+      "The agent compiles and evaluates each changed config before editing the next config. The final response names changed files and accurately distinguishes passed validation from attempted commands or external blockers."
+    ]
+  }
+}
