@@ -685,6 +685,8 @@ def submit_workflow(
     use_auth=True,
     format: Format = Format.TEXT,
     workflow_concurrency=None,
+    trial_id=None,
+    experiment_id=None,
 ):
     hub_conf = get_hub_conf(conf, root_dir=repo)
     zipline_hub = _get_zipline_hub(hub_url, hub_conf, use_auth, format)
@@ -719,6 +721,11 @@ def submit_workflow(
             conf_hash=conf_name_to_hash_dict[conf_name].hash,
             skip_long_running=False,
             concurrency=workflow_concurrency,
+            # Attribution rides along with the submission rather than being reconstructed
+            # later. Falls back to the environment so an agent that exported the trial
+            # once cannot forget it on a subsequent command.
+            trial_id=trial_id or os.environ.get(TRIAL_ID_ENV_VAR),
+            experiment_id=experiment_id or os.environ.get(EXPERIMENT_ID_ENV_VAR),
         )
 
     workflow_id = response_json.get("workflowId", "N/A")
@@ -788,6 +795,285 @@ def submit_schedule(
     print_success("Schedule deployed. 🗓️", format=format)
     print_key_value("📦 Conf", conf_name, format=format)
     print_key_value("🗓️  Schedules", readable_schedules, format=format)
+
+
+@hub.group(help="Track trials and the experiments run inside them.")
+def trial():
+    """A subgroup of `hub`, not a top-level verb.
+
+    Every trial command talks to the hub, so it needs the same connection arguments
+    the other hub commands take — hub_url, cloud, customer. Hanging it off `hub` puts
+    it where those belong instead of re-declaring them for a parallel top-level group.
+    """
+
+
+TRIAL_ID_ENV_VAR = "ZIPLINE_TRIAL_ID"
+EXPERIMENT_ID_ENV_VAR = "ZIPLINE_EXPERIMENT_ID"
+
+
+def trial_options(func):
+    """The subset of common_options a trial verb needs; there is no conf to force.
+
+    Cloud and customer come from flags rather than a conf path for the same reason
+    `cancel` takes them: without a conf there is nothing to infer them from.
+    """
+    func = repo_option(func)
+    func = hub_url_option(func)
+    func = use_auth_option(func)
+    func = format_option(func)
+    func = cloud_provider_option(func)
+    func = customer_id_option(func)
+    func = env_option(func)
+    return func
+
+
+def trial_id_argument(func):
+    """Falls back to the environment so an agent sets the trial once and forgets it.
+
+    Threading the id through every later command by hand is the step an agent is most
+    likely to skip, and a skipped link is a job nobody can attribute afterwards.
+    """
+    return click.argument("trial_id", required=False, default=None)(func)
+
+
+def _resolve_trial_id(trial_id):
+    resolved = trial_id or os.environ.get(TRIAL_ID_ENV_VAR)
+    if not resolved:
+        raise click.UsageError(
+            f"No trial id given. Pass it as an argument or export {TRIAL_ID_ENV_VAR}."
+        )
+    return resolved
+
+
+def _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env):
+    """A trial is not attached to a conf, so the hub settings come from the default
+    team's metadata, the same source `cancel` uses for its conf-less run."""
+    # Absolute: --chronon-root defaults to ".", and scope is what groups attempts,
+    # so a relative value would file every repo's trials under the same scope.
+    repo_root = os.path.abspath(repo or os.getcwd())
+    hub_conf = get_hub_conf_from_metadata_conf(
+        default_team_metadata_conf(env),
+        root_dir=repo_root,
+        cloud_provider=cloud,
+        customer_id=customer_id,
+    )
+    return _get_zipline_hub(hub_url, hub_conf, use_auth, format), hub_conf, repo_root
+
+
+def _emit(payload, format, title=None):
+    if format == Format.JSON:
+        print(json.dumps(payload, indent=2))
+        return
+    if title:
+        print_success(title, format=format)
+    for key, value in payload.items():
+        print_key_value(key, value, format=format)
+
+
+@trial.command()
+@click.argument("run_name")
+@trial_options
+@click.option("--task", help="What this trial is setting out to do.")
+@click.option(
+    "--model",
+    help=(
+        "The model this trial iterates on. Each experiment still names its own model "
+        "conf; this is the family they are variants of, and it is what a model page "
+        "lists its trials by."
+    ),
+)
+@click.option("--scope", help="Defaults to the repo root, which is what groups attempts.")
+@click.option("--branch", help="Defaults to the current git branch.")
+@click.option("--mode", default="EXECUTE", show_default=True)
+@jsonify_exceptions_if_json_format
+def start(run_name, repo, hub_url, use_auth, format, cloud, customer_id, env, task, model, scope, branch, mode):
+    """Start a trial. Re-using a run name starts a new attempt rather than resuming."""
+    zipline_hub, hub_conf, repo_root = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_start_api(
+        run_name=run_name,
+        scope=scope or repo_root,
+        branch=branch or get_current_branch(repo_root),
+        user=get_user_email(),
+        mode=mode.upper(),
+        task=task,
+        model=model,
+    )
+    created = response["trial"]
+    _emit(
+        {
+            "trialId": created["id"],
+            "runName": created["runName"],
+            "scope": created["scope"],
+            "branch": created["branch"],
+            "model": created.get("model"),
+            "exportCommand": f"export {TRIAL_ID_ENV_VAR}={created['id']}",
+        },
+        format,
+        title="Trial started. 🧪",
+    )
+
+
+@trial.command()
+@trial_id_argument
+@trial_options
+@jsonify_exceptions_if_json_format
+def show(trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env):
+    """Show one trial."""
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    _emit(zipline_hub.call_trial_get_api(_resolve_trial_id(trial_id))["trial"], format)
+
+
+@trial.command(name="list")
+@trial_options
+@click.option("--scope", help="Filter to one scope.")
+@click.option("--run-name", help="All attempts of a run name.")
+@click.option("--limit", type=int)
+@jsonify_exceptions_if_json_format
+def list_trials(repo, hub_url, use_auth, format, cloud, customer_id, env, scope, run_name, limit):
+    """List trials, newest first."""
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_list_api(scope=scope, run_name=run_name, limit=limit)
+    if format == Format.JSON:
+        print(json.dumps(response, indent=2))
+        return
+    for found in response.get("trials", []):
+        print_key_value(found["id"], f"{found['runName']} [{found['status']}] {found.get('task', '')}",
+                        format=format)
+
+
+# The memo splits a catch-all "report" verb into these four, so a caller says which field
+# it means and a partial write cannot blank the ones it did not mention.
+def _field_setter(field, help_text):
+    # help= rather than a docstring: click captures the docstring when the decorator
+    # runs, so assigning __doc__ afterwards leaves the verb undocumented in --help.
+    @trial.command(name=field, help=help_text)
+    @click.argument("value")
+    @trial_id_argument
+    @trial_options
+    @jsonify_exceptions_if_json_format
+    def setter(value, trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env,
+               _field=field):
+        zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+        response = zipline_hub.call_trial_field_api(_resolve_trial_id(trial_id), _field, value)
+        _emit({"trialId": response["trial"]["id"], _field: response["trial"].get(_field)}, format)
+
+    return setter
+
+
+_field_setter("status", "Set the trial's status.")
+_field_setter("summary", "Set the trial's summary.")
+_field_setter("plan", "Set the trial's plan (JSON).")
+_field_setter("diff", "Set the trial's root diff.")
+
+
+@trial.group(help="Record and inspect the experiments inside a trial.")
+def experiments():
+    pass
+
+
+@experiments.command(name="record")
+@click.argument("experiment_id")
+@trial_id_argument
+@trial_options
+@click.option("--title", help="A short name for this variant.")
+@click.option("--branch", help="The branch this variant was built on.")
+@click.option("--status", help="e.g. RUNNING, SUCCEEDED, FAILED.")
+@click.option("--model-conf-name", help="The model this variant trains.")
+@click.option("--features", help="Comma-separated feature names.")
+@click.option("--new-features", help="Comma-separated features this variant adds.")
+@jsonify_exceptions_if_json_format
+def record_experiment(experiment_id, trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env, title, branch,
+                      status, model_conf_name, features, new_features):
+    """Record an experiment. Fields left out keep whatever is already stored.
+
+    There is deliberately no way to pass a metric: Hub reads those from the trainer's own
+    report, so a result cannot be misreported by whoever is describing it.
+    """
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_experiment_record_api(
+        _resolve_trial_id(trial_id),
+        experiment_id,
+        title=title,
+        branch=branch,
+        status=status,
+        modelConfName=model_conf_name,
+        featureNames=features.split(",") if features else None,
+        newFeatureNames=new_features.split(",") if new_features else None,
+    )
+    _emit({"experimentId": response["experiment"]["experimentId"],
+           "status": response["experiment"].get("status")}, format)
+
+
+@experiments.command(name="metrics")
+@click.argument("experiment_id")
+@click.option("--model-conf-name", required=True, help="The model whose report to read.")
+@trial_id_argument
+@trial_options
+@jsonify_exceptions_if_json_format
+def experiment_metrics(experiment_id, model_conf_name, trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env):
+    """Attach the measured results of a finished training run.
+
+    Names the model; Hub locates that run's report and reads the numbers itself.
+    """
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_experiment_metrics_api(
+        _resolve_trial_id(trial_id), experiment_id, model_conf_name)
+    _emit({"experimentId": response["experiment"]["experimentId"],
+           "reportUri": response.get("reportUri"),
+           "metrics": response["experiment"].get("metrics")}, format)
+
+
+@experiments.command(name="list")
+@trial_id_argument
+@trial_options
+@jsonify_exceptions_if_json_format
+def list_experiments(trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env):
+    """List a trial's experiments."""
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_experiment_list_api(_resolve_trial_id(trial_id))
+    if format == Format.JSON:
+        print(json.dumps(response, indent=2))
+        return
+    for found in response.get("experiments", []):
+        print_key_value(found["experimentId"],
+                        f"[{found.get('status', '?')}] {found.get('metrics', 'no metrics yet')}",
+                        format=format)
+
+
+@trial.group(help="The shared journal of what has been tried before.")
+def journal():
+    pass
+
+
+@journal.command(name="append")
+@click.argument("summary")
+@trial_id_argument
+@trial_options
+@click.option("--diff", help="The diff this retrospective refers to.")
+@jsonify_exceptions_if_json_format
+def append_journal(summary, trial_id, repo, hub_url, use_auth, format, cloud, customer_id, env, diff):
+    """Write a short retrospective, so the next agent can find it."""
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_journal_append_api(_resolve_trial_id(trial_id), summary, diff)
+    _emit({"entryId": response["entry"]["id"], "runName": response["entry"]["runName"]}, format)
+
+
+@journal.command(name="list")
+@trial_options
+@click.option("--run-name", help="Crosses scopes: has anyone tried this before?")
+@click.option("--scope", help="Everything written in one scope.")
+@click.option("--trial-id", "trial_id_opt", help="One trial's entries.")
+@jsonify_exceptions_if_json_format
+def list_journal(repo, hub_url, use_auth, format, cloud, customer_id, env, run_name, scope, trial_id_opt):
+    """Search the journal. A run name search deliberately crosses scopes."""
+    zipline_hub, _, _ = _trial_hub(repo, hub_url, use_auth, format, cloud, customer_id, env)
+    response = zipline_hub.call_trial_journal_list_api(
+        trial_id=trial_id_opt, run_name=run_name, scope=scope)
+    if format == Format.JSON:
+        print(json.dumps(response, indent=2))
+        return
+    for entry in response.get("entries", []):
+        print_key_value(f"{entry['runName']} ({entry['scope']})", entry["summary"], format=format)
 
 
 # zipline hub backfill compiled/joins/join

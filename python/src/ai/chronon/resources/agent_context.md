@@ -76,6 +76,12 @@ You are an expert in Chronon (feature definition API) and Zipline (CLI/platform)
 - [Complete Conversion Examples](#complete-tecton-to-chronon-conversion-examples)
 - [Migration Workflow](#tecton-migration-workflow)
 
+**Part 8: Running Trials and Experiments** ⭐
+- [When to open one, without being asked](#when-to-open-one-without-being-asked) - any question whose answer is a comparison
+- [The rule that matters most](#the-rule-that-matters-most) - never type a metric yourself
+- [One model name per variant](#the-other-rule-that-matters-most) - or two experiments describe one run
+- [The loop](#the-loop) - start, record, train, read metrics, summarise, journal
+
 ---
 
 ## Core Philosophy
@@ -3104,6 +3110,194 @@ Use this checklist for each Tecton feature being migrated:
 - [ ] Documented any semantic differences
 
 
+## Part 8: Running Trials and Experiments
+
+A **trial** is one attempt at a modelling task. The **experiments** inside it are the
+variants you try. Hub stores both, so the next agent — or the human reviewing you — can
+see what was already attempted and how each variant scored without re-reading a
+transcript.
+
+### When to open one, without being asked
+
+A trial is not a thing the user requests by name. They ask a modelling question, and the
+trial is how you answer it so the answer survives. **Open one whenever you are about to
+train more than once to settle a question**, before running anything.
+
+These are all trial-shaped, however they are phrased:
+
+- "Does adding X help the CTR model?" — baseline and X are two experiments.
+- "Try a 7d and a 30d window and tell me which is better." — two experiments.
+- "Can you get the AUC above 0.78?" — every attempt is an experiment; the trial is the
+  hunt.
+- "Tune the hyperparameters on this model." — one experiment per setting tried.
+
+What makes them trial-shaped is not the word "experiment": it is that **a comparison is
+the deliverable**. If the answer is "A scored better than B", the thing that has to
+outlive the session is A's number, B's number, and what differed between them. That is
+what a trial holds.
+
+One training run to see if something works at all is not a trial. Neither is a backfill.
+If nothing is being compared, there is nothing for the trial to be about.
+
+So the shape of the work, when the question is trial-shaped, is:
+
+1. Check the journal — someone may have answered this already.
+2. Open a trial whose task is the question, in the user's words.
+3. One experiment per variant, recorded **before** it runs.
+4. Read each one's metrics from its own report.
+5. Say what you concluded, in the summary and the journal.
+
+Do this without being told to. A user who asks "does purchase history help?" and gets
+back a number in the chat has been answered; a user who gets back a trial has been
+answered in a way the next person can check.
+
+### The rule that matters most
+
+**Never type a metric yourself.** There is deliberately no flag for it. You name the
+model, and Hub finds that run's report in object storage and reads the numbers out of it:
+
+```bash
+zipline hub trial experiments metrics exp-30d \
+    --model-conf-name aws_databricks.ctr_ray.ctr_model_30d__afce3c0e00af
+```
+
+A metric an agent typed is a claim; a metric read from the trainer's own output is a
+measurement. Only the second is worth comparing against. If the run has not finished
+there is nothing to read yet — wait for it rather than paraphrasing the logs.
+
+### The other rule that matters most
+
+**One model name per variant.** Two experiments that name the same model read the same
+report, so the trial ends up showing one measurement twice, under two names, as though
+the variants had been compared. That is the same failure as typing a metric by hand —
+a number filed against something it does not describe — and it is harder to spot,
+because both rows look like real results.
+
+Hub refuses it rather than storing it:
+
+```
+Report s3://…/experiment_report.json already holds the metrics for experiment
+exp-baseline on this trial. Give exp-7d its own model version so its run writes a
+separate report, otherwise both experiments describe the same training run.
+```
+
+If you see that, you ran the second variant against the first one's model. Give it its
+own name, re-run it, and read the metrics again — see *Giving a variant somewhere of its
+own to write* below for the archive step that goes with a new name.
+
+### Before you start: has this been tried?
+
+The journal crosses scopes on purpose, so you can find another team's attempt at the
+same question:
+
+```bash
+zipline hub trial journal list --run-name ctr-features
+```
+
+### The loop
+
+```bash
+# 1. Open a trial. Re-using a run name starts a NEW attempt; it does not resume.
+#    --model names the model under study. Pass a real conf name — usually the committed
+#    one you are iterating on — because the model's page lists its trials by this value
+#    and an invented family name links nowhere. The variants below each get their own
+#    conf; this one says what the trial is about.
+zipline hub trial start ctr-features --task "Does a 30d window beat 7d for CTR?" \
+    --model aws_databricks.ctr_ray.ctr_ray_model__afce3c0e00af
+# → prints: export ZIPLINE_TRIAL_ID=<id>
+
+# 2. Export it once. Every later verb falls back to this, so the link cannot be forgotten.
+export ZIPLINE_TRIAL_ID=<id>
+
+# 3. Describe the variant BEFORE running it, so a crash still leaves a record.
+#    Note the model name: each variant gets its OWN, for the reason below.
+zipline hub trial experiments record exp-7d --title "7 day window" --status RUNNING \
+    --model-conf-name aws_databricks.ctr_ray.ctr_model_7d__afce3c0e00af
+
+# 4. Train. The workflow picks the trial up from the environment; you do not pass it.
+ZIPLINE_EXPERIMENT_ID=exp-7d zipline hub backfill \
+    compiled/models/aws_databricks/ctr_ray.ctr_model_7d__afce3c0e00af \
+    --start-ds 2026-08-24 --end-ds 2026-08-24
+
+# 5. Repeat 3–4 for the other variant — under its own model name — then read results
+#    from each trainer's own report.
+zipline hub trial experiments metrics exp-7d  --model-conf-name aws_databricks.ctr_ray.ctr_model_7d__afce3c0e00af
+zipline hub trial experiments metrics exp-30d --model-conf-name aws_databricks.ctr_ray.ctr_model_30d__afce3c0e00af
+
+# 6. Compare, then say what you concluded.
+zipline hub trial experiments list
+zipline hub trial summary "30d lifted AUC 0.71 → 0.74; 7d is not worth keeping."
+zipline hub trial status SUCCEEDED
+
+# 7. Leave the retrospective for whoever comes next.
+zipline hub trial journal append "30d window wins on AUC. Longer windows untested."
+```
+
+### Giving a variant somewhere of its own to write
+
+Two variants that run the same trainer and differ only in configuration — different
+features, different hyperparameters — have identical trainer bytes, so they share a
+version. The version is a content address of the archive and nothing else; it does not
+see your config.
+
+That matters because a run's output directory is `{base}/models/{model_name}/{version}`.
+Under one name, two variants overwrite each other's report, and a comparison between them
+reads whichever finished last, twice. **So give each variant its own model name**, not its
+own version.
+
+Then the step that is easy to miss, and that will kill the run before training starts:
+
+**A new model name needs the trainer archive published under that name.** The archive is
+fetched from `{base}/builds/{model_name}-{version}.zip`, so the key is scoped by name.
+Point a new name at an archive that isn't there and Ray fails setting up its runtime
+environment, with an error about the bucket rather than about your model:
+
+```
+OSError: unable to access bucket: 'zipline-warehouse-crucible'
+key: 'builds/my_new_variant-afce3c0e00af.zip' ... (NoSuchKey)
+```
+
+If the trainer is unchanged, copy the existing archive rather than rebuilding — same bytes
+mean the same version, which is what lets the two variants stay comparable:
+
+```bash
+aws s3 cp s3://{base}/builds/{existing_model}-{version}.zip \
+          s3://{base}/builds/{new_model}-{version}.zip
+```
+
+If you changed the trainer, rebuild it instead; the version moves with the bytes, and the
+two variants are then no longer running the same code — which is usually not what a
+controlled comparison wants.
+
+### Partial writes are safe
+
+`experiments record` merges: fields you leave out keep whatever is already stored, so
+recording a status later does not blank the title or feature list you set earlier. The
+trial's own fields are split into separate verbs (`status`, `summary`, `plan`, `diff`)
+for the same reason — there is no catch-all verb that could silently clear a field you
+did not mention.
+
+### Machine-readable output
+
+Every trial verb takes `--format json`, which is what to use when parsing rather than
+showing:
+
+```bash
+zipline hub trial experiments list --format json
+```
+
+### Reminders
+
+- One trial per question, not per day. If the question changes, start a new trial.
+- One model name per variant. Reusing a name across experiments in a trial is refused,
+  because both would read the same report and the comparison would be with itself.
+- Pass `--model` when you open the trial, and pass a conf that exists — usually the one
+  you are iterating on. The per-variant names all differ by design, so without it nothing
+  records which model the trial was about, and the model page cannot list it.
+- `--scope` defaults to the repo root, and that is what groups attempts together.
+- Record the variant before running it, not after. A record written only on success
+  loses exactly the runs you most want to learn from.
+
 ## Important Notes
 
 - **Always ask before assuming**: Especially for source type, PK, and time column
@@ -3137,6 +3331,8 @@ Use this checklist for each Tecton feature being migrated:
 | Convert Tecton Aggregations | Map function string to Operation enum |
 | Migrate Tecton project | Inventory features, convert sources first, work bottom-up |
 | Any authoring | Compile then validate after |
+| Try model variants | `zipline hub trial start`, then record each variant before running it |
+| Record a result | `zipline hub trial experiments metrics` — never type the number yourself |
 
 ---
 

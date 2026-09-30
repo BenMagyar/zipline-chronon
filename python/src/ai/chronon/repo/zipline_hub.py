@@ -684,6 +684,89 @@ class ZiplineHub:
             print_error(f"Error calling list-tables API: {self._get_error_details(e)}", format=self.format)
             raise e
 
+    # ---- Trials -------------------------------------------------------------
+    # The agent never sends a metric. It names the model it trained and Hub reads that
+    # run's own report, so a number in the UI comes from the trainer rather than from
+    # whatever is describing it.
+
+    def _trial_request(self, method: str, path: str, label: str, payload: dict = None,
+                       params: dict = None):
+        url = f"{self.base_url}/trials/v1{path}"
+        try:
+            response = requests.request(
+                method, url, json=payload, params=params,
+                headers=self.additional_headers(self.base_url),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling {label} API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format,
+            )
+            raise e
+        except requests.RequestException as e:
+            self.handle_unauth(e, label)
+            print_error(f"Error calling {label} API: {self._get_error_details(e)}", format=self.format)
+            raise e
+
+    def call_trial_start_api(self, run_name, scope, branch, user, mode, task=None, plan=None, model=None):
+        payload = {
+            "runName": run_name,
+            "scope": scope,
+            "branch": branch,
+            "user": user,
+            "mode": mode,
+        }
+        if task:
+            payload["task"] = task
+        if plan:
+            payload["plan"] = plan
+        if model:
+            payload["model"] = model
+        return self._trial_request("POST", "", "trial start", payload=payload)
+
+    def call_trial_get_api(self, trial_id):
+        return self._trial_request("GET", f"/{trial_id}", "trial show")
+
+    def call_trial_list_api(self, scope=None, run_name=None, limit=None, offset=None):
+        params = {k: v for k, v in
+                  {"scope": scope, "runName": run_name, "limit": limit, "offset": offset}.items()
+                  if v is not None}
+        return self._trial_request("GET", "", "trial list", params=params)
+
+    def call_trial_field_api(self, trial_id, field, value):
+        """One narrow setter per field, so a partial write cannot blank the others."""
+        return self._trial_request("POST", f"/{trial_id}/{field}", f"trial {field} set",
+                                   payload={field: value})
+
+    def call_trial_experiment_record_api(self, trial_id, experiment_id, **fields):
+        payload = {"experimentId": experiment_id}
+        payload.update({k: v for k, v in fields.items() if v is not None})
+        return self._trial_request("POST", f"/{trial_id}/experiments", "experiment record",
+                                   payload=payload)
+
+    def call_trial_experiment_metrics_api(self, trial_id, experiment_id, model_conf_name):
+        return self._trial_request(
+            "POST", f"/{trial_id}/experiments/{experiment_id}/metrics", "experiment metrics",
+            payload={"modelConfName": model_conf_name})
+
+    def call_trial_experiment_list_api(self, trial_id):
+        return self._trial_request("GET", f"/{trial_id}/experiments", "experiment list")
+
+    def call_trial_journal_append_api(self, trial_id, summary, diff=None):
+        payload = {"summary": summary}
+        if diff:
+            payload["diff"] = diff
+        return self._trial_request("POST", f"/{trial_id}/journal", "journal append", payload=payload)
+
+    def call_trial_journal_list_api(self, trial_id=None, run_name=None, scope=None):
+        params = {k: v for k, v in
+                  {"trialId": trial_id, "runName": run_name, "scope": scope}.items() if v}
+        return self._trial_request("GET", "/journal", "journal list", params=params)
+
     def call_workflow_start_api(
         self,
         conf_name,
@@ -695,6 +778,8 @@ class ZiplineHub:
         end=None,
         skip_long_running=False,
         concurrency=None,
+        trial_id=None,
+        experiment_id=None,
     ):
         url = f"{self.base_url}/workflow/v2/start"
         end_dt = _format_hub_partition(end, date.today().strftime("%Y-%m-%d"))
@@ -711,6 +796,10 @@ class ZiplineHub:
         }
         if concurrency is not None:
             workflow_request["workflowConcurrency"] = concurrency
+        if trial_id:
+            workflow_request["trialId"] = trial_id
+        if experiment_id:
+            workflow_request["experimentId"] = experiment_id
         try:
             response = requests.post(
                 url, json=workflow_request, headers=self.additional_headers(self.base_url)

@@ -14,6 +14,7 @@
 import datetime
 import json
 import os
+from unittest import mock
 from unittest.mock import Mock, patch
 
 import click
@@ -2028,3 +2029,153 @@ class TestGitGuardrailIntegration:
         assert result.exit_code != 0
         mock_post.assert_not_called()
 
+
+
+class TestTrialCli:
+    """The trial verbs the agent skill drives.
+
+    These assert the contract the skill depends on: which fields reach the API, that a
+    metric cannot be sent, and that the trial id can come from the environment so an
+    agent cannot forget it partway through a run.
+    """
+
+    def _hub(self, monkeypatch):
+        from ai.chronon.repo import hub_runner
+
+        calls = {}
+        fake = mock.MagicMock()
+        fake.call_trial_start_api.return_value = {
+            "trial": {"id": "t-1", "runName": "ctr-features", "scope": "/repo", "branch": "main"}
+        }
+        fake.call_trial_experiment_record_api.return_value = {
+            "experiment": {"experimentId": "exp-a", "status": "RUNNING"}
+        }
+        fake.call_trial_experiment_metrics_api.return_value = {
+            "experiment": {"experimentId": "exp-a", "metrics": '{"validation_auc":0.492}'},
+            "reportUri": "s3://bucket/models/listing_ctr_model/afce3c0e00af/experiment_report.json",
+        }
+        fake.call_trial_journal_append_api.return_value = {
+            "entry": {"id": "j-1", "runName": "ctr-features"}
+        }
+        calls["hub"] = fake
+        monkeypatch.setattr(hub_runner, "_trial_hub", lambda *a, **k: (fake, mock.MagicMock(), "/repo"))
+        monkeypatch.setattr(hub_runner, "get_user_email", lambda: "diya@zipline.ai")
+        monkeypatch.setattr(hub_runner, "get_current_branch", lambda root: "main")
+        return fake
+
+    def test_trial_hub_itself_runs(self, monkeypatch, tmp_path):
+        """Exercises _trial_hub rather than replacing it.
+
+        The other tests patch _trial_hub out, so a fault inside it — an undefined
+        name, a relative scope — survives a green suite. This one patches only the
+        layer below and asserts the scope it derives is absolute, since scope is
+        what groups a run's attempts together.
+        """
+        from ai.chronon.repo import hub_runner
+
+        fake = mock.MagicMock()
+        fake.call_trial_start_api.return_value = {
+            "trial": {"id": "t-9", "runName": "r", "scope": str(tmp_path), "branch": "main"}
+        }
+        monkeypatch.setattr(hub_runner, "get_hub_conf_from_metadata_conf",
+                            lambda *a, **k: mock.MagicMock())
+        monkeypatch.setattr(hub_runner, "_get_zipline_hub", lambda *a, **k: fake)
+        monkeypatch.setattr(hub_runner, "get_user_email", lambda: "diya@zipline.ai")
+        monkeypatch.setattr(hub_runner, "get_current_branch", lambda root: "main")
+
+        # A relative root is the case that matters: "." is the option's own default.
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(hub_runner.trial, ["start", "r", "--chronon-root", "."])
+
+        assert result.exit_code == 0, result.output
+        assert os.path.isabs(fake.call_trial_start_api.call_args.kwargs["scope"])
+
+    def test_trial_hangs_off_hub(self):
+        """Trial verbs all talk to the hub, so they live under it.
+
+        As a top-level group they had to re-declare hub_url, cloud and customer for a
+        parallel command tree. Asserted rather than assumed, because moving it back is
+        a one-line change that nothing else would notice.
+        """
+        from ai.chronon.repo.hub_runner import hub, trial
+
+        assert hub.commands.get("trial") is trial
+
+    def test_every_trial_verb_documents_itself(self):
+        """The four field setters are generated, and a generated command is the kind
+        that silently loses its help text."""
+        from ai.chronon.repo.hub_runner import trial
+
+        for name, command in trial.commands.items():
+            assert command.help or command.short_help, f"{name} has no help"
+
+    def test_start_prints_the_export_an_agent_should_use(self, monkeypatch):
+        from ai.chronon.repo.hub_runner import trial
+
+        fake = self._hub(monkeypatch)
+        result = CliRunner().invoke(trial, ["start", "ctr-features", "--task", "add features"])
+
+        assert result.exit_code == 0, result.output
+        # The agent is told how to carry the id forward, rather than being expected to.
+        assert "export ZIPLINE_TRIAL_ID=t-1" in result.output
+        assert fake.call_trial_start_api.call_args.kwargs["run_name"] == "ctr-features"
+
+    def test_trial_id_comes_from_the_environment(self, monkeypatch):
+        from ai.chronon.repo.hub_runner import trial
+
+        fake = self._hub(monkeypatch)
+        result = CliRunner().invoke(
+            trial, ["experiments", "record", "exp-a", "--status", "RUNNING"],
+            env={"ZIPLINE_TRIAL_ID": "t-from-env"},
+        )
+
+        assert result.exit_code == 0, result.output
+        assert fake.call_trial_experiment_record_api.call_args.args[0] == "t-from-env"
+
+    def test_missing_trial_id_is_a_usage_error_not_a_crash(self, monkeypatch):
+        from ai.chronon.repo.hub_runner import trial
+
+        self._hub(monkeypatch)
+        result = CliRunner().invoke(trial, ["experiments", "record", "exp-a"], env={"ZIPLINE_TRIAL_ID": ""})
+
+        assert result.exit_code != 0
+        assert "ZIPLINE_TRIAL_ID" in result.output
+
+    def test_record_offers_no_way_to_send_a_metric(self):
+        """The whole design rests on this: an agent names the model, never the numbers."""
+        from ai.chronon.repo.hub_runner import record_experiment
+
+        option_names = {opt.name for opt in record_experiment.params}
+
+        assert "metrics" not in option_names
+        assert "validation_auc" not in option_names
+        assert "model_conf_name" in option_names
+
+    def test_metrics_verb_sends_only_the_model_name(self, monkeypatch):
+        from ai.chronon.repo.hub_runner import trial
+
+        fake = self._hub(monkeypatch)
+        result = CliRunner().invoke(
+            trial,
+            ["experiments", "metrics", "exp-a", "--model-conf-name", "aws_databricks.ctr_ray.m__v1"],
+            env={"ZIPLINE_TRIAL_ID": "t-1"},
+        )
+
+        assert result.exit_code == 0, result.output
+        args = fake.call_trial_experiment_metrics_api.call_args.args
+        assert args == ("t-1", "exp-a", "aws_databricks.ctr_ray.m__v1")
+        # Hub reports back where it read from, so the caller can see which run was recorded.
+        assert "experiment_report.json" in result.output
+
+    def test_journal_search_by_run_name_crosses_scopes(self, monkeypatch):
+        from ai.chronon.repo.hub_runner import trial
+
+        fake = self._hub(monkeypatch)
+        fake.call_trial_journal_list_api.return_value = {
+            "entries": [{"runName": "ctr-features", "scope": "/repos/other", "summary": "tried already"}]
+        }
+        result = CliRunner().invoke(trial, ["journal", "list", "--run-name", "ctr-features"])
+
+        assert result.exit_code == 0, result.output
+        assert fake.call_trial_journal_list_api.call_args.kwargs["run_name"] == "ctr-features"
+        assert "/repos/other" in result.output
