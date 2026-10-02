@@ -7,7 +7,9 @@ import ai.chronon.online.GroupByServingInfoParsed
 import ai.chronon.online.serde.AvroConversions
 import org.apache.flink.api.common.eventtime.WatermarkStrategy
 import org.apache.flink.api.common.functions.RichFlatMapFunction
-import org.apache.flink.streaming.api.datastream.DataStream
+import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.connector.source.{Source, SourceSplit}
+import org.apache.flink.streaming.api.datastream.{DataStream, DataStreamSource}
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.flink.table.data.RowData
 import org.apache.flink.util.Collector
@@ -118,8 +120,7 @@ object BatchIrSourceBuilder {
       .noWatermarks[RowData]()
       .withIdleness(Duration.ofMinutes(monitorIntervalMin + 5))
 
-    val rawStream = env
-      .fromSource(icebergSource, batchWatermark, s"Iceberg batch source for $uploadTable")
+    val rawStream = attachRowDataSource(env, icebergSource, batchWatermark, s"Iceberg batch source for $uploadTable")
       .uid(s"iceberg-batch-source-$groupByName")
       .setParallelism(1)
 
@@ -129,6 +130,15 @@ object BatchIrSourceBuilder {
       .name(s"Decode batch IR for $groupByName")
       .setParallelism(1)
   }
+
+  /** IcebergSource is generic in T and does not implement ResultTypeQueryable, so the 3-arg fromSource leaves the
+    * stream with MissingTypeInfo and the first downstream operator fails with InvalidTypesException.
+    */
+  private[flink] def attachRowDataSource(env: StreamExecutionEnvironment,
+                                         source: Source[RowData, _ <: SourceSplit, _],
+                                         watermark: WatermarkStrategy[RowData],
+                                         name: String): DataStreamSource[RowData] =
+    env.fromSource(source, watermark, name, TypeInformation.of(classOf[RowData]))
 
   /** Returns an empty stream that completes immediately. Used as fallback when Iceberg is not configured. */
   private def buildIdleStream(env: StreamExecutionEnvironment, groupByName: String): DataStream[BatchIrRow] = {
